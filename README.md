@@ -9,30 +9,51 @@
 
 ---
 
+## Dependencies: pi-mono-python
+
+`openclaw-python` depends on **[pi-mono-python](https://github.com/openxjarvis/pi-mono-python)** — a companion repo that provides the core agent and LLM infrastructure as local packages:
+
+| Package | Provides |
+|---|---|
+| `pi-ai` | Unified LLM streaming layer (Gemini, Anthropic, OpenAI, …) |
+| `pi-agent` | Agent loop, tool execution, session state |
+| `pi-coding-agent` | Coding agent with file/bash/search tools |
+| `pi-tui` | Terminal UI rendering engine |
+
+These packages are resolved by `uv` as **path dependencies** relative to the parent directory. Both repos must be cloned as siblings inside the same parent directory (the name of the parent directory does not matter):
+
+```
+my-workspace/              ← any name works
+├── openclaw-python/       ← this repo
+└── pi-mono-python/        ← required sibling
+```
+
+---
+
 ## Getting Started
 
-### Prerequisites
+### 1. Install
 
-- **Python 3.11+** (3.12+ recommended)
-- **[uv](https://docs.astral.sh/uv/)** package manager
-- At least one LLM API key (Anthropic Claude, Google Gemini, or OpenAI)
-- **For Telegram:** A bot token from [@BotFather](https://t.me/botfather)
-
-### Install
+**Prerequisites:** Python 3.11+ and [uv](https://docs.astral.sh/uv/) package manager.
 
 ```bash
 # Install uv (if not already installed)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Clone and install
+# Create a workspace directory (any name) and clone both repos into it
+mkdir my-workspace && cd my-workspace
+
+git clone https://github.com/openxjarvis/pi-mono-python.git
 git clone https://github.com/openxjarvis/openclaw-python.git
+
+# Install (uv resolves pi-mono-python packages automatically)
 cd openclaw-python
 uv sync
 ```
 
-### Configure
+### 2. Add API Keys
 
-Create a `.env` file with your API keys:
+Create a `.env` file with at least one LLM provider key:
 
 ```bash
 cp .env.example .env
@@ -52,13 +73,15 @@ OPENAI_API_KEY=sk-...
 TELEGRAM_BOT_TOKEN=...
 ```
 
-### Run the Onboarding Wizard
+### 3. Onboard
 
-The interactive wizard guides you through full setup — model selection, Telegram config, daemon installation, and workspace initialization:
+Run the interactive setup wizard. It guides you through model selection, Telegram configuration, workspace initialization, and optional daemon installation — all in one go:
 
 ```bash
 uv run openclaw onboard
 ```
+
+Onboarding creates your `~/.openclaw/` workspace, generates config, and optionally installs the gateway as a background service. **Start here every time you set up a new environment.**
 
 ---
 
@@ -114,7 +137,24 @@ The UI lets you chat with the agent, inspect sessions, manage cron jobs, and con
 | `uv run openclaw gateway logs` | Tail gateway logs |
 | `uv run openclaw doctor` | Run system diagnostics |
 | `uv run openclaw config show` | Show current configuration |
-| `uv run openclaw cleanup --kill-all` | Kill stuck processes |
+| `uv run openclaw cleanup` | Clean up processes, ports, and stale state |
+
+### Cleanup
+
+Use `cleanup` when the gateway is stuck, a port is already in use, or you want to reset to a clean state:
+
+```bash
+# Kill all openclaw processes
+uv run openclaw cleanup --kill-all
+
+# Free a specific port
+uv run openclaw cleanup --ports 18789
+
+# Remove stale lock/state files only (no process kill)
+uv run openclaw cleanup --stale
+```
+
+Run `uv run openclaw cleanup --help` to see all available options.
 
 ---
 
