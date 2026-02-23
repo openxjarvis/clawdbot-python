@@ -9,6 +9,14 @@
 
 ---
 
+## Preview
+
+<img src="assets/telegram-preview.jpg" alt="Jarvis on Telegram" width="360" />
+
+*Jarvis responding on Telegram — powered by OpenXJarvis*
+
+---
+
 ## Dependencies: pi-mono-python
 
 `openclaw-python` depends on **[pi-mono-python](https://github.com/openxjarvis/pi-mono-python)** — a companion repo that provides the core agent and LLM infrastructure as local packages:
