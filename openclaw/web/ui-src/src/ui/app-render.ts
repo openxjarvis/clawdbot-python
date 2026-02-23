@@ -339,10 +339,14 @@ export function renderApp(state: AppViewState) {
                 busy: state.cronBusy,
                 form: state.cronForm,
                 channels: state.channelsSnapshot?.channelMeta?.length
-                  ? state.channelsSnapshot.channelMeta.map((entry) => entry.id)
+                  ? (Array.isArray(state.channelsSnapshot.channelMeta)
+                      ? state.channelsSnapshot.channelMeta.map((entry) => entry.id)
+                      : Object.keys(state.channelsSnapshot.channelMeta as Record<string, unknown>))
                   : (state.channelsSnapshot?.channelOrder ?? []),
                 channelLabels: state.channelsSnapshot?.channelLabels ?? {},
-                channelMeta: state.channelsSnapshot?.channelMeta ?? [],
+                channelMeta: Array.isArray(state.channelsSnapshot?.channelMeta)
+                  ? (state.channelsSnapshot?.channelMeta ?? [])
+                  : Object.values((state.channelsSnapshot?.channelMeta ?? {}) as Record<string, unknown>) as import("./types.ts").ChannelUiMetaEntry[],
                 runsJobId: state.cronRunsJobId,
                 runs: state.cronRuns,
                 onFormChange: (patch) => (state.cronForm = { ...state.cronForm, ...patch }),
