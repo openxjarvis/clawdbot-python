@@ -149,7 +149,7 @@ def _follow_events(
 
         connect_kwargs = {}
         if auth_token:
-            connect_kwargs["extra_headers"] = {"Authorization": f"Bearer {auth_token}"}
+            connect_kwargs["additional_headers"] = {"Authorization": f"Bearer {auth_token}"}
 
         if not json_output:
             console.print(f"[dim]Connecting to {ws_url}...[/dim]")

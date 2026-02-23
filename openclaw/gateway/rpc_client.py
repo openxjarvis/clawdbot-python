@@ -68,12 +68,13 @@ class GatewayRPCClient:
         
         try:
             # Prepare connection kwargs
-            connect_kwargs = {}
+            # websockets >= 11 renamed extra_headers → additional_headers
+            connect_kwargs: dict[str, Any] = {}
             if self.auth_token:
-                connect_kwargs["extra_headers"] = {
+                connect_kwargs["additional_headers"] = {
                     "Authorization": f"Bearer {self.auth_token}"
                 }
-            
+
             async with websockets.connect(self.url, **connect_kwargs) as ws:
                 # Step 1: Send connect handshake (unless calling connect itself)
                 if method != "connect" and method != "health":
@@ -118,25 +119,41 @@ class GatewayRPCClient:
                 while True:
                     response_data = await ws.recv()
                     response = json.loads(response_data)
-                    
-                    # Check if it's an event frame (not a response)
+
+                    # Skip event frames (no "id", has "event" key)
                     if "event" in response and "id" not in response:
-                        # This is an event, ignore and continue listening
                         continue
-                    
-                    # Check if it's the response to our request
-                    if response.get("id") == request_id:
-                        # Check for error
-                        if "error" in response:
-                            error = response["error"]
-                            raise GatewayRPCError(
-                                f"RPC error {error.get('code')}: {error.get('message')}"
-                            )
-                        
-                        # Got the final result
+
+                    # Match to our request id
+                    if response.get("id") != request_id:
+                        continue
+
+                    # Server uses ResponseFrame: {"type":"res","ok":bool,"payload":...,"error":...}
+                    # Client also supports standard JSON-RPC: {"jsonrpc":"2.0","result":...}
+                    if response.get("type") == "res":
+                        # Gateway ResponseFrame format
+                        if not response.get("ok", True):
+                            err = response.get("error") or {}
+                            if isinstance(err, dict):
+                                code = err.get("code", "UNKNOWN")
+                                msg = err.get("message", str(err))
+                            else:
+                                code, msg = "ERROR", str(err)
+                            raise GatewayRPCError(f"RPC error {code}: {msg}")
+                        final_result = response.get("payload")
+                    else:
+                        # Standard JSON-RPC format
+                        err = response.get("error")
+                        if err is not None:
+                            if isinstance(err, dict):
+                                code = err.get("code", "UNKNOWN")
+                                msg = err.get("message", str(err))
+                            else:
+                                code, msg = "ERROR", str(err)
+                            raise GatewayRPCError(f"RPC error {code}: {msg}")
                         final_result = response.get("result")
-                        break
-                
+                    break
+
                 return final_result
         
         except WebSocketException as e:

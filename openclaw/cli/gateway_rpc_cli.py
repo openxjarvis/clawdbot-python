@@ -23,7 +23,7 @@ class GatewayRpcOpts:
 
 
 def _resolve_gateway_url(url: Optional[str] = None) -> str:
-    if url:
+    if url and isinstance(url, str):
         return url
     try:
         from ..config.loader import load_config
@@ -52,7 +52,7 @@ def _resolve_gateway_url(url: Optional[str] = None) -> str:
 
 
 def _resolve_auth_token(token: Optional[str] = None) -> Optional[str]:
-    if token:
+    if token and isinstance(token, str):
         return token
     try:
         from ..config.loader import load_config
@@ -87,7 +87,13 @@ def call_gateway_from_cli(
     """
     url = _resolve_gateway_url(opts.url)
     auth_token = _resolve_auth_token(opts.token)
-    timeout_ms = opts.timeout if opts.timeout is not None else 30_000
+    # Guard against Typer OptionInfo objects when called programmatically without
+    # passing timeout (the Typer default annotation is not the resolved integer).
+    _raw_timeout = opts.timeout if opts.timeout is not None else 30_000
+    try:
+        timeout_ms = int(_raw_timeout)
+    except (TypeError, ValueError):
+        timeout_ms = 30_000
     use_expect_final = expect_final if expect_final is not None else opts.expect_final
     use_progress = show_progress if show_progress is not None else (not opts.json_output)
 

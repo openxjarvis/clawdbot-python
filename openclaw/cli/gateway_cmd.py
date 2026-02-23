@@ -107,7 +107,8 @@ def status(
 ):
     """Show gateway service status — delegates to daemon status"""
     from .daemon_cmd import daemon_status
-    daemon_status(probe=probe, deep=deep, json_output=json_output)
+    daemon_status(probe=probe, deep=deep, json_output=json_output,
+                  url=None, token=None, timeout=10_000)
 
 
 @gateway_app.command("install")
