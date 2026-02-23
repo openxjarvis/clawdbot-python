@@ -919,70 +919,68 @@ async def handle_config_schema(connection: Any, params: dict[str, Any]) -> dict[
     config_service = get_config_service()
     schema = config_service.get_config_schema()
     
-    # Add channels schema (matching TypeScript config.schema format)
-    channels_schema = [
-        {
-            "id": "telegram",
-            "label": "Telegram",
-            "description": "Telegram bot channel integration",
-            "configSchema": {
+    # Embed channels as a proper JSON Schema object so the frontend's
+    # resolveSchemaNode(schema, ["channels", channelId]) can traverse
+    # schema.properties.channels.properties.<channelId> correctly.
+    schema.setdefault("properties", {})["channels"] = {
+        "type": "object",
+        "description": "Channel integrations",
+        "properties": {
+            "telegram": {
                 "type": "object",
+                "description": "Telegram bot channel",
                 "properties": {
                     "enabled": {"type": "boolean", "description": "Enable Telegram channel"},
                     "bot_token": {"type": "string", "description": "Telegram bot token"},
                     "owner_id": {"type": "string", "description": "Owner user ID"},
-                    "allowed_user_ids": {"type": "array", "items": {"type": "string"}, "description": "Allowed user IDs"},
+                    "allowed_user_ids": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Allowed user IDs",
+                    },
                     "group_activation_mode": {
                         "type": "string",
                         "enum": ["mention", "always"],
-                        "description": "Group activation mode"
-                    }
+                        "description": "Group activation mode",
+                    },
                 },
-                "required": ["bot_token"]
             },
-            "configUiHints": {
-                "bot_token": {"type": "password"}
-            }
-        },
-        {
-            "id": "discord",
-            "label": "Discord",
-            "description": "Discord bot channel integration",
-            "configSchema": {
+            "discord": {
                 "type": "object",
+                "description": "Discord bot channel",
                 "properties": {
                     "enabled": {"type": "boolean"},
-                    "bot_token": {"type": "string"},
+                    "bot_token": {"type": "string", "description": "Discord bot token"},
                 },
-                "required": ["bot_token"]
             },
-            "configUiHints": {
-                "bot_token": {"type": "password"}
-            }
-        },
-        {
-            "id": "slack",
-            "label": "Slack",
-            "description": "Slack bot channel integration",
-            "configSchema": {
+            "slack": {
                 "type": "object",
+                "description": "Slack bot channel",
                 "properties": {
                     "enabled": {"type": "boolean"},
-                    "bot_token": {"type": "string"},
-                    "app_token": {"type": "string"},
+                    "bot_token": {"type": "string", "description": "Slack bot token"},
+                    "app_token": {"type": "string", "description": "Slack app-level token"},
                 },
-                "required": ["bot_token"]
             },
-            "configUiHints": {
-                "bot_token": {"type": "password"},
-                "app_token": {"type": "password"}
-            }
-        }
-    ]
-    
-    schema["channels"] = channels_schema
-    
-    return {"schema": schema}
+            "whatsapp": {
+                "type": "object",
+                "description": "WhatsApp channel",
+                "properties": {
+                    "enabled": {"type": "boolean"},
+                },
+            },
+        },
+    }
+
+    # uiHints for password fields so the form renders them masked
+    ui_hints = {
+        "channels.telegram.bot_token": {"secret": True},
+        "channels.discord.bot_token": {"secret": True},
+        "channels.slack.bot_token": {"secret": True},
+        "channels.slack.app_token": {"secret": True},
+    }
+
+    return {"schema": schema, "uiHints": ui_hints}
 
 
 @register_handler("cron.list")
