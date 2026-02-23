@@ -51,37 +51,25 @@ cd openclaw-python
 uv sync
 ```
 
-### 2. Add API Keys
+### 2. Onboard
 
-Create a `.env` file with at least one LLM provider key:
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env`:
-
-```bash
-# At least one AI provider is required
-ANTHROPIC_API_KEY=sk-ant-...
-# OR
-GOOGLE_API_KEY=...
-# OR
-OPENAI_API_KEY=sk-...
-
-# Required for Telegram
-TELEGRAM_BOT_TOKEN=...
-```
-
-### 3. Onboard
-
-Run the interactive setup wizard. It guides you through model selection, Telegram configuration, workspace initialization, and optional daemon installation — all in one go:
+Run the interactive setup wizard:
 
 ```bash
 uv run openclaw onboard
 ```
 
-Onboarding creates your `~/.openclaw/` workspace, generates config, and optionally installs the gateway as a background service. **Start here every time you set up a new environment.**
+The wizard guides you through model selection, Telegram configuration, workspace initialization, and optional daemon installation. **It will prompt for API keys interactively and save them to `.env` automatically** — you do not need to create `.env` by hand first.
+
+If you already have a `.env` with keys set, the wizard detects them and skips those prompts:
+
+```bash
+# Optional: pre-populate .env before onboarding
+cp .env.example .env
+# then edit .env with your keys, then run the wizard
+```
+
+Onboarding creates your `~/.openclaw/` workspace and config. **Run this once per new environment.**
 
 ---
 
