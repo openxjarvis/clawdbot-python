@@ -992,7 +992,8 @@ async def handle_cron_list(connection: Any, params: dict[str, Any]) -> dict[str,
     cron_service = get_cron_service()
     if not cron_service:
         return {"jobs": []}
-    jobs = await cron_service.list_jobs()
+    include_disabled = bool(params.get("includeDisabled", False))
+    jobs = await cron_service.list_jobs(include_disabled=include_disabled)
     return {"jobs": jobs}
 
 
