@@ -424,6 +424,7 @@ async def _deliver_via_channels(
     (mirrors TS splitMediaFromOutput / deliverReplies). The cleaned text is sent
     first, then any media files are sent as attachments.
     """
+    from pathlib import Path
     from openclaw.auto_reply.media_parse import split_media_from_output
     from openclaw.media.mime import detect_mime, media_kind_from_mime, MediaKind
 
@@ -431,6 +432,21 @@ async def _deliver_via_channels(
         running = cm.list_running() if hasattr(cm, "list_running") else []
         all_session_keys = _list_all_session_keys(cm)
         agent_part = _extract_agent_part(session_key)
+
+        # Resolve cron session workspace for relative-path media resolution
+        _cron_workspace: str | None = None
+        try:
+            sm = getattr(cm, "session_manager", None)
+            if sm:
+                _cron_session = sm.get_or_create_session_by_key(session_key)
+                if _cron_session:
+                    from openclaw.agents.session_workspace import resolve_session_workspace_dir
+                    _cron_workspace = str(resolve_session_workspace_dir(
+                        workspace_root=_cron_session.workspace_dir,
+                        session_key=session_key,
+                    ))
+        except Exception:
+            pass
 
         # Parse MEDIA: tokens — strip them from display text, collect URLs
         media_result = split_media_from_output(response_text)
@@ -462,16 +478,28 @@ async def _deliver_via_channels(
                     # Send media files extracted from MEDIA: tokens
                     for media_url in all_media:
                         try:
-                            mime = detect_mime(media_url)
+                            # Resolve relative paths against cron session workspace
+                            resolved_url = media_url
+                            if not media_url.startswith(("http://", "https://", "file://", "/")):
+                                candidate = Path(_cron_workspace) / media_url if _cron_workspace else None
+                                if candidate and candidate.exists():
+                                    resolved_url = str(candidate)
+                                    logger.info(f"cron: resolved relative path to: {resolved_url}")
+                                else:
+                                    home_candidate = Path(media_url).expanduser()
+                                    if home_candidate.exists():
+                                        resolved_url = str(home_candidate)
+
+                            mime = detect_mime(resolved_url)
                             kind = media_kind_from_mime(mime)
                             media_type = kind.value if kind != MediaKind.UNKNOWN else "document"
                             await channel.send_media(
                                 target=chat_id,
-                                media_url=media_url,
+                                media_url=resolved_url,
                                 media_type=media_type,
                             )
                             logger.info(
-                                f"cron: delivered media {Path(media_url).name} "
+                                f"cron: delivered media {Path(resolved_url).name} "
                                 f"(type={media_type}) to chat_id={chat_id}"
                             )
                         except Exception as e:

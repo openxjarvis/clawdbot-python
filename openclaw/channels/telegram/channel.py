@@ -629,6 +629,12 @@ class TelegramChannel(ChannelPlugin):
                 media_source = open(file_path, "rb")  # noqa: WPS515 — closed in finally
                 is_local_file = True
                 logger.info("Sending local file: %s", file_path)
+            else:
+                raise FileNotFoundError(
+                    f"Media file not found: {media_url!r}. "
+                    "Ensure the agent outputs an absolute path or that the file "
+                    "is resolved against the session workspace before calling send_media."
+                )
 
         try:
             if media_type == "photo":
