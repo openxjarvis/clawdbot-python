@@ -65,20 +65,19 @@ async def create_cron_job_from_hook(
     
     # Create one-shot schedule (run immediately)
     schedule = AtSchedule(
-        timestamp=datetime.now(timezone.utc).isoformat(),
+        at=datetime.now(timezone.utc).isoformat(),
         type="at"
     )
     
     # Build delivery config if provided
-    delivery = None
+    delivery: "CronDelivery | None" = None
     if delivery_config:
         from ..cron.types import CronDelivery
         
         delivery = CronDelivery(
             mode=delivery_config.get("mode", "announce"),
             channel=delivery_config.get("channel", "last"),
-            target=delivery_config.get("target"),
-            best_effort=delivery_config.get("best_effort", False)
+            to=delivery_config.get("to") or delivery_config.get("target"),
         )
     
     # Create agent turn payload
@@ -88,7 +87,6 @@ async def create_cron_job_from_hook(
         model=model,
         thinking=thinking,
         timeout_seconds=timeout,
-        delivery=delivery
     )
     
     # Create cron job
@@ -100,12 +98,12 @@ async def create_cron_job_from_hook(
         agent_id=agent_id,
         payload=payload,
         enabled=True,
-        delete_after_run=True,  # One-shot job
-        metadata={"source": "hook", "hook_name": hook_name}
+        delete_after_run=True,
+        delivery=delivery,
     )
     
     # Add to cron service
-    cron_service.add_job(job)
+    await cron_service.add_job(job)
     
     logger.info(f"Created cron job {job_id} from hook '{hook_name}'")
     
@@ -149,7 +147,7 @@ async def create_delayed_cron_job(
     
     # Create schedule
     schedule = AtSchedule(
-        timestamp=run_at.isoformat(),
+        at=run_at.isoformat(),
         type="at"
     )
     
@@ -159,15 +157,13 @@ async def create_delayed_cron_job(
         delivery = CronDelivery(
             mode=delivery_config.get("mode", "announce"),
             channel=delivery_config.get("channel", "last"),
-            target=delivery_config.get("target"),
-            best_effort=delivery_config.get("best_effort", False)
+            to=delivery_config.get("to") or delivery_config.get("target"),
         )
     
     # Create payload
     payload = AgentTurnPayload(
         kind="agentTurn",
         message=message,
-        delivery=delivery
     )
     
     # Create job
@@ -180,11 +176,10 @@ async def create_delayed_cron_job(
         payload=payload,
         enabled=True,
         delete_after_run=True,
-        metadata={"source": "delayed", "delay_seconds": delay_seconds}
     )
     
     # Add to service
-    cron_service.add_job(job)
+    await cron_service.add_job(job)
     
     logger.info(f"Created delayed cron job {job_id} (delay: {delay_seconds}s)")
     
@@ -236,15 +231,13 @@ async def create_recurring_cron_job(
         delivery = CronDelivery(
             mode=delivery_config.get("mode", "announce"),
             channel=delivery_config.get("channel", "last"),
-            target=delivery_config.get("target"),
-            best_effort=delivery_config.get("best_effort", False)
+            to=delivery_config.get("to") or delivery_config.get("target"),
         )
     
     # Create payload
     payload = AgentTurnPayload(
         kind="agentTurn",
         message=message,
-        delivery=delivery
     )
     
     # Create job
@@ -257,16 +250,10 @@ async def create_recurring_cron_job(
         payload=payload,
         enabled=True,
         delete_after_run=False,  # Recurring
-        metadata={
-            "source": "recurring",
-            "interval_ms": interval_ms,
-            "max_runs": max_runs,
-            "run_count": 0
-        }
     )
     
     # Add to service
-    cron_service.add_job(job)
+    await cron_service.add_job(job)
     
     logger.info(f"Created recurring cron job {job_id} (interval: {interval_ms}ms)")
     

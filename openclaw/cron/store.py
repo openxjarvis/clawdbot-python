@@ -9,6 +9,7 @@ Key features:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import shutil
@@ -156,12 +157,17 @@ class CronStore:
             mutated = True
 
         # payload migration (kind field)
+        # NOTE: TS wire format uses "message" for agentTurn (not "prompt"),
+        # so we do NOT rename message→prompt here. Keep as-is.
         payload = raw.get("payload")
         if isinstance(payload, dict):
             kind = payload.get("kind", "")
-            # Legacy: "message" used instead of "prompt"
-            if kind == "agentTurn" and "message" in payload and "prompt" not in payload:
-                payload["prompt"] = payload.pop("message")
+            # Normalise kind casing
+            if kind == "agentturn":
+                payload["kind"] = "agentTurn"
+                mutated = True
+            elif kind == "systemevent":
+                payload["kind"] = "systemEvent"
                 mutated = True
 
         # schedule migration
@@ -261,56 +267,135 @@ def _strip_legacy_delivery_fields(payload: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# CronRunLog
+# CronRunLog  (matches TS appendCronRunLog / readCronRunLogEntries)
 # ---------------------------------------------------------------------------
 
 class CronRunLog:
-    """JSONL run log for cron job execution history."""
+    """JSONL run log for cron job execution history.
 
-    def __init__(self, log_dir: Path, job_id: str, max_entries: int = 100):
+    Mirrors TS run-log.ts:
+    - Serialized writes via asyncio lock (prevents corruption)
+    - Max 2 MB / 2000 lines (prune oldest when exceeded)
+    - Read reverse-chronological (newest first up to limit)
+    - Validates action=="finished", ts, jobId on read
+    - Includes telemetry fields: sessionId, sessionKey, model, provider, usage
+    """
+
+    MAX_BYTES = 2_000_000   # 2 MB
+    MAX_LINES = 2_000
+
+    def __init__(self, log_dir: Path, job_id: str):
         self.log_path = log_dir / f"{job_id}.jsonl"
-        self.max_entries = max_entries
+        self.job_id = job_id
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Serialized write chain (asyncio lock per path)
+        self._write_lock: asyncio.Lock | None = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._write_lock is None:
+            self._write_lock = asyncio.Lock()
+        return self._write_lock
 
     def append(self, entry: dict[str, Any]) -> None:
+        """Synchronous append (fire-and-forget in async context, serialized via lock)."""
         try:
-            with open(self.log_path, "a") as f:
-                f.write(json.dumps(entry) + "\n")
+            import asyncio as _asyncio
+            loop: _asyncio.AbstractEventLoop | None = None
+            try:
+                loop = _asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            if loop and loop.is_running():
+                loop.create_task(self._async_append(entry))
+            else:
+                self._sync_append(entry)
+        except Exception as e:
+            logger.error(f"cron: run log append error: {e}", exc_info=True)
+
+    async def async_append(self, entry: dict[str, Any]) -> None:
+        """Async append with serialized writes."""
+        await self._async_append(entry)
+
+    async def _async_append(self, entry: dict[str, Any]) -> None:
+        async with self._get_lock():
+            try:
+                self._sync_append(entry)
+            except Exception as e:
+                logger.error(f"cron: run log async append error: {e}", exc_info=True)
+
+    def _sync_append(self, entry: dict[str, Any]) -> None:
+        try:
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
             self._prune_if_needed()
         except Exception as e:
-            logger.error(f"Error appending to run log: {e}", exc_info=True)
+            logger.error(f"cron: run log write error: {e}", exc_info=True)
 
-    def read(self, limit: int | None = None) -> list[dict[str, Any]]:
+    def _prune_if_needed(self) -> None:
+        """Prune log if it exceeds MAX_BYTES."""
+        try:
+            if not self.log_path.exists():
+                return
+            size = self.log_path.stat().st_size
+            if size <= self.MAX_BYTES:
+                return
+            with open(self.log_path, encoding="utf-8") as f:
+                raw = f.read()
+            lines = [ln for ln in raw.split("\n") if ln.strip()]
+            kept = lines[-self.MAX_LINES:]  # keep newest
+            tmp = self.log_path.with_suffix(f".{uuid.uuid4().hex[:8]}.tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("\n".join(kept) + "\n")
+            tmp.replace(self.log_path)
+        except Exception as e:
+            logger.error(f"cron: run log prune error: {e}", exc_info=True)
+
+    def read(self, limit: int | None = None, job_id: str | None = None) -> list[dict[str, Any]]:
+        """Read entries reverse-chronological (newest first). Matches TS readCronRunLogEntries."""
         if not self.log_path.exists():
             return []
         try:
-            entries: list[dict[str, Any]] = []
-            with open(self.log_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        entries.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue
-            if limit:
-                return entries[-limit:]
-            return entries
+            with open(self.log_path, encoding="utf-8") as f:
+                raw = f.read()
         except Exception as e:
-            logger.error(f"Error reading run log: {e}", exc_info=True)
+            logger.error(f"cron: run log read error: {e}", exc_info=True)
             return []
 
-    def _prune_if_needed(self) -> None:
-        entries = self.read()
-        if len(entries) > self.max_entries:
-            entries = entries[-self.max_entries:]
+        if not raw.strip():
+            return []
+
+        effective_limit = max(1, min(5000, int(limit or 200)))
+        filter_job_id = (job_id or self.job_id or "").strip() or None
+
+        parsed: list[dict[str, Any]] = []
+        lines = raw.split("\n")
+        for i in range(len(lines) - 1, -1, -1):
+            if len(parsed) >= effective_limit:
+                break
+            line = lines[i].strip()
+            if not line:
+                continue
             try:
-                with open(self.log_path, "w") as f:
-                    for entry in entries:
-                        f.write(json.dumps(entry) + "\n")
-            except Exception as e:
-                logger.error(f"Error pruning run log: {e}", exc_info=True)
+                obj = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(obj, dict):
+                continue
+            # Validate required fields (mirrors TS readCronRunLogEntries)
+            if obj.get("action") != "finished":
+                continue
+            job_id_val = obj.get("jobId", "")
+            if not isinstance(job_id_val, str) or not job_id_val.strip():
+                continue
+            ts_val = obj.get("ts")
+            if not isinstance(ts_val, (int, float)) or not (ts_val == ts_val):  # nan check
+                continue
+            if filter_job_id and job_id_val != filter_job_id:
+                continue
+            parsed.append(obj)
+
+        # parsed is newest-first; return as-is (reverse-chronological)
+        return parsed
 
     def clear(self) -> None:
         try:

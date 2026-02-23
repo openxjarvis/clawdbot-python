@@ -244,38 +244,25 @@ def get_method_registry() -> MethodRegistry:
 
 
 def _register_core_methods(registry: MethodRegistry):
-    """Register core Gateway methods"""
-    from .methods import (
-        AgentMethod,
-        ChannelsListMethod,
-        ConnectMethod,
-        HealthMethod,
-        PingMethod,
-    )
-    from .sessions_methods import (
-        SessionsListMethod,
-        SessionsPreviewMethod,
-        SessionsResolveMethod,
-        SessionsPatchMethod,
-        SessionsResetMethod,
-        SessionsDeleteMethod,
-        SessionsCompactMethod,
-    )
+    """Register methods from the unified runtime handler registry."""
+    from openclaw.gateway.handlers import get_method_handler, list_registered_methods
 
-    # Core methods
-    registry.register(ConnectMethod())
-    registry.register(PingMethod())
-    registry.register(HealthMethod())
-    registry.register(AgentMethod())
-    registry.register(ChannelsListMethod())
-    
-    # Session methods
-    registry.register(SessionsListMethod())
-    registry.register(SessionsPreviewMethod())
-    registry.register(SessionsResolveMethod())
-    registry.register(SessionsPatchMethod())
-    registry.register(SessionsResetMethod())
-    registry.register(SessionsDeleteMethod())
-    registry.register(SessionsCompactMethod())
+    class _HandlerAdapter:
+        category = "runtime"
 
-    logger.info(f"Registered {registry.get_method_count()} core methods")
+        def __init__(self, name: str):
+            self.name = name
+            self.description = f"Runtime handler: {name}"
+
+        async def execute(self, connection: Any, params: dict[str, Any]) -> Any:
+            handler = get_method_handler(self.name)
+            if handler is None:
+                raise RuntimeError(f"Method not registered at runtime: {self.name}")
+            return await handler(connection, params)
+
+        def get_schema(self) -> dict[str, Any]:
+            return {"type": "object", "properties": {}}
+
+    for method_name in list_registered_methods():
+        registry.register(_HandlerAdapter(method_name))
+    logger.info(f"Registered {registry.get_method_count()} runtime methods")

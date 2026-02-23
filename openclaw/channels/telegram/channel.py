@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 
+import asyncio
 import logging
 from datetime import UTC, datetime, timezone
 from typing import Any, Optional
@@ -15,8 +16,19 @@ from .command_handler import TelegramCommandHandler
 from .commands import list_native_commands, register_commands_with_telegram
 from .i18n_support import register_lang_handlers
 from .commands_extended import register_extended_commands
+from .update_offset_store import (
+    read_telegram_update_offset,
+    write_telegram_update_offset,
+)
+from .update_dedupe import TelegramUpdateDedupe, update_key, message_key, callback_key
 
 logger = logging.getLogger(__name__)
+
+# Exponential backoff config for Conflict errors — mirrors TS monitor.ts
+_CONFLICT_BACKOFF_INITIAL = 2.0   # seconds
+_CONFLICT_BACKOFF_MAX = 30.0      # seconds
+_CONFLICT_BACKOFF_FACTOR = 1.8
+_CONFLICT_MAX_RETRY_TIME = 5 * 60 # 5 minutes total
 
 
 class TelegramChannel(ChannelPlugin):
@@ -40,6 +52,10 @@ class TelegramChannel(ChannelPlugin):
         self._owner_id: Optional[str] = None
         self._command_handler: Optional[TelegramCommandHandler] = None
         self._config: Optional[dict] = None
+        self._account_id: Optional[str] = None
+        self._dedupe = TelegramUpdateDedupe()
+        self._conflict_backoff = _CONFLICT_BACKOFF_INITIAL
+        self._conflict_retry_task: Optional[asyncio.Task] = None
 
         if bot_token is not None:
             if not bot_token:
@@ -214,36 +230,143 @@ class TelegramChannel(ChannelPlugin):
             }
         }
         
+        self._account_id = account_id
         self._command_handler = TelegramCommandHandler(cmd_config, account_id, None)
-        
+
+        # Register conflict/error handler for update-processing errors
+        # (Updater polling errors are handled via error_callback in start_polling below)
+        self._app.add_error_handler(self._handle_polling_error)
+
         # Delete any existing webhook and clear pending updates to avoid conflicts
         # This ensures clean state when switching from webhook to polling mode
         await self._app.bot.delete_webhook(drop_pending_updates=True)
         logger.info("Cleared webhook and pending updates")
-        
+
         # Register bot commands with Telegram
         await self._register_bot_commands()
-        
+
         # Set bot menu button (optional)
         await self._setup_menu_button()
-        
+
+        # Restore persisted update offset so we don't reprocess old updates
+        saved_offset = read_telegram_update_offset(account_id)
+        if saved_offset is not None:
+            logger.info("Resuming from persisted update offset %d", saved_offset)
+
+        def _polling_error_cb(exc: Exception) -> None:
+            """Sync callback for Updater network_retry_loop errors — mirrors TS monitor.ts.
+
+            Called by PTB's internal polling loop on every TelegramError.
+            For Conflict (409) errors we schedule an async restart with backoff.
+            """
+            import telegram.error as tg_err
+            if isinstance(exc, tg_err.Conflict):
+                logger.warning(
+                    "Telegram Conflict (another bot instance is polling) — "
+                    "scheduling restart in %.1fs",
+                    self._conflict_backoff,
+                )
+                asyncio.get_event_loop().create_task(
+                    self._restart_polling_after_conflict()
+                )
+            elif isinstance(exc, tg_err.NetworkError):
+                logger.warning("Telegram network error (will auto-retry): %s", exc)
+            elif isinstance(exc, tg_err.TimedOut):
+                logger.debug("Telegram getUpdates timed out (will retry): %s", exc)
+            else:
+                logger.error("Telegram polling error: %s", exc)
+
         await self._app.updater.start_polling(
             allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=False  # We already dropped them above
+            drop_pending_updates=False,  # We already dropped via delete_webhook
+            error_callback=_polling_error_cb,
         )
 
         self._running = True
+        self._conflict_backoff = _CONFLICT_BACKOFF_INITIAL
         logger.info("Telegram channel started")
 
     async def stop(self) -> None:
         """Stop Telegram bot"""
+        if self._conflict_retry_task and not self._conflict_retry_task.done():
+            self._conflict_retry_task.cancel()
         if self._app:
             logger.info("Stopping Telegram channel...")
-            await self._app.updater.stop()
+            try:
+                await self._app.updater.stop()
+            except Exception:
+                pass
             await self._app.stop()
             await self._app.shutdown()
             self._running = False
             logger.info("Telegram channel stopped")
+
+    async def _handle_polling_error(
+        self, update: object, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        """PTB global error handler — mirrors TS monitor.ts conflict detection.
+
+        On a 409 Conflict (another getUpdates call is active), we stop polling
+        and schedule a restart with exponential backoff so we don't hammer the
+        API or block indefinitely.
+        """
+        import telegram.error as tg_err
+
+        exc = context.error
+        if exc is None:
+            return
+
+        if isinstance(exc, tg_err.Conflict):
+            logger.warning(
+                "Telegram Conflict (another bot instance is polling): %s — "
+                "retrying in %.1fs (backoff)",
+                exc,
+                self._conflict_backoff,
+            )
+            # Schedule the restart; don't await here to avoid blocking PTB internals
+            self._conflict_retry_task = asyncio.create_task(
+                self._restart_polling_after_conflict()
+            )
+        elif isinstance(exc, tg_err.NetworkError):
+            logger.warning("Telegram network error (will auto-retry): %s", exc)
+        elif isinstance(exc, tg_err.TimedOut):
+            logger.debug("Telegram request timed out (will auto-retry): %s", exc)
+        else:
+            logger.error("Unhandled Telegram error: %s", exc, exc_info=exc)
+
+    async def _restart_polling_after_conflict(self) -> None:
+        """Stop polling, wait with exponential backoff, then resume."""
+        wait = self._conflict_backoff
+        # Increase backoff for the next conflict (capped)
+        self._conflict_backoff = min(
+            self._conflict_backoff * _CONFLICT_BACKOFF_FACTOR,
+            _CONFLICT_BACKOFF_MAX,
+        )
+        logger.info("Pausing polling for %.1fs before restart", wait)
+        await asyncio.sleep(wait)
+
+        if not self._running or self._app is None:
+            return
+
+        try:
+            await self._app.updater.stop()
+        except Exception as exc:
+            logger.debug("Updater stop during conflict recovery: %s", exc)
+
+        try:
+            await self._app.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=False,
+            )
+            # Reset backoff on successful restart
+            self._conflict_backoff = _CONFLICT_BACKOFF_INITIAL
+            logger.info("Polling restarted after conflict backoff")
+        except Exception as exc:
+            logger.error("Failed to restart polling: %s", exc)
+            # Schedule another retry
+            self._conflict_retry_task = asyncio.create_task(
+                self._restart_polling_after_conflict()
+            )
 
     async def send_text(self, target: str, text: str, reply_to: str | None = None) -> str:
         """Send text message with Markdown support"""
@@ -458,55 +581,122 @@ class TelegramChannel(ChannelPlugin):
             raise
 
     async def send_media(
-        self, target: str, media_url: str, media_type: str, caption: str | None = None
+        self,
+        target: str,
+        media_url: str,
+        media_type: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
     ) -> str:
-        """Send media message (supports both URLs and local file paths)"""
+        """Send media message — mirrors TS delivery.ts deliverReplies().
+
+        Supports: photo, video, animation (GIF), audio, voice, document.
+        Caption longer than 1024 chars is split into a follow-up text message.
+        Accepts both local file paths and HTTP URLs.
+        """
         if not self._app:
             raise RuntimeError("Telegram channel not started")
 
+        from pathlib import Path
+
+        chat_id = int(target) if target.lstrip("-").isdigit() else target
+        reply_id = int(reply_to) if reply_to else None
+
+        # Caption splitting — Telegram limit is 1024 chars for media captions
+        _CAPTION_LIMIT = 1024
+        overflow_text: str | None = None
+        if caption and len(caption) > _CAPTION_LIMIT:
+            overflow_text = caption[_CAPTION_LIMIT:]
+            caption = caption[:_CAPTION_LIMIT]
+
+        media_source = media_url
+        is_local_file = False
+
+        # Detect local file (no URL scheme)
+        if not media_url.startswith(("http://", "https://", "file://")):
+            file_path = Path(media_url).expanduser()
+            if file_path.exists() and file_path.is_file():
+                media_source = open(file_path, "rb")  # noqa: WPS515 — closed in finally
+                is_local_file = True
+                logger.info("Sending local file: %s", file_path)
+
         try:
-            chat_id = int(target) if target.lstrip("-").isdigit() else target
-
-            # Determine if media_url is a local file path or URL
-            from pathlib import Path
-            
-            media_source = media_url
-            is_local_file = False
-            
-            # Check if it's a local file path
-            if not media_url.startswith(("http://", "https://", "file://")):
-                file_path = Path(media_url).expanduser()
-                if file_path.exists() and file_path.is_file():
-                    # Open local file for sending
-                    media_source = open(file_path, "rb")
-                    is_local_file = True
-                    logger.info(f"Sending local file: {file_path}")
-            
-            try:
-                if media_type == "photo":
-                    message = await self._app.bot.send_photo(
-                        chat_id=chat_id, photo=media_source, caption=caption
+            if media_type == "photo":
+                msg = await self._app.bot.send_photo(
+                    chat_id=chat_id,
+                    photo=media_source,
+                    caption=caption,
+                    parse_mode="Markdown" if caption else None,
+                    reply_to_message_id=reply_id,
+                )
+            elif media_type == "video":
+                msg = await self._app.bot.send_video(
+                    chat_id=chat_id,
+                    video=media_source,
+                    caption=caption,
+                    parse_mode="Markdown" if caption else None,
+                    reply_to_message_id=reply_id,
+                )
+            elif media_type == "animation":
+                msg = await self._app.bot.send_animation(
+                    chat_id=chat_id,
+                    animation=media_source,
+                    caption=caption,
+                    parse_mode="Markdown" if caption else None,
+                    reply_to_message_id=reply_id,
+                )
+            elif media_type == "voice":
+                try:
+                    msg = await self._app.bot.send_voice(
+                        chat_id=chat_id,
+                        voice=media_source,
+                        caption=caption,
+                        parse_mode="Markdown" if caption else None,
+                        reply_to_message_id=reply_id,
                     )
-                elif media_type == "video":
-                    message = await self._app.bot.send_video(
-                        chat_id=chat_id, video=media_source, caption=caption
+                except Exception as voice_err:
+                    logger.warning("send_voice failed (%s), falling back to document", voice_err)
+                    # Re-open if file was closed by failed send
+                    if is_local_file:
+                        file_path = Path(media_url).expanduser()
+                        media_source = open(file_path, "rb")  # noqa: WPS515
+                    msg = await self._app.bot.send_document(
+                        chat_id=chat_id,
+                        document=media_source,
+                        caption=caption,
+                        parse_mode="Markdown" if caption else None,
+                        reply_to_message_id=reply_id,
                     )
-                elif media_type == "document":
-                    message = await self._app.bot.send_document(
-                        chat_id=chat_id, document=media_source, caption=caption
-                    )
-                else:
-                    raise ValueError(f"Unsupported media type: {media_type}")
+            elif media_type in ("audio",):
+                msg = await self._app.bot.send_audio(
+                    chat_id=chat_id,
+                    audio=media_source,
+                    caption=caption,
+                    parse_mode="Markdown" if caption else None,
+                    reply_to_message_id=reply_id,
+                )
+            else:
+                # Default: send as document (covers pptx, pdf, zip, etc.)
+                msg = await self._app.bot.send_document(
+                    chat_id=chat_id,
+                    document=media_source,
+                    caption=caption,
+                    parse_mode="Markdown" if caption else None,
+                    reply_to_message_id=reply_id,
+                )
 
-                return str(message.message_id)
-            finally:
-                # Close file if it was opened
-                if is_local_file and hasattr(media_source, "close"):
-                    media_source.close()
+            # Send overflow caption as a follow-up text message
+            if overflow_text:
+                await self._app.bot.send_message(
+                    chat_id=chat_id,
+                    text=overflow_text,
+                    parse_mode="Markdown",
+                )
 
-        except Exception as e:
-            logger.error(f"Failed to send Telegram media: {e}", exc_info=True)
-            raise
+            return str(msg.message_id)
+        finally:
+            if is_local_file and hasattr(media_source, "close"):
+                media_source.close()
 
     def set_command_executor(self, session_manager, agent_runtime) -> None:
         """Set up command executor with session manager and agent runtime"""
@@ -515,76 +705,111 @@ class TelegramChannel(ChannelPlugin):
     async def _handle_telegram_media(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """Handle incoming media messages (photo, video, audio, document)"""
+        """Handle incoming media messages — mirrors TS bot-handlers.ts resolveMedia().
+
+        Downloads the file from Telegram, encodes it as a base64 data URL, and
+        passes it to the agent as a structured attachment (same shape as ChatAttachment
+        in the TypeScript version) so the LLM can actually process the content.
+        """
         if not update.message:
             return
 
         message = update.message
+
+        # Deduplication — mirrors TS bot-updates.ts createTelegramUpdateDedupe
+        dedup_key = message_key(message.chat_id, message.message_id)
+        if self._dedupe.should_skip(dedup_key):
+            logger.debug("Skipping duplicate media message %s", message.message_id)
+            return
+
         chat = message.chat
         sender = message.from_user
 
-        # Determine media type and get file info
-        media_type = None
-        file_id = None
-        file_name = None
-        mime_type = None
+        # Determine media type and collect file info
+        media_type: str | None = None
+        file_id: str | None = None
+        file_name: str | None = None
+        mime_type: str | None = None
         caption = message.caption or ""
 
         if message.photo:
             media_type = "photo"
-            # Get largest photo size
             file_id = message.photo[-1].file_id
             file_name = f"photo_{message.message_id}.jpg"
+            mime_type = "image/jpeg"
         elif message.video:
             media_type = "video"
             file_id = message.video.file_id
             file_name = message.video.file_name or f"video_{message.message_id}.mp4"
-            mime_type = message.video.mime_type
+            mime_type = message.video.mime_type or "video/mp4"
         elif message.audio:
             media_type = "audio"
             file_id = message.audio.file_id
             file_name = message.audio.file_name or f"audio_{message.message_id}.mp3"
-            mime_type = message.audio.mime_type
+            mime_type = message.audio.mime_type or "audio/mpeg"
         elif message.voice:
             media_type = "voice"
             file_id = message.voice.file_id
             file_name = f"voice_{message.message_id}.ogg"
-            mime_type = message.voice.mime_type
+            mime_type = message.voice.mime_type or "audio/ogg"
         elif message.document:
             media_type = "document"
             file_id = message.document.file_id
             file_name = message.document.file_name or f"document_{message.message_id}"
-            mime_type = message.document.mime_type
+            mime_type = message.document.mime_type or "application/octet-stream"
+        elif message.sticker:
+            # Skip animated/video stickers; accept static WebP only
+            if not (message.sticker.is_animated or message.sticker.is_video):
+                media_type = "photo"
+                file_id = message.sticker.file_id
+                file_name = f"sticker_{message.message_id}.webp"
+                mime_type = "image/webp"
 
         if not file_id:
-            logger.warning(f"No file_id found for media message: {message.message_id}")
+            logger.warning("No file_id found for media message %s", message.message_id)
             return
 
-        try:
-            # Get file from Telegram
-            file = await context.bot.get_file(file_id)
-            file_url = file.file_path
+        # Persist update offset
+        if update.update_id and self._account_id:
+            write_telegram_update_offset(self._account_id, update.update_id)
 
-            logger.info(f"Received {media_type}: {file_name} from user {sender.id}")
+        try:
+            # Download file from Telegram and encode as base64 data URL
+            # Mirrors TS delivery.ts resolveMedia() download logic
+            tg_file = await context.bot.get_file(file_id)
+            file_bytes = await tg_file.download_as_bytearray()
+            file_size = len(file_bytes)
+
+            import base64
+            b64_content = base64.b64encode(bytes(file_bytes)).decode()
+
+            # Determine attachment type bucket (image vs file)
+            is_image = (mime_type or "").startswith("image/")
+            attach_type = "image" if is_image else "file"
+
+            attachment: dict = {
+                "type": attach_type,
+                "mimeType": mime_type or "application/octet-stream",
+                "content": b64_content,
+                "filename": file_name,
+                "size": file_size,
+            }
+
+            logger.info(
+                "Received %s: %s (%d bytes) from user %s",
+                media_type, file_name, file_size, sender.id,
+            )
 
             # Determine chat type
             chat_type = "direct"
-            if chat.type == "group" or chat.type == "supergroup":
+            if chat.type in ("group", "supergroup"):
                 chat_type = "group"
             elif chat.type == "channel":
                 chat_type = "channel"
 
-            # Create message with media info
-            # Format text to describe the media for the AI
-            text = caption if caption else f"[User sent a {media_type}]"
-            
-            # Add media information to text so AI knows what to do
-            if media_type == "photo":
-                text = f"{text}\n\n[Image URL: {file_url}]" if caption else f"[User sent an image: {file_url}]"
-            elif media_type in ["video", "audio", "voice", "document"]:
-                text = f"{text}\n\n[{media_type.capitalize()} URL: {file_url}, filename: {file_name}]"
+            # Human-readable text description (fallback for models that don't handle attachments)
+            text = caption if caption else f"[User sent a {media_type}: {file_name}]"
 
-            # Create normalized message
             inbound = InboundMessage(
                 channel_id=self.id,
                 message_id=str(message.message_id),
@@ -602,22 +827,24 @@ class TelegramChannel(ChannelPlugin):
                     "media_type": media_type,
                     "file_id": file_id,
                     "file_name": file_name,
-                    "file_url": file_url,
                     "mime_type": mime_type,
                     "caption": caption,
                 },
+                attachments=[attachment],
             )
 
-            # Pass to handler
             await self._handle_message(inbound)
 
         except Exception as e:
-            logger.error(f"Error handling media message: {e}", exc_info=True)
-            await context.bot.send_message(
-                chat_id=chat.id,
-                text=f"❌ Sorry, I had trouble processing that {media_type}.",
-                reply_to_message_id=message.message_id
-            )
+            logger.error("Error handling media message: %s", e, exc_info=True)
+            try:
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    text=f"Sorry, I had trouble processing that {media_type}.",
+                    reply_to_message_id=message.message_id,
+                )
+            except Exception:
+                pass
 
     async def _handle_telegram_message(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -627,6 +854,17 @@ class TelegramChannel(ChannelPlugin):
             return
 
         message = update.message
+
+        # Deduplication — mirrors TS bot-updates.ts
+        dedup_key = message_key(message.chat_id, message.message_id)
+        if self._dedupe.should_skip(dedup_key):
+            logger.debug("Skipping duplicate text message %s", message.message_id)
+            return
+
+        # Persist update offset
+        if update.update_id and self._account_id:
+            write_telegram_update_offset(self._account_id, update.update_id)
+
         chat = message.chat
         sender = message.from_user
 

@@ -1,9 +1,9 @@
 """Timer management matching TypeScript openclaw/src/cron/service/timer.ts
 
-Key differences from previous implementation:
-- The 'running' flag now lives on CronService (self._timer_running)
-- Timer always re-arms after tick (even on error) for resilience
-- arm_timer accepts the jobs list directly
+Key behaviors:
+- MAX_TIMER_DELAY_MS = 60_000  (clamp so scheduler never waits > 1 min)
+- If running guard fires, re-arm at MAX_TIMER_DELAY_MS instead of returning
+- Invokes service._on_timer() when the sleep completes
 """
 from __future__ import annotations
 
@@ -12,139 +12,103 @@ import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Awaitable
 
-from .schedule import compute_next_run, is_due
-
 if TYPE_CHECKING:
-    from .types import CronJob
+    pass
 
 logger = logging.getLogger(__name__)
 
-# Maximum timeout for asyncio.sleep (~24 days)
-MAX_TIMEOUT_MS = 2**31 - 1
+# Wake at most once a minute to avoid schedule drift / process-pause recovery
+MAX_TIMER_DELAY_MS = 60_000
+
+
+def _now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
 
 
 class CronTimer:
     """
-    Timer manager for cron jobs.
+    Timer manager — mirrors TS armTimer / onTimer pattern.
 
-    Maintains a single asyncio task that sleeps until the earliest
-    nextRunAtMs across all enabled jobs.  When it fires it invokes
-    ``on_timer_callback`` with the list of due jobs.
+    Keeps a single asyncio task that sleeps for min(delay, MAX_TIMER_DELAY_MS),
+    then calls service._on_timer().
     """
 
-    def __init__(
-        self,
-        on_timer_callback: Callable[[list[CronJob]], Awaitable[None]],
-    ):
-        self.on_timer = on_timer_callback
-        self.timer_task: asyncio.Task[None] | None = None
+    def __init__(self, on_timer_callback: Callable[[], Awaitable[None]]):
+        self._on_timer = on_timer_callback
+        self._task: asyncio.Task[None] | None = None
         self.next_fire_ms: int | None = None
 
     # ------------------------------------------------------------------
     # arm / stop
     # ------------------------------------------------------------------
-    def arm_timer(self, jobs: list[CronJob]) -> None:
-        """Arm (or re-arm) the timer for the next due job."""
-        # Cancel existing timer
-        if self.timer_task and not self.timer_task.done():
-            self.timer_task.cancel()
-            self.timer_task = None
 
-        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    def arm(self, next_wake_at_ms: int | None) -> None:
+        """Arm (or re-arm) the timer. Mirrors TS armTimer."""
+        # Cancel previous
+        if self._task and not self._task.done():
+            self._task.cancel()
+        self._task = None
 
-        # Find the earliest next_run_ms across enabled, non-running jobs
-        next_run_ms: int | None = None
-        next_job_name: str | None = None
-
-        for job in jobs:
-            if not job.enabled:
-                continue
-            if job.state.running_at_ms is not None:
-                continue
-
-            nxt = job.state.next_run_ms
-            if nxt is None:
-                # Recompute if missing
-                nxt = compute_next_run(job.schedule, now_ms)
-                job.state.next_run_ms = nxt
-
-            if nxt is not None and (next_run_ms is None or nxt < next_run_ms):
-                next_run_ms = nxt
-                next_job_name = job.name or job.id
-
-        if next_run_ms is None:
+        if next_wake_at_ms is None:
             self.next_fire_ms = None
+            logger.debug("cron: armTimer skipped - no jobs with nextRunAtMs")
             return
 
-        delay_ms = max(0, next_run_ms - now_ms)
-        # Clamp to MAX_TIMEOUT_MS to avoid overflow
-        if delay_ms > MAX_TIMEOUT_MS:
-            delay_ms = MAX_TIMEOUT_MS
+        now = _now_ms()
+        delay_ms = max(0, next_wake_at_ms - now)
+        # Clamp: wake at least once per minute
+        clamped_ms = min(delay_ms, MAX_TIMER_DELAY_MS)
+        self.next_fire_ms = next_wake_at_ms
 
-        self.next_fire_ms = next_run_ms
-        delay_seconds = delay_ms / 1000
-
-        logger.info(
-            f"Timer armed for '{next_job_name}' in {delay_seconds:.1f}s"
+        logger.debug(
+            f"cron: timer armed — nextAt={next_wake_at_ms}, delay={clamped_ms}ms"
+            f"{' (clamped)' if delay_ms > MAX_TIMER_DELAY_MS else ''}"
         )
 
-        self.timer_task = asyncio.create_task(
-            self._timer_wait(delay_seconds, jobs)
-        )
+        self._task = asyncio.create_task(self._wait(clamped_ms / 1000))
+
+    def arm_at_max_delay(self) -> None:
+        """Re-arm at MAX_TIMER_DELAY_MS — used when timer fires while running."""
+        if self._task and not self._task.done():
+            self._task.cancel()
+        self._task = None
+        logger.debug("cron: re-arming at MAX_TIMER_DELAY_MS (job running)")
+        self._task = asyncio.create_task(self._wait(MAX_TIMER_DELAY_MS / 1000))
 
     def stop(self) -> None:
         """Stop the timer."""
-        if self.timer_task and not self.timer_task.done():
-            self.timer_task.cancel()
-            self.timer_task = None
+        if self._task and not self._task.done():
+            self._task.cancel()
+        self._task = None
         self.next_fire_ms = None
-        logger.info("Timer stopped")
+        logger.info("cron: timer stopped")
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
-    async def _timer_wait(
-        self, delay_seconds: float, jobs: list[CronJob]
-    ) -> None:
-        """Sleep then invoke the on_timer callback."""
+
+    async def _wait(self, delay_seconds: float) -> None:
         try:
             await asyncio.sleep(delay_seconds)
-            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-
-            # Find due jobs
-            due_jobs = [
-                j
-                for j in jobs
-                if j.enabled
-                and j.state.running_at_ms is None
-                and is_due(j.state.next_run_ms, now_ms)
-            ]
-
-            if due_jobs:
-                logger.info(f"Timer fired: {len(due_jobs)} due jobs")
-                await self.on_timer(due_jobs)
-            else:
-                # No jobs due (perhaps they were updated externally)
-                # The service's on_timer will re-arm
-                await self.on_timer([])
-
+            await self._on_timer()
         except asyncio.CancelledError:
-            logger.debug("Timer cancelled")
+            logger.debug("cron: timer cancelled")
         except Exception as e:
-            logger.error(f"Error in timer: {e}", exc_info=True)
+            logger.error(f"cron: timer tick failed: {e}", exc_info=True)
 
     # ------------------------------------------------------------------
     # Status
     # ------------------------------------------------------------------
+
     def get_status(self) -> dict[str, Any]:
-        """Get timer status."""
+        running = self._task is not None and not self._task.done()
         status: dict[str, Any] = {
-            "running": self.timer_task is not None and not self.timer_task.done(),
+            "running": running,
             "next_fire_ms": self.next_fire_ms,
         }
         if self.next_fire_ms:
-            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-            time_until_ms = self.next_fire_ms - now_ms
-            status["time_until_ms"] = max(0, time_until_ms)
-            status["time_until_seconds"] = max(0, time_until_ms / 1000)
+            now = _now_ms()
+            remaining = max(0, self.next_fire_ms - now)
+            status["time_until_ms"] = remaining
+            status["time_until_seconds"] = remaining / 1000
         return status

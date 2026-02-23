@@ -57,7 +57,7 @@ async def run_non_interactive_onboarding(
     elif provider == "openai":
         model = "openai/gpt-4"
     elif provider == "gemini":
-        model = "google/gemini-2.0-flash-exp"
+        model = "google/gemini-2.0-flash"
     elif provider == "ollama":
         model = "ollama/llama3"
     else:

@@ -5,29 +5,41 @@ Matches openclaw/src/routing/resolve-route.ts
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
-from typing import Literal
+from typing import Dict, List, Literal, Optional, Set
 
+from .bindings import list_bindings
 from .session_key import (
-    build_agent_session_key,
-    build_agent_main_session_key,
-    normalize_agent_id,
-    normalize_account_id,
     DEFAULT_ACCOUNT_ID,
+    DEFAULT_AGENT_ID,
     DEFAULT_MAIN_KEY,
+    build_agent_main_session_key,
+    build_agent_peer_session_key,
+    normalize_account_id,
+    normalize_agent_id,
+    sanitize_agent_id,
 )
+
+logger = logging.getLogger(__name__)
+
+MAX_EVALUATED_BINDINGS_CACHE_KEYS = 2000
+
+# Per-config binding evaluation cache: id(cfg) → (bindings_id, dict[cache_key → list])
+# We use id(cfg) as a proxy for WeakMap behaviour (cleared when cfg is replaced).
+_evaluated_bindings_cache: Dict[int, tuple] = {}
 
 
 @dataclass
 class RoutePeer:
-    """Peer information for routing"""
-    kind: Literal["dm", "group", "channel"]
+    """Peer information for routing."""
+    kind: Literal["direct", "dm", "group", "channel"]
     id: str
 
 
 @dataclass
 class ResolvedAgentRoute:
-    """Resolved agent route"""
+    """Resolved agent route."""
     agent_id: str
     channel: str
     account_id: str
@@ -36,27 +48,45 @@ class ResolvedAgentRoute:
     matched_by: Literal[
         "binding.peer",
         "binding.peer.parent",
+        "binding.guild+roles",
         "binding.guild",
         "binding.team",
         "binding.account",
         "binding.channel",
-        "default"
+        "default",
     ]
 
 
-def normalize_token(value: str | None) -> str:
-    """Normalize string token to lowercase"""
+# Re-export constants (matches TS `export { DEFAULT_ACCOUNT_ID, DEFAULT_AGENT_ID }`)
+__all__ = [
+    "RoutePeer",
+    "ResolvedAgentRoute",
+    "resolve_agent_route",
+    "build_agent_session_key",
+    "DEFAULT_ACCOUNT_ID",
+    "DEFAULT_AGENT_ID",
+]
+
+
+def normalize_token(value: Optional[str]) -> str:
     return (value or "").strip().lower()
 
 
-def normalize_id(value: str | None) -> str:
-    """Normalize ID (preserve case)"""
-    return (value or "").strip()
+def normalize_id(value) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (int, float)):
+        return str(int(value)).strip()
+    return ""
 
 
-def matches_account_id(match: str | None, actual: str) -> bool:
-    """Check if account ID matches"""
-    trimmed = (match or "").strip()
+def _normalize_account_id_local(value: Optional[str]) -> str:
+    trimmed = (value or "").strip()
+    return trimmed if trimmed else DEFAULT_ACCOUNT_ID
+
+
+def _matches_account_id(match_pattern: Optional[str], actual: str) -> bool:
+    trimmed = (match_pattern or "").strip()
     if not trimmed:
         return actual == DEFAULT_ACCOUNT_ID
     if trimmed == "*":
@@ -64,309 +94,347 @@ def matches_account_id(match: str | None, actual: str) -> bool:
     return trimmed == actual
 
 
-def matches_channel(binding: dict, channel: str) -> bool:
-    """Check if binding matches channel"""
-    match = binding.get("match", {})
-    key = normalize_token(match.get("channel"))
-    if not key:
+def _matches_channel(match: Optional[dict], channel: str) -> bool:
+    if not match:
         return False
-    return key == channel
+    key = normalize_token(match.get("channel") if isinstance(match, dict) else getattr(match, "channel", None))
+    return bool(key) and key == channel
 
 
-def matches_peer(binding: dict, peer: RoutePeer) -> bool:
-    """Check if binding matches peer"""
-    match = binding.get("match", {})
-    peer_match = match.get("peer")
-    if not peer_match:
-        return False
-    
-    kind = normalize_token(peer_match.get("kind"))
-    peer_id = normalize_id(peer_match.get("id"))
-    
+# ---------------------------------------------------------------------------
+# Normalized binding types (mirrors TS NormalizedBindingMatch)
+# ---------------------------------------------------------------------------
+
+def _normalize_peer_constraint(peer) -> dict:
+    """Returns {"state": "none"|"invalid"|"valid", "kind": str, "id": str}"""
+    if not peer:
+        return {"state": "none"}
+    kind_raw = peer.get("kind") if isinstance(peer, dict) else getattr(peer, "kind", None)
+    id_raw = peer.get("id") if isinstance(peer, dict) else getattr(peer, "id", None)
+    kind = normalize_token(kind_raw)
+    peer_id = normalize_id(id_raw)
     if not kind or not peer_id:
+        return {"state": "invalid"}
+    return {"state": "valid", "kind": kind, "id": peer_id}
+
+
+def _normalize_binding_match(match) -> dict:
+    """Returns NormalizedBindingMatch dict."""
+    if match is None:
+        match = {}
+    get = (lambda k: match.get(k) if isinstance(match, dict) else getattr(match, k, None))
+    raw_roles = get("roles")
+    roles: Optional[List[str]] = None
+    if isinstance(raw_roles, list) and raw_roles:
+        roles = raw_roles
+    return {
+        "account_pattern": (get("accountId") or "").strip(),
+        "peer": _normalize_peer_constraint(get("peer")),
+        "guild_id": normalize_id(get("guildId")) or None,
+        "team_id": normalize_id(get("teamId")) or None,
+        "roles": roles,
+    }
+
+
+def _matches_binding_scope(match: dict, scope_peer: Optional[RoutePeer], guild_id: str, team_id: str, member_role_ids: Set[str]) -> bool:
+    """Check if a normalized binding match satisfies the current scope."""
+    peer_constraint = match["peer"]
+    if peer_constraint["state"] == "invalid":
         return False
-    
-    return kind == peer.kind and peer_id == peer.id
-
-
-def matches_guild(binding: dict, guild_id: str) -> bool:
-    """Check if binding matches guild"""
-    match = binding.get("match", {})
-    match_guild_id = normalize_id(match.get("guildId"))
-    if not match_guild_id:
+    if peer_constraint["state"] == "valid":
+        if (
+            scope_peer is None
+            or scope_peer.kind != peer_constraint["kind"]
+            or scope_peer.id != peer_constraint["id"]
+        ):
+            return False
+    if match["guild_id"] and match["guild_id"] != guild_id:
         return False
-    return match_guild_id == guild_id
-
-
-def matches_team(binding: dict, team_id: str) -> bool:
-    """Check if binding matches team"""
-    match = binding.get("match", {})
-    match_team_id = normalize_id(match.get("teamId"))
-    if not match_team_id:
+    if match["team_id"] and match["team_id"] != team_id:
         return False
-    return match_team_id == team_id
+    if match["roles"]:
+        return any(role in member_role_ids for role in match["roles"])
+    return True
 
 
-def list_bindings(config) -> list[dict]:
+# ---------------------------------------------------------------------------
+# Per-config evaluated bindings cache
+# ---------------------------------------------------------------------------
+
+def _get_evaluated_bindings(cfg: object, channel: str, account_id: str) -> List[dict]:
     """
-    List all bindings from config.
-    
-    Args:
-        config: OpenClaw configuration
-        
-    Returns:
-        List of binding objects
+    Get evaluated (pre-filtered) bindings for a channel+account pair.
+
+    Cache is keyed by id(cfg) and invalidated when cfg.bindings reference changes.
+    Max 2000 entries; cleared on overflow (matching TS behaviour).
     """
-    # Access bindings from config
-    if hasattr(config, 'session') and hasattr(config.session, 'bindings'):
-        bindings = config.session.bindings
-        if isinstance(bindings, list):
-            return bindings
-    
-    # Fallback: try dict access
-    if isinstance(config, dict):
-        session = config.get('session', {})
-        bindings = session.get('bindings', [])
-        if isinstance(bindings, list):
-            return bindings
-    
-    return []
+    cfg_id = id(cfg)
+    bindings_ref = id(getattr(cfg, "bindings", None) if not isinstance(cfg, dict) else cfg.get("bindings"))
+
+    entry = _evaluated_bindings_cache.get(cfg_id)
+    if entry is None or entry[0] != bindings_ref:
+        # Invalidate cache for this cfg
+        entry = (bindings_ref, {})
+        _evaluated_bindings_cache[cfg_id] = entry
+
+    cache_map: dict = entry[1]
+    cache_key = f"{channel}\t{account_id}"
+    hit = cache_map.get(cache_key)
+    if hit is not None:
+        return hit
+
+    evaluated = []
+    for binding in list_bindings(cfg):
+        if not binding or not isinstance(binding, dict):
+            continue
+        match = binding.get("match")
+        if not _matches_channel(match, channel):
+            continue
+        match_dict = match if isinstance(match, dict) else {}
+        if not _matches_account_id(match_dict.get("accountId"), account_id):
+            continue
+        evaluated.append({
+            "binding": binding,
+            "match": _normalize_binding_match(match),
+        })
+
+    cache_map[cache_key] = evaluated
+    if len(cache_map) > MAX_EVALUATED_BINDINGS_CACHE_KEYS:
+        cache_map.clear()
+        cache_map[cache_key] = evaluated
+
+    return evaluated
 
 
-def resolve_default_agent_id(config) -> str:
+# ---------------------------------------------------------------------------
+# Public helpers
+# ---------------------------------------------------------------------------
+
+def build_agent_session_key(
+    agent_id: str,
+    channel: str,
+    account_id: Optional[str] = None,
+    peer: Optional[dict] = None,
+    dm_scope: str = "main",
+    identity_links: Optional[dict] = None,
+) -> str:
     """
-    Resolve default agent ID from config.
-    
-    Args:
-        config: OpenClaw configuration
-        
-    Returns:
-        Default agent ID
+    Build agent session key from routing parameters.
+
+    Matches TS buildAgentSessionKey() in resolve-route.ts.
     """
-    # Try to get default agent from config
-    if hasattr(config, 'agents') and hasattr(config.agents, 'default'):
-        return config.agents.default or "main"
-    
-    # Try dict access
-    if isinstance(config, dict):
-        agents = config.get('agents', {})
-        return agents.get('default', 'main')
-    
-    return "main"
+    channel_norm = normalize_token(channel) or "unknown"
+    peer_kind = peer.get("kind", "direct") if peer else "direct"
+    peer_id = normalize_id(peer.get("id") if peer else None) or None
+    return build_agent_peer_session_key(
+        agent_id=agent_id,
+        channel=channel_norm,
+        account_id=account_id,
+        peer_kind=peer_kind,
+        peer_id=peer_id,
+        dm_scope=dm_scope,
+        identity_links=identity_links,
+    )
 
 
-def list_agents(config) -> list[dict]:
-    """List all agents from config"""
-    if hasattr(config, 'agents') and hasattr(config.agents, 'list'):
-        agents = config.agents.list
+def _list_agents(cfg: object) -> List[dict]:
+    if hasattr(cfg, "agents") and cfg.agents:  # type: ignore[union-attr]
+        agents = getattr(cfg.agents, "list", None)  # type: ignore[union-attr]
         if isinstance(agents, list):
             return agents
-    
-    if isinstance(config, dict):
-        agents = config.get('agents', {})
-        agent_list = agents.get('list', [])
-        if isinstance(agent_list, list):
-            return agent_list
-    
+    if isinstance(cfg, dict):
+        agents = cfg.get("agents") or {}
+        if isinstance(agents, dict):
+            lst = agents.get("list", [])
+            if isinstance(lst, list):
+                return lst
     return []
 
 
-def pick_first_existing_agent_id(config, agent_id: str) -> str:
-    """
-    Pick first existing agent ID, fallback to default.
-    
-    Args:
-        config: OpenClaw configuration
-        agent_id: Requested agent ID
-        
-    Returns:
-        Resolved agent ID
-    """
+def _resolve_default_agent_id(cfg: object) -> str:
+    if hasattr(cfg, "agents") and cfg.agents:  # type: ignore[union-attr]
+        default = getattr(cfg.agents, "default", None)  # type: ignore[union-attr]
+        if default:
+            return str(default).strip()
+    if isinstance(cfg, dict):
+        agents = cfg.get("agents") or {}
+        if isinstance(agents, dict):
+            default = agents.get("default")
+            if default:
+                return str(default).strip()
+    return DEFAULT_AGENT_ID
+
+
+def _pick_first_existing_agent_id(cfg: object, agent_id: str) -> str:
     trimmed = (agent_id or "").strip()
     if not trimmed:
-        return normalize_agent_id(resolve_default_agent_id(config))
-    
+        return sanitize_agent_id(_resolve_default_agent_id(cfg))
     normalized = normalize_agent_id(trimmed)
-    agents = list_agents(config)
-    
+    agents = _list_agents(cfg)
     if not agents:
-        return normalize_agent_id(trimmed)
-    
-    # Find matching agent
+        return sanitize_agent_id(trimmed)
     for agent in agents:
         if not isinstance(agent, dict):
             continue
-        agent_id_str = agent.get('id', '')
-        if normalize_agent_id(agent_id_str) == normalized:
-            return normalize_agent_id(agent_id_str)
-    
-    # Fallback to default
-    return normalize_agent_id(resolve_default_agent_id(config))
+        aid = agent.get("id", "")
+        if normalize_agent_id(aid) == normalized:
+            return sanitize_agent_id(aid)
+    return sanitize_agent_id(_resolve_default_agent_id(cfg))
 
+
+# ---------------------------------------------------------------------------
+# Main routing function
+# ---------------------------------------------------------------------------
 
 def resolve_agent_route(
-    config,
+    cfg: object,
     channel: str,
-    account_id: str | None = None,
-    peer: RoutePeer | dict | None = None,
-    parent_peer: RoutePeer | dict | None = None,
-    guild_id: str | None = None,
-    team_id: str | None = None
+    account_id: Optional[str] = None,
+    peer: Optional[RoutePeer] = None,
+    parent_peer: Optional[RoutePeer] = None,
+    guild_id: Optional[str] = None,
+    team_id: Optional[str] = None,
+    member_role_ids: Optional[List[str]] = None,
 ) -> ResolvedAgentRoute:
     """
     Resolve agent and session key via binding hierarchy.
-    
-    Matching order:
-    1. Peer binding (exact peer ID match)
-    2. Parent peer binding (for threads)
-    3. Guild binding (for group/channel peers)
-    4. Team binding (Slack workspace)
-    5. Account binding (channel account)
-    6. Channel binding (any account wildcard)
-    7. Default agent
-    
-    Args:
-        config: OpenClaw configuration
-        channel: Channel name
-        account_id: Account ID
-        peer: Peer information (kind, id)
-        parent_peer: Parent peer for thread inheritance
-        guild_id: Guild ID (Discord)
-        team_id: Team ID (Slack)
-        
-    Returns:
-        ResolvedAgentRoute with agentId, sessionKey, matchedBy
+
+    Matching order (mirrors TS resolveAgentRoute tiers):
+    1. binding.peer          — exact peer ID match
+    2. binding.peer.parent   — parent peer for threads
+    3. binding.guild+roles   — Discord guild + member role intersection
+    4. binding.guild         — Discord guild (no role constraint)
+    5. binding.team          — Slack workspace
+    6. binding.account       — channel account (specific account ID)
+    7. binding.channel       — channel-wide (accountId="*")
+    8. default               — fallback to default agent
+
+    Matches TS resolveAgentRoute().
     """
     channel_norm = normalize_token(channel)
-    account_id_norm = normalize_account_id(account_id)
-    
+    account_id_norm = _normalize_account_id_local(account_id)
+
     # Normalize peer
-    if peer:
-        if isinstance(peer, dict):
-            peer = RoutePeer(
-                kind=peer.get("kind", "dm"),
-                id=normalize_id(peer.get("id", ""))
-            )
-        else:
-            peer = RoutePeer(
-                kind=peer.kind,
-                id=normalize_id(peer.id)
-            )
-    
-    # Normalize parent peer
-    if parent_peer:
-        if isinstance(parent_peer, dict):
-            parent_peer = RoutePeer(
-                kind=parent_peer.get("kind", "dm"),
-                id=normalize_id(parent_peer.get("id", ""))
-            )
-        else:
-            parent_peer = RoutePeer(
-                kind=parent_peer.kind,
-                id=normalize_id(parent_peer.id)
-            )
-    
-    guild_id_norm = normalize_id(guild_id) if guild_id else None
-    team_id_norm = normalize_id(team_id) if team_id else None
-    
-    # Filter bindings by channel and account
-    all_bindings = list_bindings(config)
-    bindings = []
-    for binding in all_bindings:
-        if not binding or not isinstance(binding, dict):
-            continue
-        if not matches_channel(binding, channel_norm):
-            continue
-        match = binding.get("match", {})
-        if not matches_account_id(match.get("accountId"), account_id_norm):
-            continue
-        bindings.append(binding)
-    
-    # Get dmScope and identity links from config
+    def _norm_peer(p) -> Optional[RoutePeer]:
+        if p is None:
+            return None
+        if isinstance(p, dict):
+            return RoutePeer(kind=p.get("kind", "direct"), id=normalize_id(p.get("id", "")))
+        return RoutePeer(kind=p.kind, id=normalize_id(p.id))
+
+    peer_norm = _norm_peer(peer)
+    parent_peer_norm = _norm_peer(parent_peer)
+    guild_id_norm = normalize_id(guild_id)
+    team_id_norm = normalize_id(team_id)
+    member_role_ids_list = member_role_ids or []
+    member_role_id_set: Set[str] = set(member_role_ids_list)
+
+    bindings = _get_evaluated_bindings(cfg, channel_norm, account_id_norm)
+
+    # Get dmScope and identityLinks from config
     dm_scope = "main"
     identity_links = None
-    
-    if hasattr(config, 'session'):
-        if hasattr(config.session, 'dmScope'):
-            dm_scope = config.session.dmScope or "main"
-        if hasattr(config.session, 'identityLinks'):
-            identity_links = config.session.identityLinks
-    elif isinstance(config, dict):
-        session = config.get('session', {})
-        dm_scope = session.get('dmScope', 'main')
-        identity_links = session.get('identityLinks')
-    
+    if hasattr(cfg, "session") and cfg.session:  # type: ignore[union-attr]
+        dm_scope = getattr(cfg.session, "dmScope", "main") or "main"  # type: ignore[union-attr]
+        identity_links = getattr(cfg.session, "identityLinks", None)  # type: ignore[union-attr]
+    elif isinstance(cfg, dict):
+        session = cfg.get("session") or {}
+        dm_scope = session.get("dmScope", "main") or "main"
+        identity_links = session.get("identityLinks")
+
     def choose(agent_id: str, matched_by: str) -> ResolvedAgentRoute:
-        """Build resolved route"""
-        resolved_agent_id = pick_first_existing_agent_id(config, agent_id)
-        
+        resolved_agent_id = _pick_first_existing_agent_id(cfg, agent_id)
         session_key = build_agent_session_key(
             agent_id=resolved_agent_id,
             channel=channel_norm,
             account_id=account_id_norm,
-            peer={"kind": peer.kind, "id": peer.id} if peer else None,
+            peer={"kind": peer_norm.kind, "id": peer_norm.id} if peer_norm else None,
             dm_scope=dm_scope,
-            identity_links=identity_links
+            identity_links=identity_links,
         ).lower()
-        
         main_session_key = build_agent_main_session_key(
             agent_id=resolved_agent_id,
-            main_key=DEFAULT_MAIN_KEY
+            main_key=DEFAULT_MAIN_KEY,
         ).lower()
-        
         return ResolvedAgentRoute(
             agent_id=resolved_agent_id,
             channel=channel_norm,
             account_id=account_id_norm,
             session_key=session_key,
             main_session_key=main_session_key,
-            matched_by=matched_by
+            matched_by=matched_by,  # type: ignore[arg-type]
         )
-    
-    # 1. Try peer binding
-    if peer:
-        for binding in bindings:
-            if matches_peer(binding, peer):
-                return choose(binding.get("agentId", "main"), "binding.peer")
-    
-    # 2. Try parent peer binding (thread inheritance)
-    if parent_peer and parent_peer.id:
-        for binding in bindings:
-            if matches_peer(binding, parent_peer):
-                return choose(binding.get("agentId", "main"), "binding.peer.parent")
-    
-    # 3. Try guild binding
-    if guild_id_norm:
-        for binding in bindings:
-            if matches_guild(binding, guild_id_norm):
-                return choose(binding.get("agentId", "main"), "binding.guild")
-    
-    # 4. Try team binding
-    if team_id_norm:
-        for binding in bindings:
-            if matches_team(binding, team_id_norm):
-                return choose(binding.get("agentId", "main"), "binding.team")
-    
-    # 5. Try account binding (specific account, no peer/guild/team)
-    for binding in bindings:
-        match = binding.get("match", {})
-        account_id_match = (match.get("accountId") or "").strip()
-        if account_id_match != "*" and not match.get("peer") and not match.get("guildId") and not match.get("teamId"):
-            return choose(binding.get("agentId", "main"), "binding.account")
-    
-    # 6. Try channel binding (any account wildcard)
-    for binding in bindings:
-        match = binding.get("match", {})
-        account_id_match = (match.get("accountId") or "").strip()
-        if account_id_match == "*" and not match.get("peer") and not match.get("guildId") and not match.get("teamId"):
-            return choose(binding.get("agentId", "main"), "binding.channel")
-    
-    # 7. Default
-    return choose(resolve_default_agent_id(config), "default")
 
+    def has_guild_constraint(match: dict) -> bool:
+        return bool(match.get("guild_id"))
 
-__all__ = [
-    "RoutePeer",
-    "ResolvedAgentRoute",
-    "resolve_agent_route",
-]
+    def has_roles_constraint(match: dict) -> bool:
+        return bool(match.get("roles"))
+
+    def has_team_constraint(match: dict) -> bool:
+        return bool(match.get("team_id"))
+
+    # Tiers — same order as TS
+    tiers = [
+        {
+            "matched_by": "binding.peer",
+            "enabled": peer_norm is not None,
+            "scope_peer": peer_norm,
+            "predicate": lambda e: e["match"]["peer"]["state"] == "valid",
+        },
+        {
+            "matched_by": "binding.peer.parent",
+            "enabled": parent_peer_norm is not None and bool(parent_peer_norm.id),
+            "scope_peer": parent_peer_norm if (parent_peer_norm and parent_peer_norm.id) else None,
+            "predicate": lambda e: e["match"]["peer"]["state"] == "valid",
+        },
+        {
+            "matched_by": "binding.guild+roles",
+            "enabled": bool(guild_id_norm and member_role_ids_list),
+            "scope_peer": peer_norm,
+            "predicate": lambda e: has_guild_constraint(e["match"]) and has_roles_constraint(e["match"]),
+        },
+        {
+            "matched_by": "binding.guild",
+            "enabled": bool(guild_id_norm),
+            "scope_peer": peer_norm,
+            "predicate": lambda e: has_guild_constraint(e["match"]) and not has_roles_constraint(e["match"]),
+        },
+        {
+            "matched_by": "binding.team",
+            "enabled": bool(team_id_norm),
+            "scope_peer": peer_norm,
+            "predicate": lambda e: has_team_constraint(e["match"]),
+        },
+        {
+            "matched_by": "binding.account",
+            "enabled": True,
+            "scope_peer": peer_norm,
+            "predicate": lambda e: e["match"]["account_pattern"] != "*",
+        },
+        {
+            "matched_by": "binding.channel",
+            "enabled": True,
+            "scope_peer": peer_norm,
+            "predicate": lambda e: e["match"]["account_pattern"] == "*",
+        },
+    ]
+
+    for tier in tiers:
+        if not tier["enabled"]:
+            continue
+        scope_peer: Optional[RoutePeer] = tier["scope_peer"]
+        for candidate in bindings:
+            if not tier["predicate"](candidate):
+                continue
+            if _matches_binding_scope(
+                candidate["match"],
+                scope_peer,
+                guild_id_norm,
+                team_id_norm,
+                member_role_id_set,
+            ):
+                agent_id_raw = candidate["binding"].get("agentId", DEFAULT_AGENT_ID)
+                return choose(agent_id_raw, tier["matched_by"])
+
+    return choose(_resolve_default_agent_id(cfg), "default")

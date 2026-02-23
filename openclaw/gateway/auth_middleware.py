@@ -97,7 +97,6 @@ class GatewayAuthMiddleware:
             is_valid, reason = self.device_manager.validate_token(
                 device_id=device_id,
                 token=device_token,
-                required_scopes=["gateway"]
             )
             if is_valid:
                 logger.info(f"Device auth success: {device_id}")

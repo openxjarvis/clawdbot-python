@@ -195,32 +195,53 @@ class GeminiProvider(LLMProvider):
             
             # Add images first (if any)
             if hasattr(msg, 'images') and msg.images:
-                for image_url in msg.images:
+                import base64 as _b64
+                for image_ref in msg.images:
                     try:
-                        # Download image and convert to bytes
-                        import httpx
-                        response = httpx.get(image_url, timeout=30.0)
-                        if response.status_code == 200:
-                            image_bytes = response.content
-                            # Determine MIME type from URL or content
-                            mime_type = "image/jpeg"  # Default
-                            if ".png" in image_url.lower():
-                                mime_type = "image/png"
-                            elif ".gif" in image_url.lower():
-                                mime_type = "image/gif"
-                            elif ".webp" in image_url.lower():
-                                mime_type = "image/webp"
-                            
-                            # Create image part
-                            parts.append(types.Part.from_bytes(
-                                data=image_bytes,
-                                mime_type=mime_type
-                            ))
-                            logger.info(f"Added image to Gemini request: {image_url[:50]}...")
-                        else:
-                            logger.warning(f"Failed to download image: {image_url} (status: {response.status_code})")
+                        image_bytes: bytes | None = None
+                        mime_type = "image/jpeg"
+
+                        if isinstance(image_ref, dict):
+                            # Pre-loaded content block: {"type":"image","source":{"type":"base64","media_type":...,"data":...}}
+                            src = image_ref.get("source") or {}
+                            mime_type = src.get("media_type", "image/jpeg")
+                            raw = src.get("data", "")
+                            image_bytes = _b64.b64decode(raw) if raw else None
+                        elif isinstance(image_ref, str) and image_ref.startswith("data:"):
+                            # Inline data URL: data:image/png;base64,<data>
+                            header, data_str = image_ref.split(",", 1)
+                            mime_type = header.split(";")[0].split(":", 1)[1]
+                            image_bytes = _b64.b64decode(data_str)
+                        elif isinstance(image_ref, str) and image_ref.startswith(("http://", "https://")):
+                            # Remote URL — download
+                            import httpx
+                            response = httpx.get(image_ref, timeout=30.0)
+                            if response.status_code == 200:
+                                image_bytes = response.content
+                                for ext, mt in [(".png", "image/png"), (".gif", "image/gif"), (".webp", "image/webp")]:
+                                    if ext in image_ref.lower():
+                                        mime_type = mt
+                                        break
+                            else:
+                                logger.warning(f"Failed to download image: {image_ref} (status: {response.status_code})")
+                        elif isinstance(image_ref, str):
+                            # Local file path
+                            import pathlib
+                            img_path = pathlib.Path(image_ref)
+                            if img_path.exists():
+                                image_bytes = img_path.read_bytes()
+                                for ext, mt in [(".png", "image/png"), (".gif", "image/gif"), (".webp", "image/webp"), (".jpg", "image/jpeg"), (".jpeg", "image/jpeg")]:
+                                    if img_path.suffix.lower() == ext:
+                                        mime_type = mt
+                                        break
+                            else:
+                                logger.warning(f"Image file not found: {image_ref}")
+
+                        if image_bytes:
+                            parts.append(types.Part.from_bytes(data=image_bytes, mime_type=mime_type))
+                            logger.info(f"Added image to Gemini request ({mime_type}, {len(image_bytes)} bytes)")
                     except Exception as e:
-                        logger.error(f"Error loading image {image_url}: {e}")
+                        logger.error(f"Error loading image: {e}")
             
             # Add tool calls if present (for assistant messages)
             if hasattr(msg, 'tool_calls') and msg.tool_calls and role == "model":

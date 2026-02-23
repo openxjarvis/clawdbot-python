@@ -23,15 +23,51 @@ Example usage:
 __version__ = "0.6.0"
 __author__ = "OpenClaw Contributors"
 
-from .agents import AgentRuntime, Session, SessionManager
+try:
+    from .agents import AgentRuntime, Session, SessionManager
+except ModuleNotFoundError:
+    # Optional provider SDKs may be absent in lightweight/dev environments.
+    AgentRuntime = None  # type: ignore[assignment]
+    Session = None  # type: ignore[assignment]
+    SessionManager = None  # type: ignore[assignment]
+
 from .config import Settings, get_settings
 from .config.unified import ConfigBuilder, OpenClawConfig
 
 # Refactored modules (v0.6.0+)
 from .events import Event, EventBus, EventType, get_event_bus
-from .gateway.api import MethodRegistry, get_method_registry
-from .monitoring import get_health_check, get_metrics, setup_logging
-from .runtime_env import RuntimeEnv, RuntimeEnvManager, get_runtime_env_manager
+
+try:
+    from .gateway.api import MethodRegistry, get_method_registry
+except ModuleNotFoundError:
+    MethodRegistry = None  # type: ignore[assignment]
+
+    def get_method_registry():  # type: ignore[override]
+        raise ModuleNotFoundError(
+            "Gateway API dependencies are missing. Install optional runtime dependencies."
+        )
+
+try:
+    from .monitoring import get_health_check, get_metrics, setup_logging
+except ModuleNotFoundError:
+    def get_health_check():  # type: ignore[override]
+        raise ModuleNotFoundError("Monitoring dependencies are missing.")
+
+    def get_metrics():  # type: ignore[override]
+        raise ModuleNotFoundError("Monitoring dependencies are missing.")
+
+    def setup_logging(*args, **kwargs):  # type: ignore[override]
+        raise ModuleNotFoundError("Monitoring dependencies are missing.")
+try:
+    from .runtime_env import RuntimeEnv, RuntimeEnvManager, get_runtime_env_manager
+except ModuleNotFoundError:
+    RuntimeEnv = None  # type: ignore[assignment]
+    RuntimeEnvManager = None  # type: ignore[assignment]
+
+    def get_runtime_env_manager():  # type: ignore[override]
+        raise ModuleNotFoundError(
+            "RuntimeEnv dependencies are missing. Install optional provider/tool SDKs."
+        )
 
 __all__ = [
     # Version

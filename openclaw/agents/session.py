@@ -584,44 +584,44 @@ class SessionManager:
         
         return self._sessions[session_id]
 
-    def get_or_create(self, session_key: str) -> Session:
+    def get_or_create(self, session_id: str | None = None, session_key: str | None = None) -> "Session":
         """
-        Simple get-or-create using session_key as the direct session ID.
+        Backward-compatible get-or-create entrypoint.
 
-        This is a lightweight helper for tests and simple use-cases where you
-        want a stable session identified by an arbitrary string key (not UUID).
-        Sessions are stored in workspace_dir / ".sessions" / "{session_key}.json".
-
-        Args:
-            session_key: Arbitrary key to identify the session.
-
-        Returns:
-            Session instance.
-
-        Raises:
-            ValueError: If session_key is empty.
+        Behavior:
+        - If `session_key` is provided (or `session_id` looks like an agent key),
+          resolve via session store and return UUID-backed session.
+        - Otherwise create/load a local workspace-scoped simple session.
         """
-        if not session_key:
-            raise ValueError("session_key cannot be empty")
+        candidate_key = (session_key or "").strip()
+        if not candidate_key and isinstance(session_id, str) and session_id.strip().startswith("agent:"):
+            candidate_key = session_id.strip()
 
-        # Return cached instance if available
-        if session_key in self._sessions:
-            return self._sessions[session_key]
+        if candidate_key:
+            return self.get_or_create_session(session_key=candidate_key)
+
+        if not session_id:
+            raise ValueError("session_id cannot be empty")
+
+        sid = session_id.strip()
+        if not sid:
+            raise ValueError("session_id cannot be empty")
+
+        if sid in self._sessions:
+            return self._sessions[sid]
 
         sessions_dir = self.workspace_dir / ".sessions"
         sessions_dir.mkdir(parents=True, exist_ok=True)
 
         session = Session(
-            session_id=session_key,
+            session_id=sid,
             workspace_dir=self.workspace_dir,
-            session_key=session_key,
+            session_key=sid,
             sessions_dir_override=sessions_dir,
         )
-        self._sessions[session_key] = session
-
-        # Persist immediately so list_sessions() can find it even without messages
+        self._sessions[sid] = session
+        # Persist immediately so list_sessions() can discover it.
         session._save()
-
         return session
 
     def get_or_create_session_by_key(self, session_key: str) -> Session:
@@ -639,36 +639,6 @@ class SessionManager:
         """
         return self.get_or_create_session(session_key=session_key)
 
-    def get_or_create(self, session_id: str) -> "Session":
-        """
-        Simple get-or-create a session by session_id (backward-compat / testing API).
-
-        Uses workspace_dir / ".sessions" / "{session_id}.json" for storage so that
-        tests that pass a plain string ID (not a UUID) work correctly.
-
-        Args:
-            session_id: Any string identifier for the session.
-
-        Returns:
-            Session instance stored in workspace_dir / ".sessions"
-        """
-        if not session_id:
-            raise ValueError("session_id cannot be empty")
-
-        if session_id in self._sessions:
-            return self._sessions[session_id]
-
-        sessions_dir = self.workspace_dir / ".sessions"
-        sessions_dir.mkdir(parents=True, exist_ok=True)
-
-        session = Session(
-            session_id=session_id,
-            workspace_dir=self.workspace_dir,
-            sessions_dir_override=sessions_dir,
-        )
-        self._sessions[session_id] = session
-        return session
-    
     def get_session(self, session_id: str) -> Session:
         """
         Get or create a session (legacy method)
@@ -711,7 +681,8 @@ class SessionManager:
     
     def get_session_key_for_id(self, session_id: str) -> str | None:
         """Get session key for given session ID."""
-        for key, entry in self._session_store.items():
+        store = self._get_session_store()
+        for key, entry in store.items():
             if entry.sessionId == session_id:
                 return key
         return None
@@ -719,7 +690,8 @@ class SessionManager:
     def list_sessions_by_channel(self, channel: str) -> dict[str, str]:
         """List all sessions for a specific channel."""
         sessions = {}
-        for key, entry in self._session_store.items():
+        store = self._get_session_store()
+        for key, entry in store.items():
             parsed = parse_agent_session_key(key)
             if parsed and channel in parsed.rest:
                 sessions[key] = entry.sessionId
@@ -740,21 +712,29 @@ class SessionManager:
             del self._sessions[session_id]
 
         # Remove from session map
-        keys_to_remove = [k for k, entry in self._session_store.items() if entry.sessionId == session_id]
+        store = self._get_session_store()
+        keys_to_remove = [k for k, entry in store.items() if entry.sessionId == session_id]
         for key in keys_to_remove:
-            self._session_store.delete(key)
+            store.delete(key)
         
         if keys_to_remove:
+            self._session_store = store
             self._save_session_store()
             logger.info(f"Removed {len(keys_to_remove)} session key(s) for {session_id}")
 
-        # Remove from disk
-        session_file = self.workspace_dir / ".sessions" / f"{session_id}.json"
+        # Remove from disk (new canonical path + legacy workspace path)
+        deleted = False
+        session_file = self._sessions_dir / f"{session_id}.json"
         if session_file.exists():
             session_file.unlink()
-            return True
+            deleted = True
 
-        return False
+        legacy_file = self.workspace_dir / ".sessions" / f"{session_id}.json"
+        if legacy_file.exists():
+            legacy_file.unlink()
+            deleted = True
+
+        return deleted
 
     def get_all_sessions(self) -> list[Session]:
         """

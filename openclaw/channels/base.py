@@ -43,6 +43,9 @@ class InboundMessage(BaseModel):
     timestamp: str
     reply_to: str | None = None
     metadata: dict[str, Any] = {}
+    # File attachments — each entry mirrors TS ChatAttachment:
+    # {type, mimeType, content (base64), filename, size}
+    attachments: list[dict[str, Any]] = []
 
 
 class OutboundMessage(BaseModel):

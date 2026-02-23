@@ -203,8 +203,49 @@ def filter_workspace_skill_entries(
         if normalized:
             filtered = [e for e in filtered if e.skill.name in normalized]
     
-    # Apply config-based filtering (if needed)
-    # TODO: Implement config-based filtering
+    # Apply config-based filtering
+    if config:
+        allow_bundled: set[str] | None = None
+        try:
+            allow = getattr(getattr(config, "skills", None), "allowBundled", None)
+            if allow is None and isinstance(config, dict):
+                allow = ((config.get("skills") or {}).get("allowBundled"))
+            if isinstance(allow, list):
+                allow_bundled = {str(x).strip() for x in allow if str(x).strip()}
+        except Exception:
+            allow_bundled = None
+
+        # Per-skill toggles (skills.entries.<name>.enabled)
+        disabled_skills: set[str] = set()
+        try:
+            entries_cfg = None
+            if hasattr(config, "skills") and hasattr(config.skills, "entries"):
+                entries_cfg = getattr(config.skills, "entries")
+            elif isinstance(config, dict):
+                entries_cfg = ((config.get("skills") or {}).get("entries"))
+            if isinstance(entries_cfg, dict):
+                for name, cfg in entries_cfg.items():
+                    enabled = None
+                    if isinstance(cfg, dict):
+                        enabled = cfg.get("enabled")
+                    else:
+                        enabled = getattr(cfg, "enabled", None)
+                    if enabled is False:
+                        disabled_skills.add(str(name))
+        except Exception:
+            disabled_skills = set()
+
+        def _is_allowed(entry: SkillEntry) -> bool:
+            skill_name = entry.skill.name
+            if skill_name in disabled_skills:
+                return False
+
+            source = (getattr(entry.skill, "source", "") or "").strip().lower()
+            if source == "openclaw-bundled" and allow_bundled is not None and len(allow_bundled) > 0:
+                return skill_name in allow_bundled
+            return True
+
+        filtered = [e for e in filtered if _is_allowed(e)]
     
     return filtered
 

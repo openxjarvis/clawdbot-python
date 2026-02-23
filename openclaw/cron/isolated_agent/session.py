@@ -1,11 +1,18 @@
-"""Session management for isolated cron agents"""
+"""Session management for isolated cron agents.
+
+Mirrors TypeScript: openclaw/src/cron/isolated-agent/session.ts
+"""
 from __future__ import annotations
 
 import logging
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
+
+# Session reset policy — matches TS CronSessionReset
+CronSessionReset = Literal["never", "always", "daily", "weekly"]
 
 
 class IsolatedAgentSession:
@@ -58,11 +65,36 @@ class IsolatedAgentSession:
     def exists(self) -> bool:
         """Check if session exists"""
         return self.session_path.exists()
-    
+
+    def is_fresh(self, reset_policy: CronSessionReset = "never", last_run_at_ms: int | None = None) -> bool:
+        """Check if this session should be treated as fresh (i.e., needs reset).
+
+        Mirrors TS resolveCronSession freshness logic:
+        - "always"  → always fresh (start new session each run)
+        - "daily"   → fresh if last_run_at_ms was > 24 h ago (or missing)
+        - "weekly"  → fresh if last_run_at_ms was > 7 days ago (or missing)
+        - "never"   → never fresh (reuse session forever) — default
+        """
+        if not self.exists():
+            return True
+        if reset_policy == "always":
+            return True
+        if reset_policy == "never":
+            return False
+        now_ms = int(time.time() * 1000)
+        if last_run_at_ms is None:
+            return True
+        elapsed_ms = now_ms - last_run_at_ms
+        if reset_policy == "daily":
+            return elapsed_ms > 24 * 60 * 60 * 1000
+        if reset_policy == "weekly":
+            return elapsed_ms > 7 * 24 * 60 * 60 * 1000
+        return False
+
     def get_session_key(self) -> str:
         """Get session key"""
         return self.session_key
-    
+
     def get_session_path(self) -> Path:
         """Get session file path"""
         return self.session_path

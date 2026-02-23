@@ -262,8 +262,11 @@ def doctor(
 
         # Check 5: Gateway status
         try:
-            from ..daemon.service import get_service_status
-            status = get_service_status()
+            from .daemon_cmd import is_service_installed, is_service_running
+            status = {
+                "installed": is_service_installed(),
+                "running": is_service_running() if is_service_installed() else False,
+            }
             
             if status["installed"]:
                 if status["running"]:
@@ -386,6 +389,10 @@ from .security_cmd import security_app
 from .sandbox_cmd import sandbox_app
 from .nodes_cmd import nodes_app
 from .pairing_cmd import pairing_app
+from .daemon_cmd import daemon_app
+from .dns_cmd import dns_app
+from .devices_cmd import devices_app
+from .update_cmd import update_app
 from .misc_cmd import register_misc_commands
 
 app.add_typer(gateway_app, name="gateway")
@@ -408,6 +415,10 @@ app.add_typer(plugins_app, name="plugins")
 app.add_typer(security_app, name="security")
 app.add_typer(sandbox_app, name="sandbox")
 app.add_typer(nodes_app, name="nodes")
+app.add_typer(daemon_app, name="daemon")
+app.add_typer(dns_app, name="dns")
+app.add_typer(devices_app, name="devices")
+app.add_typer(update_app, name="update")
 
 # Note: pairing_app already added above with channels
 # Register misc commands (tui, update, onboard, setup, configure, etc)

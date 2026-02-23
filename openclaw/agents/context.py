@@ -66,7 +66,10 @@ def estimate_tokens_from_messages(messages: list[dict | AgentMessage]) -> int:
         return 0
     
     total_chars = sum(len(str(msg)) for msg in messages)
-    return estimate_tokens_from_text(str(messages))
+    if total_chars <= 0:
+        return 0
+    estimated = total_chars / CHARS_PER_TOKEN_ESTIMATE
+    return int(estimated * TOKEN_BUFFER_RATIO)
 
 
 # Custom message type support (extensible)
@@ -347,10 +350,22 @@ async def transform_context(
         # Keep most recent messages
         conversation_messages = conversation_messages[-max_messages:]
     
-    # Token limit would require actual token counting
-    # For now, approximate with message limit
-    # TODO: Implement proper token counting
-    
+    # Apply token limit by keeping latest non-system messages.
+    if max_tokens is not None and max_tokens > 0:
+        result_conv: list[AgentMessage] = []
+        running_tokens = estimate_tokens_from_messages(system_messages)
+        for msg in reversed(conversation_messages):
+            msg_tokens = estimate_tokens_from_messages([msg])
+            if result_conv and running_tokens + msg_tokens > max_tokens:
+                break
+            if not result_conv and running_tokens + msg_tokens > max_tokens:
+                # Keep at least one recent message so turns do not become empty.
+                result_conv.append(msg)
+                break
+            result_conv.append(msg)
+            running_tokens += msg_tokens
+        conversation_messages = list(reversed(result_conv))
+
     return system_messages + conversation_messages
 
 
@@ -671,9 +686,8 @@ def get_dm_history_limit_from_session_key(
     
     kind = provider_parts[1].lower()
     
-    # Only apply to DM sessions
-    if kind != "dm":
-        return None
+    # TS-compatible: accept both legacy "dm" and current "direct".
+    is_dm = kind in ("dm", "direct")
     
     # Extract user ID (may have thread suffix)
     user_id_raw = ":".join(provider_parts[2:]) if len(provider_parts) > 2 else ""
@@ -688,16 +702,30 @@ def get_dm_history_limit_from_session_key(
     if not isinstance(provider_config, dict):
         return None
     
-    # Check per-DM override first
-    if user_id:
-        dms = provider_config.get("dms", {})
-        if isinstance(dms, dict) and user_id in dms:
-            dm_config = dms[user_id]
-            if isinstance(dm_config, dict) and "historyLimit" in dm_config:
-                return dm_config["historyLimit"]
-    
-    # Fall back to provider default
-    return provider_config.get("dmHistoryLimit")
+    if is_dm:
+        # Check per-DM override first
+        if user_id:
+            dms = provider_config.get("dms", {})
+            if isinstance(dms, dict) and user_id in dms:
+                dm_config = dms[user_id]
+                if isinstance(dm_config, dict) and "historyLimit" in dm_config:
+                    return dm_config["historyLimit"]
+        # Fall back to provider DM default
+        return provider_config.get("dmHistoryLimit")
+
+    # TS-compatible behavior for non-DM conversational scopes.
+    if kind in ("channel", "group"):
+        return provider_config.get("historyLimit")
+
+    return None
+
+
+def get_history_limit_from_session_key(
+    session_key: str | None,
+    config: dict | None
+) -> int | None:
+    """TS-compatible alias for history limit resolution."""
+    return get_dm_history_limit_from_session_key(session_key, config)
 
 
 def sanitize_session_history(
@@ -1086,6 +1114,7 @@ __all__ = [
     "validate_anthropic_turns",
     "limit_history_turns",
     "get_dm_history_limit_from_session_key",
+    "get_history_limit_from_session_key",
     "sanitize_session_history",
     "inject_history_images_into_messages",
     "ContextManager",

@@ -24,6 +24,8 @@ class AuthConfig(BaseModel):
     mode: str = Field(default="token")
     token: str | None = Field(default=None)
     password: str | None = Field(default=None)
+    allow_tailscale: bool | None = Field(default=None, alias="allowTailscale")
+    trusted_proxy: dict[str, Any] | None = Field(default=None, alias="trustedProxy")
 
 
 class GatewayConfig(BaseModel):
@@ -32,6 +34,7 @@ class GatewayConfig(BaseModel):
     bind: str = Field(default="loopback")
     mode: str = Field(default="local")
     auth: AuthConfig | None = Field(default=None)
+    trusted_proxies: list[str] = Field(default_factory=list, alias="trustedProxies")
     enable_web_ui: bool = Field(default=True, alias="enableWebUI")
     web_ui_port: int = Field(default=8080, alias="webUIPort")
     web_ui_base_path: str = Field(default="/", alias="webUIBasePath")
@@ -173,6 +176,43 @@ class HooksConfig(BaseModel):
     enabled: bool = Field(default=True)
 
 
+class ShellEnvConfig(BaseModel):
+    """Shell env import configuration (mirrors TS env.shellEnv)"""
+    enabled: bool = Field(default=False)
+
+
+class EnvConfig(BaseModel):
+    """Environment variable configuration block in openclaw.json.
+
+    Mirrors TS zod-schema.ts env block:
+      env:
+        GOOGLE_API_KEY: "AIza..."
+        ANTHROPIC_API_KEY: "sk-ant-..."
+        vars: { FOO: "bar" }
+        shellEnv: { enabled: true }
+
+    Any top-level key that is not a known sub-field is treated as a raw env var,
+    applied to the process environment at startup (override: false — already-set
+    vars from .env files or the shell take precedence).
+    """
+    vars: dict[str, str] | None = Field(default=None)
+    shell_env: ShellEnvConfig | None = Field(default=None, alias="shellEnv")
+
+    model_config = {"populate_by_name": True, "extra": "allow"}
+
+    def get_all_vars(self) -> dict[str, str]:
+        """Return all env var overrides as a flat dict.
+        Merges ``vars`` dict and any extra top-level string fields.
+        """
+        result: dict[str, str] = {}
+        if self.vars:
+            result.update({k: v for k, v in self.vars.items() if v})
+        for key, value in (self.model_extra or {}).items():
+            if isinstance(value, str) and value.strip():
+                result[key] = value
+        return result
+
+
 class ClawdbotConfig(BaseModel):
     """Root configuration schema (aligned with TypeScript OpenClawConfig)"""
     
@@ -188,7 +228,7 @@ class ClawdbotConfig(BaseModel):
     # Additional configs (matching TypeScript - 21 more fields)
     meta: MetaConfig | None = Field(default=None)
     auth: dict[str, Any] | None = Field(default=None)
-    env: dict[str, Any] | None = Field(default=None)
+    env: EnvConfig | dict[str, Any] | None = Field(default=None)
     wizard: WizardConfig | None = Field(default=None)
     diagnostics: dict[str, Any] | None = Field(default=None)
     logging: LoggingConfig | None = Field(default=None)

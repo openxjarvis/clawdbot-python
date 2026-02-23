@@ -178,17 +178,30 @@ class GatewayBootstrap:
         # Step 8: Create agent runtime — uses pi_coding_agent.AgentSession
         logger.info("Step 8: Creating agent runtime (pi_coding_agent)")
         try:
-            # Resolve model from config
+            # Resolve model + fallbacks from config (mirrors TS agents.defaults.model)
+            from openclaw.config.schema import ModelConfig as _ModelConfig
+            primary_model = "google/gemini-2.0-flash"
+            fallback_models: list[str] = []
             if self.config.agents and self.config.agents.defaults:
-                model = str(self.config.agents.defaults.model)
-            else:
-                model = "google/gemini-2.0-flash"
+                raw_model = self.config.agents.defaults.model
+                if isinstance(raw_model, _ModelConfig):
+                    primary_model = raw_model.primary
+                    fallback_models = list(raw_model.fallbacks or [])
+                elif isinstance(raw_model, dict):
+                    primary_model = raw_model.get("primary", primary_model)
+                    fallback_models = list(raw_model.get("fallbacks", []))
+                else:
+                    primary_model = str(raw_model)
 
-            logger.info(f"Creating PiAgentRuntime with model: {model}")
+            logger.info(
+                f"Creating PiAgentRuntime with model: {primary_model}"
+                + (f" (fallbacks: {fallback_models})" if fallback_models else "")
+            )
 
             from ..gateway.pi_runtime import PiAgentRuntime
             self.runtime = PiAgentRuntime(
-                model=model,
+                model=primary_model,
+                fallback_models=fallback_models,
                 cwd=workspace_dir,
             )
 
@@ -302,13 +315,13 @@ class GatewayBootstrap:
         def broadcast(event: str, payload: Any, opts: dict | None = None) -> None:
             """Broadcast event to WebSocket clients"""
             if hasattr(self, 'server') and self.server:
-                # WebSocket server is ready, broadcast immediately
+                # WebSocket server is ready, broadcast immediately via async task
                 try:
-                    self.server.broadcast(event, payload, opts)
+                    asyncio.ensure_future(self.server.broadcast_event(event, payload))
                 except Exception as e:
                     logger.warning(f"Broadcast failed: {e}")
             else:
-                # Queue event for later
+                # Queue event for later (server not yet ready)
                 self._event_queue.append((event, payload, opts))
         
         self.broadcast = broadcast
@@ -332,7 +345,11 @@ class GatewayBootstrap:
                 broadcast=broadcast,
             )
             self.cron_service = self.cron_service_state.cron
-            
+
+            # Register in global registry so handlers can find it via get_cron_service()
+            from openclaw.cron.service import set_cron_service
+            set_cron_service(self.cron_service)
+
             logger.info(f"Cron service initialized with {len(self.cron_service.jobs)} jobs (start deferred)")
         except Exception as e:
             logger.warning(f"Cron service initialization failed: {e}")
@@ -407,6 +424,14 @@ class GatewayBootstrap:
             results["errors"].append(f"channel_manager: {e}")
         results["steps_completed"] += 1
         
+        # Step 13b: Start cron service (deferred until channel_manager is ready)
+        if self.cron_service:
+            try:
+                await self.cron_service.start()
+                logger.info("Cron service started")
+            except Exception as e:
+                logger.warning(f"Cron service start failed: {e}")
+
         # Step 14: Start discovery service
         logger.info("Step 14: Starting discovery service")
         # mDNS/Bonjour discovery is optional
@@ -527,11 +552,42 @@ class GatewayBootstrap:
             # (since we already configured it in Step 13)
             self.server.channel_manager = self.channel_manager
             
-            # Start server in background task
-            # Pass start_channels=False since we already started channels in Step 13
-            asyncio.create_task(self.server.start(start_channels=False))
-            # Give server time to start
-            await asyncio.sleep(0.5)
+            # Start server: launch as background task but wait briefly then
+            # verify the port is actually bound before declaring success.
+            # We must use create_task (not await) because server.start() runs
+            # the aiohttp runner loop indefinitely. Instead we rely on the
+            # server setting self.running = True once the site is up.
+            import socket as _socket
+
+            server_task = asyncio.create_task(self.server.start(start_channels=False))
+
+            # Poll up to 3 s for the server to bind its port
+            deadline = asyncio.get_event_loop().time() + 3.0
+            bound = False
+            while asyncio.get_event_loop().time() < deadline:
+                await asyncio.sleep(0.1)
+                # If the task already finished it must have failed
+                if server_task.done():
+                    exc = server_task.exception() if not server_task.cancelled() else None
+                    if exc:
+                        raise exc
+                    break
+                # Try a quick connect to see if the port is listening
+                try:
+                    with _socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                        bound = True
+                        break
+                except OSError:
+                    continue
+
+            if not bound and not server_task.done():
+                # One final check — maybe loopback probe failed but server is up
+                bound = getattr(self.server, "running", False)
+
+            if not bound:
+                server_task.cancel()
+                raise OSError(f"Server failed to bind on port {port} within 3 s")
+
             logger.info(f"WebSocket server started on port {port}")
             results["steps_completed"] += 1
         except Exception as e:
@@ -632,9 +688,109 @@ class GatewayBootstrap:
         boot_state.write_text("done")
     
     def _set_env_vars(self) -> None:
-        """Set required environment variables"""
+        """Set required environment variables.
+
+        TS-aligned priority chain (highest → lowest):
+          1. Process environment (already set — never overridden)
+          2. CWD .env                      (developer convenience, via dotenv.py)
+          3. ~/.openclaw/.env              (global user .env, via dotenv.py)
+          4. openclaw.json ``env`` block   (applyConfigEnvVars)
+          5. auth-profiles.json API keys   (set as GOOGLE_API_KEY etc.)
+          6. Fallback: ~/.pi/agent/auth.json (pi_coding_agent legacy)
+
+        Also ensures OPENCLAW_AGENT_DIR / PI_CODING_AGENT_DIR are set so that
+        pi_coding_agent finds auth-profiles.json in the correct location.
+
+        TS references:
+          src/infra/dotenv.ts         → load_dot_env()
+          src/config/env-vars.ts      → apply_config_env_vars()
+          src/agents/agent-paths.ts   → ensure_agent_env()
+          src/agents/model-auth.ts    → resolve_api_key()
+        """
         if self.config and self.config.gateway:
             os.environ["OPENCLAW_GATEWAY_PORT"] = str(self.config.gateway.port)
+
+        # ── Step 1-3: Load .env files (CWD + ~/.openclaw/.env) ───────────────
+        try:
+            from openclaw.infra.dotenv import load_dot_env
+            load_dot_env(quiet=True)
+        except Exception as exc:
+            logger.debug("dotenv load skipped: %s", exc)
+
+        # ── Step 4: Apply openclaw.json ``env`` block ─────────────────────────
+        # Mirrors TS applyConfigEnvVars() — only sets vars not already present
+        try:
+            from openclaw.config.schema import EnvConfig
+            env_block = self.config.env if self.config else None
+            if env_block is not None:
+                if isinstance(env_block, EnvConfig):
+                    env_vars = env_block.get_all_vars()
+                elif isinstance(env_block, dict):
+                    env_vars = {
+                        k: v for k, v in env_block.items()
+                        if isinstance(v, str) and k not in ("shellEnv", "vars")
+                    }
+                    env_vars.update((env_block.get("vars") or {}))
+                else:
+                    env_vars = {}
+                for key, value in env_vars.items():
+                    if not os.environ.get(key):
+                        os.environ[key] = value
+                        logger.debug("Set %s from config env block", key)
+        except Exception as exc:
+            logger.debug("Config env block apply failed: %s", exc)
+
+        # ── Step 5: Ensure OPENCLAW_AGENT_DIR / PI_CODING_AGENT_DIR are set ──
+        # Mirrors TS ensureOpenClawAgentEnv() — pi_coding_agent uses this to
+        # locate auth-profiles.json.
+        try:
+            from openclaw.config.auth_profiles import ensure_agent_env
+            agent_dir = ensure_agent_env()
+            logger.debug("OPENCLAW_AGENT_DIR=%s", agent_dir)
+        except Exception as exc:
+            logger.debug("ensure_agent_env failed: %s", exc)
+
+        # ── Step 6: Load API keys from auth-profiles.json → env vars ─────────
+        # Mirrors TS: gateway startup reads auth-profiles.json and makes API
+        # keys available to the runtime (which checks env vars first).
+        _PROVIDER_ENV: dict[str, list[str]] = {
+            "google":    ["GOOGLE_API_KEY", "GEMINI_API_KEY"],
+            "anthropic": ["ANTHROPIC_API_KEY"],
+            "openai":    ["OPENAI_API_KEY"],
+        }
+        try:
+            from openclaw.config.auth_profiles import get_api_key as _get_key
+            for provider, env_names in _PROVIDER_ENV.items():
+                if os.environ.get(env_names[0]):
+                    continue  # already set from .env or shell
+                key = _get_key(provider)
+                if key:
+                    for name in env_names:
+                        os.environ[name] = key
+                    logger.info("Loaded %s API key from auth-profiles.json → %s",
+                                provider, env_names[0])
+        except Exception as exc:
+            logger.debug("auth-profiles.json key loading failed: %s", exc)
+
+        # ── Step 7: Fallback — pi_coding_agent legacy ~/.pi/agent/auth.json ──
+        _PROVIDER_ENV_LEGACY: dict[str, list[str]] = {
+            "google":    ["GOOGLE_API_KEY", "GEMINI_API_KEY"],
+            "anthropic": ["ANTHROPIC_API_KEY"],
+            "openai":    ["OPENAI_API_KEY"],
+        }
+        try:
+            from pi_coding_agent.core.auth_storage import AuthStorage
+            storage = AuthStorage()
+            for provider, env_names in _PROVIDER_ENV_LEGACY.items():
+                if os.environ.get(env_names[0]):
+                    continue
+                key = storage.get_api_key(provider)
+                if key:
+                    for name in env_names:
+                        os.environ[name] = key
+                    logger.debug("Loaded %s from legacy ~/.pi/agent/auth.json", provider)
+        except Exception:
+            pass
     
     def _start_maintenance_timers(self) -> None:
         """Start maintenance timer tasks"""

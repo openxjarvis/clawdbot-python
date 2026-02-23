@@ -1,28 +1,36 @@
 """
 Node registry for managing connected nodes and their subscriptions.
 
-This module tracks nodes (external systems that connect to the gateway)
-and manages their event subscriptions for targeted event delivery.
+Fully aligned with TypeScript openclaw/src/gateway/node-registry.ts.
 
-Nodes are different from regular clients - they typically represent:
-- External services
-- Mobile devices
-- IoT devices
-- Integration systems
-
-Matches openclaw node registry system.
+Adds:
+- NodeInvokeResult type
+- invoke() with asyncio-based pending invoke tracking and timeout
+- resolve_invoke_result() for matching node.invoke.result responses
+- unregister cleanup of pending invokes on disconnect
 """
 from __future__ import annotations
 
+import asyncio
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
 
 @dataclass
+class NodeInvokeResult:
+    """Result from a node.invoke call — mirrors TS NodeInvokeResult."""
+    ok: bool
+    payload: Any = None
+    payload_json: str | None = None
+    error: dict[str, str] | None = None
+
+
+@dataclass
 class NodeEntry:
     """Registered node information"""
-    
+
     nodeId: str
     connId: str  # WebSocket connection ID
     deviceId: str
@@ -31,6 +39,8 @@ class NodeEntry:
     connected_at: float = field(default_factory=time.time)
     last_ping_at: float = field(default_factory=time.time)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # WebSocket send callable (injected on register): async fn(event, payload)
+    _send_event: Any = field(default=None, repr=False, compare=False)
 
 
 class NodeRegistry:
@@ -76,14 +86,17 @@ class NodeRegistry:
         self._nodes: dict[str, NodeEntry] = {}  # nodeId -> NodeEntry
         self._conn_to_node: dict[str, str] = {}  # connId -> nodeId
         self._device_to_nodes: dict[str, set[str]] = {}  # deviceId -> {nodeIds}
+        # Pending invokes: invocationId -> (future, nodeId, command, timer_handle)
+        self._pending_invokes: dict[str, tuple[asyncio.Future[NodeInvokeResult], str, str, asyncio.TimerHandle | None]] = {}
     
     def register_node(
-        self, 
-        node_id: str, 
-        conn_id: str, 
-        device_id: str, 
+        self,
+        node_id: str,
+        conn_id: str,
+        device_id: str,
         capabilities: list[str] | None = None,
-        metadata: dict[str, Any] | None = None
+        metadata: dict[str, Any] | None = None,
+        send_event: Any = None,
     ) -> NodeEntry:
         """
         Register connected node.
@@ -106,7 +119,8 @@ class NodeRegistry:
             subscriptions={},
             connected_at=time.time(),
             last_ping_at=time.time(),
-            metadata=metadata or {}
+            metadata=metadata or {},
+            _send_event=send_event,
         )
         
         self._nodes[node_id] = node
@@ -120,27 +134,131 @@ class NodeRegistry:
         return node
     
     def unregister_node(self, node_id: str) -> NodeEntry | None:
-        """
-        Unregister node on disconnect.
-        
-        Args:
-            node_id: Node ID to unregister
-            
-        Returns:
-            Unregistered node entry if found, None otherwise
-        """
+        """Unregister node on disconnect, cancelling any pending invokes."""
         node = self._nodes.pop(node_id, None)
         if node:
             self._conn_to_node.pop(node.connId, None)
-            
-            # Remove from device mapping
             device_nodes = self._device_to_nodes.get(node.deviceId)
             if device_nodes:
                 device_nodes.discard(node_id)
                 if not device_nodes:
                     del self._device_to_nodes[node.deviceId]
-        
+
+            # Cancel pending invokes for this node — mirrors TS unregister()
+            to_cancel = [
+                inv_id for inv_id, (_, nid, _, _) in self._pending_invokes.items()
+                if nid == node_id
+            ]
+            for inv_id in to_cancel:
+                fut, _, cmd, timer = self._pending_invokes.pop(inv_id)
+                if timer is not None:
+                    timer.cancel()
+                if not fut.done():
+                    fut.set_result(NodeInvokeResult(
+                        ok=False,
+                        error={"code": "DISCONNECTED", "message": f"node disconnected ({cmd})"},
+                    ))
+
         return node
+
+    async def invoke(
+        self,
+        *,
+        node_id: str,
+        command: str,
+        params: Any = None,
+        timeout_ms: int = 30_000,
+        idempotency_key: str | None = None,
+    ) -> NodeInvokeResult:
+        """Send a command invocation to a connected node and await the result.
+
+        Mirrors TS NodeRegistry.invoke().
+        Returns NodeInvokeResult immediately if the node is not connected.
+        Times out with TIMEOUT error if the node doesn't respond.
+        """
+        node = self._nodes.get(node_id)
+        if node is None:
+            return NodeInvokeResult(
+                ok=False,
+                error={"code": "NOT_CONNECTED", "message": "node not connected"},
+            )
+
+        import json
+        invocation_id = str(uuid.uuid4())
+        payload = {
+            "id": invocation_id,
+            "nodeId": node_id,
+            "command": command,
+            "paramsJSON": json.dumps(params) if params is not None else None,
+            "timeoutMs": timeout_ms,
+            "idempotencyKey": idempotency_key,
+        }
+
+        # Send to node
+        send = node._send_event
+        if send is None:
+            return NodeInvokeResult(
+                ok=False,
+                error={"code": "UNAVAILABLE", "message": "node has no send_event callback"},
+            )
+        try:
+            await send("node.invoke.request", payload)
+        except Exception as exc:
+            return NodeInvokeResult(
+                ok=False,
+                error={"code": "UNAVAILABLE", "message": f"failed to send invoke: {exc}"},
+            )
+
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future[NodeInvokeResult] = loop.create_future()
+
+        def _on_timeout() -> None:
+            if invocation_id in self._pending_invokes:
+                del self._pending_invokes[invocation_id]
+            if not future.done():
+                future.set_result(NodeInvokeResult(
+                    ok=False,
+                    error={"code": "TIMEOUT", "message": "node invoke timed out"},
+                ))
+
+        timer = loop.call_later(timeout_ms / 1000.0, _on_timeout)
+        self._pending_invokes[invocation_id] = (future, node_id, command, timer)
+        return await future
+
+    def resolve_invoke_result(
+        self,
+        *,
+        invocation_id: str,
+        node_id: str,
+        ok: bool,
+        payload: Any = None,
+        payload_json: str | None = None,
+        error: dict[str, str] | None = None,
+    ) -> bool:
+        """Resolve a pending invoke with the result from node.invoke.result.
+
+        Returns True if a matching pending invoke was found and resolved,
+        False if the invocation was not found (e.g. timed out).
+
+        Mirrors TS NodeRegistry.handleInvokeResult().
+        """
+        entry = self._pending_invokes.get(invocation_id)
+        if entry is None:
+            return False
+        future, pending_node_id, _, timer = entry
+        if pending_node_id != node_id:
+            return False
+        if timer is not None:
+            timer.cancel()
+        del self._pending_invokes[invocation_id]
+        if not future.done():
+            future.set_result(NodeInvokeResult(
+                ok=ok,
+                payload=payload,
+                payload_json=payload_json,
+                error=error,
+            ))
+        return True
     
     def get_node(self, node_id: str) -> NodeEntry | None:
         """
@@ -317,5 +435,6 @@ class NodeRegistry:
 
 __all__ = [
     "NodeEntry",
+    "NodeInvokeResult",
     "NodeRegistry",
 ]

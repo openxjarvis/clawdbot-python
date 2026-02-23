@@ -21,6 +21,8 @@ from openclaw.config.sessions.transcripts import (
     compact_transcript,
     delete_transcript,
     get_session_transcript_path,
+    load_session_transcript,
+    save_session_transcript,
 )
 from openclaw.gateway.session_utils import (
     SessionsListOptions,
@@ -28,13 +30,86 @@ from openclaw.gateway.session_utils import (
     resolve_gateway_session_store_target,
     resolve_main_session_key,
 )
-from openclaw.gateway.sessions_resolve import (
-    SessionResolveParams,
-    resolve_session_key_from_resolve_params,
-)
+from openclaw.gateway.sessions_resolve import resolve_session_key_from_resolve_params
 from openclaw.gateway.sessions_patch import apply_sessions_patch_to_store
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Runtime cleanup helpers — mirrors TS ensureSessionRuntimeCleanup()
+# =============================================================================
+
+async def _ensure_session_runtime_cleanup(
+    connection: Any,
+    session_key: str,
+    session_id: str | None,
+    timeout_ms: int = 15_000,
+) -> str | None:
+    """Abort active pi run, clear queues, and stop subagents for a session.
+
+    Mirrors TS ensureSessionRuntimeCleanup() in sessions.ts.
+    Returns an error message if the session could not be cleanly stopped,
+    or None on success.
+    """
+    gateway = getattr(connection, "gateway", None)
+
+    # 1. Clear steering/follow-up queues
+    try:
+        from openclaw.auto_reply.reply.queue import clear_session_queues as _clear_session_queues
+        _clear_session_queues([session_key])
+    except Exception as exc:
+        logger.warning(f"Failed to clear session queues for {session_key}: {exc}")
+
+    # 1b. Stop subagents spawned by this session
+    try:
+        from openclaw.auto_reply.reply.abort import stop_subagents_for_requester as _stop_subagents
+        _stop_subagents(requester_session_key=session_key)
+    except Exception as exc:
+        logger.debug(f"stop_subagents_for_requester not available: {exc}")
+    # Also attempt legacy channel_manager path
+    try:
+        if gateway is not None:
+            channel_manager = getattr(gateway, "channel_manager", None)
+            if channel_manager is not None:
+                session_manager = getattr(channel_manager, "session_manager", None)
+                if session_manager is not None and hasattr(session_manager, "clear_queues"):
+                    session_manager.clear_queues(session_key)
+    except Exception as exc:
+        logger.debug(f"Legacy session queue clear failed for {session_key}: {exc}")
+
+    # 2. Abort any active agent turn task
+    try:
+        if gateway is not None and hasattr(gateway, "active_runs"):
+            # Find tasks associated with this session_key
+            tasks_to_cancel = [
+                task for task in gateway.active_runs.values()
+                if (
+                    isinstance(task, __import__("asyncio").Task)
+                    and hasattr(task, "_openclaw_meta")
+                    and task._openclaw_meta.get("session_key") == session_key  # type: ignore[attr-defined]
+                )
+            ]
+            for task in tasks_to_cancel:
+                task.cancel()
+    except Exception as exc:
+        logger.warning(f"Failed to abort active runs for {session_key}: {exc}")
+
+    # 3. Abort embedded pi run and wait for it to end
+    if session_id:
+        try:
+            if gateway is not None:
+                pi_runtime = getattr(gateway, "pi_runtime", None)
+                if pi_runtime is not None and hasattr(pi_runtime, "abort_session"):
+                    await pi_runtime.abort_session(session_id)
+                elif pi_runtime is not None and hasattr(pi_runtime, "_sessions"):
+                    pi_session = pi_runtime._sessions.get(session_id)
+                    if pi_session is not None and hasattr(pi_session, "abort"):
+                        pi_session.abort()
+        except Exception as exc:
+            logger.warning(f"Failed to abort pi run for session {session_id}: {exc}")
+
+    return None
 
 
 # =============================================================================
@@ -216,18 +291,21 @@ class SessionsPreviewMethod:
                     continue
                 
                 # Read transcript preview
-                items = read_session_preview_items(
-                    entry.sessionId,
-                    target.store_path,
-                    entry.sessionFile,
-                    limit=limit,
-                    max_chars=max_chars
-                )
+                items_raw = read_session_preview_items(target.canonical_key, limit=limit)
+                items = []
+                for item in items_raw:
+                    if isinstance(item, dict):
+                        text = str(item.get("content", ""))[:max_chars]
+                        role = str(item.get("type", "text"))
+                    else:
+                        text = str(item)[:max_chars]
+                        role = "text"
+                    items.append({"role": role, "text": text})
                 
                 previews.append({
                     "key": key,
                     "status": "ok" if items else "empty",
-                    "items": [{"role": item.role, "text": item.text} for item in items]
+                    "items": items
                 })
                 
             except Exception as e:
@@ -278,22 +356,22 @@ class SessionsResolveMethod:
         Returns:
         - { ok: true, key: str } or { ok: false, error: str }
         """
-        resolve_params = SessionResolveParams(
-            key=params.get("key"),
-            session_id=params.get("sessionId"),
-            label=params.get("label"),
-            include_global=params.get("includeGlobal", True),
-            include_unknown=params.get("includeUnknown", True),
-            agent_id=params.get("agentId"),
-            spawned_by=params.get("spawnedBy"),
-        )
-        
-        result = resolve_session_key_from_resolve_params(resolve_params)
-        
-        if result.ok:
-            return {"ok": True, "key": result.key}
+        resolve_params = {
+            "key": params.get("key"),
+            "sessionId": params.get("sessionId"),
+            "label": params.get("label"),
+            "includeGlobal": params.get("includeGlobal", True),
+            "includeUnknown": params.get("includeUnknown", True),
+            "agentId": params.get("agentId"),
+            "spawnedBy": params.get("spawnedBy"),
+        }
+        cfg = getattr(getattr(connection, "gateway", None), "cfg", None)
+        result = resolve_session_key_from_resolve_params(resolve_params, cfg=cfg)
+
+        if result.get("ok"):
+            return {"ok": True, "key": result["key"]}
         else:
-            return {"ok": False, "error": result.error}
+            return {"ok": False, "error": result.get("error", {}).get("message", "resolve failed")}
     
     def get_schema(self) -> dict[str, Any]:
         return {
@@ -454,23 +532,26 @@ class SessionsResetMethod:
             
             store[target.canonical_key] = reset_entry
         
+        # Runtime cleanup: abort pi run, clear queues, stop subagents
+        cleanup_error = await _ensure_session_runtime_cleanup(
+            connection, key, old_session_id
+        )
+        if cleanup_error:
+            logger.warning(f"sessions.reset cleanup warning for {key}: {cleanup_error}")
+
         update_session_store(target.store_path, mutator)
-        
-        # CRITICAL: Invalidate cached Session object
-        # Remove old session from session_manager cache to ensure fresh load
+
+        # Invalidate cached Session object to force fresh load
         try:
             if hasattr(connection, 'gateway') and connection.gateway:
                 channel_manager = connection.gateway.channel_manager
                 if channel_manager and channel_manager.session_manager:
                     session_manager = channel_manager.session_manager
-                    if old_session_id and old_session_id in session_manager._sessions:
+                    if old_session_id and old_session_id in getattr(session_manager, "_sessions", {}):
                         del session_manager._sessions[old_session_id]
-                        logger.info(f"✅ Invalidated cached session: {old_session_id}")
-                    # Also invalidate session store cache to force reload
                     session_manager._session_store_loaded_at = 0.0
-                    logger.info(f"✅ Invalidated session store cache")
-        except Exception as e:
-            logger.warning(f"Failed to invalidate session cache: {e}")
+        except Exception as exc:
+            logger.warning(f"Failed to invalidate session cache: {exc}")
         
         # Delete old transcript
         if old_session_id:
@@ -491,10 +572,13 @@ class SessionsResetMethod:
             except Exception as e:
                 logger.warning(f"Failed to delete transcript for {target.canonical_key}: {e}")
         
+        # Return updated entry shape (TS-compatible sessions.reset payload)
+        updated_store = load_session_store(target.store_path)
+        updated_entry = updated_store.get(target.canonical_key)
         return {
             "ok": True,
             "key": target.canonical_key,
-            "sessionId": new_session_id
+            "entry": updated_entry.model_dump(exclude_none=False) if updated_entry else {"sessionId": new_session_id},
         }
     
     def get_schema(self) -> dict[str, Any]:
@@ -541,19 +625,23 @@ class SessionsDeleteMethod:
         main_key = resolve_main_session_key(target.agent_id)
         if target.canonical_key == main_key:
             raise ValueError("Cannot delete main session")
-        
-        # Delete transcript
+
+        # Runtime cleanup before deleting
         store = load_session_store(target.store_path)
         entry = store.get(target.canonical_key)
+        old_session_id = entry.sessionId if entry else None
+        await _ensure_session_runtime_cleanup(connection, key, old_session_id)
+        archived: list[str] = []
         
         if entry and entry.sessionId:
-            delete_transcript(
-                entry.sessionId,
-                target.store_path,
-                entry.sessionFile,
-                archive_first=archive_transcript,
-                archive_reason="delete"
-            )
+            transcript_path = get_session_transcript_path(target.canonical_key)
+            if archive_transcript and transcript_path.exists():
+                archive_name = f"{transcript_path.stem}_delete_{int(time.time() * 1000)}{transcript_path.suffix}"
+                archive_path = transcript_path.parent / archive_name
+                transcript_path.rename(archive_path)
+                archived.append(str(archive_path))
+            else:
+                delete_transcript(target.canonical_key)
         
         # Delete from store
         def mutator(store_dict: Dict[str, SessionEntry]) -> None:
@@ -562,7 +650,7 @@ class SessionsDeleteMethod:
         
         update_session_store(target.store_path, mutator)
         
-        return {"ok": True, "deleted": True}
+        return {"ok": True, "key": target.canonical_key, "deleted": True, "archived": archived}
     
     def get_schema(self) -> dict[str, Any]:
         return {
@@ -612,14 +700,34 @@ class SessionsCompactMethod:
         if not entry or not entry.sessionId:
             raise ValueError(f"Session not found: {key}")
         
-        # Compact transcript
-        result = compact_transcript(
-            entry.sessionId,
-            target.store_path,
-            keep_lines=max_lines,
-            session_file=entry.sessionFile,
-            archive_reason="compaction"
-        )
+        transcript = load_session_transcript(target.canonical_key)
+        if not transcript:
+            return {
+                "ok": True,
+                "key": target.canonical_key,
+                "compacted": False,
+                "reason": "no transcript",
+            }
+
+        lines = [l for l in transcript.splitlines() if l.strip()]
+        if len(lines) <= max_lines:
+            return {
+                "ok": True,
+                "key": target.canonical_key,
+                "compacted": False,
+                "kept": len(lines),
+            }
+
+        transcript_path = get_session_transcript_path(target.canonical_key)
+        archived_path = ""
+        if transcript_path.exists():
+            archive_name = f"{transcript_path.stem}_compaction_{int(time.time() * 1000)}{transcript_path.suffix}"
+            archive_path = transcript_path.parent / archive_name
+            transcript_path.rename(archive_path)
+            archived_path = str(archive_path)
+
+        kept_lines = lines[-max_lines:]
+        save_session_transcript(target.canonical_key, "\n".join(kept_lines) + "\n")
         
         # Update store: clear token counts, increment compaction count
         def mutator(store_dict: Dict[str, SessionEntry]) -> None:
@@ -629,15 +737,16 @@ class SessionsCompactMethod:
                 e.output_tokens = None
                 e.total_tokens = None
                 e.compaction_count = (e.compaction_count or 0) + 1
-                e.updated_at = int(time.time() * 1000)
+                e.updatedAt = int(time.time() * 1000)
         
         update_session_store(target.store_path, mutator)
         
         return {
             "ok": True,
-            "removedLines": result["removed_lines"],
-            "keptLines": result["kept_lines"],
-            "archivedPath": result["archived_path"],
+            "key": target.canonical_key,
+            "compacted": True,
+            "archived": [archived_path] if archived_path else [],
+            "kept": len(kept_lines),
         }
     
     def get_schema(self) -> dict[str, Any]:

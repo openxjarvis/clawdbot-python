@@ -1,13 +1,33 @@
 """Routing and session key management"""
 
-from .session_key import (
+from .bindings import (
+    build_channel_account_bindings,
+    list_bindings,
+    list_bound_account_ids,
+    resolve_default_agent_bound_account_id,
+    resolve_preferred_account_id,
+)
+from .resolve_route import (
     DEFAULT_ACCOUNT_ID,
     DEFAULT_AGENT_ID,
+    ResolvedAgentRoute,
+    RoutePeer,
+    build_agent_session_key,
+    resolve_agent_route,
+)
+from .session_key import (
     DEFAULT_MAIN_KEY,
+    THREAD_SESSION_MARKERS,
     ParsedAgentSessionKey,
+    SessionKeyShape,
     build_agent_main_session_key,
     build_agent_peer_session_key,
+    build_group_history_key,
+    classify_session_key_shape,
+    get_subagent_depth,
     is_acp_session_key,
+    is_cron_run_session_key,
+    is_cron_session_key,
     is_subagent_session_key,
     looks_like_session_key,
     normalize_account_id,
@@ -15,19 +35,29 @@ from .session_key import (
     normalize_main_key,
     parse_agent_session_key,
     resolve_agent_id_from_session_key,
+    resolve_thread_parent_session_key,
+    resolve_thread_session_keys,
     sanitize_agent_id,
     to_agent_request_session_key,
     to_agent_store_session_key,
 )
 
 __all__ = [
+    # session_key
     "DEFAULT_ACCOUNT_ID",
     "DEFAULT_AGENT_ID",
     "DEFAULT_MAIN_KEY",
+    "THREAD_SESSION_MARKERS",
     "ParsedAgentSessionKey",
+    "SessionKeyShape",
     "build_agent_main_session_key",
     "build_agent_peer_session_key",
+    "build_group_history_key",
+    "classify_session_key_shape",
+    "get_subagent_depth",
     "is_acp_session_key",
+    "is_cron_run_session_key",
+    "is_cron_session_key",
     "is_subagent_session_key",
     "looks_like_session_key",
     "normalize_account_id",
@@ -35,7 +65,20 @@ __all__ = [
     "normalize_main_key",
     "parse_agent_session_key",
     "resolve_agent_id_from_session_key",
+    "resolve_thread_parent_session_key",
+    "resolve_thread_session_keys",
     "sanitize_agent_id",
     "to_agent_request_session_key",
     "to_agent_store_session_key",
+    # resolve_route
+    "RoutePeer",
+    "ResolvedAgentRoute",
+    "resolve_agent_route",
+    "build_agent_session_key",
+    # bindings
+    "list_bindings",
+    "list_bound_account_ids",
+    "resolve_default_agent_bound_account_id",
+    "build_channel_account_bindings",
+    "resolve_preferred_account_id",
 ]

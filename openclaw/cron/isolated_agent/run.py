@@ -1,222 +1,139 @@
-"""Isolated agent execution for cron jobs"""
+"""Isolated agent execution for cron jobs.
+
+Mirrors TypeScript: openclaw/src/cron/isolated-agent/run.ts
+
+The main entry point `run_cron_isolated_agent_turn` delegates to the
+gateway-provided `run_agent_fn` callback (which wraps PiAgentRuntime),
+exactly as TS runCronIsolatedAgentTurn calls state.deps.runIsolatedAgentJob.
+
+Caller (cron_bootstrap.py) provides run_agent_fn that handles the actual
+agent execution via the configured pi runtime.
+"""
 from __future__ import annotations
 
 import logging
-from pathlib import Path
-from typing import TYPE_CHECKING, Any
-
-from ...agents.agent import Agent
-from ...agents.providers import LLMProvider
-from ...agents.tools.base import AgentTool
-from .session import resolve_isolated_session
-
-if TYPE_CHECKING:
-    from ..types import AgentTurnPayload, CronJob
+import re
+from typing import Any, Callable, Awaitable
 
 logger = logging.getLogger(__name__)
 
 
-async def run_isolated_agent_turn(
-    job: CronJob,
-    provider: LLMProvider,
-    tools: list[AgentTool],
-    sessions_dir: Path,
-    system_prompt: str | None = None,
+async def run_cron_isolated_agent_turn(
+    job: Any,
+    run_agent_fn: Callable[..., Awaitable[dict[str, Any]]],
+    message: str,
 ) -> dict[str, Any]:
     """
-    Run full isolated agent turn for cron job
-    
-    This function:
-    1. Creates or loads session for the job
-    2. Executes agent prompt
-    3. Extracts summary from response
-    4. Returns result for delivery
-    
-    Args:
-        job: Cron job
-        provider: LLM provider
-        tools: Available tools
-        sessions_dir: Sessions directory
-        system_prompt: Optional system prompt
-        
-    Returns:
-        Result dictionary with:
-        - summary: Response summary
-        - full_response: Full agent response
-        - session_key: Session key used
+    Run an isolated agent turn for a cron job.
+
+    Delegates to run_agent_fn (gateway callback), which executes the agent
+    using pi_runtime or an equivalent, and returns a result dict.
+
+    Returns dict with:
+        status: "ok" | "error" | "skipped"
+        summary: str | None
+        output_text: str | None
+        delivered: bool
+        session_id: str | None
+        session_key: str | None
+        model: str | None
+        provider: str | None
+        usage: dict | None
+        error: str | None
     """
-    # Validate payload
-    from ..types import AgentTurnPayload
-    
-    if not isinstance(job.payload, AgentTurnPayload):
-        raise ValueError(f"Job payload must be agentTurn, got {type(job.payload)}")
-    
-    payload: AgentTurnPayload = job.payload
-    
-    # Resolve session
-    session = resolve_isolated_session(
-        sessions_dir=sessions_dir,
-        job_id=job.id,
-        agent_id=job.agent_id
-    )
-    
-    logger.info(f"Running isolated agent turn for job '{job.name}' in session {session.session_key}")
-    
     try:
-        # Determine model
-        model = payload.model or "google/gemini-3-pro-preview"
-        
-        # Create agent
-        agent = Agent(
-            provider=provider,
-            tools=tools,
-            model=model,
-            system_prompt=system_prompt
-        )
-        
-        # Execute agent prompt
-        logger.info(f"Executing prompt: {payload.prompt[:100]}...")
-        
-        messages = await agent.prompt(payload.prompt)
-        
-        # Extract response
-        full_response = ""
-        if messages:
-            # Get last assistant message
-            for msg in reversed(messages):
-                if msg.role == "assistant":
-                    full_response = msg.content
-                    break
-        
-        # Extract summary (first paragraph or first 200 chars)
-        summary = extract_summary(full_response)
-        
-        # Update session metadata
-        session.update_metadata(
-            model=model,
-            token_count=len(full_response.split()),  # Rough estimate
-        )
-        
-        logger.info(f"Isolated agent turn completed. Summary: {summary[:100]}...")
-        
+        result = await run_agent_fn(job=job, message=message)
+    except Exception as err:
+        logger.error(f"cron: isolated agent run failed for job {getattr(job, 'id', '?')!r}: {err}")
         return {
-            "success": True,
-            "summary": summary,
-            "full_response": full_response,
-            "session_key": session.session_key,
-            "model": model,
-        }
-        
-    except Exception as e:
-        error_msg = str(e)
-        logger.error(f"Error in isolated agent turn: {error_msg}", exc_info=True)
-        
-        return {
-            "success": False,
-            "error": error_msg,
-            "session_key": session.session_key,
+            "status": "error",
+            "error": str(err),
+            "summary": None,
+            "output_text": None,
+            "delivered": False,
+            "session_id": None,
+            "session_key": None,
+            "model": None,
+            "provider": None,
+            "usage": None,
         }
 
+    # Normalise result keys (support both snake_case and camelCase)
+    status = result.get("status") or ("ok" if result.get("success") else "error")
+    summary = result.get("summary")
+    output_text = result.get("output_text") or result.get("outputText")
+    delivered = bool(result.get("delivered"))
+    session_id = result.get("session_id") or result.get("sessionId")
+    session_key = result.get("session_key") or result.get("sessionKey")
+    model = result.get("model")
+    provider = result.get("provider")
+    usage = result.get("usage")
+    error = result.get("error")
+
+    return {
+        "status": status,
+        "summary": summary,
+        "output_text": output_text,
+        "delivered": delivered,
+        "session_id": session_id,
+        "session_key": session_key,
+        "model": model,
+        "provider": provider,
+        "usage": usage,
+        "error": error,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Helpers (retained for use in tests / fallback implementations)
+# ---------------------------------------------------------------------------
 
 def extract_summary(text: str, max_length: int = 200) -> str:
-    """
-    Extract summary from text
-    
-    Takes the first paragraph or first max_length characters.
-    
-    Args:
-        text: Text to summarize
-        max_length: Maximum summary length
-        
-    Returns:
-        Summary string
-    """
+    """Extract a short summary from agent output text."""
     if not text:
         return ""
-    
-    # Split into paragraphs
     paragraphs = text.split("\n\n")
-    
-    if paragraphs:
-        first_para = paragraphs[0].strip()
-        
-        # If first paragraph is short enough, use it
-        if len(first_para) <= max_length:
-            return first_para
-        
-        # Otherwise truncate
-        return first_para[:max_length].rsplit(" ", 1)[0] + "..."
-    
-    # Fallback: truncate text
-    if len(text) <= max_length:
-        return text
-    
-    return text[:max_length].rsplit(" ", 1)[0] + "..."
+    first = paragraphs[0].strip() if paragraphs else text.strip()
+    if len(first) <= max_length:
+        return first
+    # Truncate at word boundary
+    cut = first[:max_length]
+    last_space = cut.rfind(" ")
+    return (cut[:last_space] + "…") if last_space > 0 else (cut + "…")
 
 
 def detect_self_sent_via_messaging(messages: list[Any]) -> bool:
-    """
-    Check if agent already sent message via messaging tool
-    
-    This prevents duplicate delivery when agent uses a messaging tool
-    to send its own response.
-    
-    Args:
-        messages: Agent messages
-        
-    Returns:
-        True if agent sent via messaging tool
-    """
-    # Check for tool calls to messaging/channel tools
-    messaging_tools = [
+    """Check if agent already sent message via a messaging tool call."""
+    messaging_tools = {
         "send_telegram_message",
         "send_discord_message",
         "send_slack_message",
         "send_message",
         "channel_send",
-    ]
-    
+    }
     for msg in messages:
         if hasattr(msg, "tool_calls") and msg.tool_calls:
-            for tool_call in msg.tool_calls:
-                tool_name = tool_call.get("name", "")
-                if any(mt in tool_name.lower() for mt in messaging_tools):
-                    logger.info("Agent sent message via messaging tool, skipping delivery")
+            for tc in msg.tool_calls:
+                name = (tc.get("name") or "").lower()
+                if any(mt in name for mt in messaging_tools):
                     return True
-    
     return False
 
 
 async def post_summary_to_main_session(
-    job: CronJob,
+    job: Any,
     result: dict[str, Any],
     main_session_callback: Any,
 ) -> None:
-    """
-    Post summary to main session
-    
-    Args:
-        job: Cron job
-        result: Execution result
-        main_session_callback: Callback to post to main session
-    """
-    if not result.get("success"):
-        logger.warning("Not posting failed result to main session")
+    """Post execution summary back to main session."""
+    if result.get("status") not in ("ok", None) or result.get("error"):
         return
-    
-    summary = result.get("summary", "")
-    
+    summary = (result.get("summary") or "").strip()
     if not summary:
-        logger.warning("No summary to post to main session")
         return
-    
-    # Format message
-    message = f"🤖 Cron job '{job.name}' completed:\n\n{summary}"
-    
-    # Post to main session
+    message = f"Cron job '{getattr(job, 'name', job)}' completed:\n\n{summary}"
     try:
         if main_session_callback:
             await main_session_callback(message)
-            logger.info("Posted summary to main session")
     except Exception as e:
-        logger.error(f"Error posting to main session: {e}", exc_info=True)
+        logger.error(f"cron: error posting summary to main session: {e}")

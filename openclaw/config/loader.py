@@ -14,6 +14,7 @@ Matches TypeScript openclaw/src/config/io.ts:
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -26,6 +27,8 @@ from typing import Any, Optional, Union
 logger = logging.getLogger(__name__)
 
 _cached_config: Optional["ClawdbotConfig"] = None
+_cached_config_path: Optional[Path] = None
+_cached_config_mtime_ns: Optional[int] = None
 
 # ---------------------------------------------------------------------------
 # JSON5 parsing
@@ -81,7 +84,12 @@ def _substitute_env_vars(obj: Any, preserve: bool = False) -> Any:
     return obj
 
 
-def _resolve_includes(obj: Any, base_dir: Path, depth: int = 0) -> Any:
+def _resolve_includes(
+    obj: Any,
+    base_dir: Path,
+    depth: int = 0,
+    seen: set[Path] | None = None,
+) -> Any:
     """
     Resolve {"$include": "./path.json"} directives recursively.
 
@@ -89,19 +97,32 @@ def _resolve_includes(obj: Any, base_dir: Path, depth: int = 0) -> Any:
     """
     if depth > 10:
         raise ValueError("$include depth limit exceeded (circular?)")
+    if seen is None:
+        seen = set()
 
     if isinstance(obj, dict):
-        if "$include" in obj and len(obj) == 1:
-            include_path = base_dir / obj["$include"]
-            if not include_path.exists():
-                logger.warning(f"$include target not found: {include_path}")
-                return {}
-            raw = include_path.read_text(encoding="utf-8")
-            included = _parse_json5(raw)
-            return _resolve_includes(included, include_path.parent, depth + 1)
-        return {k: _resolve_includes(v, base_dir, depth) for k, v in obj.items()}
+        if "$include" in obj:
+            include_value = obj["$include"]
+            include_list = include_value if isinstance(include_value, list) else [include_value]
+            merged: dict[str, Any] = {}
+            for item in include_list:
+                include_path = (base_dir / str(item)).resolve()
+                if include_path in seen:
+                    raise ValueError(f"Circular $include detected: {include_path}")
+                if not include_path.exists():
+                    logger.warning(f"$include target not found: {include_path}")
+                    continue
+                raw = include_path.read_text(encoding="utf-8")
+                included = _parse_json5(raw)
+                resolved = _resolve_includes(included, include_path.parent, depth + 1, seen | {include_path})
+                if isinstance(resolved, dict):
+                    merged = _deep_merge(merged, resolved)
+            local = {k: v for k, v in obj.items() if k != "$include"}
+            resolved_local = {k: _resolve_includes(v, base_dir, depth, seen) for k, v in local.items()}
+            return _deep_merge(merged, resolved_local)
+        return {k: _resolve_includes(v, base_dir, depth, seen) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [_resolve_includes(v, base_dir, depth) for v in obj]
+        return [_resolve_includes(v, base_dir, depth, seen) for v in obj]
     return obj
 
 
@@ -136,6 +157,31 @@ def _append_config_audit(config_path: Path, event: str, details: str = "") -> No
         pass
 
 
+def _restore_env_refs_preserving(raw_obj: Any, new_obj: Any) -> Any:
+    """
+    Preserve ${VAR} references from raw config when the resolved value did not change.
+    """
+    if isinstance(raw_obj, str) and isinstance(new_obj, str) and "${" in raw_obj:
+        try:
+            expanded = _substitute_env_vars(raw_obj, preserve=False)
+            if expanded == new_obj:
+                return raw_obj
+        except Exception:
+            return new_obj
+        return new_obj
+    if isinstance(raw_obj, dict) and isinstance(new_obj, dict):
+        out: dict[str, Any] = {}
+        for key, value in new_obj.items():
+            out[key] = _restore_env_refs_preserving(raw_obj.get(key), value)
+        return out
+    if isinstance(raw_obj, list) and isinstance(new_obj, list):
+        return [
+            _restore_env_refs_preserving(raw_obj[idx] if idx < len(raw_obj) else None, value)
+            for idx, value in enumerate(new_obj)
+        ]
+    return new_obj
+
+
 # ---------------------------------------------------------------------------
 # Core load / save
 # ---------------------------------------------------------------------------
@@ -148,7 +194,9 @@ def _resolve_config_path(config_path: Optional[str | Path]) -> Optional[Path]:
         Path.cwd() / "openclaw.json",
         Path.cwd() / "openclaw.json5",
         Path.cwd() / "config" / "openclaw.json",
-        Path.home() / ".openclaw" / "config.json",
+        Path.home() / ".openclaw" / "openclaw.json",   # Python-native config (preferred)
+        Path.home() / ".openclaw" / "openclaw.json5",
+        Path.home() / ".openclaw" / "config.json",     # TS-format config (fallback)
         Path.home() / ".openclaw" / "config.json5",
     ]
     for candidate in candidates:
@@ -185,13 +233,20 @@ def load_config(
     """
     from .schema import ClawdbotConfig
 
-    global _cached_config
-
-    if _cached_config is not None:
-        return _cached_config.model_dump() if as_dict else _cached_config
+    global _cached_config, _cached_config_path, _cached_config_mtime_ns
 
     config_dict: dict[str, Any] = {}
     path = _resolve_config_path(config_path)
+    path_mtime = None
+    if path and path.exists():
+        path_mtime = path.stat().st_mtime_ns
+
+    if (
+        _cached_config is not None
+        and _cached_config_path == path
+        and _cached_config_mtime_ns == path_mtime
+    ):
+        return _cached_config.model_dump() if as_dict else _cached_config
 
     if path and path.exists():
         try:
@@ -207,64 +262,185 @@ def load_config(
         logger.warning(f"Failed to parse config: {exc}")
         config_obj = ClawdbotConfig()
 
+    # Apply runtime in-memory overrides (matches TS applyConfigOverrides at end of loadConfig)
+    try:
+        from .runtime_overrides import apply_config_overrides
+        config_obj = apply_config_overrides(config_obj)
+    except Exception:
+        pass
+
     _cached_config = config_obj
+    _cached_config_path = path
+    _cached_config_mtime_ns = path_mtime
     return config_obj.model_dump() if as_dict else config_obj
 
 
 def invalidate_config_cache() -> None:
     """Invalidate the in-process config cache so the next load_config() re-reads disk."""
-    global _cached_config
+    global _cached_config, _cached_config_path, _cached_config_mtime_ns
     _cached_config = None
+    _cached_config_path = None
+    _cached_config_mtime_ns = None
 
 
-def save_config(config: Any, config_path: Optional[str | Path] = None) -> None:
-    """Save OpenClaw configuration to file.
+# Alias used by existing code
+clear_config_cache = invalidate_config_cache
 
-    - Creates backup rotation (up to 3 .bak files)
-    - Preserves ${VAR} tokens in the output (not expanded)
-    - Appends an audit log entry
 
-    Args:
-        config: Configuration object or dictionary to save.
-        config_path: Optional path to config file (defaults to ~/.openclaw/config.json).
+def _resolve_backup_paths(path: Path) -> list[tuple[Path, Path]]:
     """
-    global _cached_config
+    Return (src, dst) rename pairs for 5-backup rotation.
 
-    path = Path(config_path) if config_path else Path.home() / ".openclaw" / "config.json"
+    Convention: .bak, .bak.1, .bak.2, .bak.3, .bak.4 (matches TS backup-rotation.ts)
+    """
+    pairs = []
+    stem = path.stem
+    suffix = path.suffix
+    base = path.parent
+    # Rotate .bak.3 → .bak.4, .bak.2 → .bak.3, .bak.1 → .bak.2, .bak → .bak.1
+    for i in range(3, 0, -1):
+        src = base / f"{stem}{suffix}.bak.{i}"
+        dst = base / f"{stem}{suffix}.bak.{i + 1}"
+        pairs.append((src, dst))
+    pairs.append((base / f"{stem}{suffix}.bak", base / f"{stem}{suffix}.bak.1"))
+    return pairs
+
+
+def _rotate_config_backups(path: Path) -> None:
+    """Rotate config backups (5 levels, matches TS backup-rotation.ts)."""
+    try:
+        # Delete oldest backup first
+        oldest = path.parent / f"{path.stem}{path.suffix}.bak.4"
+        if oldest.exists():
+            oldest.unlink()
+        for src, dst in _resolve_backup_paths(path):
+            if src.exists():
+                shutil.move(str(src), str(dst))
+        # Create new .bak from current file
+        if path.exists():
+            shutil.copy2(str(path), str(path.parent / f"{path.stem}{path.suffix}.bak"))
+    except Exception as exc:
+        logger.debug(f"Backup rotation skipped: {exc}")
+
+
+def resolve_config_snapshot_hash(raw: Optional[str]) -> Optional[str]:
+    """
+    Compute SHA-256 hash of a config file snapshot.
+
+    Matches TS resolveConfigSnapshotHash().
+    """
+    if not raw:
+        return None
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _get_app_version() -> Optional[str]:
+    """Attempt to resolve the running openclaw-python version string."""
+    try:
+        import importlib.metadata
+        return importlib.metadata.version("openclaw-python")
+    except Exception:
+        pass
+    try:
+        from openclaw import __version__  # type: ignore[import]
+        return __version__
+    except Exception:
+        pass
+    return None
+
+
+def write_config_file(
+    config: Any,
+    config_path: Optional[str | Path] = None,
+    stamp_version: bool = True,
+) -> None:
+    """
+    Write configuration to file.
+
+    - Preserves ${VAR} references where resolved values are unchanged.
+    - Rotates up to 5 backup files (.bak, .bak.1 … .bak.4).
+    - Stamps meta.lastTouchedVersion / meta.lastTouchedAt.
+    - Clears config cache.
+    - Appends audit log entry.
+
+    Matches TS writeConfigFile().
+    """
+    global _cached_config, _cached_config_path, _cached_config_mtime_ns
+
+    path = Path(config_path) if config_path else Path.home() / ".openclaw" / "openclaw.json"
     path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Invalidate cache before writing
+    invalidate_config_cache()
 
     # Convert to dict
     if hasattr(config, "model_dump"):
         config_dict: dict[str, Any] = config.model_dump(exclude_none=True)
     elif hasattr(config, "dict"):
-        config_dict = config.dict(exclude_none=True)
+        config_dict = config.dict(exclude_none=True)  # type: ignore[union-attr]
     elif hasattr(config, "__dict__"):
-        config_dict = config.__dict__
+        config_dict = dict(config.__dict__)
     elif isinstance(config, dict):
-        config_dict = config
+        config_dict = dict(config)
     else:
         config_dict = {}
 
-    # Backup rotation (keep up to 3 backups)
+    # Preserve ${VAR} references from existing file
     if path.exists():
         try:
-            for i in range(2, 0, -1):
-                src = path.with_suffix(f".bak{i}")
-                dst = path.with_suffix(f".bak{i+1}")
-                if src.exists():
-                    shutil.copy2(src, dst)
-            shutil.copy2(path, path.with_suffix(".bak1"))
-        except Exception as exc:
-            logger.debug(f"Backup rotation skipped: {exc}")
+            existing_raw = _parse_json5(path.read_text(encoding="utf-8"))
+            if isinstance(existing_raw, dict):
+                config_dict = _restore_env_refs_preserving(existing_raw, config_dict)
+        except Exception:
+            pass
 
-    # Write file
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(config_dict, f, indent=2)
+    # Stamp version metadata (matches TS meta.lastTouchedVersion / lastTouchedAt)
+    if stamp_version:
+        meta = config_dict.setdefault("meta", {})
+        if isinstance(meta, dict):
+            version = _get_app_version()
+            if version:
+                meta["lastTouchedVersion"] = version
+            meta["lastTouchedAt"] = datetime.now(UTC).isoformat()
 
-    _append_config_audit(path, "save", f"keys={list(config_dict.keys())[:5]}")
+    # Rotate backups (5 levels)
+    _rotate_config_backups(path)
 
-    # Update cache
-    _cached_config = config if not isinstance(config, dict) else None
+    # Atomic write: temp file → rename
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    serialized = json.dumps(config_dict, indent=2)
+    try:
+        tmp_path.write_text(serialized, encoding="utf-8")
+        tmp_path.replace(path)
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
+
+    payload_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    _append_config_audit(
+        path,
+        "write",
+        f"keys={list(config_dict.keys())[:5]},bytes={len(serialized.encode('utf-8'))},sha256={payload_hash}",
+    )
+
+    _cached_config_path = path
+    _cached_config_mtime_ns = path.stat().st_mtime_ns if path.exists() else None
+
+
+def save_config(config: Any, config_path: Optional[str | Path] = None) -> None:
+    """Save OpenClaw configuration to file (alias for write_config_file).
+
+    - Rotates up to 5 backup files (.bak … .bak.4)
+    - Preserves ${VAR} tokens in the output (not expanded)
+    - Stamps meta.lastTouchedVersion / meta.lastTouchedAt
+    - Appends an audit log entry
+
+    Args:
+        config: Configuration object or dictionary to save.
+        config_path: Optional path to config file (defaults to ~/.openclaw/openclaw.json).
+    """
+    write_config_file(config, config_path)
 
 
 def get_config_path() -> Path:

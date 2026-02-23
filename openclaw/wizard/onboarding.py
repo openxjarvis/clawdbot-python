@@ -16,6 +16,9 @@ from ..config.loader import load_config, save_config
 from ..config.schema import ClawdbotConfig, AgentConfig, GatewayConfig, ChannelsConfig, AuthConfig
 from .auth import configure_auth, check_env_api_key
 from .config import configure_telegram_enhanced, configure_discord_enhanced, configure_agent
+from .onboard_hooks import setup_hooks
+from .onboard_skills import setup_skills
+from .onboard_finalize import finalize_onboarding
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +42,7 @@ async def check_gateway_health(port: int = 18789, token: Optional[str] = None) -
                 headers["Authorization"] = f"Bearer {token}"
             
             response = await client.get(
-                f"http://localhost:{port}/health",
+                f"http://127.0.0.1:{port}/health",
                 headers=headers
             )
             response.raise_for_status()
@@ -322,63 +325,67 @@ async def run_onboarding_wizard(
         print("~" * 60)
         
         try:
-            from ..daemon.service import get_service_manager
-            manager = get_service_manager("openclaw")
+            from ..cli.daemon_cmd import (
+                is_service_installed,
+                is_service_running,
+                install_service_programmatic,
+                start_service_programmatic,
+                stop_service_programmatic,
+            )
+            gateway_port = claw_config.gateway.port if claw_config.gateway else 18789
             
             # Check if already installed
-            if manager.is_installed():
+            if is_service_installed():
                 if non_interactive or mode == "quickstart":
                     action = "R"  # Auto-restart in non-interactive/quickstart
                     print("Gateway service already installed. Restarting...")
                 else:
                     action = input("\nGateway service already installed. [R]estart / Re[i]nstall / [S]kip? [R]: ").strip().upper() or "R"
                 
-                if action == "I":
-                    print("Uninstalling existing service...")
-                    manager.uninstall()
-                    gateway_installed = False
-                elif action == "S":
+                if action == "S":
                     print("Skipping Gateway service installation")
                     should_install_daemon = False
                     gateway_installed = True
-                    # Check if it's running
-                    gateway_running = manager.is_running()
-                elif action == "R":
-                    print("Restarting Gateway service...")
-                    try:
-                        manager.restart()
-                        print("✓ Gateway service restarted")
+                    gateway_running = is_service_running()
+                elif action in ("R", "I"):
+                    print("Stopping existing service...")
+                    stop_service_programmatic()
+                    if action == "I":
+                        print("Uninstalling existing service...")
+                        from ..cli.daemon_cmd import daemon_uninstall
+                        try:
+                            daemon_uninstall(json_output=False)
+                        except SystemExit:
+                            pass
+                    print("Installing Gateway service...")
+                    ok = install_service_programmatic(port=gateway_port)
+                    if ok:
+                        print("✓ Gateway service installed and started")
                         gateway_installed = True
                         gateway_running = True
-                    except Exception as e:
-                        logger.error(f"Failed to restart Gateway: {e}")
-                        print(f"✗ Gateway restart failed: {e}")
+                    else:
+                        print("✗ Gateway service install failed")
                         gateway_running = False
             
             if should_install_daemon and not gateway_installed:
                 print("Installing Gateway service...")
-                manager.install()
-                print("✓ Gateway service installed")
-                gateway_installed = True
-                
-                # Start the service
-                print("Starting Gateway service...")
-                try:
-                    manager.start()
-                    print("✓ Gateway service started")
+                ok = install_service_programmatic(port=gateway_port)
+                if ok:
+                    print("✓ Gateway service installed")
+                    gateway_installed = True
                     gateway_running = True
-                except Exception as e:
-                    logger.error(f"Failed to start Gateway: {e}")
-                    print(f"✗ Gateway start failed: {e}")
-                    print("You can start it manually with:")
-                    print("  $ uv run openclaw gateway start")
+                else:
+                    print("✗ Gateway service install failed")
+                    print("You can install it manually with:")
+                    print("  $ uv run openclaw daemon install")
+                    gateway_installed = False
                     gateway_running = False
                     
         except Exception as e:
             logger.error(f"Failed to install/start Gateway: {e}")
             print(f"✗ Gateway service installation failed: {e}")
             print("\nYou can install it manually later with:")
-            print("  $ uv run openclaw gateway install")
+            print("  $ uv run openclaw daemon install")
             print("  $ uv run openclaw gateway start")
             gateway_installed = False
             gateway_running = False
@@ -537,6 +544,11 @@ async def run_onboarding_wizard(
     
     print("\n" + "=" * 80 + "\n")
     
+    # Step 11: staged onboarding modules (TS-style decomposition)
+    hooks_result = await setup_hooks(workspace_dir=workspace_dir, mode=mode)
+    skills_result = await setup_skills(mode=mode)
+    finalize_result = await finalize_onboarding(mode=mode, skip_ui=skip_ui)
+
     logger.info("Onboarding wizard complete")
     
     return {
@@ -544,6 +556,9 @@ async def run_onboarding_wizard(
         "skipped": False,
         "mode": mode,
         "provider": provider_config.get("provider") if provider_config else None,
+        "hooks": hooks_result,
+        "skills": skills_result,
+        "finalize": finalize_result,
     }
 
 

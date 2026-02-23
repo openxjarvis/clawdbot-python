@@ -29,6 +29,8 @@ from openclaw.routing.session_key import (
 
 logger = logging.getLogger(__name__)
 
+DERIVED_TITLE_MAX_LEN = 60
+
 
 # ============================================================================
 # Data Structures
@@ -320,43 +322,59 @@ def classify_session_key(key: str, entry: Optional[SessionEntry] = None) -> Lite
 # Session Title Derivation
 # ============================================================================
 
+def _truncate_title(text: str, max_len: int) -> str:
+    """Truncate title at word boundary. Mirrors TS truncateTitle()."""
+    if len(text) <= max_len:
+        return text
+    cut = text[:max_len - 1]
+    last_space = cut.rfind(" ")
+    if last_space > max_len * 0.6:
+        return cut[:last_space] + "…"
+    return cut + "…"
+
+
+def _format_session_id_prefix(session_id: str, updated_at: Optional[int] = None) -> str:
+    """Format a short session ID prefix with optional date."""
+    prefix = session_id[:8]
+    if updated_at and updated_at > 0:
+        from datetime import datetime, timezone
+        d = datetime.fromtimestamp(updated_at / 1000, tz=timezone.utc)
+        return f"{prefix} ({d.strftime('%Y-%m-%d')})"
+    return prefix
+
+
 def derive_session_title(
-    entry: SessionEntry,
+    entry: Optional[SessionEntry],
     first_user_message: Optional[str] = None
-) -> str:
+) -> Optional[str]:
     """
-    Derive display title for session
-    
+    Derive display title for session.
+    Mirrors TS deriveSessionTitle() exactly (60-char word-boundary truncation).
+
     Priority:
     1. displayName
     2. subject
-    3. first user message
-    4. sessionId (first 8 chars)
-    
-    Args:
-        entry: Session entry
-        first_user_message: Optional first user message
-        
-    Returns:
-        Derived title
+    3. first user message (word-boundary truncated to 60 chars)
+    4. sessionId prefix with date
     """
-    # 1. Display name
-    if entry.displayName:
-        return entry.displayName
-    
-    # 2. Subject
-    if entry.subject:
-        return entry.subject
-    
-    # 3. First user message
-    if first_user_message:
-        # Truncate to reasonable length
-        if len(first_user_message) > 50:
-            return first_user_message[:50] + "..."
-        return first_user_message
-    
-    # 4. Session ID prefix
-    return entry.sessionId[:8]
+    if entry is None:
+        return None
+
+    if entry.displayName and entry.displayName.strip():
+        return entry.displayName.strip()
+
+    if entry.subject and entry.subject.strip():
+        return entry.subject.strip()
+
+    if first_user_message and first_user_message.strip():
+        import re as _re
+        normalized = _re.sub(r"\s+", " ", first_user_message).strip()
+        return _truncate_title(normalized, DERIVED_TITLE_MAX_LEN)
+
+    if entry.sessionId:
+        return _format_session_id_prefix(entry.sessionId, getattr(entry, "updatedAt", None))
+
+    return None
 
 
 # ============================================================================
@@ -541,6 +559,266 @@ class SessionPreviewItem:
     """Preview item for session transcript"""
     role: Literal["user", "assistant", "tool", "system", "other"]
     text: str
+
+
+# ============================================================================
+# TS-aligned utility functions (added for full parity)
+# ============================================================================
+
+def find_store_keys_ignore_case(
+    store: Dict[str, Any],
+    target_key: str,
+) -> List[str]:
+    """
+    Find all store keys that match target_key case-insensitively.
+    Mirrors TS findStoreKeysIgnoreCase().
+    """
+    lowered = target_key.lower()
+    return [k for k in store if k.lower() == lowered]
+
+
+def prune_legacy_store_keys(
+    store: Dict[str, Any],
+    canonical_key: str,
+    candidates: Any,
+) -> None:
+    """
+    Remove legacy key variants from the store, keeping only canonical_key.
+    Mirrors TS pruneLegacyStoreKeys().
+    """
+    keys_to_delete: set[str] = set()
+    for candidate in candidates:
+        trimmed = str(candidate or "").strip()
+        if not trimmed:
+            continue
+        if trimmed != canonical_key:
+            keys_to_delete.add(trimmed)
+        for match in find_store_keys_ignore_case(store, trimmed):
+            if match != canonical_key:
+                keys_to_delete.add(match)
+    for key in keys_to_delete:
+        store.pop(key, None)
+
+
+def parse_group_key(
+    key: str,
+) -> Optional[Dict[str, str]]:
+    """
+    Parse a group/channel session key into {channel, kind, id}.
+    Returns None if not a group/channel key.
+    Mirrors TS parseGroupKey().
+    """
+    from openclaw.routing.session_key import parse_agent_session_key as _parse_ask
+    parsed = _parse_ask(key)
+    raw_key = parsed.rest if parsed else key
+    parts = [p for p in raw_key.split(":") if p]
+    if len(parts) >= 3:
+        channel, kind, *rest = parts
+        if kind in ("group", "channel"):
+            return {"channel": channel, "kind": kind, "id": ":".join(rest)}
+    return None
+
+
+def list_agents_for_gateway(cfg: Any) -> Dict[str, Any]:
+    """
+    List agents configured for the gateway with identity info.
+    Mirrors TS listAgentsForGateway().
+
+    Returns:
+        {"defaultId": str, "mainKey": str, "scope": str, "agents": list}
+    """
+    from openclaw.routing.session_key import normalize_agent_id as _norm_agent_id
+
+    agents_section = (cfg or {}).get("agents") or {}
+    session_section = (cfg or {}).get("session") or {}
+
+    default_id = _norm_agent_id(agents_section.get("defaultAgent") or "main")
+    main_key = session_section.get("mainKey") or "main"
+    scope = session_section.get("scope") or "per-sender"
+
+    agents_list: list = agents_section.get("agents") or agents_section.get("list") or []
+
+    configured_by_id: Dict[str, Dict[str, Any]] = {}
+    for entry in agents_list:
+        if not isinstance(entry, dict) or not entry.get("id"):
+            continue
+        agent_id = _norm_agent_id(str(entry["id"]))
+        identity_raw = entry.get("identity")
+        identity = None
+        if isinstance(identity_raw, dict):
+            identity = {
+                "name": (identity_raw.get("name") or "").strip() or None,
+                "theme": (identity_raw.get("theme") or "").strip() or None,
+                "emoji": (identity_raw.get("emoji") or "").strip() or None,
+                "avatar": (identity_raw.get("avatar") or "").strip() or None,
+            }
+        name_raw = entry.get("name")
+        configured_by_id[agent_id] = {
+            "name": name_raw.strip() if isinstance(name_raw, str) and name_raw.strip() else None,
+            "identity": identity,
+        }
+
+    explicit_ids = {
+        _norm_agent_id(str(e["id"]))
+        for e in agents_list
+        if isinstance(e, dict) and e.get("id")
+    }
+    allowed_ids = (explicit_ids | {default_id}) if explicit_ids else None
+
+    # Collect agent ids: from config, plus disk scan, plus default
+    agent_ids_set: set[str] = {default_id}
+    for e in agents_list:
+        if isinstance(e, dict) and e.get("id"):
+            agent_ids_set.add(_norm_agent_id(str(e["id"])))
+
+    # Disk scan
+    try:
+        from openclaw.config.paths import resolve_state_dir
+        state_dir = Path(resolve_state_dir())
+        agents_dir = state_dir / "agents"
+        if agents_dir.is_dir():
+            for d in agents_dir.iterdir():
+                if d.is_dir():
+                    agent_ids_set.add(_norm_agent_id(d.name))
+    except Exception:
+        pass
+
+    agent_ids = sorted(
+        aid for aid in agent_ids_set
+        if aid and (allowed_ids is None or aid in allowed_ids)
+    )
+    # Ensure default comes first
+    if default_id in agent_ids:
+        agent_ids = [default_id] + [aid for aid in agent_ids if aid != default_id]
+
+    agents = [
+        {
+            "id": aid,
+            "name": configured_by_id.get(aid, {}).get("name"),
+            "identity": configured_by_id.get(aid, {}).get("identity"),
+        }
+        for aid in agent_ids
+    ]
+
+    return {"defaultId": default_id, "mainKey": main_key, "scope": scope, "agents": agents}
+
+
+def resolve_session_model_ref(
+    cfg: Any,
+    entry: Any = None,
+    agent_id: Optional[str] = None,
+) -> Dict[str, str]:
+    """
+    Resolve the effective {provider, model} for a session entry.
+    Mirrors TS resolveSessionModelRef().
+
+    Priority:
+    1. Runtime model recorded on entry (entry.model)
+    2. Per-session model override (entry.modelOverride)
+    3. Configured default for agent
+    """
+    from openclaw.agents.model_selection import (
+        resolve_default_model_for_agent,
+        resolve_configured_model_ref,
+        parse_model_ref,
+        DEFAULT_PROVIDER,
+        DEFAULT_MODEL,
+    )
+
+    if agent_id:
+        resolved = resolve_default_model_for_agent(cfg, agent_id)
+    else:
+        resolved = resolve_configured_model_ref(cfg)
+
+    provider = resolved.provider
+    model = resolved.model
+
+    if isinstance(entry, dict) or hasattr(entry, "model"):
+        entry_dict = entry if isinstance(entry, dict) else {}
+        if not isinstance(entry, dict):
+            for attr in ("model", "modelProvider", "modelOverride", "providerOverride"):
+                if hasattr(entry, attr):
+                    entry_dict[attr] = getattr(entry, attr)
+
+        runtime_model = (entry_dict.get("model") or "").strip()
+        runtime_provider = (entry_dict.get("modelProvider") or "").strip()
+        if runtime_model:
+            parsed_runtime = parse_model_ref(
+                runtime_model,
+                runtime_provider or provider or DEFAULT_PROVIDER,
+            )
+            if parsed_runtime:
+                provider = parsed_runtime.provider
+                model = parsed_runtime.model
+            else:
+                provider = runtime_provider or provider
+                model = runtime_model
+            return {"provider": provider, "model": model}
+
+        stored_override = (entry_dict.get("modelOverride") or "").strip()
+        if stored_override:
+            override_provider = (entry_dict.get("providerOverride") or "").strip() or provider or DEFAULT_PROVIDER
+            parsed_override = parse_model_ref(stored_override, override_provider)
+            if parsed_override:
+                provider = parsed_override.provider
+                model = parsed_override.model
+            else:
+                provider = override_provider
+                model = stored_override
+
+    return {"provider": provider, "model": model}
+
+
+def archive_file_on_disk(file_path: str, reason: str) -> str:
+    """
+    Move a file to an archived copy with timestamp suffix.
+    Mirrors TS archiveFileOnDisk().
+
+    reason: "bak" | "reset" | "deleted"
+    Returns the archived file path.
+    """
+    import shutil
+    from datetime import datetime, timezone
+    ts = datetime.now(tz=timezone.utc).isoformat().replace(":", "-")
+    archived = f"{file_path}.{reason}.{ts}"
+    shutil.move(file_path, archived)
+    return archived
+
+
+def archive_session_transcripts(
+    session_id: str,
+    store_path: Optional[str],
+    session_file: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    reason: str = "reset",
+) -> List[str]:
+    """
+    Archive all transcript files for a session. Best-effort.
+    Mirrors TS archiveSessionTranscripts().
+    """
+    archived: List[str] = []
+    candidates: List[str] = []
+
+    if session_file:
+        candidates.append(session_file)
+    if store_path and session_id:
+        candidates.append(str(Path(store_path).parent / f"{session_id}.jsonl"))
+    if session_id:
+        # Legacy location
+        import os
+        home = Path.home()
+        candidates.append(str(home / ".openclaw" / "sessions" / f"{session_id}.jsonl"))
+
+    for candidate in candidates:
+        p = Path(candidate)
+        if not p.exists():
+            continue
+        try:
+            archived.append(archive_file_on_disk(str(p), reason))
+        except Exception:
+            pass
+
+    return archived
 
 
 def read_session_preview_items(

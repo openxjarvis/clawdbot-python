@@ -22,6 +22,147 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Constants — mirrors TS chat-abort.ts
+# ---------------------------------------------------------------------------
+# Max timeout when no gateway timeout is in effect (≈ 25 days in ms)
+NO_GATEWAY_TIMEOUT_MS = 2_147_000_000
+
+
+# =============================================================================
+# TS-aligned utility functions
+# =============================================================================
+
+def is_chat_stop_command_text(text: str) -> bool:
+    """
+    Return True if the text is a stop command (/stop or known abort triggers).
+    Mirrors TS isChatStopCommandText().
+    """
+    trimmed = text.strip()
+    if not trimmed:
+        return False
+    lower = trimmed.lower()
+    if lower == "/stop":
+        return True
+    # Known abort trigger words
+    _ABORT_TRIGGERS = frozenset(["abort", "cancel", "/abort", "/cancel", "stop", "/quit"])
+    return lower in _ABORT_TRIGGERS
+
+
+def resolve_chat_run_expires_at_ms(
+    now: int,
+    timeout_ms: int,
+    grace_ms: int = 60_000,
+    min_ms: int = 2 * 60_000,
+    max_ms: int = 24 * 60 * 60_000,
+) -> int:
+    """
+    Compute the absolute expiry timestamp for a chat run.
+    Mirrors TS resolveChatRunExpiresAtMs().
+    """
+    bounded_timeout_ms = max(0, timeout_ms)
+    target = now + bounded_timeout_ms + grace_ms
+    min_ts = now + min_ms
+    max_ts = now + max_ms
+    return min(max_ts, max(min_ts, target))
+
+
+def strip_envelope_from_message(message: Any) -> Any:
+    """
+    Strip message-ID envelope markers from user message text/content blocks.
+    Mirrors TS stripEnvelopeFromMessage().
+    """
+    if not isinstance(message, dict):
+        return message
+    role = str(message.get("role", "")).lower()
+    if role != "user":
+        return message
+
+    import re
+
+    def _strip_envelope(text: str) -> str:
+        # Remove common envelope patterns: [msg:uuid], [envelope:...], [id:...]
+        text = re.sub(r'\[msg:[a-f0-9\-]{8,}\]', '', text)
+        text = re.sub(r'\[envelope:[^\]]+\]', '', text)
+        text = re.sub(r'\[id:[^\]]+\]', '', text)
+        return text
+
+    changed = False
+    next_msg = dict(message)
+
+    content = message.get("content")
+    if isinstance(content, str):
+        stripped = _strip_envelope(content)
+        if stripped != content:
+            next_msg["content"] = stripped
+            changed = True
+    elif isinstance(content, list):
+        new_content = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
+                stripped = _strip_envelope(block["text"])
+                if stripped != block["text"]:
+                    new_content.append({**block, "text": stripped})
+                    changed = True
+                    continue
+            new_content.append(block)
+        if changed:
+            next_msg["content"] = new_content
+    elif isinstance(message.get("text"), str):
+        stripped = _strip_envelope(message["text"])
+        if stripped != message["text"]:
+            next_msg["text"] = stripped
+            changed = True
+
+    return next_msg if changed else message
+
+
+def strip_envelope_from_messages(messages: list[Any]) -> list[Any]:
+    """
+    Strip envelope markers from all user messages in a list.
+    Mirrors TS stripEnvelopeFromMessages().
+    """
+    if not messages:
+        return messages
+    changed = False
+    result = []
+    for msg in messages:
+        stripped = strip_envelope_from_message(msg)
+        if stripped is not msg:
+            changed = True
+        result.append(stripped)
+    return result if changed else messages
+
+
+def normalize_rpc_attachments_to_chat_attachments(
+    attachments: list[Any] | None,
+) -> list[dict[str, Any]]:
+    """
+    Normalise raw RPC attachment dicts to internal ChatAttachment format.
+    Mirrors TS normalizeRpcAttachmentsToChatAttachments().
+    """
+    if not attachments:
+        return []
+    result = []
+    for a in attachments:
+        if not isinstance(a, dict):
+            continue
+        content = a.get("content")
+        if isinstance(content, bytes):
+            import base64
+            content = base64.b64encode(content).decode("ascii")
+        elif not isinstance(content, str):
+            continue  # skip if no usable content
+        item: dict[str, Any] = {"content": content}
+        if isinstance(a.get("type"), str):
+            item["type"] = a["type"]
+        if isinstance(a.get("mimeType"), str):
+            item["mimeType"] = a["mimeType"]
+        if isinstance(a.get("fileName"), str):
+            item["fileName"] = a["fileName"]
+        result.append(item)
+    return result
+
 
 # =============================================================================
 # Helper Functions
@@ -125,50 +266,209 @@ def append_message_to_transcript(
         return False, None, str(e)
 
 
-_MAX_TEXT_BLOCK_CHARS = 12_000   # Per text-content block
-_MAX_MESSAGE_BYTES = 128 * 1024  # 128 KB per message
+CHAT_HISTORY_TEXT_MAX_CHARS = 12_000
+CHAT_HISTORY_MAX_SINGLE_MESSAGE_BYTES = 128 * 1024
+CHAT_HISTORY_OVERSIZED_PLACEHOLDER = "[chat.history omitted: message too large]"
+
+
+def _strip_disallowed_control_chars(text: str) -> str:
+    """Remove disallowed control characters, keeping tab/LF/CR and printable chars."""
+    out = []
+    for ch in text:
+        code = ord(ch)
+        if code in (9, 10, 13) or (32 <= code != 127):
+            out.append(ch)
+    return "".join(out)
+
+
+def sanitize_chat_send_message_input(
+    message: str,
+) -> tuple[bool, str, str | None]:
+    """Validate and sanitize a chat.send message.
+
+    Mirrors TS sanitizeChatSendMessageInput().
+    Returns (ok, message, error).
+    """
+    normalized = message.normalize("NFC") if hasattr(message, "normalize") else message
+    if "\x00" in normalized:
+        return False, message, "message must not contain null bytes"
+    return True, _strip_disallowed_control_chars(normalized), None
+
+
+def _truncate_history_text(text: str) -> tuple[str, bool]:
+    """Truncate to CHAT_HISTORY_TEXT_MAX_CHARS chars."""
+    if len(text) <= CHAT_HISTORY_TEXT_MAX_CHARS:
+        return text, False
+    return f"{text[:CHAT_HISTORY_TEXT_MAX_CHARS]}\n...(truncated)...", True
+
+
+def _sanitize_history_content_block(block: Any) -> tuple[Any, bool]:
+    """Sanitize a single content block.
+
+    Mirrors TS sanitizeChatHistoryContentBlock().
+    """
+    if not isinstance(block, dict):
+        return block, False
+    entry = dict(block)
+    changed = False
+
+    for field in ("text", "partialJson", "arguments", "thinking"):
+        if isinstance(entry.get(field), str):
+            new_val, truncated = _truncate_history_text(entry[field])
+            if truncated:
+                entry[field] = new_val
+                changed = True
+
+    if "thinkingSignature" in entry:
+        del entry["thinkingSignature"]
+        changed = True
+
+    if entry.get("type") == "image" and isinstance(entry.get("data"), str):
+        byte_size = len(entry["data"].encode("utf-8"))
+        del entry["data"]
+        entry["omitted"] = True
+        entry["bytes"] = byte_size
+        changed = True
+
+    return (entry if changed else block), changed
+
+
+def _sanitize_history_message(message: Any) -> tuple[Any, bool]:
+    """Sanitize a single history message.
+
+    Mirrors TS sanitizeChatHistoryMessage().
+    """
+    if not isinstance(message, dict):
+        return message, False
+    entry = dict(message)
+    changed = False
+
+    for field in ("details", "usage", "cost"):
+        if field in entry:
+            del entry[field]
+            changed = True
+
+    if isinstance(entry.get("content"), str):
+        new_val, truncated = _truncate_history_text(entry["content"])
+        if truncated:
+            entry["content"] = new_val
+            changed = True
+    elif isinstance(entry.get("content"), list):
+        new_blocks = []
+        any_block_changed = False
+        for blk in entry["content"]:
+            new_blk, blk_changed = _sanitize_history_content_block(blk)
+            new_blocks.append(new_blk)
+            any_block_changed = any_block_changed or blk_changed
+        if any_block_changed:
+            entry["content"] = new_blocks
+            changed = True
+
+    if isinstance(entry.get("text"), str):
+        new_val, truncated = _truncate_history_text(entry["text"])
+        if truncated:
+            entry["text"] = new_val
+            changed = True
+
+    return (entry if changed else message), changed
+
+
+def _json_utf8_bytes(value: Any) -> int:
+    """Return UTF-8 byte length of JSON serialization."""
+    try:
+        return len(json.dumps(value).encode("utf-8"))
+    except Exception:
+        return len(str(value).encode("utf-8"))
+
+
+def _build_oversized_placeholder(message: Any) -> dict[str, Any]:
+    """Build a placeholder for an oversized message."""
+    role = "assistant"
+    timestamp = int(datetime.now(UTC).timestamp() * 1000)
+    if isinstance(message, dict):
+        if isinstance(message.get("role"), str):
+            role = message["role"]
+        if isinstance(message.get("timestamp"), (int, float)):
+            timestamp = int(message["timestamp"])
+    return {
+        "role": role,
+        "timestamp": timestamp,
+        "content": [{"type": "text", "text": CHAT_HISTORY_OVERSIZED_PLACEHOLDER}],
+        "__openclaw": {"truncated": True, "reason": "oversized"},
+    }
+
+
+def _replace_oversized_messages(
+    messages: list[Any],
+    max_single_bytes: int = CHAT_HISTORY_MAX_SINGLE_MESSAGE_BYTES,
+) -> tuple[list[Any], int]:
+    """Replace messages exceeding max_single_bytes with placeholder.
+
+    Mirrors TS replaceOversizedChatHistoryMessages().
+    Returns (messages, replaced_count).
+    """
+    if not messages:
+        return messages, 0
+    replaced = 0
+    result = []
+    for msg in messages:
+        if _json_utf8_bytes(msg) > max_single_bytes:
+            result.append(_build_oversized_placeholder(msg))
+            replaced += 1
+        else:
+            result.append(msg)
+    return (result if replaced > 0 else messages), replaced
+
+
+def _enforce_chat_history_budget(
+    messages: list[Any],
+    max_bytes: int,
+) -> tuple[list[Any], int]:
+    """Drop oldest messages until total JSON byte size fits within max_bytes.
+
+    Mirrors TS enforceChatHistoryFinalBudget().
+    Returns (messages, placeholder_count).
+    """
+    if not messages:
+        return messages, 0
+    if _json_utf8_bytes(messages) <= max_bytes:
+        return messages, 0
+    # Drop from the front until we fit
+    while messages and _json_utf8_bytes(messages) > max_bytes:
+        messages = messages[1:]
+    return messages, 0
 
 
 def _sanitize_history_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """
-    Sanitize history messages before sending to clients.
+    """Full history sanitization pipeline.
 
-    Mirrors TypeScript chat.history sanitization:
-    - Truncates individual text blocks to 12K chars
-    - Enforces 128KB budget per message
-    - Removes sensitive / internal fields
+    Mirrors TS chat.history sanitization in order:
+    1. sanitizeChatHistoryMessages (strip details/usage/cost + truncate text)
+    2. replaceOversizedChatHistoryMessages (128KB per-message limit)
+    3. enforceChatHistoryFinalBudget (total byte budget from server constants)
     """
-    result = []
+    if not messages:
+        return messages
+
+    # Step 1: field-level sanitization
+    any_changed = False
+    sanitized: list[Any] = []
     for msg in messages:
-        msg = dict(msg)  # shallow copy
+        new_msg, changed = _sanitize_history_message(msg)
+        sanitized.append(new_msg)
+        any_changed = any_changed or changed
+    if any_changed:
+        messages = sanitized
 
-        # Remove sensitive internal fields
-        msg.pop("_internal", None)
-        msg.pop("systemPrompt", None)
+    # Step 2: replace oversized single messages
+    messages, _ = _replace_oversized_messages(messages)
 
-        # Sanitize content blocks
-        content = msg.get("content")
-        if isinstance(content, list):
-            sanitized_content = []
-            budget = _MAX_MESSAGE_BYTES
-            for block in content:
-                if not isinstance(block, dict):
-                    sanitized_content.append(block)
-                    continue
-                block = dict(block)
-                if block.get("type") == "text":
-                    text = block.get("text", "")
-                    if len(text) > _MAX_TEXT_BLOCK_CHARS:
-                        block["text"] = text[:_MAX_TEXT_BLOCK_CHARS] + "…[truncated]"
-                block_bytes = len(json.dumps(block).encode())
-                if block_bytes <= budget:
-                    sanitized_content.append(block)
-                    budget -= block_bytes
-                # else: drop the block – over budget
-            msg["content"] = sanitized_content
+    # Step 3: enforce total budget (~8 MB default matching TS getMaxChatHistoryMessagesBytes)
+    from openclaw.gateway.server_constants import get_max_chat_history_messages_bytes
+    max_total_bytes = get_max_chat_history_messages_bytes()
+    messages, _ = _enforce_chat_history_budget(messages, max_total_bytes)
 
-        result.append(msg)
-    return result
+    return messages
 
 
 def broadcast_chat_event(
@@ -274,6 +574,9 @@ class ChatHistoryMethod:
         logger.info(f"chat.history: sessionKey={session_key}, sessionId={session_id}, transcript={transcript_path}")
         messages = read_session_messages(transcript_path, limit=min(limit, 1000))
 
+        # Strip envelope markers from user messages — mirrors TS stripEnvelopeFromMessages()
+        messages = strip_envelope_from_messages(messages)
+
         # Sanitize messages — mirrors TypeScript chat.history sanitization
         messages = _sanitize_history_messages(messages)
 
@@ -327,19 +630,51 @@ class ChatSendMethod:
         logger.debug(f"chat.send full params: {params}")
         
         session_key = params.get("sessionKey")
-        message = params.get("message", "").strip()
+        raw_message = params.get("message", "")
+        if not isinstance(raw_message, str):
+            raw_message = ""
         idempotency_key = params.get("idempotencyKey")
         attachments = params.get("attachments", [])
-        
+
         if not session_key:
             raise ValueError("sessionKey is required")
-        
+
         if not idempotency_key:
             raise ValueError("idempotencyKey is required")
-        
-        if not message and not attachments:
+
+        if not raw_message.strip() and not attachments:
             raise ValueError("message or attachments required")
-        
+
+        # Sanitize message input — mirrors TS sanitizeChatSendMessageInput()
+        if raw_message:
+            ok, raw_message, err = sanitize_chat_send_message_input(raw_message)
+            if not ok:
+                raise ValueError(err or "invalid message")
+
+        message = raw_message.strip()
+
+        # Normalise attachments — mirrors TS normalizeRpcAttachmentsToChatAttachments()
+        normalized_attachments = normalize_rpc_attachments_to_chat_attachments(
+            attachments if isinstance(attachments, list) else []
+        )
+
+        # Empty message + no attachments → reject early
+        if not message and not normalized_attachments:
+            raise ValueError("message or attachment required")
+
+        # Check for stop command — mirrors TS isChatStopCommandText()
+        if is_chat_stop_command_text(message):
+            # Abort any active runs for this session and return
+            gateway = connection.gateway
+            if gateway and hasattr(gateway, "active_runs"):
+                import asyncio as _asyncio
+                for task in list(getattr(gateway, "active_runs", {}).values()):
+                    if isinstance(task, _asyncio.Task):
+                        meta = getattr(task, "_openclaw_meta", {})
+                        if meta.get("session_key") == session_key:
+                            task.cancel()
+            return {"ok": True, "aborted": True, "runIds": []}
+
         # Get gateway and channel manager
         if not connection.gateway or not connection.gateway.channel_manager:
             raise RuntimeError("Gateway not initialized")
@@ -367,15 +702,31 @@ class ChatSendMethod:
         
         # Build user message
         now = datetime.now(UTC)
+        now_ms = int(now.timestamp() * 1000)
         user_message_content = []
         
         if message:
             user_message_content.append({"type": "text", "text": message})
-        
-        # Handle attachments (images)
-        if attachments:
-            for att in attachments:
-                if att.get("type") == "image":
+
+        # Resolve run expiry — mirrors TS resolveChatRunExpiresAtMs()
+        timeout_ms = params.get("timeoutMs") or NO_GATEWAY_TIMEOUT_MS
+        expires_at_ms = resolve_chat_run_expires_at_ms(now_ms, int(timeout_ms))
+
+        # Handle attachments (images) using normalized attachments
+        if normalized_attachments:
+            for att in normalized_attachments:
+                if att.get("type") == "image" or (att.get("mimeType") or "").startswith("image/"):
+                    user_message_content.append({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": att.get("mimeType", "image/jpeg"),
+                            "data": att.get("content", ""),
+                        },
+                    })
+        elif attachments:
+            for att in (attachments if isinstance(attachments, list) else []):
+                if isinstance(att, dict) and att.get("type") == "image":
                     user_message_content.append({
                         "type": "image",
                         "source": {
@@ -388,7 +739,7 @@ class ChatSendMethod:
         user_message = {
             "role": "user",
             "content": user_message_content,
-            "timestamp": int(now.timestamp() * 1000),
+            "timestamp": now_ms,
         }
         
         # Append user message to transcript IMMEDIATELY
@@ -409,6 +760,15 @@ class ChatSendMethod:
             payload={"runId": run_id, "status": "started"}
         ))
         
+        # Build image data URLs from normalized attachments to pass to the agent runtime.
+        # Encoded as "data:<mimeType>;base64,<content>" so providers can handle them inline.
+        image_data_urls: list[str] = []
+        for att in normalized_attachments:
+            mime = att.get("mimeType", "")
+            content = att.get("content", "")
+            if content and (att.get("type") == "image" or mime.startswith("image/")):
+                image_data_urls.append(f"data:{mime or 'image/jpeg'};base64,{content}")
+
         # Create agent task and register for abort support
         task = asyncio.create_task(self._execute_agent_turn(
             connection=connection,
@@ -419,6 +779,7 @@ class ChatSendMethod:
             message=message,
             run_id=run_id,
             transcript_path=transcript_path,
+            images=image_data_urls or None,
         ))
 
         # Tag task with metadata so abort can find it by session_key
@@ -459,112 +820,78 @@ class ChatSendMethod:
         message: str,
         run_id: str,
         transcript_path: Path,
+        images: list[str] | None = None,
     ) -> None:
-        """Execute agent turn asynchronously"""
+        """Execute agent turn, streaming events via runtime.run_turn() async generator."""
+        from openclaw.events import EventType
+
         try:
-            # Get agent runtime
             runtime = channel_manager.default_runtime
             if not runtime:
                 raise RuntimeError("Agent runtime not available")
-            
-            # Get tools from gateway
+
             tools = []
-            if hasattr(connection.gateway, 'tools') and connection.gateway.tools:
-                tools = connection.gateway.tools
-            elif hasattr(connection.gateway, 'tool_registry') and connection.gateway.tool_registry:
+            if hasattr(connection.gateway, "tool_registry") and connection.gateway.tool_registry:
                 tools = connection.gateway.tool_registry.list_tools()
-            
+            elif hasattr(connection.gateway, "tools") and connection.gateway.tools:
+                tools = connection.gateway.tools
+
             logger.info(f"🔧 Loaded {len(tools)} tools for agent turn")
-            
-            # Execute agent turn using AgentSession (pi-ai style)
-            logger.info(f"Executing agent turn for session {session_key}, run_id={run_id}, message={message[:50]}...")
-            
-            # Broadcast start event
-            broadcast_chat_event(connection, "start", run_id, session_key)
-            
-            # Import AgentSession
-            from openclaw.agents.agent_session import AgentSession
-            
-            # Create AgentSession (pi-ai style automatic tool loop)
-            agent_session = AgentSession(
-                session=session,
-                runtime=runtime,
-                tools=tools,
-                system_prompt=None,  # System prompt already in runtime
-                max_iterations=5,
-                max_tokens=4096,
-                max_turns=None,
+            logger.info(
+                f"Executing agent turn: session={session_key}, run_id={run_id}, msg={message[:60]!r}..."
             )
-            
-            # Stream response
+
+            broadcast_chat_event(connection, "start", run_id, session_key)
+
             assistant_response = ""
-            tool_calls_log = []
-            
-            # Collect events from AgentSession
-            events_queue = []
-            
-            def collect_event(event):
-                """Collect events synchronously"""
-                events_queue.append(event)
-            
-            # Subscribe to events
-            unsubscribe = agent_session.subscribe(collect_event)
-            
-            try:
-                # Execute prompt (pi-ai style)
-                await agent_session.prompt(message)
-                
-                # Process collected events
-                for event in events_queue:
-                    event_type_str = str(event.type).split(".")[-1] if hasattr(event.type, 'value') else str(event.type)
-                    logger.info(f"Received event: type={event_type_str}, has_data={hasattr(event, 'data')}")
-                    
-                    # Get event data
-                    event_data = event.data if hasattr(event, 'data') else (event.payload if hasattr(event, 'payload') else {})
-                    
-                    if event_type_str in ("AGENT_TEXT", "TEXT_DELTA", "text_delta"):
-                        # Accumulate text and broadcast delta
-                        # Handle both {"text": "..."} and {"delta": {"text": "..."}}
-                        text_chunk = ""
-                        if isinstance(event_data.get("text"), str):
-                            text_chunk = event_data["text"]
-                        elif isinstance(event_data.get("delta"), dict):
-                            text_chunk = event_data["delta"].get("text", "")
-                        elif isinstance(event_data.get("delta"), str):
-                            text_chunk = event_data["delta"]
-                        
-                        if text_chunk:
-                            assistant_response += text_chunk
-                            # Broadcast text delta
-                            broadcast_chat_event(connection, "delta", run_id, session_key, text=text_chunk)
-                            logger.info(f"Broadcasting text delta: {text_chunk[:50]}...")
-                    
-                    elif event_type_str in ("TOOL_USE", "tool_use"):
-                        # Tool called
-                        if event_data:
-                            tool_calls_log.append(event_data)
-                            logger.info(f"Tool called: {event_data.get('name', 'unknown')}")
-                    
-                    elif event_type_str in ("AGENT_TURN_COMPLETE", "TURN_END", "turn_complete"):
-                        # Agent turn completed
-                        logger.info(f"Agent turn completed for {session_key}, accumulated text: {len(assistant_response)} chars")
-                    
-                    elif event_type_str in ("ERROR", "error"):
-                        # Error occurred
-                        error_msg = event_data.get("message", "Unknown error") if event_data else "Unknown error"
-                        logger.error(f"Agent error: {error_msg}")
+
+            # Get the fully-built system prompt from ChannelManager (contains
+            # USER.md, SOUL.md, IDENTITY.md inlined) and forward it to run_turn
+            # so the pi_coding_agent session receives openclaw's prompt instead
+            # of its own internal one.  Mirrors the TS runtime which always
+            # passes the pre-built system prompt to the underlying agent.
+            system_prompt = getattr(channel_manager, "system_prompt", None)
+
+            # Stream events from run_turn() async generator — this is the correct
+            # pattern: events arrive in real time via an internal asyncio.Queue,
+            # so they are never missed regardless of await scheduling.
+            async for event in runtime.run_turn(session, message, tools, images=images, system_prompt=system_prompt):
+                evt_type = getattr(event, "type", "")
+                event_data: dict[str, Any] = {}
+                if hasattr(event, "data") and isinstance(event.data, dict):
+                    event_data = event.data
+
+                if evt_type in (EventType.TEXT, EventType.TEXT_DELTA, "text", "text_delta"):
+                    # Accept both {"text": "..."} and {"delta": "..."}
+                    text_chunk = (
+                        event_data.get("text")
+                        or event_data.get("delta")
+                        or ""
+                    )
+                    if isinstance(text_chunk, dict):
+                        text_chunk = text_chunk.get("text", "")
+                    text_chunk = str(text_chunk) if text_chunk else ""
+                    if text_chunk:
+                        assistant_response += text_chunk
                         broadcast_chat_event(
-                            connection, "error", run_id, session_key, error_message=error_msg
+                            connection, "delta", run_id, session_key, text=text_chunk
                         )
-                
-                logger.info(f"Processed all {len(events_queue)} events from AgentSession")
-            
-            finally:
-                # Unsubscribe from events
-                unsubscribe()
-            
-            # Build assistant message
-            logger.info(f"Building final message with {len(assistant_response)} chars")
+                        logger.debug(f"delta: {text_chunk[:80]!r}")
+
+                elif evt_type in (EventType.ERROR, EventType.AGENT_ERROR, "error", "agent.error"):
+                    error_msg = event_data.get("message", "Unknown error")
+                    logger.error(f"Agent error during turn: {error_msg}")
+                    broadcast_chat_event(
+                        connection, "error", run_id, session_key, error_message=error_msg
+                    )
+
+                elif evt_type in (EventType.TURN_END, EventType.AGENT_TURN_COMPLETE, "turn_end", "agent.turn_complete"):
+                    logger.info(
+                        f"Turn complete for {session_key}: {len(assistant_response)} chars accumulated"
+                    )
+
+            logger.info(f"run_turn complete: {len(assistant_response)} chars")
+
             now = datetime.now(UTC)
             assistant_message = {
                 "role": "assistant",
@@ -572,25 +899,21 @@ class ChatSendMethod:
                 "timestamp": int(now.timestamp() * 1000),
                 "stopReason": "end_turn",
             }
-            
-            # Append to transcript
-            logger.info(f"Appending assistant message to transcript: {transcript_path}")
+
             success, msg_id, error = append_message_to_transcript(
                 transcript_path, assistant_message, create_if_missing=False
             )
-            
             if not success:
                 logger.warning(f"Failed to append assistant message: {error}")
             else:
-                logger.info(f"Successfully appended message {msg_id}")
-            
-            # Broadcast final event
+                logger.info(f"Assistant message saved: {msg_id}")
+
             logger.info(f"Broadcasting final event for run_id={run_id}")
             broadcast_chat_event(
                 connection, "final", run_id, session_key, message=assistant_message
             )
-            logger.info(f"Final event broadcast complete")
-            
+            logger.info("Final event broadcast complete")
+
         except Exception as e:
             logger.error(f"Agent execution failed: {e}", exc_info=True)
             broadcast_chat_event(

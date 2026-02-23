@@ -106,19 +106,19 @@ class TestBuildAgentPeerSessionKey:
         key = build_agent_peer_session_key(
             "main", "telegram", "dm", "user123", dm_scope="per-peer"
         )
-        assert key == "agent:main:dm:user123"
+        assert key == "agent:main:direct:user123"
     
     def test_dm_scope_per_channel_peer(self):
         key = build_agent_peer_session_key(
             "main", "telegram", "dm", "user123", dm_scope="per-channel-peer"
         )
-        assert key == "agent:main:telegram:dm:user123"
+        assert key == "agent:main:telegram:direct:user123"
     
     def test_dm_scope_per_account_channel_peer(self):
         key = build_agent_peer_session_key(
             "main", "telegram", "dm", "user123", "acc1", dm_scope="per-account-channel-peer"
         )
-        assert key == "agent:main:telegram:acc1:dm:user123"
+        assert key == "agent:main:telegram:acc1:direct:user123"
     
     def test_group(self):
         key = build_agent_peer_session_key(

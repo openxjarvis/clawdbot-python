@@ -84,6 +84,20 @@ class InboundDedupe:
             # Remove oldest
             self._cache.popitem(last=False)
     
+    def is_duplicate_key(self, key: str) -> bool:
+        """Check if a raw deduplication key is already seen (without requiring an envelope)."""
+        if key in self._cache:
+            age = time.time() - self._cache[key]
+            if age < self.ttl:
+                self._cache.move_to_end(key)
+                return True
+            del self._cache[key]
+        return False
+
+    def mark_seen_key(self, key: str) -> None:
+        """Mark a raw deduplication key as seen."""
+        self._add_to_cache(key)
+
     def clear_expired(self) -> int:
         """
         Clear expired entries

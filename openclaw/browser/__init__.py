@@ -13,10 +13,16 @@ Provides:
 
 from .controller import BrowserController
 from .profiles import BrowserProfile
-from .tools.browser_tool import UnifiedBrowserTool
 
 __all__ = [
     "BrowserController",
     "BrowserProfile",
     "UnifiedBrowserTool",
 ]
+
+
+def __getattr__(name: str):
+    if name == "UnifiedBrowserTool":
+        from .tools.browser_tool import UnifiedBrowserTool
+        return UnifiedBrowserTool
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

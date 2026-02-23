@@ -153,13 +153,17 @@ class AgentMethod:
 
         logger.info(f"Agent request: session={session_id}, message={message[:50]}...")
 
-        # This would integrate with AgentRuntime
-        # For now, return placeholder
-        return {
-            "sessionId": session_id,
-            "status": "streaming",
-            "message": "Agent response would stream here",
-        }
+        # Delegate to unified runtime handler so behavior matches gateway/handlers.py
+        try:
+            from openclaw.gateway.handlers import get_method_handler as get_runtime_handler
+
+            runtime_handler = get_runtime_handler("agent")
+            if runtime_handler is None:
+                raise RuntimeError("Runtime handler for 'agent' is not registered")
+            return await runtime_handler(connection, params)
+        except Exception as e:
+            logger.error(f"Agent runtime delegation failed: {e}", exc_info=True)
+            raise
 
     def get_schema(self) -> dict[str, Any]:
         return {
@@ -318,5 +322,16 @@ METHOD_REGISTRY = {method.name: method for method in ALL_METHODS}
 
 
 def get_method_handler(method_name: str):
-    """Get method handler by name"""
+    """Get method handler by name.
+
+    Prefer the unified runtime handler registry in `gateway/handlers.py`
+    so all dispatch paths share a single source of truth.
+    """
+    try:
+        from openclaw.gateway.handlers import get_method_handler as get_runtime_handler
+        runtime_handler = get_runtime_handler(method_name)
+        if runtime_handler is not None:
+            return runtime_handler
+    except Exception:
+        pass
     return METHOD_REGISTRY.get(method_name)

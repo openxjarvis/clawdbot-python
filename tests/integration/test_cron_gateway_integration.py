@@ -95,24 +95,25 @@ class TestCronDelivery:
         from openclaw.cron.types import CronJob, AtSchedule, AgentTurnPayload, CronDelivery
         from datetime import datetime, timezone
         
-        # Mock channel manager
-        mock_channel_manager = Mock()
+        # Mock channel manager - delivery.py accesses _channels dict
         mock_channel = Mock()
         mock_channel.is_running = Mock(return_value=True)
         mock_channel.send_text = AsyncMock()
+        mock_channel_manager = Mock()
+        mock_channel_manager._channels = {"telegram": mock_channel}
         mock_channel_manager.get_channel = Mock(return_value=mock_channel)
         
         # Create job with delivery
         job = CronJob(
             id="test",
             name="Test",
-            schedule=AtSchedule(timestamp=datetime.now(timezone.utc).isoformat(), type="at"),
+            schedule=AtSchedule(at=datetime.now(timezone.utc).isoformat(), type="at"),
             session_target="isolated",
             payload=AgentTurnPayload(kind="agentTurn", message="Test"),
             enabled=True,
             delivery=CronDelivery(
                 channel="telegram",
-                target="123456789"
+                to="123456789"
             )
         )
         
@@ -220,7 +221,7 @@ class TestHooksCronIntegration:
         
         # Verify job created
         assert job_id in service.jobs
-        assert service.jobs[job_id].schedule.kind == "at"
+        assert service.jobs[job_id].schedule.type == "at"
 
 
 @pytest.mark.skip(reason="Requires full bootstrap and WebSocket server")

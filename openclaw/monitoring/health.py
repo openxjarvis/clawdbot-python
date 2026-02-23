@@ -113,6 +113,14 @@ class HealthCheck:
                 result = await asyncio.wait_for(check_fn(), timeout=self._check_timeout)
                 elapsed = (datetime.now(UTC) - start).total_seconds() * 1000
 
+                # If check_fn returns a ComponentHealth directly, use it but inject critical flag
+                if isinstance(result, ComponentHealth):
+                    if "critical" not in result.details:
+                        result.details["critical"] = critical
+                    result.last_check = datetime.now(UTC)
+                    result.response_time_ms = elapsed
+                    return result
+
                 return ComponentHealth(
                     name=name,
                     status=HealthStatus.HEALTHY if result else HealthStatus.UNHEALTHY,

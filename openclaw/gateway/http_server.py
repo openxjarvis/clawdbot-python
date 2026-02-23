@@ -1,4 +1,8 @@
-"""HTTP server for control UI - matches TypeScript implementation"""
+"""HTTP server for control UI and hooks endpoints.
+
+Aligned with TypeScript openclaw/src/gateway/server-http.ts.
+Adds /hooks/* endpoints for the webhook integration system.
+"""
 
 import logging
 from pathlib import Path
@@ -32,7 +36,35 @@ class ControlUIServer:
     
     def _setup_routes(self):
         """Setup HTTP routes"""
-        
+
+        # --------------- Hooks endpoints (/hooks/*) ---------------
+        @self.app.api_route("/hooks/{path:path}", methods=["POST"])
+        async def handle_hooks(path: str, request: Request):
+            """HTTP hook endpoint — aligned with TS /hooks/* handling."""
+            try:
+                from openclaw.gateway.hooks import resolve_hooks_config, handle_hook_request
+                cfg = getattr(self.gateway, "config", None)
+                if cfg is None:
+                    return JSONResponse({"error": "gateway not configured"}, status_code=503)
+                hooks_config = resolve_hooks_config(cfg)
+                if hooks_config is None:
+                    return JSONResponse({"error": "hooks not enabled"}, status_code=404)
+                body = await request.body()
+                headers: dict[str, str] = dict(request.headers)
+                full_path = f"{hooks_config.base_path}/{path}"
+                result = await handle_hook_request(
+                    method=request.method,
+                    path=full_path,
+                    headers=headers,
+                    body=body,
+                    hooks_config=hooks_config,
+                    gateway=self.gateway,
+                )
+                return JSONResponse(result["body"], status_code=result["status"])
+            except Exception as exc:
+                logger.error(f"Hooks handler error: {exc}", exc_info=True)
+                return JSONResponse({"error": str(exc)}, status_code=500)
+
         # Health check endpoint
         @self.app.get(f"{self.base_path}/health")
         async def health_check():

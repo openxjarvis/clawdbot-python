@@ -63,7 +63,7 @@ async def test_tool_followup_flow():
         # 创建 runtime
         runtime = MultiProviderRuntime(
             provider_name="gemini",
-            model_id="gemini-2.0-flash-exp",
+            model_id="gemini-2.0-flash",
             api_key=os.getenv("GEMINI_API_KEY")
         )
         

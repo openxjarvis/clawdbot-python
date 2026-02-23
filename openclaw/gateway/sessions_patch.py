@@ -1,355 +1,501 @@
 """
-Session entry patching with field validation
+Session entry patching with field validation.
 
-This module implements session entry patch logic matching the TypeScript implementation.
-Supports updating session fields with validation and constraints.
+Fully aligned with TypeScript openclaw/src/gateway/sessions-patch.ts.
+Returns {"ok": True, "entry": ...} or {"ok": False, "error": ...}.
 """
+from __future__ import annotations
 
 import logging
 import time
 import uuid
-from typing import Any, Dict, Optional
-
-from openclaw.agents.session_entry import SessionEntry, merge_session_entry
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# Field Validation
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Normalisation helpers — mirrors TS private helpers
+# ---------------------------------------------------------------------------
 
-def validate_thinking_level(value: Any) -> Optional[str]:
-    """
-    Validate thinking level
-    
-    Args:
-        value: Thinking level value
-        
-    Returns:
-        Normalized thinking level or None
-        
-    Raises:
-        ValueError: If invalid
-    """
-    if value is None:
-        return None
-    
-    valid_levels = ["low", "medium", "high", "xhigh"]
-    value_str = str(value).lower()
-    
-    if value_str not in valid_levels:
-        raise ValueError(f"Invalid thinking level: {value}. Must be one of: {valid_levels}")
-    
-    return value_str
+def normalize_exec_host(raw: str) -> str | None:
+    """Normalise execHost value. Mirrors TS normalizeExecHost()."""
+    normalized = raw.strip().lower()
+    if normalized in ("sandbox", "gateway", "node"):
+        return normalized
+    return None
 
 
-def validate_verbose_level(value: Any) -> Optional[str]:
-    """Validate verbose level"""
-    if value is None:
-        return None
-    return str(value)
+def normalize_exec_security(raw: str) -> str | None:
+    """Normalise execSecurity value. Mirrors TS normalizeExecSecurity()."""
+    normalized = raw.strip().lower()
+    if normalized in ("deny", "allowlist", "full"):
+        return normalized
+    return None
 
 
-def validate_reasoning_level(value: Any) -> Optional[str]:
-    """Validate reasoning level"""
-    if value is None:
-        return None
-    return str(value)
+def normalize_exec_ask(raw: str) -> str | None:
+    """Normalise execAsk value. Mirrors TS normalizeExecAsk()."""
+    normalized = raw.strip().lower()
+    if normalized in ("off", "on-miss", "always"):
+        return normalized
+    return None
 
 
-def validate_elevated_level(value: Any) -> Optional[str]:
-    """Validate elevated level"""
-    if value is None:
-        return None
-    return str(value)
+def _normalize_think_level(raw: str) -> str | None:
+    """Normalise a thinkingLevel string."""
+    normalized = raw.strip().lower()
+    valid = ("off", "minimal", "low", "medium", "high", "xhigh")
+    return normalized if normalized in valid else None
 
 
-def validate_response_usage(value: Any) -> Optional[str]:
-    """Validate response usage mode"""
-    if value is None:
-        return None
-    
-    valid_modes = ["on", "off", "tokens", "full"]
-    value_str = str(value)
-    
-    if value_str not in valid_modes:
-        raise ValueError(f"Invalid response usage: {value}. Must be one of: {valid_modes}")
-    
-    return value_str
+def _normalize_reasoning_level(raw: str) -> str | None:
+    normalized = raw.strip().lower()
+    return normalized if normalized in ("on", "off", "stream") else None
 
 
-def validate_send_policy(value: Any) -> Optional[str]:
-    """Validate send policy"""
-    if value is None:
-        return None
-    
-    valid_policies = ["allow", "deny"]
-    value_str = str(value)
-    
-    if value_str not in valid_policies:
-        raise ValueError(f"Invalid send policy: {value}. Must be one of: {valid_policies}")
-    
-    return value_str
+def _normalize_elevated_level(raw: str) -> str | None:
+    normalized = raw.strip().lower()
+    return normalized if normalized in ("on", "off", "ask", "full") else None
 
 
-def validate_group_activation(value: Any) -> Optional[str]:
-    """Validate group activation mode"""
-    if value is None:
-        return None
-    
-    valid_modes = ["mention", "always"]
-    value_str = str(value)
-    
-    if value_str not in valid_modes:
-        raise ValueError(f"Invalid group activation: {value}. Must be one of: {valid_modes}")
-    
-    return value_str
+def _normalize_usage_display(raw: str) -> str | None:
+    normalized = raw.strip().lower()
+    return normalized if normalized in ("off", "tokens", "full") else None
 
 
-def validate_label(value: Any) -> Optional[str]:
-    """Validate session label"""
-    if value is None:
-        return None
-    
-    label = str(value).strip()
-    
-    if len(label) == 0:
-        return None
-    
+def _normalize_send_policy(raw: str) -> str | None:
+    normalized = raw.strip().lower()
+    return normalized if normalized in ("allow", "deny") else None
+
+
+def _normalize_group_activation(raw: str) -> str | None:
+    normalized = raw.strip().lower()
+    return normalized if normalized in ("mention", "always") else None
+
+
+def _supports_xhigh_thinking(provider: str, model: str) -> bool:
+    """Return True if provider/model supports xhigh thinking level."""
+    p = (provider or "").lower()
+    m = (model or "").lower()
+    if p == "anthropic" and "claude" in m:
+        return True
+    return False
+
+
+def format_xhigh_model_hint() -> str:
+    """Return hint message for xhigh-only models. Mirrors TS formatXHighModelHint()."""
+    return "Claude (Anthropic) models only"
+
+
+def _format_thinking_levels_hint(provider: str, model: str) -> str:
+    """Format valid thinking levels for a provider/model."""
+    if _supports_xhigh_thinking(provider, model):
+        return '"off"|"minimal"|"low"|"medium"|"high"|"xhigh"'
+    return '"off"|"minimal"|"low"|"medium"|"high"'
+
+
+def _parse_session_label(raw: Any) -> dict[str, Any]:
+    """Validate and normalise a session label. Returns {"ok": True, "label": ...} or {"ok": False, "error": ...}."""
+    if raw is None:
+        return {"ok": False, "error": "invalid label: null"}
+    label = str(raw).strip()
+    if not label:
+        return {"ok": False, "error": "invalid label: empty"}
     if len(label) > 64:
-        raise ValueError(f"Label must be 64 characters or less, got {len(label)}")
-    
-    return label
+        return {"ok": False, "error": f"label must be ≤64 characters (got {len(label)})"}
+    # Allow alphanumeric, hyphens, underscores, dots
+    import re
+    if not re.match(r'^[a-zA-Z0-9_\-\.]+$', label):
+        return {"ok": False, "error": f"invalid label: use a-z, 0-9, -, _, ."}
+    return {"ok": True, "label": label}
 
 
-def validate_spawned_by(value: Any, existing_value: Optional[str]) -> Optional[str]:
-    """
-    Validate spawned_by (immutable once set)
-    
-    Args:
-        value: New value
-        existing_value: Current value
-        
-    Returns:
-        Validated value
-        
-    Raises:
-        ValueError: If attempting to change existing value
-    """
-    if value is None:
-        return existing_value
-    
-    new_value = str(value).strip()
-    
-    if existing_value is not None and existing_value != new_value:
-        raise ValueError("Cannot change spawned_by once set")
-    
-    return new_value
+def _is_subagent_session_key(key: str) -> bool:
+    return key.strip().lower().startswith("subagent:")
 
 
-# ============================================================================
-# Label Uniqueness Check
-# ============================================================================
+def _invalid(message: str) -> dict[str, Any]:
+    return {"ok": False, "error": {"code": "INVALID_REQUEST", "message": message}}
+
+
+# ---------------------------------------------------------------------------
+# Label uniqueness check
+# ---------------------------------------------------------------------------
 
 def check_label_uniqueness(
-    label: Optional[str],
-    store: Dict[str, SessionEntry],
-    current_key: str
+    label: str | None,
+    store: dict[str, Any],
+    current_key: str,
 ) -> None:
-    """
-    Check if label is unique within store
-    
-    Args:
-        label: Label to check
-        store: Session store
-        current_key: Current session key (excluded from check)
-        
-    Raises:
-        ValueError: If label is not unique
-    """
+    """Raise ValueError if label is already used by another session."""
     if not label:
         return
-    
     for key, entry in store.items():
         if key == current_key:
             continue
-        
-        if entry.label == label:
-            raise ValueError(f"Label '{label}' is already used by session: {key}")
+        entry_label = (
+            entry.get("label") if isinstance(entry, dict) else getattr(entry, "label", None)
+        )
+        if entry_label == label:
+            raise ValueError(f"label already in use: {label}")
 
 
-# ============================================================================
-# Session Patch Application
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Main patch function
+# ---------------------------------------------------------------------------
 
 def apply_sessions_patch_to_store(
-    store: Dict[str, SessionEntry],
+    store: dict[str, Any],
     store_key: str,
-    patch: Dict[str, Any],
-    model_catalog: Optional[Any] = None
-) -> SessionEntry:
+    patch: dict[str, Any],
+    cfg: Any = None,
+    model_catalog: Any = None,
+) -> dict[str, Any]:
     """
-    Apply patch to session entry with validation
-    
-    Args:
-        store: Session store dictionary
-        store_key: Key of session to patch
-        patch: Patch data
-        model_catalog: Optional model catalog for validation
-        
-    Returns:
-        Updated SessionEntry
-        
-    Raises:
-        ValueError: If validation fails
+    Apply patch to session entry with validation.
+    Mirrors TS applySessionsPatchToStore().
+
+    Returns {"ok": True, "entry": SessionEntry} or {"ok": False, "error": {...}}.
     """
-    # Get existing entry or create new
-    existing = store.get(store_key)
-    
-    # Build validated patch
-    validated_patch: Dict[str, Any] = {}
-    
-    # =========================================================================
-    # Core fields
-    # =========================================================================
-    
-    # Session ID (generate if new)
-    if "session_id" in patch:
-        validated_patch["session_id"] = str(patch["session_id"])
-    elif not existing:
-        validated_patch["session_id"] = str(uuid.uuid4())
-    
-    # Updated timestamp
-    now_ms = int(time.time() * 1000)
-    validated_patch["updated_at"] = max(
-        existing.updated_at if existing else 0,
-        patch.get("updated_at", 0),
-        now_ms
-    )
-    
-    # =========================================================================
-    # Immutable fields
-    # =========================================================================
-    
-    if "spawned_by" in patch:
-        validated_patch["spawned_by"] = validate_spawned_by(
-            patch["spawned_by"],
-            existing.spawned_by if existing else None
+    from openclaw.agents.sessions.model_overrides import apply_model_override_to_session_entry
+
+    now = int(time.time() * 1000)
+
+    # Resolve default model for this session's agent
+    try:
+        from openclaw.routing.session_key import parse_agent_session_key, normalize_agent_id
+        from openclaw.agents.model_selection import resolve_default_model_for_agent, DEFAULT_PROVIDER, DEFAULT_MODEL
+        parsed_agent = parse_agent_session_key(store_key)
+        session_agent_id = normalize_agent_id(
+            parsed_agent.agent_id if parsed_agent else "main"
         )
-    
-    # =========================================================================
-    # Label (with uniqueness check)
-    # =========================================================================
-    
+        resolved_default = resolve_default_model_for_agent(cfg, session_agent_id)
+    except Exception:
+        from openclaw.agents.model_selection import DEFAULT_PROVIDER, DEFAULT_MODEL, ModelRef
+        session_agent_id = "main"
+        resolved_default = ModelRef(provider=DEFAULT_PROVIDER, model=DEFAULT_MODEL)
+
+    # Resolve subagent model hint
+    subagent_model_hint: str | None = None
+    if _is_subagent_session_key(store_key):
+        try:
+            from openclaw.agents.model_selection import resolve_subagent_configured_model_selection
+            subagent_model_hint = resolve_subagent_configured_model_selection(cfg, session_agent_id)
+        except Exception:
+            pass
+
+    existing = store.get(store_key)
+    if existing is None:
+        next_entry: dict[str, Any] = {"sessionId": str(uuid.uuid4()), "updatedAt": now}
+    else:
+        # Work on a dict copy; support both dict and dataclass/pydantic
+        if isinstance(existing, dict):
+            next_entry = dict(existing)
+        else:
+            try:
+                next_entry = existing.model_dump()
+            except AttributeError:
+                import dataclasses
+                try:
+                    next_entry = dataclasses.asdict(existing)
+                except Exception:
+                    next_entry = dict(vars(existing))
+        next_entry["updatedAt"] = max(next_entry.get("updatedAt") or 0, now)
+
+    # -------------------------------------------------------------------------
+    # spawnedBy (immutable once set)
+    # -------------------------------------------------------------------------
+    if "spawnedBy" in patch:
+        raw = patch["spawnedBy"]
+        if raw is None:
+            if next_entry.get("spawnedBy"):
+                return _invalid("spawnedBy cannot be cleared once set")
+        else:
+            trimmed = str(raw).strip()
+            if not trimmed:
+                return _invalid("invalid spawnedBy: empty")
+            if not _is_subagent_session_key(store_key):
+                return _invalid("spawnedBy is only supported for subagent:* sessions")
+            existing_sb = next_entry.get("spawnedBy")
+            if existing_sb and existing_sb != trimmed:
+                return _invalid("spawnedBy cannot be changed once set")
+            next_entry["spawnedBy"] = trimmed
+
+    # -------------------------------------------------------------------------
+    # spawnDepth (immutable once set, subagent only)
+    # -------------------------------------------------------------------------
+    if "spawnDepth" in patch:
+        raw = patch["spawnDepth"]
+        if raw is None:
+            if isinstance(next_entry.get("spawnDepth"), int):
+                return _invalid("spawnDepth cannot be cleared once set")
+        else:
+            if not _is_subagent_session_key(store_key):
+                return _invalid("spawnDepth is only supported for subagent:* sessions")
+            try:
+                numeric = int(raw)
+            except (TypeError, ValueError):
+                return _invalid("invalid spawnDepth (use an integer >= 0)")
+            if numeric < 0:
+                return _invalid("invalid spawnDepth (use an integer >= 0)")
+            existing_sd = next_entry.get("spawnDepth")
+            if isinstance(existing_sd, int) and existing_sd != numeric:
+                return _invalid("spawnDepth cannot be changed once set")
+            next_entry["spawnDepth"] = numeric
+
+    # -------------------------------------------------------------------------
+    # label
+    # -------------------------------------------------------------------------
     if "label" in patch:
-        label = validate_label(patch["label"])
-        if label:
-            check_label_uniqueness(label, store, store_key)
-        validated_patch["label"] = label
-    
-    # =========================================================================
-    # Model configuration
-    # =========================================================================
-    
-    if "thinking_level" in patch:
-        validated_patch["thinking_level"] = validate_thinking_level(patch["thinking_level"])
-    
-    if "verbose_level" in patch:
-        validated_patch["verbose_level"] = validate_verbose_level(patch["verbose_level"])
-    
-    if "reasoning_level" in patch:
-        validated_patch["reasoning_level"] = validate_reasoning_level(patch["reasoning_level"])
-    
-    if "elevated_level" in patch:
-        validated_patch["elevated_level"] = validate_elevated_level(patch["elevated_level"])
-    
-    if "provider_override" in patch:
-        validated_patch["provider_override"] = patch["provider_override"]
-    
-    if "model_override" in patch:
-        validated_patch["model_override"] = patch["model_override"]
-    
-    # =========================================================================
-    # Execution environment
-    # =========================================================================
-    
-    if "exec_host" in patch:
-        validated_patch["exec_host"] = patch["exec_host"]
-    
-    if "exec_security" in patch:
-        validated_patch["exec_security"] = patch["exec_security"]
-    
-    if "exec_ask" in patch:
-        validated_patch["exec_ask"] = patch["exec_ask"]
-    
-    if "exec_node" in patch:
-        validated_patch["exec_node"] = patch["exec_node"]
-    
-    # =========================================================================
-    # Behavior configuration
-    # =========================================================================
-    
-    if "response_usage" in patch:
-        validated_patch["response_usage"] = validate_response_usage(patch["response_usage"])
-    
-    if "send_policy" in patch:
-        validated_patch["send_policy"] = validate_send_policy(patch["send_policy"])
-    
-    if "group_activation" in patch:
-        validated_patch["group_activation"] = validate_group_activation(patch["group_activation"])
-    
-    # =========================================================================
-    # Display and metadata
-    # =========================================================================
-    
-    if "display_name" in patch:
-        validated_patch["display_name"] = patch["display_name"]
-    
-    if "subject" in patch:
-        validated_patch["subject"] = patch["subject"]
-    
-    # =========================================================================
-    # Token tracking (allow updates)
-    # =========================================================================
-    
-    if "input_tokens" in patch:
-        validated_patch["input_tokens"] = patch["input_tokens"]
-    
-    if "output_tokens" in patch:
-        validated_patch["output_tokens"] = patch["output_tokens"]
-    
-    if "total_tokens" in patch:
-        validated_patch["total_tokens"] = patch["total_tokens"]
-    
-    # =========================================================================
-    # Other fields (pass through)
-    # =========================================================================
-    
-    passthrough_fields = [
-        "session_file", "system_sent", "aborted_last_run",
-        "chat_type", "channel", "group_id", "group_channel", "space",
-        "tts_auto", "auth_profile_override", "auth_profile_override_source",
-        "queue_mode", "queue_debounce_ms", "queue_cap", "queue_drop",
-        "model_provider", "model", "context_tokens",
-        "compaction_count", "memory_flush_at", "memory_flush_compaction_count",
-        "origin", "delivery_context",
-        "last_channel", "last_to", "last_account_id", "last_thread_id",
-        "last_heartbeat_text", "last_heartbeat_sent_at",
-        "skills_snapshot", "system_prompt_report",
+        raw = patch["label"]
+        if raw is None:
+            next_entry.pop("label", None)
+        else:
+            parsed = _parse_session_label(raw)
+            if not parsed["ok"]:
+                return _invalid(parsed["error"])
+            label = parsed["label"]
+            for key, entry in store.items():
+                if key == store_key:
+                    continue
+                entry_label = (
+                    entry.get("label") if isinstance(entry, dict)
+                    else getattr(entry, "label", None)
+                )
+                if entry_label == label:
+                    return _invalid(f"label already in use: {label}")
+            next_entry["label"] = label
+
+    # -------------------------------------------------------------------------
+    # thinkingLevel
+    # -------------------------------------------------------------------------
+    if "thinkingLevel" in patch:
+        raw = patch["thinkingLevel"]
+        if raw is None:
+            next_entry.pop("thinkingLevel", None)
+        else:
+            normalized = _normalize_think_level(str(raw))
+            if not normalized:
+                hint_provider = (next_entry.get("providerOverride") or "").strip() or resolved_default.provider
+                hint_model = (next_entry.get("modelOverride") or "").strip() or resolved_default.model
+                return _invalid(
+                    f"invalid thinkingLevel (use {_format_thinking_levels_hint(hint_provider, hint_model)})"
+                )
+            next_entry["thinkingLevel"] = normalized
+
+    # -------------------------------------------------------------------------
+    # verboseLevel
+    # -------------------------------------------------------------------------
+    if "verboseLevel" in patch:
+        raw = patch["verboseLevel"]
+        if raw is None:
+            next_entry.pop("verboseLevel", None)
+        else:
+            next_entry["verboseLevel"] = str(raw)
+
+    # -------------------------------------------------------------------------
+    # reasoningLevel
+    # -------------------------------------------------------------------------
+    if "reasoningLevel" in patch:
+        raw = patch["reasoningLevel"]
+        if raw is None:
+            next_entry.pop("reasoningLevel", None)
+        else:
+            normalized = _normalize_reasoning_level(str(raw))
+            if not normalized:
+                return _invalid('invalid reasoningLevel (use "on"|"off"|"stream")')
+            if normalized == "off":
+                next_entry.pop("reasoningLevel", None)
+            else:
+                next_entry["reasoningLevel"] = normalized
+
+    # -------------------------------------------------------------------------
+    # responseUsage
+    # -------------------------------------------------------------------------
+    if "responseUsage" in patch:
+        raw = patch["responseUsage"]
+        if raw is None:
+            next_entry.pop("responseUsage", None)
+        else:
+            normalized = _normalize_usage_display(str(raw))
+            if not normalized:
+                return _invalid('invalid responseUsage (use "off"|"tokens"|"full")')
+            if normalized == "off":
+                next_entry.pop("responseUsage", None)
+            else:
+                next_entry["responseUsage"] = normalized
+
+    # -------------------------------------------------------------------------
+    # elevatedLevel
+    # -------------------------------------------------------------------------
+    if "elevatedLevel" in patch:
+        raw = patch["elevatedLevel"]
+        if raw is None:
+            next_entry.pop("elevatedLevel", None)
+        else:
+            normalized = _normalize_elevated_level(str(raw))
+            if not normalized:
+                return _invalid('invalid elevatedLevel (use "on"|"off"|"ask"|"full")')
+            next_entry["elevatedLevel"] = normalized
+
+    # -------------------------------------------------------------------------
+    # execHost / execSecurity / execAsk / execNode
+    # -------------------------------------------------------------------------
+    if "execHost" in patch:
+        raw = patch["execHost"]
+        if raw is None:
+            next_entry.pop("execHost", None)
+        else:
+            normalized = normalize_exec_host(str(raw))
+            if not normalized:
+                return _invalid('invalid execHost (use "sandbox"|"gateway"|"node")')
+            next_entry["execHost"] = normalized
+
+    if "execSecurity" in patch:
+        raw = patch["execSecurity"]
+        if raw is None:
+            next_entry.pop("execSecurity", None)
+        else:
+            normalized = normalize_exec_security(str(raw))
+            if not normalized:
+                return _invalid('invalid execSecurity (use "deny"|"allowlist"|"full")')
+            next_entry["execSecurity"] = normalized
+
+    if "execAsk" in patch:
+        raw = patch["execAsk"]
+        if raw is None:
+            next_entry.pop("execAsk", None)
+        else:
+            normalized = normalize_exec_ask(str(raw))
+            if not normalized:
+                return _invalid('invalid execAsk (use "off"|"on-miss"|"always")')
+            next_entry["execAsk"] = normalized
+
+    if "execNode" in patch:
+        raw = patch["execNode"]
+        if raw is None:
+            next_entry.pop("execNode", None)
+        else:
+            trimmed = str(raw).strip()
+            if not trimmed:
+                return _invalid("invalid execNode: empty")
+            next_entry["execNode"] = trimmed
+
+    # -------------------------------------------------------------------------
+    # model override — with catalog validation + apply_model_override_to_session_entry
+    # -------------------------------------------------------------------------
+    if "model" in patch:
+        raw = patch["model"]
+        if raw is None:
+            # Reset to default
+            apply_model_override_to_session_entry(
+                entry=next_entry,
+                selection={
+                    "provider": resolved_default.provider,
+                    "model": resolved_default.model,
+                    "isDefault": True,
+                },
+            )
+        else:
+            trimmed = str(raw).strip()
+            if not trimmed:
+                return _invalid("invalid model: empty")
+            # Validate against catalog if available
+            try:
+                from openclaw.agents.model_selection import resolve_allowed_model_ref
+                catalog_list = []
+                if model_catalog is not None:
+                    catalog_list = (
+                        list(model_catalog) if hasattr(model_catalog, "__iter__") else []
+                    )
+                resolved = resolve_allowed_model_ref(
+                    cfg or {},
+                    trimmed,
+                    default_provider=resolved_default.provider,
+                    catalog=catalog_list,
+                    default_model=subagent_model_hint or resolved_default.model,
+                )
+                if "error" in resolved:
+                    return _invalid(resolved["error"])
+                ref = resolved["ref"]
+                is_default = (
+                    ref.provider == resolved_default.provider
+                    and ref.model == resolved_default.model
+                )
+                apply_model_override_to_session_entry(
+                    entry=next_entry,
+                    selection={
+                        "provider": ref.provider,
+                        "model": ref.model,
+                        "isDefault": is_default,
+                    },
+                )
+            except Exception as exc:
+                logger.warning("Model override validation error: %s", exc)
+                next_entry["modelOverride"] = trimmed
+                next_entry["providerOverride"] = resolved_default.provider
+
+    # -------------------------------------------------------------------------
+    # xhigh guard — downgrade to "high" for unsupported models
+    # -------------------------------------------------------------------------
+    if next_entry.get("thinkingLevel") == "xhigh":
+        effective_provider = (next_entry.get("providerOverride") or "").strip() or resolved_default.provider
+        effective_model = (next_entry.get("modelOverride") or "").strip() or resolved_default.model
+        if not _supports_xhigh_thinking(effective_provider, effective_model):
+            if "thinkingLevel" in patch:
+                return _invalid(
+                    f'thinkingLevel "xhigh" is only supported for {format_xhigh_model_hint()}'
+                )
+            next_entry["thinkingLevel"] = "high"
+
+    # -------------------------------------------------------------------------
+    # sendPolicy
+    # -------------------------------------------------------------------------
+    if "sendPolicy" in patch:
+        raw = patch["sendPolicy"]
+        if raw is None:
+            next_entry.pop("sendPolicy", None)
+        else:
+            normalized = _normalize_send_policy(str(raw))
+            if not normalized:
+                return _invalid('invalid sendPolicy (use "allow"|"deny")')
+            next_entry["sendPolicy"] = normalized
+
+    # -------------------------------------------------------------------------
+    # groupActivation
+    # -------------------------------------------------------------------------
+    if "groupActivation" in patch:
+        raw = patch["groupActivation"]
+        if raw is None:
+            next_entry.pop("groupActivation", None)
+        else:
+            normalized = _normalize_group_activation(str(raw))
+            if not normalized:
+                return _invalid('invalid groupActivation (use "mention"|"always")')
+            next_entry["groupActivation"] = normalized
+
+    # -------------------------------------------------------------------------
+    # Passthrough fields (no special validation)
+    # -------------------------------------------------------------------------
+    _passthrough = [
+        "sessionFile", "systemSent", "abortedLastRun",
+        "chatType", "channel", "groupId", "groupChannel", "space",
+        "ttsAuto", "authProfileOverride", "authProfileOverrideSource",
+        "queueMode", "queueDebounceMs", "queueCap", "queueDrop",
+        "modelProvider", "model", "contextTokens",
+        "compactionCount", "memoryFlushAt", "memoryFlushCompactionCount",
+        "origin", "deliveryContext",
+        "lastChannel", "lastTo", "lastAccountId", "lastThreadId",
+        "lastHeartbeatText", "lastHeartbeatSentAt",
+        "skillsSnapshot", "systemPromptReport",
+        "inputTokens", "outputTokens", "totalTokens",
+        "displayName", "subject",
     ]
-    
-    for field in passthrough_fields:
+    for field in _passthrough:
         if field in patch:
-            validated_patch[field] = patch[field]
-    
-    # =========================================================================
-    # Merge and update store
-    # =========================================================================
-    
-    updated_entry = merge_session_entry(existing, validated_patch)
-    store[store_key] = updated_entry
-    
-    logger.info(f"Patched session: {store_key}")
-    
-    return updated_entry
+            next_entry[field] = patch[field]
+
+    store[store_key] = next_entry
+    logger.debug("Patched session: %s", store_key)
+    return {"ok": True, "entry": next_entry}

@@ -1,36 +1,21 @@
 """
-Agent Control Protocol (ACP) client.
+Agent Control Protocol (ACP) module.
 
-For inter-agent communication.
+Mirrors src/acp/ — bridges ACP IDE clients with the OpenClaw gateway.
 """
 from __future__ import annotations
 
-import logging
-from typing import Any
-
-logger = logging.getLogger(__name__)
-
-
-class ACPClient:
-    """
-    Agent Control Protocol client.
-    
-    Placeholder for ACP integration.
-    """
-    
-    def __init__(self, endpoint: str):
-        self.endpoint = endpoint
-    
-    async def send_message(self, agent_id: str, message: str) -> dict:
-        """Send message to agent"""
-        # Would implement ACP protocol
-        return {"success": False, "error": "Not implemented"}
-    
-    async def get_response(self, message_id: str) -> dict:
-        """Get response for message"""
-        return {"success": False, "error": "Not implemented"}
-
+from .server import serve_acp_gateway
+from .session import AcpSessionStore, create_in_memory_session_store
+from .translator import AcpGatewayAgent
+from .types import ACP_AGENT_INFO, AcpServerOptions, AcpSession
 
 __all__ = [
-    "ACPClient",
+    "serve_acp_gateway",
+    "create_in_memory_session_store",
+    "AcpSessionStore",
+    "AcpGatewayAgent",
+    "AcpServerOptions",
+    "AcpSession",
+    "ACP_AGENT_INFO",
 ]

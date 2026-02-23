@@ -25,6 +25,7 @@ from __future__ import annotations
 
 
 import asyncio
+import hashlib
 import json
 import logging
 import secrets
@@ -37,10 +38,10 @@ from aiohttp import web, WSMsgType
 import aiohttp
 
 from openclaw.gateway.auth import (
+    AuthRateLimiter,
     AuthMode,
     AuthMethod,
     authorize_gateway_connect,
-    is_loopback_address,
     validate_auth_config,
 )
 from openclaw.gateway.authorization import AuthContext, authorize_gateway_method
@@ -70,11 +71,19 @@ logger = logging.getLogger(__name__)
 class GatewayConnection:
     """Represents a single WebSocket connection (aiohttp WebSocketResponse)"""
 
-    def __init__(self, websocket: web.WebSocketResponse, config: ClawdbotConfig, gateway: "GatewayServer" = None, remote_addr: str = ""):
+    def __init__(
+        self,
+        websocket: web.WebSocketResponse,
+        config: ClawdbotConfig,
+        gateway: "GatewayServer" = None,
+        remote_addr: str = "",
+        headers: dict[str, str] | None = None,
+    ):
         self.websocket = websocket
         self.config = config
         self.gateway = gateway  # Reference to parent gateway server
         self.remote_addr = remote_addr  # Store remote address for logging
+        self.headers = {str(k).lower(): str(v) for k, v in (headers or {}).items()}
         self.authenticated = False
         self.client_info: dict[str, Any] | None = None
         self.protocol_version = 1
@@ -208,10 +217,30 @@ class GatewayConnection:
     async def handle_connect(self, request: RequestFrame) -> None:
         """Handle connection handshake with authentication"""
         try:
+            if self.authenticated:
+                await self.send_response(
+                    request.id,
+                    error=ErrorShape(
+                        code="INVALID_REQUEST",
+                        message="connect is only valid as the first request",
+                    ),
+                )
+                return
+
             connect_req = ConnectRequest(**(request.params or {}))
 
-            # Negotiate protocol version (max is 3)
-            negotiated_protocol = min(connect_req.maxProtocol, 3)
+            protocol_version = 3
+            if connect_req.maxProtocol < protocol_version or connect_req.minProtocol > protocol_version:
+                await self.send_response(
+                    request.id,
+                    error=ErrorShape(
+                        code="INVALID_REQUEST",
+                        message="protocol mismatch",
+                        details={"expectedProtocol": protocol_version},
+                    ),
+                )
+                return
+            negotiated_protocol = min(connect_req.maxProtocol, protocol_version)
 
             # Extract auth params
             auth_params = connect_req.auth or {}
@@ -221,64 +250,91 @@ class GatewayConnection:
             # Extract device identity if provided
             device_identity = None
             if connect_req.deviceIdentity:
+                signed_at_raw = connect_req.deviceIdentity.get("signedAt", "")
+                try:
+                    signed_at_num = int(signed_at_raw)
+                except Exception:
+                    signed_at_num = None
+                if signed_at_num is None or abs(int(time.time() * 1000) - signed_at_num) > 10 * 60 * 1000:
+                    await self.send_response(
+                        request.id,
+                        error=ErrorShape(code="INVALID_REQUEST", message="device signature expired"),
+                    )
+                    return
                 device_identity = DeviceIdentity(
                     id=connect_req.deviceIdentity.get("id", ""),
                     public_key=connect_req.deviceIdentity.get("publicKey", ""),
                     signature=connect_req.deviceIdentity.get("signature", ""),
-                    signed_at=connect_req.deviceIdentity.get("signedAt", ""),
+                    signed_at=str(signed_at_raw),
                     nonce=connect_req.deviceIdentity.get("nonce")
                 )
-            
-            # Get client IP (remote_addr is already stored in __init__)
-            # self.remote_addr is a string like "127.0.0.1:12345"
-            client_ip = self.remote_addr.split(':')[0] if self.remote_addr else None
-            
-            # Check if local direct (bypass auth for loopback)
-            if client_ip and is_loopback_address(client_ip):
-                logger.info("Local direct connection, bypassing auth")
-                auth_result_ok = True
-                auth_method = AuthMethod.LOCAL_DIRECT
-            else:
-                # Perform authentication
-                # TODO: Get auth config from self.config
-                config_token = getattr(self.config, "gateway_token", None)
-                config_password = getattr(self.config, "gateway_password", None)
-                auth_mode = AuthMode.TOKEN if config_token else AuthMode.PASSWORD
-                
-                auth_result = authorize_gateway_connect(
-                    auth_mode=auth_mode,
-                    config_token=config_token,
-                    config_password=config_password,
-                    request_token=request_token,
-                    request_password=request_password,
-                    allow_tailscale=False,  # TODO: Get from config
-                    client_ip=client_ip,
-                )
-                
-                auth_result_ok = auth_result.ok
-                auth_method = auth_result.method
-                
-                # If basic auth failed but device identity provided, try device auth
-                if not auth_result_ok and device_identity:
-                    device_result = authorize_device_identity(
-                        device_identity,
-                        nonce=self.nonce,
-                        require_nonce=True
-                    )
-                    if device_result.ok:
-                        auth_result_ok = True
-                        auth_method = AuthMethod.DEVICE_TOKEN
-                
-                if not auth_result_ok:
+                # TS parity: verify declared device id derives from public key.
+                derived_id = hashlib.sha256(device_identity.public_key.encode("utf-8")).hexdigest()[:32]
+                if device_identity.id != derived_id:
                     await self.send_response(
                         request.id,
-                        error=ErrorShape(
-                            code="AUTH_FAILED",
-                            message=auth_result.reason or "Authentication failed"
-                        )
+                        error=ErrorShape(code="INVALID_REQUEST", message="device identity mismatch"),
                     )
-                    logger.warning(f"Authentication failed: {auth_result.reason}")
                     return
+            
+            # Get client IP (remote_addr from aiohttp request.remote)
+            client_ip = self.remote_addr.split(":")[0] if self.remote_addr else None
+            auth_cfg = getattr(self.config.gateway, "auth", None) if hasattr(self.config, "gateway") else None
+            config_token = getattr(auth_cfg, "token", None) if auth_cfg else None
+            config_password = getattr(auth_cfg, "password", None) if auth_cfg else None
+            mode_raw = (getattr(auth_cfg, "mode", None) or "").lower() if auth_cfg else ""
+            if mode_raw == "password":
+                auth_mode = AuthMode.PASSWORD
+            elif mode_raw == "trusted-proxy":
+                auth_mode = AuthMode.TRUSTED_PROXY
+            elif mode_raw == "none":
+                auth_mode = AuthMode.NONE
+            else:
+                auth_mode = AuthMode.TOKEN
+
+            auth_result = authorize_gateway_connect(
+                auth_mode=auth_mode,
+                config_token=config_token,
+                config_password=config_password,
+                request_token=request_token,
+                request_password=request_password,
+                allow_tailscale=bool(getattr(auth_cfg, "allow_tailscale", False)) if auth_cfg else False,
+                client_ip=client_ip,
+                trusted_proxies=getattr(self.config.gateway, "trusted_proxies", []),
+                headers=self.headers,
+                host_header=self.headers.get("host"),
+                remote_addr=client_ip,
+                trusted_proxy_config=(getattr(auth_cfg, "trusted_proxy", None) if auth_cfg else None),
+                rate_limiter=getattr(self.gateway, "auth_rate_limiter", None),
+                rate_limit_scope="shared-secret",
+            )
+
+            auth_result_ok = auth_result.ok
+            auth_method = auth_result.method
+
+            # If shared auth failed but device identity is provided, try device auth.
+            if not auth_result_ok and device_identity and not auth_result.rate_limited:
+                device_result = authorize_device_identity(
+                    device_identity,
+                    nonce=self.nonce,
+                    require_nonce=True,
+                )
+                if device_result.ok:
+                    auth_result_ok = True
+                    auth_method = AuthMethod.DEVICE_TOKEN
+
+            if not auth_result_ok:
+                await self.send_response(
+                    request.id,
+                    error=ErrorShape(
+                        code="AUTH_FAILED",
+                        message=auth_result.reason or "Authentication failed",
+                        retryable=True if auth_result.rate_limited else None,
+                        retryAfterMs=auth_result.retry_after_ms,
+                    ),
+                )
+                logger.warning(f"Authentication failed: {auth_result.reason}")
+                return
 
             # Authentication successful
             self.client_info = connect_req.client
@@ -396,6 +452,7 @@ class GatewayServer:
         self.config = config
         self.connections: set[GatewayConnection] = set()
         self.running = False
+        self.started_at: float | None = None
         self.agent_runtime = agent_runtime
         self.session_manager = session_manager
         self.tools = tools or []
@@ -403,6 +460,7 @@ class GatewayServer:
         self.http_server = None
         self.http_server_task = None
         self.active_runs: dict[str, asyncio.Task] = {}  # Track active agent runs for abort
+        self.auth_rate_limiter = AuthRateLimiter(limit=8, window_ms=60_000)
         
         # Initialize memory manager (lazy initialization)
         self._memory_manager = None
@@ -486,7 +544,13 @@ class GatewayServer:
         remote_addr = request.remote or "unknown"
         
         # Create connection
-        connection = GatewayConnection(ws, self.config, gateway=self, remote_addr=remote_addr)
+        connection = GatewayConnection(
+            ws,
+            self.config,
+            gateway=self,
+            remote_addr=remote_addr,
+            headers={k: v for k, v in request.headers.items()},
+        )
         self.connections.add(connection)
 
         try:
@@ -557,15 +621,41 @@ class GatewayServer:
         
         return self._memory_manager
 
+    def _get_assistant_name(self) -> str:
+        """Resolve assistant name from config"""
+        try:
+            if self.config and hasattr(self.config, 'agent'):
+                agent = self.config.agent
+                if hasattr(agent, 'name') and agent.name:
+                    return agent.name
+        except Exception:
+            pass
+        return "OpenClaw"
+
     def _get_control_ui_config_script(self) -> str:
         """Generate config injection script (matches openclaw-ts)"""
-        return """
+        import json
+        name = self._get_assistant_name()
+        return f"""
     <script>
         window.__OPENCLAW_CONTROL_UI_BASE_PATH__ = "/";
-        window.__OPENCLAW_ASSISTANT_NAME__ = "OpenClaw";
+        window.__OPENCLAW_ASSISTANT_NAME__ = {json.dumps(name)};
         window.__OPENCLAW_ASSISTANT_AVATAR__ = null;
     </script>
     """
+
+    async def serve_bootstrap_config(self, request: web.Request) -> web.Response:
+        """Serve /__openclaw/control-ui-config.json (matches openclaw-ts)"""
+        return web.Response(
+            text=__import__('json').dumps({
+                "basePath": "/",
+                "assistantName": self._get_assistant_name(),
+                "assistantAvatar": None,
+                "assistantAgentId": "main",
+            }),
+            content_type="application/json",
+            headers={"Cache-Control": "no-cache"},
+        )
 
     async def serve_control_ui(self, request: web.Request) -> web.Response:
         """Serve Control UI index.html"""
@@ -639,6 +729,7 @@ class GatewayServer:
         protocol = "wss" if enable_tls else "ws"
         logger.info(f"Starting unified Gateway server on {host}:{port} (TLS: {enable_tls})")
         self.running = True
+        self.started_at = time.time()
 
         # Create aiohttp application
         app = web.Application()
@@ -651,6 +742,8 @@ class GatewayServer:
             app.router.add_get('/', self.handle_root)
             # Dedicated WebSocket endpoint
             app.router.add_get('/ws', self.handle_websocket)
+            # Bootstrap config JSON endpoint (matches openclaw-ts)
+            app.router.add_get('/__openclaw/control-ui-config.json', self.serve_bootstrap_config)
             # SPA fallback for all other paths
             app.router.add_get('/{path:.*}', self.serve_control_ui_spa)
         else:

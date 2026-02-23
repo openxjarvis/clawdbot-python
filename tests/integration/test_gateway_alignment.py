@@ -12,15 +12,13 @@ Tests all critical features to ensure behavioral parity:
 - Config hot reload
 """
 import asyncio
+from pathlib import Path
 import pytest
 
 from openclaw.gateway.chat_state import ChatRunRegistry
-from openclaw.gateway.dedupe import DedupeCache
-from openclaw.gateway.device_pairing import (
-    DeviceIdentity,
-    DevicePairingManager,
-    DevicePairingRequest,
-)
+from openclaw.gateway.dedupe import DedupeManager as DedupeCache
+from openclaw.gateway.device_auth import DeviceIdentity
+from openclaw.auth.device_pairing import DevicePairingManager, DevicePairingRequest
 from openclaw.gateway.heartbeat import HeartbeatConfig, HeartbeatManager
 from openclaw.gateway.node_registry import NodeEntry, NodeRegistry
 from openclaw.gateway.presence import PresenceEntry, PresenceManager
@@ -44,24 +42,27 @@ async def test_event_sequencing():
 @pytest.mark.integration
 async def test_deduplication():
     """Test idempotent operation deduplication"""
-    cache = DedupeCache(ttl_minutes=60)
+    cache = DedupeCache(ttl_ms=60 * 60 * 1000)
     
     # First request
     key = "chat:test_idempotency_key"
-    cached = cache.get(key)
+    cached = await cache.get(key)
     assert cached is None
     
     # Cache result
-    cache.set(key, ok=True, payload={"response": "Hello"})
+    import time as _time
+    from openclaw.gateway.dedupe import DedupeEntry
+    entry = DedupeEntry(ts=_time.time() * 1000, ok=True, payload={"response": "Hello"})
+    await cache.set(key, entry)
     
     # Second request - should get cached
-    cached = cache.get(key)
+    cached = await cache.get(key)
     assert cached is not None
     assert cached.ok is True
     assert cached.payload == {"response": "Hello"}
     
     # Cleanup test
-    count = cache.cleanup()
+    count = await cache.cleanup()
     assert count >= 0
 
 
@@ -107,40 +108,31 @@ async def test_device_pairing():
     from pathlib import Path
     
     with tempfile.TemporaryDirectory() as tmpdir:
-        config_path = Path(tmpdir) / "devices.json"
-        manager = DevicePairingManager(config_path)
+        state_dir = Path(tmpdir)
+        manager = DevicePairingManager(state_dir)
         
-        # Create pairing request
-        request = DevicePairingRequest(
-            deviceId="device_test_123",
-            publicKey="test_public_key_base64",
-            deviceName="Test Device",
-            requestedRole="operator",
-            requestedScopes=["operator.read", "operator.write"]
+        # Create pairing request via create_pairing_request
+        request = manager.create_pairing_request(
+            device_id="device_test_123",
+            public_key="test_public_key_base64",
+            display_name="Test Device",
+            role="operator",
         )
-        
-        # Request pairing
-        manager.request_pairing(request)
+        assert request is not None
         
         # Verify pending
-        pending = manager.get_pending_request("device_test_123")
-        assert pending is not None
+        pending = manager.list_pending()
+        assert len(pending) >= 1
+        req_id = pending[0].request_id
         
         # Approve pairing
-        device = manager.approve_pairing(
-            "device_test_123",
-            role="operator",
-            scopes=["operator.read", "operator.write"]
-        )
-        
-        assert device.id == "device_test_123"
-        
-        # Verify saved
-        assert config_path.exists()
+        device = manager.approve_request(req_id)
+        assert device is not None
+        assert device.device_id == "device_test_123"
         
         # Verify can retrieve
-        retrieved = manager.get_device("device_test_123")
-        assert retrieved is not None
+        retrieved = manager.list_paired()
+        assert len(retrieved) >= 1
 
 
 @pytest.mark.asyncio

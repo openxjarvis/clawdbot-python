@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING
+from collections.abc import Awaitable, Callable
 
 from pydantic import BaseModel, Field
 
@@ -48,6 +49,7 @@ class SessionCompactor:
         compaction_threshold: float = 0.8,
         min_messages_to_compact: int = 10,
         preserve_recent_count: int = 5,
+        summarizer: Callable[[list["AgentMessage"]], Awaitable[str]] | None = None,
     ):
         """
         Initialize SessionCompactor.
@@ -62,6 +64,7 @@ class SessionCompactor:
         self.compaction_threshold = compaction_threshold
         self.min_messages_to_compact = min_messages_to_compact
         self.preserve_recent_count = preserve_recent_count
+        self._summarizer = summarizer
     
     async def should_compact(self, messages: list[AgentMessage]) -> bool:
         """
@@ -180,12 +183,18 @@ class SessionCompactor:
         """
         Use LLM to generate a natural language summary.
         
-        TODO: Implement actual LLM call
-        For now, falls back to simple summarization.
+        Uses injected summarizer callback when available.
+        Falls back to local summary when no callback is configured.
         """
-        # Placeholder for LLM summarization
-        # In production, this would call the LLM provider with a summarization prompt
-        logger.warning("LLM summarization not yet implemented, using simple summary")
+        if self._summarizer is not None:
+            try:
+                summary = await self._summarizer(messages)
+                if isinstance(summary, str) and summary.strip():
+                    return summary.strip()
+            except Exception as e:
+                logger.warning(f"External summarizer failed, falling back: {e}")
+
+        logger.warning("No LLM summarizer configured, using simple summary")
         return self._simple_summarize(messages)
     
     def _simple_summarize(self, messages: list[AgentMessage]) -> str:

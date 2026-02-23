@@ -61,6 +61,10 @@ class AnthropicProvider(LLMProvider):
         if system_msgs:
             system = system_msgs[0].content
 
+        # Strip provider-internal kwargs not accepted by Anthropic API
+        _ANTHROPIC_SKIP_KWARGS = {"provider", "provider_name", "enable_search"}
+        api_kwargs = {k: v for k, v in kwargs.items() if k not in _ANTHROPIC_SKIP_KWARGS}
+
         try:
             # Start streaming
             async with client.messages.stream(
@@ -69,7 +73,7 @@ class AnthropicProvider(LLMProvider):
                 messages=anthropic_messages,
                 system=system,
                 tools=tools,
-                **kwargs,
+                **api_kwargs,
             ) as stream:
                 async for event in stream:
                     if hasattr(event, "type"):

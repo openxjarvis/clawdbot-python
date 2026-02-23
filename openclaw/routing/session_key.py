@@ -5,7 +5,7 @@ Matches TypeScript src/routing/session-key.ts
 
 Session keys uniquely identify conversation contexts:
   - agent:main:main (default main session)
-  - agent:main:dm:user123 (DM with user123)
+  - agent:main:direct:user123 (DM with user123)
   - agent:main:telegram:group:456 (Telegram group 456)
   - agent:main:discord:channel:789 (Discord channel 789)
 """
@@ -123,56 +123,94 @@ def build_agent_main_session_key(
     return f"agent:{normalized_agent}:{normalized_main}"
 
 
+def _resolve_linked_peer_id(
+    identity_links: dict | None,
+    channel: str,
+    peer_id: str,
+) -> str | None:
+    """
+    Resolve a canonical peer ID via identity link mapping.
+
+    Matches TS resolveLinkedPeerId() in routing/session-key.ts.
+    """
+    if not identity_links:
+        return None
+    peer_id_trimmed = peer_id.strip()
+    if not peer_id_trimmed:
+        return None
+
+    raw_candidate = peer_id_trimmed.lower()
+    channel_norm = channel.strip().lower()
+    candidates = {raw_candidate}
+    if channel_norm:
+        candidates.add(f"{channel_norm}:{peer_id_trimmed}".lower())
+
+    for canonical, ids in identity_links.items():
+        canonical_name = canonical.strip()
+        if not canonical_name:
+            continue
+        if not isinstance(ids, list):
+            continue
+        for id_entry in ids:
+            normalized = (id_entry or "").strip().lower()
+            if normalized and normalized in candidates:
+                return canonical_name
+    return None
+
+
 def build_agent_peer_session_key(
     agent_id: str,
     channel: str,
-    peer_kind: str = "dm",
+    peer_kind: str = "direct",
     peer_id: str | None = None,
     account_id: str | None = None,
     main_key: str | None = None,
     dm_scope: str = "main",
+    identity_links: dict | None = None,
 ) -> str:
     """
-    Build peer session key (simplified version matching TS buildAgentPeerSessionKey).
-    
+    Build peer session key (matches TS buildAgentPeerSessionKey).
+
     DM scope modes:
     - "main": agent:<agentId>:main (all DMs share main session)
-    - "per-peer": agent:<agentId>:dm:<peerId>
-    - "per-channel-peer": agent:<agentId>:<channel>:dm:<peerId>
-    - "per-account-channel-peer": agent:<agentId>:<channel>:<accountId>:dm:<peerId>
-    
-    For groups:
-    - agent:<agentId>:<channel>:group:<groupId>
-    
-    For channels/rooms:
-    - agent:<agentId>:<channel>:channel:<channelId>
+    - "per-peer": agent:<agentId>:direct:<peerId>
+    - "per-channel-peer": agent:<agentId>:<channel>:direct:<peerId>
+    - "per-account-channel-peer": agent:<agentId>:<channel>:<accountId>:direct:<peerId>
+
+    For groups:   agent:<agentId>:<channel>:group:<groupId>
+    For channels: agent:<agentId>:<channel>:channel:<channelId>
+
+    identity_links: optional canonical peer ID mapping (matches TS identityLinks).
     """
     normalized_agent = normalize_agent_id(agent_id)
     normalized_channel = channel.strip().lower() if channel else "unknown"
-    normalized_peer_id = (peer_id or "").strip()
-    
+    raw_peer_id = (peer_id or "").strip()
+
     # DM handling
-    if peer_kind == "dm":
+    normalized_peer_kind = (peer_kind or "").strip().lower()
+    if normalized_peer_kind in ("dm", "direct"):
         if dm_scope == "main":
             return build_agent_main_session_key(agent_id, main_key)
-        elif dm_scope == "per-peer":
-            return f"agent:{normalized_agent}:dm:{normalized_peer_id}"
-        elif dm_scope == "per-channel-peer":
-            return f"agent:{normalized_agent}:{normalized_channel}:dm:{normalized_peer_id}"
-        elif dm_scope == "per-account-channel-peer":
+        # Identity link resolution (only for non-main scopes, matches TS)
+        effective_peer_id = raw_peer_id
+        if identity_links and effective_peer_id:
+            linked = _resolve_linked_peer_id(identity_links, normalized_channel, effective_peer_id)
+            if linked:
+                effective_peer_id = linked
+        effective_peer_id = effective_peer_id.lower()
+        if dm_scope == "per-peer" and effective_peer_id:
+            return f"agent:{normalized_agent}:direct:{effective_peer_id}"
+        if dm_scope == "per-channel-peer" and effective_peer_id:
+            return f"agent:{normalized_agent}:{normalized_channel}:direct:{effective_peer_id}"
+        if dm_scope == "per-account-channel-peer" and effective_peer_id:
             normalized_account = normalize_account_id(account_id)
-            return f"agent:{normalized_agent}:{normalized_channel}:{normalized_account}:dm:{normalized_peer_id}"
-    
-    # Group handling
-    if peer_kind == "group":
-        return f"agent:{normalized_agent}:{normalized_channel}:group:{normalized_peer_id}"
-    
-    # Channel/room handling
-    if peer_kind == "channel":
-        return f"agent:{normalized_agent}:{normalized_channel}:channel:{normalized_peer_id}"
-    
-    # Fallback
-    return build_agent_main_session_key(agent_id, main_key)
+            return f"agent:{normalized_agent}:{normalized_channel}:{normalized_account}:direct:{effective_peer_id}"
+        return build_agent_main_session_key(agent_id, main_key)
+
+    # Non-DM: group / channel / other
+    normalized_channel_out = normalized_channel or "unknown"
+    peer_id_out = (raw_peer_id or "unknown").lower()
+    return f"agent:{normalized_agent}:{normalized_channel_out}:{normalized_peer_kind}:{peer_id_out}"
 
 
 def parse_agent_session_key(session_key: str | None) -> ParsedAgentSessionKey | None:
@@ -280,6 +318,149 @@ def is_acp_session_key(session_key: str | None) -> bool:
     if not parsed:
         return False
     return parsed.rest.startswith("acp:")
+
+
+# ---------------------------------------------------------------------------
+# Functions ported from src/sessions/session-key-utils.ts
+# ---------------------------------------------------------------------------
+
+THREAD_SESSION_MARKERS = (":thread:", ":topic:")
+
+
+def is_cron_run_session_key(session_key: str | None) -> bool:
+    """
+    Return True if the session key identifies a single cron job run.
+
+    Pattern: agent:<agentId>:cron:<name>:run:<runId>
+
+    Matches TS isCronRunSessionKey().
+    """
+    import re
+    parsed = parse_agent_session_key(session_key)
+    if not parsed:
+        return False
+    return bool(re.match(r"^cron:[^:]+:run:[^:]+$", parsed.rest))
+
+
+def is_cron_session_key(session_key: str | None) -> bool:
+    """
+    Return True if the session key belongs to the cron subsystem.
+
+    Matches TS isCronSessionKey().
+    """
+    parsed = parse_agent_session_key(session_key)
+    if not parsed:
+        return False
+    return parsed.rest.lower().startswith("cron:")
+
+
+def get_subagent_depth(session_key: str | None) -> int:
+    """
+    Return nesting depth of subagent session key.
+
+    Examples:
+        "agent:main:main" → 0
+        "agent:main:subagent:..." → 1
+        "agent:main:subagent:...:subagent:..." → 2
+
+    Matches TS getSubagentDepth().
+    """
+    raw = (session_key or "").strip().lower()
+    if not raw:
+        return 0
+    return raw.count(":subagent:")
+
+
+def resolve_thread_parent_session_key(session_key: str | None) -> str | None:
+    """
+    Resolve the parent session key from a thread session key.
+
+    Finds the *last* occurrence of ':thread:' or ':topic:' and returns
+    everything before it.
+
+    Returns None if no thread marker is found.
+
+    Matches TS resolveThreadParentSessionKey().
+    """
+    raw = (session_key or "").strip()
+    if not raw:
+        return None
+    normalized = raw.lower()
+    idx = -1
+    for marker in THREAD_SESSION_MARKERS:
+        candidate = normalized.rfind(marker)
+        if candidate > idx:
+            idx = candidate
+    if idx <= 0:
+        return None
+    parent = raw[:idx].strip()
+    return parent if parent else None
+
+
+SessionKeyShape = str  # "missing" | "agent" | "legacy_or_alias" | "malformed_agent"
+
+
+def classify_session_key_shape(session_key: str | None) -> SessionKeyShape:
+    """
+    Classify the shape of a session key string.
+
+    Returns:
+        "missing"          — empty/None
+        "agent"            — well-formed agent:<id>:<rest>
+        "malformed_agent"  — starts with "agent:" but not fully valid
+        "legacy_or_alias"  — any other non-empty string
+
+    Matches TS classifySessionKeyShape().
+    """
+    raw = (session_key or "").strip()
+    if not raw:
+        return "missing"
+    if parse_agent_session_key(raw):
+        return "agent"
+    return "malformed_agent" if raw.lower().startswith("agent:") else "legacy_or_alias"
+
+
+def build_group_history_key(
+    channel: str,
+    peer_kind: str,
+    peer_id: str,
+    account_id: str | None = None,
+) -> str:
+    """
+    Build a group/channel history key (not a full session key, used for history lookups).
+
+    Format: <channel>:<accountId>:<peerKind>:<peerId>
+
+    Matches TS buildGroupHistoryKey().
+    """
+    channel_norm = channel.strip().lower() or "unknown"
+    account_id_norm = normalize_account_id(account_id)
+    peer_id_norm = peer_id.strip().lower() or "unknown"
+    return f"{channel_norm}:{account_id_norm}:{peer_kind}:{peer_id_norm}"
+
+
+def resolve_thread_session_keys(
+    base_session_key: str,
+    thread_id: str | None = None,
+    parent_session_key: str | None = None,
+    use_suffix: bool = True,
+) -> dict:
+    """
+    Build thread session key with optional suffix.
+
+    Returns:
+        {"session_key": str, "parent_session_key": str | None}
+
+    Matches TS resolveThreadSessionKeys().
+    """
+    thread_id_trimmed = (thread_id or "").strip()
+    if not thread_id_trimmed:
+        return {"session_key": base_session_key, "parent_session_key": None}
+    normalized_thread_id = thread_id_trimmed.lower()
+    session_key = (
+        f"{base_session_key}:thread:{normalized_thread_id}" if use_suffix else base_session_key
+    )
+    return {"session_key": session_key, "parent_session_key": parent_session_key}
 
 
 def evaluate_session_freshness(

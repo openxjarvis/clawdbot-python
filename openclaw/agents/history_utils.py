@@ -108,15 +108,7 @@ def limit_history_turns(
     Returns:
         Limited messages
     """
-    # Apply provider-specific defaults
-    if max_turns is None and provider:
-        if provider.lower() in ["gemini", "google"]:
-            max_turns = 20  # Keep last 20 user messages
-        elif provider.lower() in ["anthropic", "claude"]:
-            max_turns = 30
-        else:
-            max_turns = 50  # Default
-    
+    # Keep behavior aligned with TS: no implicit provider defaults.
     if max_turns is None or max_turns <= 0:
         return messages
     

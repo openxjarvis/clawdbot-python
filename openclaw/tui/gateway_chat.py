@@ -85,7 +85,7 @@ class GatewayChat:
             except Exception as exc:
                 raise RuntimeError(f"No WebSocket library available: {exc}")
 
-        url = f"ws://localhost:{self._port}"
+        url = f"ws://127.0.0.1:{self._port}"
         logger.debug(f"Connecting to gateway: {url}")
         self._ws = await websockets.connect(url)
 
@@ -103,7 +103,7 @@ class GatewayChat:
     async def _connect_aiohttp(self) -> None:
         import aiohttp
         session = aiohttp.ClientSession()
-        url = f"ws://localhost:{self._port}"
+        url = f"ws://127.0.0.1:{self._port}"
         self._ws = await session.ws_connect(url)
         # Challenge
         msg = await self._ws.receive()
@@ -115,10 +115,24 @@ class GatewayChat:
         self._recv_task = asyncio.create_task(self._receive_loop_aiohttp())
 
     async def _authenticate(self, nonce: str) -> None:
+        """Send connect request using the gateway protocol (type=req, method=connect)."""
+        import time
         payload = {
-            "type": "connect",
-            "token": self._auth_token,
-            "nonce": nonce,
+            "type": "req",
+            "id": self._next_request_id(),
+            "method": "connect",
+            "params": {
+                "minProtocol": 3,
+                "maxProtocol": 3,
+                "auth": {"token": self._auth_token},
+                "client": {
+                    "id": "openclaw-tui",
+                    "version": "dev",
+                    "platform": "terminal",
+                    "mode": "tui",
+                    "nonce": nonce,
+                },
+            },
         }
         await self._send_raw(json.dumps(payload))
 
@@ -185,7 +199,7 @@ class GatewayChat:
             await self.connect()
         req_id = self._next_request_id()
         payload = json.dumps({
-            "type": "request",
+            "type": "req",
             "id": req_id,
             "method": method,
             "params": params,

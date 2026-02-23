@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 import mimetypes
+from urllib.parse import urlparse, unquote
 import aiohttp
 
 logger = logging.getLogger(__name__)
@@ -42,18 +43,29 @@ async def load_web_media(url_or_path: str, max_bytes: Optional[int] = None) -> L
         ValueError: If max_bytes exceeded or file not found
         IOError: If download fails
     """
+    max_size = max_bytes or 10 * 1024 * 1024
+
+    # TS-compatible convenience prefix.
+    if url_or_path.startswith("MEDIA:"):
+        url_or_path = url_or_path[len("MEDIA:") :]
+    if url_or_path.startswith("~/"):
+        url_or_path = str(Path.home() / url_or_path[2:])
+
+    parsed = urlparse(url_or_path)
+    scheme = parsed.scheme.lower()
+
     # Check if it's a local file path
-    if url_or_path.startswith("/") or url_or_path.startswith("file://"):
-        path_str = url_or_path.replace("file://", "")
+    if scheme in ("", "file") or url_or_path.startswith("/"):
+        path_str = unquote(url_or_path.replace("file://", ""))
         path = Path(path_str)
 
         if not path.exists():
             raise ValueError(f"File not found: {path}")
 
         file_size = path.stat().st_size
-        if max_bytes and file_size > max_bytes:
+        if file_size > max_size:
             raise ValueError(
-                f"File size {file_size} exceeds max_bytes {max_bytes}"
+                f"File size {file_size} exceeds max_bytes {max_size}"
             )
 
         buffer = path.read_bytes()
@@ -62,33 +74,46 @@ async def load_web_media(url_or_path: str, max_bytes: Optional[int] = None) -> L
 
         return LoadedMedia(buffer=buffer, content_type=content_type, file_name=file_name)
 
+    if scheme not in ("http", "https"):
+        raise ValueError(f"Unsupported media scheme: {scheme}")
+
     # Download from URL
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url_or_path) as response:
+        timeout = aiohttp.ClientTimeout(total=30, connect=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url_or_path, allow_redirects=True, max_redirects=5) as response:
                 response.raise_for_status()
 
                 # Check content length if provided
                 content_length = response.headers.get("Content-Length")
-                if content_length and max_bytes:
-                    if int(content_length) > max_bytes:
+                if content_length:
+                    if int(content_length) > max_size:
                         raise ValueError(
-                            f"Content length {content_length} exceeds max_bytes {max_bytes}"
+                            f"Content length {content_length} exceeds max_bytes {max_size}"
                         )
 
-                # Read response
-                buffer = await response.read()
+                # Read response in chunks to enforce bounds during transfer.
+                chunks: list[bytes] = []
+                current = 0
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    current += len(chunk)
+                    if current > max_size:
+                        raise ValueError(
+                            f"Downloaded {current} bytes, exceeds max_bytes {max_size}"
+                        )
+                    chunks.append(chunk)
+                buffer = b"".join(chunks)
 
                 # Check actual size
-                if max_bytes and len(buffer) > max_bytes:
+                if len(buffer) > max_size:
                     raise ValueError(
-                        f"Downloaded {len(buffer)} bytes, exceeds max_bytes {max_bytes}"
+                        f"Downloaded {len(buffer)} bytes, exceeds max_bytes {max_size}"
                     )
 
                 content_type = response.headers.get("Content-Type")
 
                 # Extract filename from URL
-                file_name = url_or_path.split("/")[-1].split("?")[0]
+                file_name = Path(unquote(parsed.path)).name
                 if not file_name or "." not in file_name:
                     file_name = None
 

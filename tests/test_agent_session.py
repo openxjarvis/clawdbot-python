@@ -2,9 +2,31 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+import types
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
+
+# Keep this test independent from optional provider SDK installs.
+if "anthropic" not in sys.modules:
+    anthropic = types.ModuleType("anthropic")
+    anthropic.AsyncAnthropic = object
+    anthropic.Anthropic = object
+    sys.modules["anthropic"] = anthropic
+if "openai" not in sys.modules:
+    openai = types.ModuleType("openai")
+    openai.AsyncOpenAI = object
+    sys.modules["openai"] = openai
+if "google" not in sys.modules:
+    google = types.ModuleType("google")
+    genai = types.ModuleType("google.genai")
+    genai.Client = object
+    google.genai = genai
+    sys.modules["google"] = google
+    sys.modules["google.genai"] = genai
+if "aiofiles" not in sys.modules:
+    sys.modules["aiofiles"] = types.ModuleType("aiofiles")
 
 from openclaw.agents.agent_session import AgentSession, HookRegistry
 from openclaw.events import Event, EventType
@@ -68,6 +90,36 @@ def test_agent_session_legacy_params_accepted():
     assert agent_session._external_session_id == "legacy-session-id"
     assert agent_session._system_prompt == "Test prompt"
     assert agent_session.is_streaming is False
+
+
+def test_agent_session_reuses_runtime_pool(mock_pi_session):
+    """When runtime provides pooled session getter, AgentSession should reuse it."""
+    runtime = Mock()
+    runtime._get_or_create_pi_session = Mock(return_value=mock_pi_session)
+    s = AgentSession(
+        session_key="agent:main:telegram:direct:100",
+        runtime=runtime,
+        session_id="sid-100",
+    )
+    out = s._get_pi_session()
+    assert out is mock_pi_session
+    runtime._get_or_create_pi_session.assert_called_once_with("sid-100", [])
+
+
+def test_agent_session_runtime_pool_uses_session_key_fallback(mock_pi_session):
+    """When session_id is missing, session_key should drive runtime pooling."""
+    runtime = Mock()
+    runtime._get_or_create_pi_session = Mock(return_value=mock_pi_session)
+    s = AgentSession(
+        session_key="agent:main:telegram:direct:room-7",
+        runtime=runtime,
+    )
+    out = s._get_pi_session()
+    assert out is mock_pi_session
+    runtime._get_or_create_pi_session.assert_called_once_with(
+        "agent:main:telegram:direct:room-7",
+        [],
+    )
 
 
 # ---------------------------------------------------------------------------

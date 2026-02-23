@@ -12,10 +12,15 @@ logger = logging.getLogger(__name__)
 async def launch_tui(gateway_url: str = "ws://localhost:18789") -> None:
     """Launch TUI application"""
     print("\n🚀 Launching Terminal UI...")
-    
+
     try:
-        from openclaw.tui import run_tui
-        await run_tui(gateway_url=gateway_url)
+        from openclaw.tui import run_tui, TUIOptions
+        from urllib.parse import urlparse
+
+        parsed = urlparse(gateway_url)
+        port = parsed.port or 18789
+        options = TUIOptions(gateway_port=port)
+        await run_tui(options)
     except Exception as e:
         logger.error(f"Failed to launch TUI: {e}")
         print(f"  ❌ Failed to launch TUI: {e}")

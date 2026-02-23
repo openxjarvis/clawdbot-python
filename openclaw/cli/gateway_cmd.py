@@ -27,10 +27,18 @@ def run(
         import subprocess
         import signal
         from ..gateway.bootstrap import GatewayBootstrap
-        
+
+        # Load .env files at startup — mirrors TS index.ts: loadDotEnv({ quiet: true })
+        # Priority: CWD .env → ~/.openclaw/.env (neither overrides already-set vars)
+        try:
+            from ..infra.dotenv import load_dot_env
+            load_dot_env(quiet=True)
+        except Exception:
+            pass
+
         level = logging.DEBUG if verbose else logging.INFO
         logging.basicConfig(level=level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-        
+
         config = load_config()
         
         if port:
@@ -93,172 +101,60 @@ def run(
 
 @gateway_app.command("status")
 def status(
-    probe: bool = typer.Option(False, "--probe", help="Probe gateway via RPC"),
+    probe: bool = typer.Option(True, "--probe/--no-probe", help="Probe gateway via RPC"),
     deep: bool = typer.Option(False, "--deep", help="Scan system-level services"),
     json_output: bool = typer.Option(False, "--json", help="Output JSON"),
 ):
-    """Show gateway service status"""
-    from ..daemon.service import get_service_manager
-    
-    try:
-        manager = get_service_manager()
-        
-        if json_output:
-            result = {
-                "installed": manager.is_installed(),
-                "running": manager.is_running() if manager.is_installed() else False,
-            }
-            console.print(json.dumps(result, indent=2))
-            return
-        
-        table = Table(title="Gateway Status")
-        table.add_column("Property", style="cyan")
-        table.add_column("Value", style="green")
-        
-        installed = manager.is_installed()
-        table.add_row("Installed", "✓ Yes" if installed else "✗ No")
-        
-        if installed:
-            running = manager.is_running()
-            table.add_row("Running", "✓ Yes" if running else "✗ No")
-        
-        console.print(table)
-        
-        if probe:
-            console.print("\n[yellow]⚠[/yellow]  RPC probe not yet implemented")
-    
-    except Exception as e:
-        console.print(f"[red]Error:[/red] {e}")
-        raise typer.Exit(1)
+    """Show gateway service status — delegates to daemon status"""
+    from .daemon_cmd import daemon_status
+    daemon_status(probe=probe, deep=deep, json_output=json_output)
 
 
 @gateway_app.command("install")
 def install(
-    port: int = typer.Option(None, "--port", help="Gateway port"),
+    port: int = typer.Option(18789, "--port", help="Gateway port"),
     force: bool = typer.Option(False, "--force", help="Reinstall if already installed"),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
 ):
     """Install the Gateway service (launchd/systemd)"""
-    from ..daemon.service import get_service_manager
-    
-    try:
-        manager = get_service_manager()
-        
-        if manager.is_installed() and not force:
-            console.print("[yellow]Gateway service already installed[/yellow]")
-            console.print("Use --force to reinstall")
-            return
-        
-        config = load_config()
-        if port:
-            config.gateway.port = port
-        
-        console.print("[cyan]Installing Gateway service...[/cyan]")
-        manager.install()
-        
-        console.print("[green]✓[/green] Gateway service installed")
-        console.print("\nNext steps:")
-        console.print("  openclaw gateway start")
-    
-    except Exception as e:
-        console.print(f"[red]Error:[/red] {e}")
-        raise typer.Exit(1)
+    from .daemon_cmd import daemon_install
+    daemon_install(port=port, force=force, json_output=json_output)
 
 
 @gateway_app.command("uninstall")
-def uninstall():
+def uninstall(
+    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
+):
     """Uninstall the Gateway service"""
-    from ..daemon.service import get_service_manager
-    
-    try:
-        manager = get_service_manager()
-        
-        if not manager.is_installed():
-            console.print("[yellow]Gateway service not installed[/yellow]")
-            return
-        
-        console.print("[cyan]Uninstalling Gateway service...[/cyan]")
-        manager.uninstall()
-        
-        console.print("[green]✓[/green] Gateway service uninstalled")
-    
-    except Exception as e:
-        console.print(f"[red]Error:[/red] {e}")
-        raise typer.Exit(1)
+    from .daemon_cmd import daemon_uninstall
+    daemon_uninstall(json_output=json_output)
 
 
 @gateway_app.command("start")
-def start():
+def start(
+    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
+):
     """Start the Gateway service"""
-    from ..daemon.service import get_service_manager
-    
-    try:
-        manager = get_service_manager()
-        
-        if not manager.is_installed():
-            console.print("[red]Gateway service not installed[/red]")
-            console.print("Run: openclaw gateway install")
-            raise typer.Exit(1)
-        
-        if manager.is_running():
-            console.print("[yellow]Gateway service already running[/yellow]")
-            return
-        
-        console.print("[cyan]Starting Gateway service...[/cyan]")
-        manager.start()
-        
-        console.print("[green]✓[/green] Gateway service started")
-    
-    except Exception as e:
-        console.print(f"[red]Error:[/red] {e}")
-        raise typer.Exit(1)
+    from .daemon_cmd import daemon_start
+    daemon_start(json_output=json_output)
 
 
 @gateway_app.command("stop")
-def stop():
+def stop(
+    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
+):
     """Stop the Gateway service"""
-    from ..daemon.service import get_service_manager
-    
-    try:
-        manager = get_service_manager()
-        
-        if not manager.is_installed():
-            console.print("[yellow]Gateway service not installed[/yellow]")
-            return
-        
-        if not manager.is_running():
-            console.print("[yellow]Gateway service not running[/yellow]")
-            return
-        
-        console.print("[cyan]Stopping Gateway service...[/cyan]")
-        manager.stop()
-        
-        console.print("[green]✓[/green] Gateway service stopped")
-    
-    except Exception as e:
-        console.print(f"[red]Error:[/red] {e}")
-        raise typer.Exit(1)
+    from .daemon_cmd import daemon_stop
+    daemon_stop(json_output=json_output)
 
 
 @gateway_app.command("restart")
-def restart():
+def restart(
+    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
+):
     """Restart the Gateway service"""
-    from ..daemon.service import get_service_manager
-    
-    try:
-        manager = get_service_manager()
-        
-        if not manager.is_installed():
-            console.print("[red]Gateway service not installed[/red]")
-            raise typer.Exit(1)
-        
-        console.print("[cyan]Restarting Gateway service...[/cyan]")
-        manager.restart()
-        
-        console.print("[green]✓[/green] Gateway service restarted")
-    
-    except Exception as e:
-        console.print(f"[red]Error:[/red] {e}")
-        raise typer.Exit(1)
+    from .daemon_cmd import daemon_restart
+    daemon_restart(json_output=json_output)
 
 
 @gateway_app.command("call")

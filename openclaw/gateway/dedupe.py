@@ -42,9 +42,9 @@ class DedupeManager:
     - Automatic cleanup of expired entries
     """
     
-    DEDUPE_TTL_MS = 60_000  # 60 seconds - aligned with openclaw-ts
-    DEDUPE_MAX = 1000       # Maximum entries - aligned with openclaw-ts
-    
+    DEDUPE_TTL_MS = 5 * 60_000  # 5 minutes — aligned with TS server-constants.ts
+    DEDUPE_MAX = 1_000          # Maximum entries — aligned with TS
+
     def __init__(self, ttl_ms: int = DEDUPE_TTL_MS, max_entries: int = DEDUPE_MAX):
         """
         Initialize dedupe manager

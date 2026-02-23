@@ -186,6 +186,13 @@ Actions:
     # ------------------------------------------------------------------
     async def execute(self, args: dict[str, Any]) -> ToolResult:
         if not self._cron_service:
+            # Lazily resolve the global cron service set by GatewayBootstrap
+            try:
+                from openclaw.cron.service import get_cron_service
+                self._cron_service = get_cron_service()
+            except Exception:
+                pass
+        if not self._cron_service:
             return _err("Cron service not available")
 
         action = args.get("action")

@@ -69,8 +69,23 @@ class HookRegistry:
 # ---------------------------------------------------------------------------
 
 def _convert_pi_event(pi_event: Any, session_id: str) -> Any | None:
-    """Convert a pi_agent AgentEvent to an openclaw Event."""
+    """Convert a pi_agent AgentEvent (or plain dict) to an openclaw Event."""
     from openclaw.events import Event, EventType
+
+    # pi_coding_agent emits two kinds of events via subscribe():
+    #   1. AgentEvent objects  (message_start, message_update, …)
+    #   2. Plain dicts         ({"type": "text_delta", "text": "…"})
+    if isinstance(pi_event, dict):
+        etype = pi_event.get("type")
+        if etype == "text_delta":
+            text = pi_event.get("text", "") or pi_event.get("delta", "")
+            return Event(
+                type=EventType.TEXT,
+                source="pi-session",
+                session_id=session_id,
+                data={"text": text},
+            )
+        return None
 
     etype = getattr(pi_event, "type", None)
     if etype is None:
@@ -157,12 +172,34 @@ def _wrap_openclaw_tool(oc_tool: Any) -> Any:
         on_update: Any | None = None,
     ) -> AgentToolResult:
         try:
-            raw = await oc_tool.execute(
-                tool_call_id=tool_call_id,
-                params=args,
-                signal=signal,
-                on_update=on_update,
+            import inspect as _inspect
+            _sig = _inspect.signature(oc_tool.execute)
+            _params = _sig.parameters
+            _kwargs: dict[str, Any] = {}
+
+            # Inject tool_call_id only if the tool accepts it
+            if "tool_call_id" in _params:
+                _kwargs["tool_call_id"] = tool_call_id
+
+            # Find the name of the dict/args parameter (may be "params", "args", etc.)
+            # It is the first parameter that isn't self / tool_call_id / signal / on_update.
+            _SKIP = {"self", "tool_call_id", "signal", "on_update"}
+            _dict_param = next(
+                (n for n in _params if n not in _SKIP),
+                None,
             )
+            if _dict_param is not None:
+                _kwargs[_dict_param] = args
+            else:
+                # Fallback: positional
+                _kwargs["params"] = args
+
+            if "signal" in _params:
+                _kwargs["signal"] = signal
+            if "on_update" in _params:
+                _kwargs["on_update"] = on_update
+
+            raw = await oc_tool.execute(**_kwargs)
             # Convert openclaw AgentToolResult to pi_agent AgentToolResult
             if hasattr(raw, "content"):
                 content = [TextContent(text=str(c)) for c in raw.content]
@@ -239,6 +276,8 @@ class AgentSession:
         if session is not None and session_id is None:
             self._external_session_id = getattr(session, "session_id", None)
 
+        # Optional shared runtime (PiAgentRuntime) for session pool reuse.
+        self._runtime = runtime
         self._pi_session: Any | None = None
         self._subscribers: list[Callable] = []
         self.hooks: HookRegistry = HookRegistry()
@@ -251,6 +290,13 @@ class AgentSession:
     def _get_pi_session(self) -> Any:
         """Lazily create the underlying pi_coding_agent.AgentSession."""
         if self._pi_session is not None:
+            return self._pi_session
+
+        # Preferred low-risk path: reuse PiAgentRuntime pool when available.
+        if self._runtime is not None and hasattr(self._runtime, "_get_or_create_pi_session"):
+            runtime_session_id = self._external_session_id or self.session_key or "default"
+            self._pi_session = self._runtime._get_or_create_pi_session(runtime_session_id, self._extra_tools)
+            self._pi_session.subscribe(self._on_pi_event)
             return self._pi_session
 
         from pi_coding_agent import AgentSession as PiAgentSession

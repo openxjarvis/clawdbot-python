@@ -29,9 +29,16 @@ class NodeInfo:
 @dataclass
 class PairRequest:
     """Node pairing request"""
+    request_id: str
     node_id: str
-    nonce: str
-    signature: str
+    nonce: str = ""
+    signature: str = ""
+    display_name: Optional[str] = None
+    platform: Optional[str] = None
+    version: Optional[str] = None
+    caps: list[str] = field(default_factory=list)
+    commands: list[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
     requested_at: float = field(default_factory=time.time)
     status: str = "pending"  # pending | approved | rejected
     token: Optional[str] = None
@@ -53,6 +60,7 @@ class NodeManager:
         self.nodes: Dict[str, NodeInfo] = {}
         self.pending_pairs: Dict[str, PairRequest] = {}
         self.tokens: Dict[str, str] = {}  # token -> node_id mapping
+        self.pending_invocations: Dict[str, Dict[str, Any]] = {}
     
     def register_node(
         self,
@@ -88,8 +96,16 @@ class NodeManager:
     def request_pairing(
         self,
         node_id: str,
-        nonce: str,
-        signature: str
+        nonce: str = "",
+        signature: str = "",
+        *,
+        request_id: str | None = None,
+        display_name: str | None = None,
+        platform: str | None = None,
+        version: str | None = None,
+        caps: list[str] | None = None,
+        commands: list[str] | None = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> PairRequest:
         """
         Request node pairing
@@ -103,19 +119,25 @@ class NodeManager:
             PairRequest
         """
         request = PairRequest(
+            request_id=request_id or secrets.token_urlsafe(12),
             node_id=node_id,
             nonce=nonce,
-            signature=signature
+            signature=signature,
+            display_name=display_name,
+            platform=platform,
+            version=version,
+            caps=caps or [],
+            commands=commands or [],
+            metadata=metadata or {},
         )
-        
-        self.pending_pairs[node_id] = request
+        self.pending_pairs[request.request_id] = request
         logger.info(f"Node pairing requested: {node_id}")
         
         # TODO: Broadcast node.pair.requested event
         
         return request
     
-    def approve_pairing(self, node_id: str) -> Optional[str]:
+    def approve_pairing(self, request_or_node_id: str) -> Optional[str]:
         """
         Approve node pairing
         
@@ -125,9 +147,11 @@ class NodeManager:
         Returns:
             Access token or None if request not found
         """
-        request = self.pending_pairs.get(node_id)
+        request = self.pending_pairs.get(request_or_node_id)
+        if request is None:
+            request = next((r for r in self.pending_pairs.values() if r.node_id == request_or_node_id), None)
         if not request:
-            logger.warning(f"No pending pair request for node: {node_id}")
+            logger.warning(f"No pending pair request for node/request: {request_or_node_id}")
             return None
         
         # Generate token
@@ -136,18 +160,18 @@ class NodeManager:
         request.token = token
         
         # Store token mapping
-        self.tokens[token] = node_id
+        self.tokens[token] = request.node_id
         
         # Remove from pending
-        del self.pending_pairs[node_id]
+        self.pending_pairs.pop(request.request_id, None)
         
-        logger.info(f"Node pairing approved: {node_id}")
+        logger.info(f"Node pairing approved: {request.node_id}")
         
         # TODO: Broadcast node.pair.resolved event
         
         return token
     
-    def reject_pairing(self, node_id: str, reason: Optional[str] = None):
+    def reject_pairing(self, request_or_node_id: str, reason: Optional[str] = None):
         """
         Reject node pairing
         
@@ -155,17 +179,19 @@ class NodeManager:
             node_id: Node identifier
             reason: Rejection reason
         """
-        request = self.pending_pairs.get(node_id)
+        request = self.pending_pairs.get(request_or_node_id)
+        if request is None:
+            request = next((r for r in self.pending_pairs.values() if r.node_id == request_or_node_id), None)
         if not request:
-            logger.warning(f"No pending pair request for node: {node_id}")
+            logger.warning(f"No pending pair request for node/request: {request_or_node_id}")
             return
         
         request.status = "rejected"
         
         # Remove from pending
-        del self.pending_pairs[node_id]
+        self.pending_pairs.pop(request.request_id, None)
         
-        logger.info(f"Node pairing rejected: {node_id}, reason: {reason}")
+        logger.info(f"Node pairing rejected: {request.node_id}, reason: {reason}")
         
         # TODO: Broadcast node.pair.rejected event
     
@@ -198,11 +224,45 @@ class NodeManager:
         pairs = []
         for request in self.pending_pairs.values():
             pairs.append({
+                "requestId": request.request_id,
                 "nodeId": request.node_id,
+                "displayName": request.display_name,
+                "platform": request.platform,
+                "version": request.version,
+                "caps": request.caps,
+                "commands": request.commands,
                 "requestedAt": request.requested_at,
-                "status": request.status
+                "status": request.status,
             })
         return pairs
+
+    def list_paired_nodes(self) -> List[Dict[str, Any]]:
+        """List paired nodes inferred from issued tokens."""
+        rows: list[dict[str, Any]] = []
+        for token, node_id in self.tokens.items():
+            node = self.nodes.get(node_id)
+            metadata = node.metadata if node and isinstance(node.metadata, dict) else {}
+            capabilities = node.capabilities if node and isinstance(node.capabilities, dict) else {}
+            rows.append(
+                {
+                    "nodeId": node_id,
+                    "status": "paired",
+                    "token": token,
+                    "displayName": metadata.get("displayName"),
+                    "platform": metadata.get("platform"),
+                    "version": metadata.get("version"),
+                    "coreVersion": metadata.get("coreVersion"),
+                    "uiVersion": metadata.get("uiVersion"),
+                    "deviceFamily": metadata.get("deviceFamily"),
+                    "modelIdentifier": metadata.get("modelIdentifier"),
+                    "remoteIp": metadata.get("remoteIp"),
+                    "caps": capabilities.get("types", []),
+                    "commands": metadata.get("commands", []),
+                    "permissions": metadata.get("permissions"),
+                    "pathEnv": metadata.get("pathEnv"),
+                }
+            )
+        return rows
     
     def get_node(self, node_id: str) -> Optional[NodeInfo]:
         """
@@ -227,12 +287,26 @@ class NodeManager:
             Node ID or None if invalid
         """
         return self.tokens.get(token)
+
+    def verify_pairing(self, token: str) -> dict[str, Any]:
+        node_id = self.verify_token(token)
+        return {"ok": bool(node_id), "nodeId": node_id}
+
+    def rename_node(self, node_id: str, name: str) -> bool:
+        node = self.nodes.get(node_id)
+        if not node:
+            return False
+        node.metadata = {**(node.metadata or {}), "displayName": name}
+        return True
     
     async def invoke_node(
         self,
         node_id: str,
         command: str,
-        params: Optional[Dict[str, Any]] = None
+        params: Optional[Dict[str, Any]] = None,
+        *,
+        timeout_ms: int | None = None,
+        idempotency_key: str | None = None,
     ) -> Dict[str, Any]:
         """
         Invoke command on a node
@@ -252,16 +326,37 @@ class NodeManager:
         if node.status != "active":
             raise ValueError(f"Node is not active: {node_id}")
         
-        # TODO: Send command to node via Gateway connection
-        # For now, return a stub response
+        allowed_commands = node.metadata.get("commands") if isinstance(node.metadata, dict) else None
+        if isinstance(allowed_commands, list) and allowed_commands and command not in allowed_commands:
+            raise ValueError(f"Node command not allowed: {command}")
+
         logger.info(f"Invoking command on node {node_id}: {command}")
-        
-        return {
+        invocation_id = idempotency_key or secrets.token_urlsafe(16)
+        payload = {
             "nodeId": node_id,
             "command": command,
+            "params": params or {},
+            "timeoutMs": timeout_ms,
+            "ts": int(time.time() * 1000),
             "status": "queued",
-            "invocationId": secrets.token_urlsafe(16)
+            "invocationId": invocation_id,
         }
+        self.pending_invocations[invocation_id] = payload
+        return {
+            **payload
+        }
+
+    def resolve_invoke_result(self, invocation_id: str | None, result: Any) -> Dict[str, Any] | None:
+        """Resolve a previously queued invocation result."""
+        if not invocation_id:
+            return None
+        inv = self.pending_invocations.get(invocation_id)
+        if inv is None:
+            return None
+        inv["status"] = "completed"
+        inv["result"] = result
+        inv["completedAt"] = int(time.time() * 1000)
+        return inv
 
 
 # Global node manager instance

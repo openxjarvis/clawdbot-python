@@ -13,6 +13,8 @@ class ErrorShape(BaseModel):
     code: str
     message: str
     details: dict[str, Any] | None = None
+    retryable: bool | None = None
+    retryAfterMs: int | None = None
 
 
 class RequestFrame(BaseModel):
@@ -68,6 +70,7 @@ class ConnectRequest(BaseModel):
         default=None,
         description="Device identity for device-based authentication"
     )
+    challenge: dict[str, Any] | None = Field(default=None, description="Optional challenge response payload")
 
 
 class HelloResponse(BaseModel):
@@ -80,3 +83,10 @@ class HelloResponse(BaseModel):
     snapshot: dict[str, Any] | None = Field(default=None, description="Initial state snapshot")
     policy: dict[str, Any] | None = Field(default=None, description="Access policy")
     auth: dict[str, Any] | None = Field(default=None, description="Auth tokens (device token)")
+
+
+class HelloErrorResponse(BaseModel):
+    """Connection handshake error payload (TS-compatible envelope)."""
+
+    type: Literal["hello-error"] = "hello-error"
+    error: ErrorShape

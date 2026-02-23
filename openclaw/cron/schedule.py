@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from croniter import croniter
 
@@ -12,19 +13,9 @@ logger = logging.getLogger(__name__)
 
 
 def compute_next_run(schedule: CronScheduleType, now_ms: int | None = None) -> int | None:
-    """
-    Compute next run time for schedule
-    
-    Args:
-        schedule: Schedule configuration
-        now_ms: Current time in milliseconds (default: now)
-        
-    Returns:
-        Next run time in milliseconds, or None if schedule is invalid
-    """
+    """Compute next run time in milliseconds."""
     if now_ms is None:
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    
     try:
         if isinstance(schedule, AtSchedule):
             return _compute_at_schedule(schedule, now_ms)
@@ -41,157 +32,84 @@ def compute_next_run(schedule: CronScheduleType, now_ms: int | None = None) -> i
 
 
 def _compute_at_schedule(schedule: AtSchedule, now_ms: int) -> int | None:
-    """
-    Compute next run for 'at' schedule (one-time timestamp)
-    
-    Args:
-        schedule: At schedule
-        now_ms: Current time in milliseconds
-        
-    Returns:
-        Timestamp in milliseconds if in future, None otherwise
-    """
-    try:
-        # Parse ISO-8601 timestamp
-        dt = datetime.fromisoformat(schedule.timestamp.replace('Z', '+00:00'))
-        run_ms = int(dt.timestamp() * 1000)
-        
-        # Only return if in future
-        if run_ms > now_ms:
-            return run_ms
-        else:
-            logger.debug(f"At schedule {schedule.timestamp} is in the past")
-            return None
-            
-    except Exception as e:
-        logger.error(f"Error parsing at schedule timestamp: {e}")
+    """One-time timestamp schedule — matches TS computeNextRunAtMs for kind="at"."""
+    from .normalize import parse_absolute_time_ms
+    at_val = schedule.at or ""
+    run_ms = parse_absolute_time_ms(at_val)
+    if run_ms is None:
+        logger.debug(f"at schedule: could not parse timestamp {at_val!r}")
         return None
+    # One-shot jobs remain due (return atMs) regardless of whether it's past
+    return run_ms
 
 
 def _compute_every_schedule(schedule: EverySchedule, now_ms: int) -> int | None:
-    """
-    Compute next run for 'every' schedule (interval-based)
-    
-    Args:
-        schedule: Every schedule
-        now_ms: Current time in milliseconds
-        
-    Returns:
-        Next run timestamp in milliseconds
-    """
-    interval_ms = schedule.interval_ms
-    
-    if interval_ms <= 0:
-        logger.error(f"Invalid interval: {interval_ms}")
+    """Interval schedule — mirrors TS computeNextRunAtMs for kind="every"."""
+    every_ms = schedule.every_ms
+    if every_ms <= 0:
+        logger.error(f"Invalid everyMs: {every_ms}")
         return None
-    
-    # If anchor is provided, use it as base
-    if schedule.anchor:
-        try:
-            anchor_dt = datetime.fromisoformat(schedule.anchor.replace('Z', '+00:00'))
-            anchor_ms = int(anchor_dt.timestamp() * 1000)
-            
-            # Calculate how many intervals have passed since anchor
-            elapsed_ms = now_ms - anchor_ms
-            
-            if elapsed_ms < 0:
-                # Anchor is in future, use it as next run
-                return anchor_ms
-            
-            # Calculate next interval after now
-            intervals_passed = elapsed_ms // interval_ms
-            next_run_ms = anchor_ms + (intervals_passed + 1) * interval_ms
-            
-            return next_run_ms
-            
-        except Exception as e:
-            logger.error(f"Error parsing anchor timestamp: {e}")
-            # Fall through to use now as base
-    
-    # No anchor or anchor parsing failed - use now as base
-    return now_ms + interval_ms
+
+    # Resolve anchor (epoch ms)
+    anchor_ms = schedule.anchor_ms if schedule.anchor_ms is not None else 0
+    if anchor_ms <= 0:
+        anchor_ms = 0
+
+    elapsed_ms = now_ms - anchor_ms
+    if elapsed_ms < 0:
+        # Anchor is in the future
+        return anchor_ms
+
+    intervals_passed = elapsed_ms // every_ms
+    return anchor_ms + (intervals_passed + 1) * every_ms
 
 
 def _compute_cron_schedule(schedule: CronSchedule, now_ms: int) -> int | None:
-    """
-    Compute next run for 'cron' schedule (cron expression)
-    
-    Args:
-        schedule: Cron schedule
-        now_ms: Current time in milliseconds
-        
-    Returns:
-        Next run timestamp in milliseconds
-    """
+    """Cron expression schedule — matches TS computeNextRunAtMs for kind="cron"."""
     try:
-        # Convert now_ms to datetime
         now_dt = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
-        
-        # Create croniter instance
-        cron = croniter(schedule.expression, now_dt)
-        
-        # Get next occurrence
+
+        # Apply timezone if specified
+        tz_str = schedule.tz or "UTC"
+        try:
+            tz = ZoneInfo(tz_str)
+            now_dt = now_dt.astimezone(tz)
+        except (ZoneInfoNotFoundError, Exception):
+            pass  # Fallback to UTC
+
+        cron = croniter(schedule.expr, now_dt)
         next_dt = cron.get_next(datetime)
-        next_ms = int(next_dt.timestamp() * 1000)
-        
-        return next_ms
-        
+        return int(next_dt.timestamp() * 1000)
     except Exception as e:
-        logger.error(f"Error computing cron schedule: {e}")
+        logger.error(f"Error computing cron schedule for expr={schedule.expr!r}: {e}")
         return None
 
 
 def format_next_run(next_run_ms: int | None) -> str:
-    """
-    Format next run time as human-readable string
-    
-    Args:
-        next_run_ms: Next run time in milliseconds
-        
-    Returns:
-        Formatted string
-    """
     if next_run_ms is None:
         return "Never"
-    
     try:
         dt = datetime.fromtimestamp(next_run_ms / 1000, tz=timezone.utc)
-        
-        # Get time until run
         now = datetime.now(timezone.utc)
         delta = dt - now
-        
-        if delta.total_seconds() < 0:
+        s = delta.total_seconds()
+        if s < 0:
             return f"{dt.isoformat()} (overdue)"
-        elif delta.total_seconds() < 60:
-            return f"in {int(delta.total_seconds())}s"
-        elif delta.total_seconds() < 3600:
-            return f"in {int(delta.total_seconds() / 60)}m"
-        elif delta.total_seconds() < 86400:
-            return f"in {int(delta.total_seconds() / 3600)}h"
+        elif s < 60:
+            return f"in {int(s)}s"
+        elif s < 3600:
+            return f"in {int(s / 60)}m"
+        elif s < 86400:
+            return f"in {int(s / 3600)}h"
         else:
-            return f"in {int(delta.total_seconds() / 86400)}d"
-            
-    except Exception as e:
-        logger.error(f"Error formatting next run: {e}")
+            return f"in {int(s / 86400)}d"
+    except Exception:
         return "Unknown"
 
 
 def is_due(next_run_ms: int | None, now_ms: int | None = None) -> bool:
-    """
-    Check if job is due to run
-    
-    Args:
-        next_run_ms: Next run time in milliseconds
-        now_ms: Current time in milliseconds (default: now)
-        
-    Returns:
-        True if job is due
-    """
     if next_run_ms is None:
         return False
-    
     if now_ms is None:
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    
     return next_run_ms <= now_ms

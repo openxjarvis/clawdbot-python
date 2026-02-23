@@ -187,7 +187,7 @@ async def configure_agents_section(config: ClawdbotConfig) -> ClawdbotConfig:
     print("\nDefault model:")
     print("  1. claude-3-5-sonnet-20241022 (Anthropic)")
     print("  2. gpt-4o (OpenAI)")
-    print("  3. gemini-2.0-flash-exp (Google)")
+    print("  3. gemini-2.0-flash (Google)")
     print("  4. Custom")
     
     model_choice = input("Choose default model [1]: ").strip()
@@ -195,7 +195,7 @@ async def configure_agents_section(config: ClawdbotConfig) -> ClawdbotConfig:
     if model_choice == "2":
         config.agents.defaults.model = "gpt-4o"
     elif model_choice == "3":
-        config.agents.defaults.model = "gemini-2.0-flash-exp"
+        config.agents.defaults.model = "gemini-2.0-flash"
     elif model_choice == "4":
         custom_model = input("Enter custom model: ").strip()
         if custom_model:

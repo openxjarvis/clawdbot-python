@@ -35,7 +35,6 @@ from .nodes import NodesTool
 from .patch import ApplyPatchTool
 from .process import ProcessTool
 from .sessions import SessionsHistoryTool, SessionsListTool, SessionsSendTool, SessionsSpawnTool
-from .session_status import SESSION_STATUS_TOOL
 from .tts import TTSTool
 from .voice_call import VoiceCallTool
 from .web import WebFetchTool, WebSearchTool
@@ -94,13 +93,10 @@ class ToolRegistry:
             ]:
                 self._tools[t.name] = t
 
-        # Session status tool (always available)
-        self._tools[SESSION_STATUS_TOOL.name] = SESSION_STATUS_TOOL
-
         # Advanced tools
         for t in [
             BrowserTool(),
-            CronTool(self._channel_registry, self._session_manager),
+            CronTool(channel_registry=self._channel_registry, session_manager=self._session_manager),
             PPTGeneratorTool(),
             PDFGeneratorTool(),
             TTSTool(),

@@ -13,21 +13,37 @@ Architecture:
         └── Event Broadcasting (Observer Pattern)
 """
 
-from .channel_manager import (
-    ChannelEventListener,
-    ChannelManager,
-    ChannelRuntimeEnv,
-    ChannelState,
-    discover_channel_plugins,
-    load_channel_plugins,
-)
+try:
+    from .channel_manager import (
+        ChannelEventListener,
+        ChannelManager,
+        ChannelRuntimeEnv,
+        ChannelState,
+        discover_channel_plugins,
+        load_channel_plugins,
+    )
+except ModuleNotFoundError:
+    ChannelEventListener = None  # type: ignore[assignment]
+    ChannelManager = None  # type: ignore[assignment]
+    ChannelRuntimeEnv = None  # type: ignore[assignment]
+    ChannelState = None  # type: ignore[assignment]
+
+    def discover_channel_plugins(*args, **kwargs):  # type: ignore[override]
+        raise ModuleNotFoundError("Channel runtime dependencies are missing.")
+
+    def load_channel_plugins(*args, **kwargs):  # type: ignore[override]
+        raise ModuleNotFoundError("Channel runtime dependencies are missing.")
 from .protocol import (
     ErrorShape,
     EventFrame,
     RequestFrame,
     ResponseFrame,
 )
-from .server import GatewayConnection, GatewayServer
+try:
+    from .server import GatewayConnection, GatewayServer
+except ModuleNotFoundError:
+    GatewayConnection = None  # type: ignore[assignment]
+    GatewayServer = None  # type: ignore[assignment]
 
 __all__ = [
     # Server

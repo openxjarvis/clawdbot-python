@@ -1,1 +1,68 @@
-"""Plugin system"""
+"""Plugin system — type exports and module surface."""
+from .config_state import NormalizedPluginsConfig, normalize_plugins_config, resolve_enable_state
+from .hooks import HookRunner, HookRunnerOptions, create_hook_runner
+from .manifest import PluginManifest, load_plugin_manifest, resolve_plugin_manifest_path
+from .manifest_registry import PluginManifestRecord, PluginManifestRegistry, load_plugin_manifest_registry
+from .registry import (
+    ConcretePluginApi,
+    PluginRecord,
+    PluginRegistryApi,
+    PluginRegistryData,
+    create_empty_plugin_registry,
+    create_plugin_registry,
+)
+from .types import (
+    OpenClawPluginApi,
+    OpenClawPluginCommandDefinition,
+    OpenClawPluginDefinition,
+    OpenClawPluginHookOptions,
+    OpenClawPluginService,
+    OpenClawPluginToolOptions,
+    Plugin,
+    PluginAPI,
+    PluginDiagnostic,
+    PluginHookName,
+    PluginHookRegistration,
+    PluginKind,
+    PluginLogger,
+    PluginManifest as PluginManifestLegacy,
+    PluginOrigin,
+    ProviderPlugin,
+)
+
+__all__ = [
+    "NormalizedPluginsConfig",
+    "normalize_plugins_config",
+    "resolve_enable_state",
+    "HookRunner",
+    "HookRunnerOptions",
+    "create_hook_runner",
+    "PluginManifest",
+    "load_plugin_manifest",
+    "resolve_plugin_manifest_path",
+    "PluginManifestRecord",
+    "PluginManifestRegistry",
+    "load_plugin_manifest_registry",
+    "ConcretePluginApi",
+    "PluginRecord",
+    "PluginRegistryApi",
+    "PluginRegistryData",
+    "create_empty_plugin_registry",
+    "create_plugin_registry",
+    "OpenClawPluginApi",
+    "OpenClawPluginCommandDefinition",
+    "OpenClawPluginDefinition",
+    "OpenClawPluginHookOptions",
+    "OpenClawPluginService",
+    "OpenClawPluginToolOptions",
+    "Plugin",
+    "PluginAPI",
+    "PluginDiagnostic",
+    "PluginHookName",
+    "PluginHookRegistration",
+    "PluginKind",
+    "PluginLogger",
+    "PluginManifestLegacy",
+    "PluginOrigin",
+    "ProviderPlugin",
+]

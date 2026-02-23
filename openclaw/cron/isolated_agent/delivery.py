@@ -50,11 +50,11 @@ async def resolve_delivery_target(
     delivery = job.delivery
     
     # If explicit target provided, use it
-    if delivery.target and delivery.channel != "last":
-        logger.info(f"Using explicit delivery target: {delivery.channel}:{delivery.target}")
+    if delivery.to and delivery.channel != "last":
+        logger.info(f"Using explicit delivery target: {delivery.channel}:{delivery.to}")
         return DeliveryTarget(
             channel=delivery.channel,
-            target_id=delivery.target
+            target_id=delivery.to
         )
     
     # If channel is "last", resolve from session history

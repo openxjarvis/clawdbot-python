@@ -111,9 +111,10 @@ async def install_launchd_service(runtime: str = "python") -> bool:
     plist_file.write_text(plist_content)
     print(f"  ✅ Service file created: {plist_file}")
     
-    # Load service
+    # Load service (replace existing definition if present)
     try:
-        subprocess.run(["launchctl", "load", str(plist_file)], check=True)
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(plist_file)], check=False)
+        subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist_file)], check=True)
         print("  ✅ Service loaded and started")
         return True
     except subprocess.CalledProcessError as e:
@@ -125,15 +126,36 @@ async def install_windows_service(runtime: str = "python") -> bool:
     """Install OpenClaw as Windows Service"""
     print("\n📦 Installing Windows service...")
     print("  ℹ️  Windows service installation requires admin privileges")
-    print("  ℹ️  Consider using Task Scheduler or NSSM instead")
-    
-    # TODO: Implement Windows service installation
-    print("  ⚠️  Windows service installation not yet implemented")
-    print("  💡 Alternative: Use Task Scheduler to run at startup:")
-    print(f"     Program: {sys.executable}")
-    print("     Arguments: -m openclaw gateway run")
-    
-    return False
+    service_name = "OpenClawGateway"
+    bin_path = f'"{sys.executable}" -m openclaw gateway run'
+    try:
+        # Remove stale service (best effort)
+        subprocess.run(["sc.exe", "stop", service_name], capture_output=True, text=True, check=False)
+        subprocess.run(["sc.exe", "delete", service_name], capture_output=True, text=True, check=False)
+        # Create and start service.
+        create = subprocess.run(
+            ["sc.exe", "create", service_name, "binPath=", bin_path, "start=", "auto"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if create.returncode != 0:
+            logger.error(f"Failed to create Windows service: {create.stderr.strip()}")
+            return False
+        start = subprocess.run(
+            ["sc.exe", "start", service_name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if start.returncode != 0:
+            logger.error(f"Failed to start Windows service: {start.stderr.strip()}")
+            return False
+        print("  ✅ Windows service installed and started")
+        return True
+    except Exception as e:
+        logger.error(f"Windows service install failed: {e}")
+        return False
 
 
 async def install_service(mode: str = "quickstart") -> dict:
@@ -204,4 +226,4 @@ async def install_service(mode: str = "quickstart") -> dict:
     }
 
 
-__all__ = ["install_service", "setup_skills", "detect_package_manager", "list_available_skills"]
+__all__ = ["install_service", "detect_runtime", "install_systemd_service", "install_launchd_service", "install_windows_service"]

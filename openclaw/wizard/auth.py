@@ -97,32 +97,94 @@ def save_auth_to_env(provider: str, api_key: str) -> None:
     print(f"API key saved to {env_path}")
 
 
+def save_api_key_to_credentials(provider: str, api_key: str) -> None:
+    """Save API key to the TS-aligned credentials store.
+
+    Primary:  ~/.openclaw/agents/main/agent/auth-profiles.json
+              Mirrors setGeminiApiKey / setAnthropicApiKey in
+              openclaw/src/commands/onboard-auth.credentials.ts.
+
+    Fallback: ~/.pi/agent/auth.json (pi_coding_agent legacy)
+              Kept for backward compatibility until pi_coding_agent
+              is updated to use OPENCLAW_AGENT_DIR.
+    """
+    _PROVIDER_NORMALISE = {
+        "gemini": "google",
+        "google": "google",
+        "anthropic": "anthropic",
+        "openai": "openai",
+        "openrouter": "openrouter",
+    }
+    pi_provider = _PROVIDER_NORMALISE.get(provider.lower(), provider.lower())
+
+    # ── Primary: ~/.openclaw/agents/main/agent/auth-profiles.json ────────────
+    try:
+        from openclaw.config.auth_profiles import set_api_key
+        set_api_key(pi_provider, api_key)
+    except Exception as e:
+        print(f"Warning: Could not save to auth-profiles.json: {e}")
+
+    # ── Fallback: ~/.pi/agent/auth.json (pi_coding_agent legacy) ─────────────
+    try:
+        from pi_coding_agent.core.auth_storage import AuthStorage
+        AuthStorage().set_api_key(pi_provider, api_key)
+    except Exception:
+        pass  # non-fatal — primary store is enough
+
+
 def configure_auth(provider: str) -> dict:
-    """Configure authentication for a provider"""
-    
-    # Check if API key exists in environment
+    """Configure authentication for a provider.
+
+    TS-aligned: saves to both the credentials store (pi_coding_agent
+    AuthStorage → ~/.pi/agent/auth.json) AND the .env file for convenience.
+    The credentials store is what the gateway daemon uses; .env is for
+    interactive `uv run` invocations.
+    """
+    # Check if API key already stored in credentials store (auth-profiles.json)
+    stored_key: str | None = None
+    try:
+        from openclaw.config.auth_profiles import get_api_key, _PROVIDER_NORMALISE  # type: ignore[attr-defined]
+        pi_provider = {
+            "gemini": "google", "google": "google",
+            "anthropic": "anthropic", "openai": "openai",
+        }.get(provider.lower(), provider.lower())
+        stored_key = get_api_key(pi_provider)
+    except Exception:
+        pass
+
+    # Check environment variable
     env_key = check_env_api_key(provider)
-    
-    if env_key:
-        use_env = input(f"Found {provider.upper()} API key in environment. Use it? [Y/n]: ").strip().lower()
-        if use_env != "n":
+
+    existing_key = stored_key or env_key
+    if existing_key:
+        source = "credentials store" if stored_key else "environment"
+        use_existing = input(
+            f"Found {provider.upper()} API key in {source}. Use it? [Y/n]: "
+        ).strip().lower()
+        if use_existing != "n":
+            # Ensure it's in the credentials store even if it came from env
+            if not stored_key:
+                save_api_key_to_credentials(provider, existing_key)
             return {
                 "provider": provider,
-                "api_key": env_key,
-                "source": "environment",
+                "api_key": existing_key,
+                "source": source,
             }
-    
+
     # Prompt for API key
     api_key = prompt_api_key_simple(provider)
-    
-    # Ask if user wants to save to .env
-    save_to_env = input("Save API key to .env file? [Y/n]: ").strip().lower()
+
+    # Save to credentials store (primary — used by daemon service)
+    save_api_key_to_credentials(provider, api_key)
+
+    # Also offer to save to .env (convenience for interactive runs)
+    save_to_env = input("Also save API key to .env file? [Y/n]: ").strip().lower()
     if save_to_env != "n":
         try:
             save_auth_to_env(provider, api_key)
         except Exception as e:
             print(f"Warning: Could not save to .env: {e}")
-    
+
     return {
         "provider": provider,
         "api_key": api_key,
