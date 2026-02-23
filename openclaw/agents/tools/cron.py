@@ -490,16 +490,26 @@ def _normalize_schedule(config: dict[str, Any]):
 
     stype = config.get("type", config.get("kind", ""))
     if stype == "at":
-        return AtSchedule(timestamp=config.get("timestamp", config.get("at", "")))
+        at_val = config.get("at") or config.get("timestamp") or ""
+        return AtSchedule(at=at_val)
     elif stype == "every":
-        return EverySchedule(
-            interval_ms=config.get("interval_ms", config.get("intervalMs", 0)),
-            anchor=config.get("anchor"),
+        every_ms = (
+            config.get("every_ms")
+            or config.get("everyMs")
+            or config.get("interval_ms")
+            or config.get("intervalMs")
+            or 0
         )
+        anchor_ms = config.get("anchor_ms") or config.get("anchorMs")
+        return EverySchedule(every_ms=int(every_ms), anchor_ms=anchor_ms)
     elif stype == "cron":
+        expr = config.get("expr") or config.get("expression") or ""
+        tz = config.get("tz") or config.get("timezone") or "UTC"
+        stagger_ms = config.get("stagger_ms") or config.get("staggerMs")
         return CronSchedule(
-            expression=config.get("expression", ""),
-            timezone=config.get("timezone", "UTC"),
+            expr=expr,
+            tz=tz,
+            stagger_ms=int(stagger_ms) if stagger_ms is not None else None,
         )
     return None
 
