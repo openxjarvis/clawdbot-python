@@ -859,6 +859,21 @@ class ChannelManager:
                 logger.info(f"[{channel_id}] Starting run_turn with {len(self.tools)} tools")
 
                 from openclaw.events import EventType
+                from openclaw.auto_reply.reply.typing import create_typing_controller
+
+                # Wire up typing indicator (mirrors TS bot-message-dispatch.ts)
+                # send_typing() is defined on TelegramChannel; ignore for other channel types.
+                _typing_target = str(message.chat_id)
+                async def _send_typing() -> None:
+                    if hasattr(channel, "send_typing"):
+                        try:
+                            await channel.send_typing(_typing_target)
+                        except Exception:
+                            pass
+
+                typing_ctrl = create_typing_controller(on_reply_start=_send_typing)
+                await typing_ctrl.on_reply_start()
+                await typing_ctrl.start_typing_loop()
 
                 # Build image data URLs from inbound attachments (mirrors TS chat.ts)
                 # Non-image attachments are described in message_text by the channel layer.
@@ -925,6 +940,9 @@ class ChannelManager:
 
                 logger.info(f"[{channel_id}] Accumulated response length: {len(response_text)}")
 
+                # Agent run finished — stop typing indicator
+                typing_ctrl.mark_run_complete()
+
                 # Send response back
                 if response_text:
                     await channel.send_text(
@@ -946,7 +964,11 @@ class ChannelManager:
                         except Exception as send_err:
                             logger.error(f"Failed to send empty response notification: {send_err}")
 
+                # Dispatch complete — tear down typing indicator
+                typing_ctrl.mark_dispatch_idle()
+
             except Exception as e:
+                typing_ctrl.cleanup()
                 has_error = True
                 logger.error(f"Error processing message: {e}", exc_info=True)
                 # Optionally send error message

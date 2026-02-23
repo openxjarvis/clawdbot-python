@@ -368,6 +368,16 @@ class TelegramChannel(ChannelPlugin):
                 self._restart_polling_after_conflict()
             )
 
+    async def send_typing(self, target: str) -> None:
+        """Send a 'typing…' chat action to show the bot is processing."""
+        if not self._app:
+            return
+        try:
+            chat_id = int(target) if str(target).lstrip("-").isdigit() else target
+            await self._app.bot.send_chat_action(chat_id=chat_id, action="typing")
+        except Exception as exc:
+            logger.debug("send_typing failed for %s: %s", target, exc)
+
     async def send_text(self, target: str, text: str, reply_to: str | None = None) -> str:
         """Send text message with Markdown support"""
         if not self._app:
