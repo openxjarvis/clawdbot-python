@@ -222,9 +222,14 @@ class ChannelManager:
                 model_name = self.default_runtime.model_str
             
             # Get complete runtime parameters (includes timezone, runtime_info, etc.)
-            # Config is not available here, so timezone will be auto-detected
+            # Load config so the configured timezone (agents.defaults.timezone) is used.
+            try:
+                from openclaw.config.loader import load_config
+                _cfg = load_config()
+            except Exception:
+                _cfg = None
             prompt_params = build_system_prompt_params(
-                config=None,  # Will auto-detect timezone
+                config=_cfg,
                 workspace_dir=self.workspace_dir,
                 runtime={
                     "agent_id": "main",

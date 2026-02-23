@@ -22,33 +22,71 @@ _cached_time_format: ResolvedTimeFormat | None = None
 # Timezone
 # ---------------------------------------------------------------------------
 
+# Map common timezone abbreviations to canonical IANA names.
+# macOS often reports abbreviations like HKT, CST, JST that zoneinfo rejects.
+_TZ_ABBREV_MAP: dict[str, str] = {
+    "HKT":  "Asia/Hong_Kong",
+    "CST":  "Asia/Shanghai",
+    "JST":  "Asia/Tokyo",
+    "KST":  "Asia/Seoul",
+    "SGT":  "Asia/Singapore",
+    "IST":  "Asia/Kolkata",
+    "ICT":  "Asia/Bangkok",
+    "WIB":  "Asia/Jakarta",
+    "PHT":  "Asia/Manila",
+    "AEST": "Australia/Sydney",
+    "AEDT": "Australia/Sydney",
+    "NZST": "Pacific/Auckland",
+    "PST":  "America/Los_Angeles",
+    "PDT":  "America/Los_Angeles",
+    "MST":  "America/Denver",
+    "MDT":  "America/Denver",
+    "CST6": "America/Chicago",
+    "CDT":  "America/Chicago",
+    "EST":  "America/New_York",
+    "EDT":  "America/New_York",
+    "GMT":  "Europe/London",
+    "BST":  "Europe/London",
+    "CET":  "Europe/Paris",
+    "CEST": "Europe/Paris",
+    "EET":  "Europe/Helsinki",
+    "MSK":  "Europe/Moscow",
+}
+
+
+def _resolve_iana(name: str) -> str | None:
+    """Try to resolve a timezone name or abbreviation to a valid IANA key."""
+    import zoneinfo
+    candidate = _TZ_ABBREV_MAP.get(name.upper(), name)
+    try:
+        zoneinfo.ZoneInfo(candidate)
+        return candidate
+    except Exception:
+        return None
+
+
 def resolve_user_timezone(configured: str | None = None) -> str:
     """Return a valid IANA timezone string.
 
     Mirrors TS resolveUserTimezone().
     Validates the configured value; falls back to the system timezone or UTC.
+    Handles macOS abbreviations (HKT, CST, JST, …) that zoneinfo rejects.
     """
     if configured:
         trimmed = configured.strip()
         if trimmed:
-            try:
-                import zoneinfo
-                zoneinfo.ZoneInfo(trimmed)
-                return trimmed
-            except Exception:
-                pass
+            result = _resolve_iana(trimmed)
+            if result:
+                return result
 
     try:
-        import zoneinfo
         host = datetime.now(timezone.utc).astimezone().tzinfo
         if host is not None:
             name = getattr(host, "key", None) or str(host)
-            if name and name.strip() and name != "UTC":
-                try:
-                    zoneinfo.ZoneInfo(name)
-                    return name.strip()
-                except Exception:
-                    pass
+            if name and name.strip() and name.upper() != "UTC":
+                result = _resolve_iana(name.strip())
+                if result:
+                    return result
     except Exception:
         pass
 

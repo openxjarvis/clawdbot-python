@@ -43,16 +43,24 @@ def build_system_prompt_params(
                               default_model, channel, capabilities, repo_root)
         - repo_root: str | None
     """
-    # Resolve user timezone from config
+    # Resolve user timezone from config — accept both "timezone" and "userTimezone" keys
     timezone_config = None
     if config and hasattr(config, "agents"):
         if hasattr(config.agents, "defaults"):
-            timezone_config = getattr(config.agents.defaults, "userTimezone", None)
+            timezone_config = (
+                getattr(config.agents.defaults, "timezone", None)
+                or getattr(config.agents.defaults, "userTimezone", None)
+            )
     elif isinstance(config, dict):
-        timezone_config = config.get("agents", {}).get("defaults", {}).get("userTimezone")
+        defaults = config.get("agents", {}).get("defaults", {})
+        timezone_config = defaults.get("timezone") or defaults.get("userTimezone")
     
-    # Use resolve_user_timezone which handles validation and fallbacks
-    user_timezone = resolve_user_timezone(timezone_config)
+    # Use resolve_user_timezone from date_time module (handles abbreviation mapping)
+    try:
+        from openclaw.agents.date_time import resolve_user_timezone as _resolve_tz
+        user_timezone = _resolve_tz(timezone_config)
+    except Exception:
+        user_timezone = resolve_user_timezone(timezone_config)
     
     # Get runtime info
     if not runtime:
