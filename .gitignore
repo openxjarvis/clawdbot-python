@@ -5,8 +5,12 @@ __pycache__/
 *.so
 .Python
 *.egg-info/
-dist/
 build/
+# Python package build output (not the web UI dist)
+/dist/
+openclaw/web/ui-src/node_modules/
+# Source maps are large debug artifacts — exclude from repo
+*.js.map
 
 # Testing
 .pytest_cache/
