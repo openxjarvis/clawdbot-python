@@ -73,8 +73,13 @@ class ToolRegistry:
         self._tools[WebFetchTool().name] = WebFetchTool()
         self._tools[WebSearchTool().name] = WebSearchTool()
 
-        # Image analysis
-        img = ImageTool(); self._tools[img.name] = img
+        # Image analysis — pass workspace_root so the tool saves the image to
+        # disk and emits a MEDIA:/abs/path token in its result, which lets
+        # channel_manager deliver the file to the user (mirrors TS imageResult).
+        from pathlib import Path
+        _img_ws = Path(self._workspace_dir) if self._workspace_dir else None
+        img = ImageTool(workspace_root=_img_ws)
+        self._tools[img.name] = img
 
         # Memory search (if workspace available)
         if self._workspace_dir:

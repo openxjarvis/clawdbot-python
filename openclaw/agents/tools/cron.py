@@ -523,7 +523,7 @@ def _normalize_payload(config: dict[str, Any]):
         return SystemEventPayload(text=config.get("text", ""))
     elif kind == "agentTurn":
         return AgentTurnPayload(
-            prompt=config.get("prompt", config.get("message", "")),
+            message=config.get("message", config.get("prompt", "")),
             model=config.get("model"),
         )
     return None
