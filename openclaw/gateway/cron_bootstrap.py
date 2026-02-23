@@ -420,16 +420,26 @@ async def _deliver_via_channels(
     """
     Deliver the heartbeat response to active channel sessions (e.g. Telegram).
 
-    Sends the text response and, if any local file paths are mentioned in the
-    response, attempts to send them as attachments via send_media().
+    Uses split_media_from_output to extract MEDIA: tokens from the agent response
+    (mirrors TS splitMediaFromOutput / deliverReplies). The cleaned text is sent
+    first, then any media files are sent as attachments.
     """
+    from openclaw.auto_reply.media_parse import split_media_from_output
+    from openclaw.media.mime import detect_mime, media_kind_from_mime, MediaKind
+
     try:
         running = cm.list_running() if hasattr(cm, "list_running") else []
         all_session_keys = _list_all_session_keys(cm)
         agent_part = _extract_agent_part(session_key)
 
-        # Extract any local file paths mentioned in the response
-        file_paths = _extract_file_paths(response_text)
+        # Parse MEDIA: tokens — strip them from display text, collect URLs
+        media_result = split_media_from_output(response_text)
+        display_text = media_result.text if media_result.text is not None else response_text
+        all_media: list[str] = []
+        if media_result.media_url:
+            all_media.append(media_result.media_url)
+        if media_result.media_urls:
+            all_media.extend(media_result.media_urls)
 
         for ch_id in running:
             channel = cm.get_channel(ch_id)
@@ -440,60 +450,36 @@ async def _deliver_via_channels(
                     chat_id = _extract_telegram_chat_id(sk)
                     if not chat_id:
                         continue
-                    try:
-                        await channel.send_text(target=chat_id, text=response_text)
-                        logger.info(f"cron: delivered text to telegram chat_id={chat_id}")
-                    except Exception as e:
-                        logger.warning(f"cron: send_text failed chat_id={chat_id}: {e}")
 
-                    # Send any files found in the response
-                    for fpath in file_paths:
+                    # Send text (without MEDIA: lines)
+                    if display_text:
                         try:
-                            if hasattr(channel, "send_media"):
-                                await channel.send_media(
-                                    target=chat_id,
-                                    path=str(fpath),
-                                    caption=fpath.name,
-                                )
-                                logger.info(
-                                    f"cron: delivered file {fpath.name} to chat_id={chat_id}"
-                                )
-                            elif hasattr(channel, "send_document"):
-                                await channel.send_document(
-                                    target=chat_id, document=str(fpath)
-                                )
+                            await channel.send_text(target=chat_id, text=display_text)
+                            logger.info(f"cron: delivered text to telegram chat_id={chat_id}")
+                        except Exception as e:
+                            logger.warning(f"cron: send_text failed chat_id={chat_id}: {e}")
+
+                    # Send media files extracted from MEDIA: tokens
+                    for media_url in all_media:
+                        try:
+                            mime = detect_mime(media_url)
+                            kind = media_kind_from_mime(mime)
+                            media_type = kind.value if kind != MediaKind.UNKNOWN else "document"
+                            await channel.send_media(
+                                target=chat_id,
+                                media_url=media_url,
+                                media_type=media_type,
+                            )
+                            logger.info(
+                                f"cron: delivered media {Path(media_url).name} "
+                                f"(type={media_type}) to chat_id={chat_id}"
+                            )
                         except Exception as e:
                             logger.warning(
-                                f"cron: failed to send file {fpath} to chat_id={chat_id}: {e}"
+                                f"cron: failed to send media {media_url} to chat_id={chat_id}: {e}"
                             )
     except Exception as e:
         logger.debug(f"cron: _deliver_via_channels error: {e}")
-
-
-def _extract_file_paths(text: str) -> list:
-    """
-    Extract local file paths mentioned in text that actually exist on disk.
-    Handles absolute paths and paths relative to the user home directory.
-    """
-    import re
-    from pathlib import Path
-
-    found: list[Path] = []
-    seen: set[str] = set()
-
-    # Match path-like tokens: start with / ~ or contain / with a known extension
-    pattern = re.compile(
-        r'(?:^|[\s\"\'\(])([~/][^\s\"\'\)\,]+\.(?:pptx?|docx?|xlsx?|pdf|zip|tar\.gz|png|jpg|jpeg|gif|mp4|mp3|txt|csv|json|py|js|ts|html|md))',
-        re.IGNORECASE | re.MULTILINE,
-    )
-    for m in pattern.finditer(text):
-        raw = m.group(1).strip()
-        p = Path(raw).expanduser()
-        key = str(p)
-        if key not in seen and p.exists() and p.is_file():
-            seen.add(key)
-            found.append(p)
-    return found
 
 
 def _extract_agent_part(session_key: str) -> str | None:

@@ -943,17 +943,47 @@ class ChannelManager:
                 # Agent run finished — stop typing indicator
                 typing_ctrl.mark_run_complete()
 
+                # Parse MEDIA: tokens from response text (mirrors TS splitMediaFromOutput)
+                from openclaw.auto_reply.media_parse import split_media_from_output
+                from openclaw.media.mime import detect_mime, media_kind_from_mime, MediaKind
+
+                media_result = split_media_from_output(response_text)
+                # Use cleaned text (MEDIA: lines removed) as the text to send
+                display_text = media_result.text if media_result.text is not None else response_text
+
                 # Send response back
-                if response_text:
+                if display_text:
                     await channel.send_text(
                         target=message.chat_id,
-                        text=response_text,
+                        text=display_text,
                         reply_to=message.message_id,
                     )
                     logger.info(f"📤 [{channel_id}] Sent response to {message.chat_id}")
-                else:
+
+                # Send any media files found in MEDIA: tokens
+                all_media = []
+                if media_result.media_url:
+                    all_media.append(media_result.media_url)
+                if media_result.media_urls:
+                    all_media.extend(media_result.media_urls)
+                for media_url in all_media:
+                    try:
+                        mime = detect_mime(media_url)
+                        kind = media_kind_from_mime(mime)
+                        media_type = kind.value if kind != MediaKind.UNKNOWN else "document"
+                        await channel.send_media(
+                            target=message.chat_id,
+                            media_url=media_url,
+                            media_type=media_type,
+                            reply_to=message.message_id,
+                        )
+                        logger.info(f"📎 [{channel_id}] Sent media file: {media_url}")
+                    except Exception as media_err:
+                        logger.error(f"[{channel_id}] Failed to send media {media_url}: {media_err}")
+
+                if not display_text and not all_media:
                     logger.warning(f"[{channel_id}] No response text generated")
-                    # Send user-visible notification for empty response
+                    # Send user-visible notification only when no text AND no media
                     if not has_error:
                         try:
                             await channel.send_text(
