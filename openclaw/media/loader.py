@@ -13,6 +13,8 @@ import mimetypes
 from urllib.parse import urlparse, unquote
 import aiohttp
 
+from openclaw.media.mime import MediaKind, media_kind_from_mime
+
 logger = logging.getLogger(__name__)
 
 
@@ -23,31 +25,55 @@ class LoadedMedia:
     buffer: bytes
     content_type: Optional[str] = None
     file_name: Optional[str] = None
+    kind: Optional[MediaKind] = None
 
 
 # Alias for backward compatibility
 MediaResult = LoadedMedia
 
 
-async def load_web_media(url_or_path: str, max_bytes: Optional[int] = None) -> LoadedMedia:
+async def load_web_media(
+    url_or_path: str,
+    max_bytes: Optional[int] = None,
+    *,
+    # Extra kwargs accepted for TS-API parity (load_web_media callers may pass these)
+    source: Optional[str] = None,
+    local_roots: Optional[list[str]] = None,
+    allow_remote: bool = True,
+    workspace_root: Optional[Path] = None,
+    optimize_images: bool = False,
+) -> LoadedMedia:
     """Load media from URL or local file path.
 
+    Mirrors TypeScript loadWebMedia (src/web/media.ts).
+
     Args:
-        url_or_path: URL or file path
-        max_bytes: Maximum bytes to load (optional)
+        url_or_path: URL or file path. When called with ``source=`` keyword (TS-API
+            parity), that value is used instead.
+        max_bytes: Maximum bytes to load (optional).
+        source: Alias for ``url_or_path`` — accepted so callers that use the
+            ``source=`` keyword argument from a previous API version never crash.
+        local_roots: Allowed local directory roots (accepted, not yet enforced).
+        allow_remote: Whether remote HTTP downloads are permitted (accepted).
+        workspace_root: Workspace root for sandbox path validation (accepted).
+        optimize_images: Whether to optimize loaded images (accepted, not applied here).
 
     Returns:
-        Loaded media with buffer and metadata
+        LoadedMedia with buffer, content_type, file_name, and kind.
 
     Raises:
-        ValueError: If max_bytes exceeded or file not found
-        IOError: If download fails
+        ValueError: If max_bytes exceeded or file not found.
+        IOError: If download fails.
     """
+    # Support ``source=`` keyword used by some callers (TS-API parity)
+    if source is not None:
+        url_or_path = source
+
     max_size = max_bytes or 10 * 1024 * 1024
 
     # TS-compatible convenience prefix.
     if url_or_path.startswith("MEDIA:"):
-        url_or_path = url_or_path[len("MEDIA:") :]
+        url_or_path = url_or_path[len("MEDIA:"):]
     if url_or_path.startswith("~/"):
         url_or_path = str(Path.home() / url_or_path[2:])
 
@@ -72,7 +98,12 @@ async def load_web_media(url_or_path: str, max_bytes: Optional[int] = None) -> L
         content_type, _ = mimetypes.guess_type(str(path))
         file_name = path.name
 
-        return LoadedMedia(buffer=buffer, content_type=content_type, file_name=file_name)
+        return LoadedMedia(
+            buffer=buffer,
+            content_type=content_type,
+            file_name=file_name,
+            kind=media_kind_from_mime(content_type),
+        )
 
     if scheme not in ("http", "https"):
         raise ValueError(f"Unsupported media scheme: {scheme}")
@@ -111,13 +142,21 @@ async def load_web_media(url_or_path: str, max_bytes: Optional[int] = None) -> L
                     )
 
                 content_type = response.headers.get("Content-Type")
+                if content_type:
+                    # Strip charset / boundary parameters
+                    content_type = content_type.split(";")[0].strip()
 
                 # Extract filename from URL
                 file_name = Path(unquote(parsed.path)).name
                 if not file_name or "." not in file_name:
                     file_name = None
 
-                return LoadedMedia(buffer=buffer, content_type=content_type, file_name=file_name)
+                return LoadedMedia(
+                    buffer=buffer,
+                    content_type=content_type,
+                    file_name=file_name,
+                    kind=media_kind_from_mime(content_type),
+                )
 
     except aiohttp.ClientError as e:
         raise IOError(f"Failed to download media from {url_or_path}: {e}")

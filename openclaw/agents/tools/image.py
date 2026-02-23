@@ -21,7 +21,7 @@ from typing import Any
 
 from openclaw.media.image_ops import ImageProcessor, convert_heic_to_jpeg
 from openclaw.media.loader import MediaLoader, load_media
-from openclaw.media.mime import MediaKind, is_heic_file, is_heic_mime
+from openclaw.media.mime import MediaKind, extension_for_mime, is_heic_file, is_heic_mime
 
 from .base import AgentTool, ToolResult
 
@@ -121,51 +121,78 @@ class ImageTool(AgentTool):
                 max_bytes = int(max_bytes_mb * 1024 * 1024)
             elif self.max_bytes:
                 max_bytes = self.max_bytes
-            
-            # Load media
-            media = await load_media(
-                source=image_input,
-                max_bytes=max_bytes,
-                optimize_images=self.optimize_images,
-                allow_remote=self.workspace_root is None,  # No remote in sandbox
-                workspace_root=self.workspace_root,
-            )
 
-            if media.kind != MediaKind.IMAGE:
+            # Load media — pass url_or_path positionally so load_media's
+            # source/url_or_path first-arg works regardless of name.
+            media = await load_media(image_input, max_bytes)
+
+            # Validate that we received an image
+            kind = media.kind or MediaKind.UNKNOWN
+            if kind not in (MediaKind.IMAGE, MediaKind.UNKNOWN):
                 return ToolResult(
                     success=False,
                     content="",
-                    error=f"Unsupported media type: {media.kind.value}"
+                    error=f"Unsupported media type: {kind.value}",
                 )
 
             buffer = media.buffer
             mime_type = media.content_type or "image/png"
-            
+
             # Convert HEIC to JPEG if needed
             if is_heic_mime(mime_type):
                 logger.info("Converting HEIC to JPEG")
                 buffer = await convert_heic_to_jpeg(buffer)
                 mime_type = "image/jpeg"
-            
+
             # Optimize if too large
             if self.optimize_images and max_bytes and len(buffer) > max_bytes:
                 logger.info(f"Optimizing image: {len(buffer)} -> target {max_bytes}")
                 optimized = await ImageProcessor.optimize_image(
                     buffer,
                     max_bytes=max_bytes,
-                    preserve_alpha=True
+                    preserve_alpha=True,
                 )
                 buffer = optimized.buffer
                 mime_type = f"image/{optimized.format}"
                 logger.info(f"Optimized to {len(buffer)} bytes")
 
-            # Encode to base64
+            # --- Save to workspace (mirrors TS imageResultFromFile) -----------
+            # When a workspace root is available, persist the loaded image so
+            # the delivery layer can send it as an attachment.  The saved path
+            # is emitted as a MEDIA: token in the tool-result text so that
+            # split_media_from_output() in channel_manager picks it up and
+            # send_media() delivers it to the user (same as TS imageResult).
+            saved_path: str | None = None
+            if self.workspace_root:
+                import hashlib as _hashlib
+
+                ext = extension_for_mime(mime_type) or ".jpg"
+                # Prefer the original filename; fall back to a content hash.
+                base_name = (media.file_name or "").strip()
+                if not base_name:
+                    digest = _hashlib.md5(buffer[:256]).hexdigest()[:8]
+                    base_name = f"image_{digest}{ext}"
+                elif not Path(base_name).suffix:
+                    base_name = f"{base_name}{ext}"
+
+                dest = Path(self.workspace_root) / base_name
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(buffer)
+                saved_path = str(dest)
+                logger.info("Image saved to workspace: %s", saved_path)
+
+            # Encode to base64 for vision-model analysis
             image_data = base64.b64encode(buffer).decode("utf-8")
 
             # Analyze with model (with fallback)
             result = await self._analyze_with_fallback(
                 image_data, mime_type, prompt, model
             )
+
+            # Prepend MEDIA: token so delivery layer sends the file to the user
+            # (mirrors TS imageResult where text = "MEDIA:${path}\n<analysis>")
+            if saved_path and result.success:
+                result.content = f"MEDIA:{saved_path}\n{result.content}"
 
             return result
 
