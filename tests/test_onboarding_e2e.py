@@ -51,158 +51,219 @@ class TestFirstRunDetection:
             assert content["version"] == "0.6.0"
 
 
+def _noop_coroutine(*args, **kwargs):
+    """Async no-op mock for coroutine functions like setup_hooks/skills/finalize."""
+    import asyncio
+    async def _inner():
+        return {}
+    return _inner()
+
+
 class TestOnboardingWizardQuickStart:
     """Test QuickStart onboarding mode"""
-    
+
     @pytest.mark.asyncio
     async def test_quickstart_mode_basic(self):
         """Test basic QuickStart onboarding flow"""
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir)
-            
-            # Mock user inputs
+
             inputs = [
                 "y",  # Confirm risks
                 "1",  # QuickStart mode
-                "1",  # Anthropic provider
-                "test-api-key",  # API key
+                "1",  # Select Anthropic provider
+                "",   # Model selection (default)
+                "n",  # No fallback models
+                "n",  # Configure channels? No
+                "",   # User name (skip)
+                "",   # Timezone (default)
+                "",   # Personality (default)
                 "Y",  # Save configuration
             ]
-            
+
             with patch("builtins.input", side_effect=inputs):
-                with patch("openclaw.wizard.auth.save_auth_to_env"):
-                    with patch("openclaw.config.loader.save_config"):
-                        result = await run_onboarding_wizard(
-                            config=None,
-                            workspace_dir=workspace
-                        )
-            
+                with patch("openclaw.wizard.onboarding.configure_auth",
+                           return_value={"provider": "anthropic", "api_key": "test-key"}):
+                    with patch("openclaw.wizard.onboarding.save_config"):
+                        with patch("openclaw.wizard.onboarding.setup_hooks", side_effect=_noop_coroutine):
+                            with patch("openclaw.wizard.onboarding.setup_skills", side_effect=_noop_coroutine):
+                                with patch("openclaw.wizard.onboarding.finalize_onboarding", side_effect=_noop_coroutine):
+                                    result = await run_onboarding_wizard(
+                                        config=None,
+                                        workspace_dir=workspace,
+                                        install_daemon=False,
+                                    )
+
             assert result["completed"] is True
             assert result.get("mode") == "quickstart"
             assert result.get("provider") == "anthropic"
-    
+
     @pytest.mark.asyncio
     async def test_quickstart_with_env_api_key(self):
         """Test QuickStart with existing environment API key"""
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir)
-            
+
             inputs = [
                 "y",  # Confirm risks
                 "1",  # QuickStart mode
-                "Y",  # Use env API key
+                "Y",  # Use env API key (found in env)
+                "",   # Model selection (default)
+                "n",  # No fallback models
+                "n",  # Configure channels? No
+                "",   # User name (skip)
+                "",   # Timezone (default)
+                "",   # Personality (default)
                 "Y",  # Save configuration
             ]
-            
+
             with patch("builtins.input", side_effect=inputs):
-                with patch("openclaw.wizard.auth.check_env_api_key", return_value="env-key"):
-                    with patch("openclaw.config.loader.save_config"):
-                        result = await run_onboarding_wizard(workspace_dir=workspace)
-            
+                with patch("openclaw.wizard.onboarding.check_env_api_key", return_value="env-key"):
+                    with patch("openclaw.wizard.onboarding.save_config"):
+                        with patch("openclaw.wizard.onboarding.setup_hooks", side_effect=_noop_coroutine):
+                            with patch("openclaw.wizard.onboarding.setup_skills", side_effect=_noop_coroutine):
+                                with patch("openclaw.wizard.onboarding.finalize_onboarding", side_effect=_noop_coroutine):
+                                    result = await run_onboarding_wizard(
+                                        workspace_dir=workspace,
+                                        install_daemon=False,
+                                    )
+
             assert result["completed"] is True
 
 
 class TestOnboardingWizardAdvanced:
     """Test Advanced onboarding mode"""
-    
+
     @pytest.mark.asyncio
     async def test_advanced_mode_full_config(self):
         """Test Advanced mode with full configuration"""
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir)
-            
+
             inputs = [
                 "y",  # Confirm risks
                 "2",  # Advanced mode
                 "3",  # Reset config
                 "2",  # OpenAI provider
-                "test-openai-key",  # API key
+                "",   # Model selection (default)
+                "n",  # No fallback models
                 "2",  # Medium think level
-                "",  # Default workspace
+                "",   # Default workspace
                 "9000",  # Custom port
                 "1",  # Loopback bind
                 "1",  # Token auth
-                "n",  # Skip channels
+                "3",  # Skip channels
+                "",   # User name (skip)
+                "",   # Timezone (default)
+                "",   # Personality (default)
                 "Y",  # Save configuration
             ]
-            
+
             with patch("builtins.input", side_effect=inputs):
-                with patch("openclaw.wizard.auth.save_auth_to_env"):
-                    with patch("openclaw.config.loader.save_config"):
-                        result = await run_onboarding_wizard(workspace_dir=workspace)
-            
+                with patch("openclaw.wizard.onboarding.configure_auth",
+                           return_value={"provider": "openai", "api_key": "test-openai-key"}):
+                    with patch("openclaw.wizard.onboarding.save_config"):
+                        with patch("openclaw.wizard.onboarding.setup_hooks", side_effect=_noop_coroutine):
+                            with patch("openclaw.wizard.onboarding.setup_skills", side_effect=_noop_coroutine):
+                                with patch("openclaw.wizard.onboarding.finalize_onboarding", side_effect=_noop_coroutine):
+                                    result = await run_onboarding_wizard(
+                                        workspace_dir=workspace,
+                                        install_daemon=False,
+                                    )
+
             assert result["completed"] is True
             assert result.get("mode") == "advanced"
 
 
 class TestOnboardingRejection:
     """Test onboarding rejection scenarios"""
-    
+
     @pytest.mark.asyncio
     async def test_risk_rejection(self):
         """Test onboarding when user rejects risks"""
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir)
-            
+
             inputs = ["n"]  # Reject risks
-            
+
             with patch("builtins.input", side_effect=inputs):
                 result = await run_onboarding_wizard(workspace_dir=workspace)
-            
+
             assert result["completed"] is False
             assert result["skipped"] is True
             assert "declined" in result.get("reason", "").lower()
-    
+
     @pytest.mark.asyncio
     async def test_save_rejection(self):
         """Test onboarding when user rejects saving config"""
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir)
-            
+
             inputs = [
                 "y",  # Confirm risks
                 "1",  # QuickStart
-                "1",  # Anthropic
-                "test-key",  # API key
+                "1",  # Select Anthropic provider
+                "",   # Model selection (default)
+                "n",  # No fallback models
+                "n",  # Configure channels? No
+                "",   # User name (skip)
+                "",   # Timezone (default)
+                "",   # Personality (default)
                 "n",  # Don't save
             ]
-            
+
             with patch("builtins.input", side_effect=inputs):
-                with patch("openclaw.wizard.auth.save_auth_to_env"):
-                    result = await run_onboarding_wizard(workspace_dir=workspace)
-            
+                with patch("openclaw.wizard.onboarding.configure_auth",
+                           return_value={"provider": "anthropic", "api_key": "test-key"}):
+                    result = await run_onboarding_wizard(
+                        workspace_dir=workspace,
+                        install_daemon=False,
+                    )
+
             assert result["completed"] is False
             assert result["skipped"] is True
 
 
 class TestOnboardingConfigPersistence:
     """Test configuration persistence"""
-    
+
     @pytest.mark.asyncio
     async def test_config_saved_correctly(self):
         """Test that configuration is saved correctly"""
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir)
-            
+
             saved_config = None
-            
+
             def mock_save_config(config):
                 nonlocal saved_config
                 saved_config = config
-            
+
             inputs = [
                 "y",  # Confirm risks
                 "1",  # QuickStart
-                "1",  # Anthropic
-                "test-key",
+                "1",  # Select Anthropic provider
+                "",   # Model selection (default)
+                "n",  # No fallback models
+                "n",  # Configure channels? No
+                "",   # User name (skip)
+                "",   # Timezone (default)
+                "",   # Personality (default)
                 "Y",  # Save
             ]
-            
+
             with patch("builtins.input", side_effect=inputs):
-                with patch("openclaw.wizard.auth.save_auth_to_env"):
-                    with patch("openclaw.config.loader.save_config", side_effect=mock_save_config):
-                        result = await run_onboarding_wizard(workspace_dir=workspace)
-            
+                with patch("openclaw.wizard.onboarding.configure_auth",
+                           return_value={"provider": "anthropic", "api_key": "test-key"}):
+                    with patch("openclaw.wizard.onboarding.save_config", side_effect=mock_save_config):
+                        with patch("openclaw.wizard.onboarding.setup_hooks", side_effect=_noop_coroutine):
+                            with patch("openclaw.wizard.onboarding.setup_skills", side_effect=_noop_coroutine):
+                                with patch("openclaw.wizard.onboarding.finalize_onboarding", side_effect=_noop_coroutine):
+                                    result = await run_onboarding_wizard(
+                                        workspace_dir=workspace,
+                                        install_daemon=False,
+                                    )
+
             assert result["completed"] is True
             assert saved_config is not None
 
@@ -247,22 +308,33 @@ class TestOnboardingExistingConfig:
                 "2",  # Advanced mode
                 "2",  # Modify
                 "1",  # Anthropic
-                "new-key",
-                "",  # Default think level
-                "",  # Default workspace
-                "",  # Default port
-                "",  # Default bind
-                "",  # Default auth
-                "n",  # Skip channels
+                "",   # Model selection (default)
+                "n",  # No fallback models
+                "",   # Default think level
+                "",   # Default workspace
+                "",   # Default port
+                "",   # Default bind
+                "",   # Default auth
+                "3",  # Skip channels
+                "",   # User name (skip)
+                "",   # Timezone (default)
+                "",   # Personality (default)
                 "Y",  # Save
             ]
-            
+
             with patch("builtins.input", side_effect=inputs):
                 with patch("openclaw.config.loader.load_config", return_value=existing_config):
-                    with patch("openclaw.wizard.auth.save_auth_to_env"):
-                        with patch("openclaw.config.loader.save_config"):
-                            result = await run_onboarding_wizard(workspace_dir=workspace)
-            
+                    with patch("openclaw.wizard.onboarding.configure_auth",
+                               return_value={"provider": "anthropic", "api_key": "new-key"}):
+                        with patch("openclaw.wizard.onboarding.save_config"):
+                            with patch("openclaw.wizard.onboarding.setup_hooks", side_effect=_noop_coroutine):
+                                with patch("openclaw.wizard.onboarding.setup_skills", side_effect=_noop_coroutine):
+                                    with patch("openclaw.wizard.onboarding.finalize_onboarding", side_effect=_noop_coroutine):
+                                        result = await run_onboarding_wizard(
+                                            workspace_dir=workspace,
+                                            install_daemon=False,
+                                        )
+
             assert result["completed"] is True
 
 

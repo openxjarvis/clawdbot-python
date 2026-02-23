@@ -36,18 +36,34 @@ class TestNewUserFullFlow:
                 "y",  # Confirm risks
                 "1",  # QuickStart mode
                 "1",  # Anthropic provider
-                "test-api-key",  # API key
+                "",   # Model selection (default)
+                "n",  # No fallback models
+                "n",  # Configure channels? No
+                "",   # User name (skip)
+                "",   # Timezone (default)
+                "",   # Personality (default)
                 "Y",  # Save configuration
             ]
-            
+
+            def _noop_coro(*args, **kwargs):
+                async def _inner(): return {}
+                return _inner()
+
             with patch("builtins.input", side_effect=inputs):
-                with patch("openclaw.wizard.auth.save_auth_to_env"):
+                with patch("openclaw.wizard.onboarding.configure_auth",
+                           return_value={"provider": "anthropic", "api_key": "test-api-key"}):
                     config = ClawdbotConfig()
                     config.gateway = GatewayConfig(port=8765)
                     config.agent = AgentConfig(model="claude-sonnet-4")
-                    
-                    with patch("openclaw.config.loader.save_config"):
-                        result = await run_onboarding_wizard(workspace_dir=workspace)
+
+                    with patch("openclaw.wizard.onboarding.save_config"):
+                        with patch("openclaw.wizard.onboarding.setup_hooks", side_effect=_noop_coro):
+                            with patch("openclaw.wizard.onboarding.setup_skills", side_effect=_noop_coro):
+                                with patch("openclaw.wizard.onboarding.finalize_onboarding", side_effect=_noop_coro):
+                                    result = await run_onboarding_wizard(
+                                        workspace_dir=workspace,
+                                        install_daemon=False,
+                                    )
             
             assert result["completed"] is True
             

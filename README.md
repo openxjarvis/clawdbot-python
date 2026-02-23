@@ -61,23 +61,38 @@ uv sync
 
 ### 2. Onboard
 
-Run the interactive setup wizard:
+Run the interactive setup wizard (once per environment):
 
 ```bash
 uv run openclaw onboard
 ```
 
-The wizard guides you through model selection, Telegram configuration, workspace initialization, and optional daemon installation. **It will prompt for API keys interactively and save them to `.env` automatically** — you do not need to create `.env` by hand first.
+The wizard walks you through:
+- LLM provider and model selection (Anthropic, OpenAI, Gemini, Ollama)
+- Optional fallback models for resilience
+- Telegram bot setup
+- Gateway port and authentication
+- Workspace and personality initialization
 
-If you already have a `.env` with keys set, the wizard detects them and skips those prompts:
+**It prompts for API keys interactively and saves them to `.env` automatically** — no need to create `.env` by hand first.
+
+If you already have keys in `.env`, the wizard detects and reuses them:
 
 ```bash
-# Optional: pre-populate .env before onboarding
+# Optional: pre-populate before onboarding
 cp .env.example .env
-# then edit .env with your keys, then run the wizard
+# edit .env with your keys, then run the wizard
 ```
 
-Onboarding creates your `~/.openclaw/` workspace and config. **Run this once per new environment.**
+Onboarding creates `~/.openclaw/` with your config and workspace. **Run this once per new environment.**
+
+### 3. Start
+
+```bash
+uv run openclaw start
+```
+
+That's it. The gateway and all configured channels start in the foreground. Open `http://localhost:18789` to access the Web UI.
 
 ---
 
@@ -85,29 +100,50 @@ Onboarding creates your `~/.openclaw/` workspace and config. **Run this once per
 
 The gateway is the core server. It manages the agent runtime, channels, sessions, cron, and serves the Web Control UI.
 
-### Foreground (development)
+> **Quick summary:** Use `uv run openclaw start` for the simplest one-command startup.
+> Use `uv run openclaw gateway install` if you want it to run automatically as a system service.
+
+### Option A — One-command start (simplest)
+
+```bash
+uv run openclaw start
+```
+
+Starts everything (gateway + Telegram channel) in the foreground. Logs print to the terminal. Press `Ctrl+C` to stop.
+This is the easiest way to get running. Use it for development or quick local use.
+
+### Option B — Foreground gateway only
 
 ```bash
 uv run openclaw gateway run
 ```
 
-Logs stream directly to the terminal. Press `Ctrl+C` to stop.
+Same as above but starts only the gateway server (no channels). Useful when you want to control channels separately.
 
-### Background daemon (recommended for production)
+### Option C — Background daemon (recommended for always-on use)
+
+If you want the gateway to start automatically and keep running in the background (even after a reboot), install it as a system service first:
 
 ```bash
-# Install as a system service (launchd on macOS, systemd on Linux)
+# 1. Install as a system service (runs once — launchd on macOS, systemd on Linux)
 uv run openclaw gateway install
 
-# Start / stop / restart
-uv run openclaw gateway start
-uv run openclaw gateway stop
-uv run openclaw gateway restart
-
-# Check status and tail logs
-uv run openclaw gateway status
-uv run openclaw gateway logs
+# 2. Then manage it with:
+uv run openclaw gateway start       # start the daemon
+uv run openclaw gateway stop        # stop it
+uv run openclaw gateway restart     # restart
+uv run openclaw gateway status      # check if it's running
+uv run openclaw gateway logs        # tail the log file
 ```
+
+> **Important:** `uv run openclaw gateway install` and `uv run openclaw start` are **not interchangeable**:
+>
+> | Command | What it does |
+> |---|---|
+> | `uv run openclaw start` | Runs directly in the terminal (foreground). Stops when you close the terminal. |
+> | `uv run openclaw gateway install` | Registers a background system service. Survives terminal close and reboots. Requires running `gateway start` after install. |
+>
+> A common mistake is running `gateway install` and then also `start` at the same time — this would launch **two instances** that both try to bind to the same port. Pick one approach and stick with it.
 
 ### Web Control UI
 
@@ -125,14 +161,20 @@ The UI lets you chat with the agent, inspect sessions, manage cron jobs, and con
 
 | Command | Description |
 |---|---|
-| `uv run openclaw onboard` | Interactive setup wizard |
-| `uv run openclaw gateway run` | Start gateway in foreground |
-| `uv run openclaw gateway install` | Install as background daemon |
-| `uv run openclaw gateway start/stop/restart` | Manage background daemon |
-| `uv run openclaw gateway status` | Check daemon status |
-| `uv run openclaw gateway logs` | Tail gateway logs |
+| `uv run openclaw onboard` | Interactive setup wizard (run once) |
+| `uv run openclaw start` | Start gateway + channels in the foreground |
+| `uv run openclaw gateway run` | Start gateway only in the foreground |
+| `uv run openclaw gateway install` | Install as a background system service (one-time setup) |
+| `uv run openclaw gateway start` | Start the installed background service |
+| `uv run openclaw gateway stop` | Stop the background service |
+| `uv run openclaw gateway restart` | Restart the background service |
+| `uv run openclaw gateway status` | Check background service status |
+| `uv run openclaw gateway logs` | Tail gateway log file |
 | `uv run openclaw doctor` | Run system diagnostics |
 | `uv run openclaw config show` | Show current configuration |
+| `uv run openclaw models status` | Show configured model and fallbacks |
+| `uv run openclaw models set <model>` | Set the default model |
+| `uv run openclaw models fallbacks list` | List fallback models |
 | `uv run openclaw cleanup` | Clean up processes, ports, and stale state |
 
 ### Cleanup

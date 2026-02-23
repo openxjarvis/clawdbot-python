@@ -209,18 +209,18 @@ def status(
 def _show_status(json_output: bool, plain: bool, check: bool, probe: bool, agent: Optional[str]):
     raw = _load_raw()
     defaults = _get_nested(raw, "agents", "defaults") or {}
-    model = defaults.get("model", "(not set)")
     image_model = defaults.get("imageModel", "(not set)")
-    fallbacks = _get_nested(raw, "models", "fallbacks") or []
-    image_fallbacks = _get_nested(raw, "models", "imageFallbacks") or []
     aliases = _get_nested(raw, "models", "aliases") or {}
+
+    # Read model + fallbacks from agents.defaults.model (canonical path)
+    primary, fallbacks = _get_primary_and_fallbacks(raw)
+    model = primary or "(not set)"
 
     if json_output:
         console.print(json.dumps({
             "model": model,
             "imageModel": image_model,
             "fallbacks": fallbacks,
-            "imageFallbacks": image_fallbacks,
             "aliases": aliases,
         }, indent=2))
         return
@@ -230,8 +230,6 @@ def _show_status(json_output: bool, plain: bool, check: bool, probe: bool, agent
     console.print(f"  Default image model: [cyan]{image_model}[/cyan]")
     if fallbacks:
         console.print(f"  Fallbacks:           {', '.join(fallbacks)}")
-    if image_fallbacks:
-        console.print(f"  Image fallbacks:     {', '.join(image_fallbacks)}")
     if aliases:
         console.print("\n  Aliases:")
         for k, v in aliases.items():
@@ -400,15 +398,36 @@ fallbacks_app = typer.Typer(help="Manage fallback models")
 models_app.add_typer(fallbacks_app, name="fallbacks")
 
 
-def _fallbacks_key() -> list:
-    return ["models", "fallbacks"]
+def _get_primary_and_fallbacks(raw: dict) -> tuple[str, list[str]]:
+    """Read agents.defaults.model and return (primary, fallbacks).
+
+    Mirrors the TS storage format: agents.defaults.model is either a plain
+    string (primary only) or {primary, fallbacks} when fallbacks are set.
+    This is the same path that bootstrap.py reads at runtime.
+    """
+    m = _get_nested(raw, "agents", "defaults", "model") or ""
+    if isinstance(m, dict):
+        return m.get("primary", ""), list(m.get("fallbacks") or [])
+    return str(m), []
+
+
+def _set_primary_and_fallbacks(raw: dict, primary: str, fallbacks: list[str]) -> None:
+    """Write primary + fallbacks back to agents.defaults.model.
+
+    Writes a plain string when fallbacks is empty (keeps config clean),
+    otherwise writes {primary, fallbacks} object — matching TS format.
+    """
+    if fallbacks:
+        _set_nested(raw, ["agents", "defaults", "model"], {"primary": primary, "fallbacks": fallbacks})
+    else:
+        _set_nested(raw, ["agents", "defaults", "model"], primary)
 
 
 @fallbacks_app.command("list")
 def fallbacks_list(json_output: bool = typer.Option(False, "--json", help="Output JSON")):
     """List fallback models"""
     raw = _load_raw()
-    fallbacks = _get_nested(raw, "models", "fallbacks") or []
+    _, fallbacks = _get_primary_and_fallbacks(raw)
     if json_output:
         console.print(json.dumps(fallbacks, indent=2))
         return
@@ -424,14 +443,12 @@ def fallbacks_list(json_output: bool = typer.Option(False, "--json", help="Outpu
 def fallbacks_add(model: str = typer.Argument(..., help="Model ID to add")):
     """Add a model to the fallback list"""
     raw = _load_raw()
-    if "models" not in raw or not isinstance(raw.get("models"), dict):
-        raw["models"] = {}
-    fb = raw["models"].get("fallbacks") or []
-    if model in fb:
+    primary, fallbacks = _get_primary_and_fallbacks(raw)
+    if model in fallbacks:
         console.print(f"[yellow]Already in fallbacks:[/yellow] {model}")
         return
-    fb.append(model)
-    raw["models"]["fallbacks"] = fb
+    fallbacks.append(model)
+    _set_primary_and_fallbacks(raw, primary, fallbacks)
     try:
         _save_raw(raw)
         console.print(f"[green]✓[/green] Added to fallbacks: {model}")
@@ -444,12 +461,12 @@ def fallbacks_add(model: str = typer.Argument(..., help="Model ID to add")):
 def fallbacks_remove(model: str = typer.Argument(..., help="Model ID to remove")):
     """Remove a model from the fallback list"""
     raw = _load_raw()
-    fb = _get_nested(raw, "models", "fallbacks") or []
-    if model not in fb:
+    primary, fallbacks = _get_primary_and_fallbacks(raw)
+    if model not in fallbacks:
         console.print(f"[yellow]Not in fallbacks:[/yellow] {model}")
         raise typer.Exit(1)
-    fb.remove(model)
-    raw.setdefault("models", {})["fallbacks"] = fb
+    fallbacks.remove(model)
+    _set_primary_and_fallbacks(raw, primary, fallbacks)
     try:
         _save_raw(raw)
         console.print(f"[green]✓[/green] Removed from fallbacks: {model}")
@@ -467,7 +484,8 @@ def fallbacks_clear(yes: bool = typer.Option(False, "--yes", help="Skip confirma
             console.print("Cancelled")
             return
     raw = _load_raw()
-    raw.setdefault("models", {})["fallbacks"] = []
+    primary, _ = _get_primary_and_fallbacks(raw)
+    _set_primary_and_fallbacks(raw, primary, [])
     try:
         _save_raw(raw)
         console.print("[green]✓[/green] Fallback models cleared")

@@ -144,19 +144,35 @@ async def run_onboarding_wizard(
     # Step 4: Provider configuration
     provider_config = await _configure_provider(mode)
     if provider_config:
-        # Update agent config with provider
+        model_value = provider_config.get("model", "claude-sonnet-4")
+        # Write to agents.defaults.model — the canonical path read by bootstrap.py
+        if not claw_config.agents:
+            from openclaw.config.schema import AgentsConfig
+            claw_config.agents = AgentsConfig()
+        if not claw_config.agents.defaults:
+            from openclaw.config.schema import AgentDefaults
+            claw_config.agents.defaults = AgentDefaults()
+        claw_config.agents.defaults.model = model_value
+        # Keep legacy agent.model in sync (string only — strip fallbacks wrapper)
         if not claw_config.agent:
             claw_config.agent = AgentConfig()
-        claw_config.agent.model = provider_config.get("model", "claude-sonnet-4")
+        primary_str = model_value if isinstance(model_value, str) else (
+            model_value.get("primary", "") if isinstance(model_value, dict) else str(model_value)
+        )
+        claw_config.agent.model = primary_str
         # Store auth in environment variables (handled by configure_auth)
     
     # Step 5: Agent configuration
     if mode == "advanced":
         agent_config = await _configure_agent_settings()
         if agent_config:
-            if not claw_config.agent:
-                claw_config.agent = AgentConfig()
-            claw_config.agent.workspace = agent_config.get("workspace", "./workspace")
+            if not claw_config.agents:
+                from openclaw.config.schema import AgentsConfig
+                claw_config.agents = AgentsConfig()
+            if not claw_config.agents.defaults:
+                from openclaw.config.schema import AgentDefaults
+                claw_config.agents.defaults = AgentDefaults()
+            claw_config.agents.defaults.workspace = agent_config.get("workspace", "./workspace")
     
     # Step 6: Gateway configuration
     gateway_config = await _configure_gateway(mode)
@@ -238,8 +254,12 @@ async def run_onboarding_wizard(
     print("\n" + "-" * 80)
     print("Configuration Summary:")
     print("-" * 80)
-    print(f"Provider: {provider_config.get('provider', 'Not configured')}")
-    print(f"Model: {claw_config.agent.model if claw_config.agent else 'Default'}")
+    print(f"Provider: {provider_config.get('provider', 'Not configured') if provider_config else 'Not configured'}")
+    _m = (claw_config.agents.defaults.model if claw_config.agents and claw_config.agents.defaults else None) or (claw_config.agent.model if claw_config.agent else "Default")
+    if isinstance(_m, dict):
+        print(f"Model: {_m.get('primary', '')}  (fallbacks: {', '.join(_m.get('fallbacks', []))})")
+    else:
+        print(f"Model: {_m}")
     print(f"Gateway Port: {claw_config.gateway.port if claw_config.gateway else 18789}")
     print(f"Gateway Bind: {claw_config.gateway.bind if claw_config.gateway else 'loopback'}")
     if channels_config:
@@ -623,12 +643,69 @@ def _prompt_config_action() -> str:
         return "modify"
 
 
+# Per-provider model menus (curated short-list, mirrors TS model catalog).
+# Format: (model_id, display_hint)
+_PROVIDER_MODELS: dict[str, list[tuple[str, str]]] = {
+    "anthropic": [
+        ("anthropic/claude-sonnet-4",           "Claude Sonnet 4         (recommended)"),
+        ("anthropic/claude-opus-4-5-20250514",  "Claude Opus 4.5         (most capable)"),
+        ("anthropic/claude-3-5-haiku-20241022", "Claude 3.5 Haiku        (fast / cheap)"),
+    ],
+    "openai": [
+        ("openai/gpt-4o",       "GPT-4o       (recommended)"),
+        ("openai/gpt-4o-mini",  "GPT-4o mini  (fast / cheap)"),
+        ("openai/o1-mini",      "o1-mini      (reasoning)"),
+    ],
+    "gemini": [
+        ("google/gemini-3-pro-preview",  "Gemini 3 Pro        (recommended)"),
+        ("google/gemini-2.0-flash",      "Gemini 2.0 Flash    (fast)"),
+        ("google/gemini-2.0-flash-lite", "Gemini 2.0 Flash Lite (cheap)"),
+    ],
+    "ollama": [
+        ("ollama/llama3",    "Llama 3"),
+        ("ollama/mistral",   "Mistral"),
+        ("ollama/codellama", "CodeLlama"),
+    ],
+}
+
+
+def _pick_model(provider: str, exclude: list[str] | None = None) -> str | None:
+    """Show numbered model menu for *provider* and return the chosen model id.
+
+    Returns None if the user presses Enter with no input (accept default) or
+    chooses an invalid option (falls back to first entry).
+    """
+    options = [
+        (mid, hint)
+        for mid, hint in _PROVIDER_MODELS.get(provider, [])
+        if not exclude or mid not in exclude
+    ]
+    if not options:
+        return None
+
+    print()
+    for i, (mid, hint) in enumerate(options, 1):
+        default_tag = "  ← default" if i == 1 else ""
+        print(f"  {i}. {hint}{default_tag}")
+
+    raw = input(f"\nSelect model [1]: ").strip()
+    if not raw:
+        return options[0][0]
+    try:
+        idx = int(raw) - 1
+        if 0 <= idx < len(options):
+            return options[idx][0]
+    except ValueError:
+        pass
+    return options[0][0]
+
+
 async def _configure_provider(mode: str) -> Optional[dict]:
     """Configure LLM provider"""
     print("\n" + "-" * 80)
     print("Provider Configuration")
     print("-" * 80)
-    
+
     if mode == "quickstart":
         # QuickStart: Check environment variables first
         providers = ["anthropic", "openai", "gemini"]
@@ -637,20 +714,21 @@ async def _configure_provider(mode: str) -> Optional[dict]:
                 print(f"\n✓ Found {provider.title()} API key in environment")
                 use_it = input(f"Use {provider.title()}? [Y/n]: ").strip().lower()
                 if use_it != "n":
-                    return {
-                        "provider": provider,
-                        "model": "claude-sonnet-4" if provider == "anthropic" else f"{provider}-default",
-                    }
-    
+                    # Still let the user pick a specific model
+                    print(f"\nSelect {provider.title()} model:")
+                    primary = _pick_model(provider) or _PROVIDER_MODELS[provider][0][0]
+                    model_value = _ask_fallbacks(provider, primary)
+                    return {"provider": provider, "model": model_value}
+
     # Prompt for provider
     print("\nSelect your LLM provider:")
     print("  1. Anthropic (Claude)  - Recommended")
     print("  2. OpenAI (GPT-4)")
     print("  3. Google (Gemini)")
     print("  4. Ollama (Local)")
-    
+
     choice = input("\nSelect provider [1]: ").strip()
-    
+
     provider_map = {
         "1": "anthropic",
         "2": "openai",
@@ -658,7 +736,7 @@ async def _configure_provider(mode: str) -> Optional[dict]:
         "4": "ollama",
     }
     provider = provider_map.get(choice, "anthropic")
-    
+
     # Configure auth (skips if Ollama)
     if provider != "ollama":
         try:
@@ -667,17 +745,37 @@ async def _configure_provider(mode: str) -> Optional[dict]:
         except Exception as e:
             print(f"\n✗ Failed to configure {provider}: {e}")
             return None
-    
-    # Select model
-    model_map = {
-        "anthropic": "claude-sonnet-4",
-        "openai": "gpt-4",
-        "gemini": "gemini-pro",
-        "ollama": "llama2",
-    }
-    model = model_map.get(provider, "claude-sonnet-4")
-    
-    return {"provider": provider, "model": model}
+
+    # Select primary model
+    print(f"\nSelect primary model for {provider.title()}:")
+    primary = _pick_model(provider) or _PROVIDER_MODELS.get(provider, [("",)])[0][0]
+
+    model_value = _ask_fallbacks(provider, primary)
+    return {"provider": provider, "model": model_value}
+
+
+def _ask_fallbacks(provider: str, primary: str) -> str | dict:
+    """Ask if the user wants fallback models. Returns a string (no fallbacks)
+    or a dict {primary, fallbacks} suitable for agents.defaults.model."""
+    add_fb = input("\nAdd fallback models? [y/N]: ").strip().lower()
+    if add_fb != "y":
+        return primary
+
+    fallbacks: list[str] = []
+    print("\nSelect fallback models (shown in priority order). Enter 'done' to finish.")
+    while len(fallbacks) < 3:
+        print(f"\nFallback #{len(fallbacks) + 1} for {provider.title()}:")
+        chosen = _pick_model(provider, exclude=[primary] + fallbacks)
+        if chosen is None:
+            break
+        fallbacks.append(chosen)
+        another = input("Add another fallback? [y/N]: ").strip().lower()
+        if another != "y":
+            break
+
+    if not fallbacks:
+        return primary
+    return {"primary": primary, "fallbacks": fallbacks}
 
 
 async def _configure_agent_settings() -> Optional[dict]:
