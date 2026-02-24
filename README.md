@@ -157,12 +157,22 @@ The UI lets you chat with the agent, inspect sessions, manage cron jobs, and con
 
 ---
 
-## Key Commands
+## CLI Commands
+
+### Core Commands
 
 | Command | Description |
 |---|---|
-| `uv run openclaw onboard` | Interactive setup wizard (run once) |
 | `uv run openclaw start` | Start gateway + channels in the foreground |
+| `uv run openclaw onboard` | Interactive setup wizard (run once) |
+| `uv run openclaw doctor` | Run system diagnostics |
+| `uv run openclaw version` | Show OpenClaw version |
+| `uv run openclaw tui` | Launch Terminal UI |
+
+### Gateway Management
+
+| Command | Description |
+|---|---|
 | `uv run openclaw gateway run` | Start gateway only in the foreground |
 | `uv run openclaw gateway install` | Install as a background system service (one-time setup) |
 | `uv run openclaw gateway start` | Start the installed background service |
@@ -170,29 +180,93 @@ The UI lets you chat with the agent, inspect sessions, manage cron jobs, and con
 | `uv run openclaw gateway restart` | Restart the background service |
 | `uv run openclaw gateway status` | Check background service status |
 | `uv run openclaw gateway logs` | Tail gateway log file |
-| `uv run openclaw doctor` | Run system diagnostics |
+| `uv run openclaw gateway uninstall` | Remove the background service |
+
+### Configuration
+
+| Command | Description |
+|---|---|
 | `uv run openclaw config show` | Show current configuration |
+| `uv run openclaw config get <key>` | Get a config value |
+| `uv run openclaw config set <key> <value>` | Set a config value |
+| `uv run openclaw config unset <key>` | Remove a config value |
+| `uv run openclaw directory` | Show OpenClaw directories |
+
+### Models
+
+| Command | Description |
+|---|---|
 | `uv run openclaw models status` | Show configured model and fallbacks |
 | `uv run openclaw models set <model>` | Set the default model |
 | `uv run openclaw models fallbacks list` | List fallback models |
+| `uv run openclaw models fallbacks add <model>` | Add a fallback model |
+| `uv run openclaw models fallbacks remove <model>` | Remove a fallback model |
+
+### Channels & Pairing
+
+| Command | Description |
+|---|---|
+| `uv run openclaw channels list` | List configured channels |
+| `uv run openclaw channels status` | Show channel status |
+| `uv run openclaw pairing list <channel>` | List pending pairing requests |
+| `uv run openclaw pairing approve <channel> <code>` | Approve a pairing request |
+| `uv run openclaw pairing deny <channel> <code>` | Deny a pairing request |
+| `uv run openclaw pairing clear <channel>` | Clear all pending pairing requests |
+| `uv run openclaw pairing allowlist <channel>` | Show allowFrom list for a channel |
+
+### Cron (Scheduled Tasks)
+
+| Command | Description |
+|---|---|
+| `uv run openclaw cron list` | List scheduled jobs |
+| `uv run openclaw cron add` | Add a new cron job (interactive) |
+| `uv run openclaw cron run <job-id>` | Force-run a job immediately |
+| `uv run openclaw cron remove <job-id>` | Remove a cron job |
+| `uv run openclaw cron enable <job-id>` | Enable a cron job |
+| `uv run openclaw cron disable <job-id>` | Disable a cron job |
+
+### Agent & Sessions
+
+| Command | Description |
+|---|---|
+| `uv run openclaw agent run` | Run an agent turn via the Gateway |
+| `uv run openclaw agent agents` | Manage isolated agents |
+| `uv run openclaw message send <channel> <target>` | Send a message to a channel |
+| `uv run openclaw memory search <query>` | Search memory index |
+| `uv run openclaw memory rebuild` | Rebuild memory index |
+
+### Skills & Tools
+
+| Command | Description |
+|---|---|
+| `uv run openclaw skills list` | List available skills |
+| `uv run openclaw skills show <name>` | Show skill details |
+| `uv run openclaw skills refresh` | Refresh skills cache |
+| `uv run openclaw tools list` | List available tools |
+| `uv run openclaw tools show <name>` | Show tool details |
+
+### Cleanup & Maintenance
+
+| Command | Description |
+|---|---|
 | `uv run openclaw cleanup` | Clean up processes, ports, and stale state |
+| `uv run openclaw cleanup --kill-all` | Kill all openclaw processes |
+| `uv run openclaw cleanup --ports 18789` | Free a specific port |
+| `uv run openclaw cleanup --stale` | Remove stale lock/state files only |
+| `uv run openclaw logs tail` | Tail gateway log file |
+| `uv run openclaw logs clear` | Clear log files |
 
-### Cleanup
+### Advanced
 
-Use `cleanup` when the gateway is stuck, a port is already in use, or you want to reset to a clean state:
-
-```bash
-# Kill all openclaw processes
-uv run openclaw cleanup --kill-all
-
-# Free a specific port
-uv run openclaw cleanup --ports 18789
-
-# Remove stale lock/state files only (no process kill)
-uv run openclaw cleanup --stale
-```
-
-Run `uv run openclaw cleanup --help` to see all available options.
+| Command | Description |
+|---|---|
+| `uv run openclaw approvals list` | List pending approvals |
+| `uv run openclaw acp` | Launch Approvals Control Panel |
+| `uv run openclaw hooks list` | List lifecycle hooks |
+| `uv run openclaw plugins list` | List loaded plugins |
+| `uv run openclaw security permissions` | Show security permissions |
+| `uv run openclaw system heartbeat` | Trigger system heartbeat |
+| `uv run openclaw browser launch` | Launch OpenClaw dedicated browser |
 
 ---
 

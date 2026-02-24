@@ -282,6 +282,26 @@ class PiAgentRuntime:
                 try:
                     m = _resolve_model(candidate_model)
                     await pi_session.set_model(m)
+                    
+                    # CRITICAL FIX: Adjust thinking_level based on model capabilities
+                    # When falling back from a reasoning model to a non-reasoning model,
+                    # we must clear the thinking_level or the API will return 400.
+                    if hasattr(m, "reasoning"):
+                        if m.reasoning:
+                            # New model supports reasoning — set thinking_level
+                            try:
+                                pi_session.set_thinking_level("low")
+                                logger.info("Set thinking_level=low for reasoning model %s", m.id)
+                            except Exception as exc:
+                                logger.debug("Could not set thinking level: %s", exc)
+                        else:
+                            # New model does NOT support reasoning — clear thinking_level
+                            try:
+                                pi_session.set_thinking_level("off")
+                                logger.info("Cleared thinking_level for non-reasoning model %s", m.id)
+                            except Exception as exc:
+                                logger.debug("Could not clear thinking level: %s", exc)
+                    
                     logger.info("Switched session %s to model %r", session_id[:8], candidate_model)
                 except Exception as exc:
                     logger.warning("Model switch to %r failed: %s", candidate_model, exc)
@@ -305,14 +325,27 @@ class PiAgentRuntime:
             def on_event(pi_event: Any) -> None:
                 from openclaw.events import Event, EventType  # noqa: F811
 
-                etype = getattr(pi_event, "type", None)
+                # pi can emit both AgentEvent objects and plain dicts
+                if isinstance(pi_event, dict):
+                    etype = pi_event.get("type")
+                else:
+                    etype = getattr(pi_event, "type", None)
 
                 if etype == "message_update":
-                    msg = getattr(pi_event, "message", None)
-                    content = getattr(msg, "content", []) if msg else []
+                    if isinstance(pi_event, dict):
+                        msg = pi_event.get("message")
+                    else:
+                        msg = getattr(pi_event, "message", None)
+                    if isinstance(msg, dict):
+                        content = msg.get("content", [])
+                    else:
+                        content = getattr(msg, "content", []) if msg else []
                     full_text = ""
                     for chunk in content:
-                        t = getattr(chunk, "text", None)
+                        if isinstance(chunk, dict):
+                            t = chunk.get("text") if chunk.get("type") == "text" else None
+                        else:
+                            t = getattr(chunk, "text", None)
                         if t and isinstance(t, str):
                             full_text += t
                     delta = full_text[len(_prev_text[0]):]
@@ -330,14 +363,22 @@ class PiAgentRuntime:
                     _prev_text[0] = ""
 
                 if etype in ("agent_end", "turn_end"):
-                    msgs = getattr(pi_event, "messages", None) or []
+                    if isinstance(pi_event, dict):
+                        msgs = pi_event.get("messages") or []
+                        msg = pi_event.get("message")
+                    else:
+                        msgs = getattr(pi_event, "messages", None) or []
+                        msg = getattr(pi_event, "message", None)
                     if not isinstance(msgs, list):
                         msgs = [msgs] if msgs else []
-                    msg = getattr(pi_event, "message", None)
                     if msg:
                         msgs = [msg] + list(msgs)
                     for m in msgs:
-                        err = getattr(m, "error_message", None)
+                        # m may be a dict (pi emits some events as plain dicts)
+                        if isinstance(m, dict):
+                            err = m.get("error_message") or m.get("errorMessage")
+                        else:
+                            err = getattr(m, "error_message", None)
                         if err:
                             logger.error("pi agent error (stop_reason=error): %s", err)
                             # Check whether this is a quota error so the outer

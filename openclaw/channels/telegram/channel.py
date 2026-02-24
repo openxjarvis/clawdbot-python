@@ -12,8 +12,6 @@ from telegram.ext import Application, ContextTypes, MessageHandler, CommandHandl
 
 from ..chat_commands import ChatCommandExecutor, ChatCommandParser
 from ..base import ChannelCapabilities, ChannelPlugin, InboundMessage
-from .command_handler import TelegramCommandHandler
-from .commands import list_native_commands, register_commands_with_telegram
 from .i18n_support import register_lang_handlers
 from .commands_extended import register_extended_commands
 from .update_offset_store import (
@@ -50,7 +48,6 @@ class TelegramChannel(ChannelPlugin):
         self._command_parser: Optional[ChatCommandParser] = None
         self._command_executor: Optional[ChatCommandExecutor] = None
         self._owner_id: Optional[str] = None
-        self._command_handler: Optional[TelegramCommandHandler] = None
         self._config: Optional[dict] = None
         self._account_id: Optional[str] = None
         self._dedupe = TelegramUpdateDedupe()
@@ -231,7 +228,6 @@ class TelegramChannel(ChannelPlugin):
         }
         
         self._account_id = account_id
-        self._command_handler = TelegramCommandHandler(cmd_config, account_id, None)
 
         # Register conflict/error handler for update-processing errors
         # (Updater polling errors are handled via error_callback in start_polling below)
@@ -971,33 +967,35 @@ class TelegramChannel(ChannelPlugin):
         await self._handle_message(inbound)
 
     async def _register_bot_commands(self):
-        """Register bot commands with Telegram API (makes them visible in client)"""
-        commands = [
-            # Basic commands
-            BotCommand("start", "🚀 Start using the bot"),
-            BotCommand("help", "📋 View help information"),
-            BotCommand("new", "🆕 Start new conversation"),
-            BotCommand("status", "📊 View status"),
-            BotCommand("model", "🤖 Switch AI model"),
-            
-            # Extended commands (already have handlers registered)
-            BotCommand("commands", "📋 List all available commands"),
-            BotCommand("context", "📖 Explain context management"),
-            BotCommand("compact", "🗜️ Compact session context"),
-            BotCommand("stop", "⏹️ Stop current run"),
-            BotCommand("verbose", "🔍 Toggle verbose mode"),
-            BotCommand("reasoning", "🧠 Toggle reasoning visibility"),
-            BotCommand("usage", "📊 Show usage statistics"),
-            
-            # Session management
-            BotCommand("reset", "🔄 Reset conversation (clear transcript)"),
-        ]
-        
+        """Register bot commands with Telegram API using dynamic registration."""
         try:
-            await self._app.bot.set_my_commands(commands)
-            logger.info(f"✅ Registered {len(commands)} commands with Telegram API")
+            from openclaw.channels.telegram.command_handler import register_telegram_native_commands
+            
+            # Use dynamic registration from command registry
+            await register_telegram_native_commands(
+                bot=self._app.bot,
+                cfg=self._config or {},
+                account_id=self._account_id or "default",
+                native_enabled=True,
+                native_skills_enabled=True,
+            )
         except Exception as e:
             logger.error(f"Failed to register commands with Telegram API: {e}")
+            
+            # Fallback to minimal hardcoded commands
+            try:
+                from telegram import BotCommand
+                
+                minimal_commands = [
+                    BotCommand("start", "Start using the bot"),
+                    BotCommand("help", "View help information"),
+                    BotCommand("status", "View status"),
+                ]
+                
+                await self._app.bot.set_my_commands(minimal_commands)
+                logger.info("Registered minimal fallback commands")
+            except Exception as fallback_err:
+                logger.error(f"Failed to register fallback commands: {fallback_err}")
 
     async def _setup_menu_button(self):
         """Setup bot menu button"""
@@ -1272,7 +1270,8 @@ class TelegramChannel(ChannelPlugin):
         # Get allowFrom from pairing store
         try:
             from ...pairing.pairing_store import read_channel_allow_from_store
-            allow_from_store = read_channel_allow_from_store("telegram")
+            # Pass account_id to read both account-scoped and legacy allowFrom lists
+            allow_from_store = read_channel_allow_from_store("telegram", self._account_id)
         except Exception as e:
             logger.warning(f"Failed to read pairing store: {e}")
             allow_from_store = []
@@ -1321,10 +1320,11 @@ class TelegramChannel(ChannelPlugin):
             from ...pairing.pairing_store import upsert_channel_pairing_request
             from ...pairing.messages import format_pairing_request_message
             
-            # Create or update pairing request
+            # Create or update pairing request (with account_id for multi-account support)
             result = upsert_channel_pairing_request(
                 channel="telegram",
                 sender_id=str(sender.id),
+                account_id=self._account_id,
                 meta={
                     "username": sender.username or "",
                     "first_name": sender.first_name or "",
