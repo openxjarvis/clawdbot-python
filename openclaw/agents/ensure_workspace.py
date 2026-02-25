@@ -18,6 +18,7 @@ DEFAULT_IDENTITY_FILENAME = "IDENTITY.md"
 DEFAULT_USER_FILENAME = "USER.md"
 DEFAULT_HEARTBEAT_FILENAME = "HEARTBEAT.md"
 DEFAULT_BOOTSTRAP_FILENAME = "BOOTSTRAP.md"
+DEFAULT_BOOT_FILENAME = "BOOT.md"
 
 
 def strip_frontmatter(content: str) -> str:
@@ -83,14 +84,14 @@ def write_file_if_missing(file_path: Path, content: str) -> bool:
     Returns:
         True if file was created, False if it already existed
     """
+    if file_path.exists():
+        return False
+    
     try:
-        # Use 'x' mode to fail if file exists
+        file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
         logger.info(f"Created workspace file: {file_path.name}")
         return True
-    except FileExistsError:
-        # File already exists, skip
-        return False
     except Exception as e:
         logger.warning(f"Failed to create {file_path.name}: {e}")
         return False
@@ -166,6 +167,7 @@ def ensure_agent_workspace(
     user_path = workspace_dir / DEFAULT_USER_FILENAME
     heartbeat_path = workspace_dir / DEFAULT_HEARTBEAT_FILENAME
     bootstrap_path = workspace_dir / DEFAULT_BOOTSTRAP_FILENAME
+    boot_path = workspace_dir / DEFAULT_BOOT_FILENAME
     
     # Check if this is a brand new workspace
     is_new = is_brand_new_workspace(workspace_dir)
@@ -179,6 +181,7 @@ def ensure_agent_workspace(
         user_template = load_template(DEFAULT_USER_FILENAME)
         heartbeat_template = load_template(DEFAULT_HEARTBEAT_FILENAME)
         bootstrap_template = load_template(DEFAULT_BOOTSTRAP_FILENAME)
+        boot_template = load_template(DEFAULT_BOOT_FILENAME)
     except FileNotFoundError as e:
         logger.error(f"Failed to load templates: {e}")
         return result
@@ -190,6 +193,7 @@ def ensure_agent_workspace(
     write_file_if_missing(identity_path, identity_template)
     write_file_if_missing(user_path, user_template)
     write_file_if_missing(heartbeat_path, heartbeat_template)
+    write_file_if_missing(boot_path, boot_template)
     
     # BOOTSTRAP.md only for brand new workspaces
     if is_new:
@@ -204,6 +208,7 @@ def ensure_agent_workspace(
         "user_path": user_path,
         "heartbeat_path": heartbeat_path,
         "bootstrap_path": bootstrap_path,
+        "boot_path": boot_path,
     })
     
     return result
@@ -221,4 +226,5 @@ __all__ = [
     "DEFAULT_USER_FILENAME",
     "DEFAULT_HEARTBEAT_FILENAME",
     "DEFAULT_BOOTSTRAP_FILENAME",
+    "DEFAULT_BOOT_FILENAME",
 ]

@@ -1,144 +1,132 @@
 """Message processing pipeline.
 
 Processes inbound messages and determines responses.
-Aligned with TypeScript src/web/auto-reply/monitor/process-message.ts
+Fully aligned with TypeScript src/web/auto-reply/monitor/process-message.ts
+and src/web/auto-reply/monitor/on-message.ts
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional, Any
+import logging
+from typing import Any, Callable, Awaitable
 
-from openclaw.auto_reply.types import ReplyPayload, GetReplyOptions
-from openclaw.auto_reply.reply import get_reply
-from .group_gating import should_process_group_message
-from .mentions import strip_mentions
+from openclaw.auto_reply.group_history import GroupHistoryEntry
 
-
-@dataclass
-class ProcessedMessage:
-    """Result of message processing."""
-    
-    should_reply: bool  # Whether to send a reply
-    reply_payload: Optional[ReplyPayload] = None  # Reply to send
-    reason: Optional[str] = None  # Reason for decision
+logger = logging.getLogger(__name__)
 
 
 async def process_message(
-    session_key: str,
-    message_text: str,
-    is_group: bool = False,
-    config: Optional[dict] = None,
-    reply_options: Optional[GetReplyOptions] = None
-) -> ProcessedMessage:
-    """Process an inbound message.
-    
-    Main entry point for message processing pipeline.
-    
-    Args:
-        session_key: Session key for routing
-        message_text: Message text
-        is_group: Whether this is a group message
-        config: Optional configuration
-        reply_options: Optional reply options
-    
-    Returns:
-        ProcessedMessage with decision and reply
-    """
-    # Check group gating
-    if is_group:
-        if not should_process_group_message(message_text, is_group, config):
-            return ProcessedMessage(
-                should_reply=False,
-                reason="group_gating_failed"
-            )
-    
-    # Strip mentions from message
-    cleaned_message = strip_mentions(message_text)
-    
-    if not cleaned_message.strip():
-        return ProcessedMessage(
-            should_reply=False,
-            reason="empty_message"
-        )
-    
-    try:
-        # Get reply from agent
-        reply = await get_reply(
-            session_key=session_key,
-            user_message=cleaned_message,
-            options=reply_options
-        )
-        
-        if not reply:
-            return ProcessedMessage(
-                should_reply=False,
-                reason="no_reply"
-            )
-        
-        # Handle list of replies
-        if isinstance(reply, list):
-            if len(reply) == 0:
-                return ProcessedMessage(
-                    should_reply=False,
-                    reason="empty_reply_list"
-                )
-            reply = reply[0]  # Use first reply
-        
-        return ProcessedMessage(
-            should_reply=True,
-            reply_payload=reply,
-            reason="success"
-        )
-    
-    except Exception as e:
-        # Return error
-        return ProcessedMessage(
-            should_reply=True,
-            reply_payload=ReplyPayload(
-                text=f"Error processing message: {str(e)}",
-                is_error=True
-            ),
-            reason="error"
-        )
-
-
-async def process_and_send(
-    session_key: str,
-    message_text: str,
-    is_group: bool = False,
-    config: Optional[dict] = None,
-    reply_options: Optional[GetReplyOptions] = None,
-    send_callback: Optional[callable] = None
+    cfg: dict[str, Any],
+    msg: dict[str, Any],
+    route: dict[str, Any],
+    group_history_key: str,
+    group_histories: dict[str, list[GroupHistoryEntry]] | None = None,
+    process_message_fn: Callable[[dict[str, Any], dict[str, Any], str], Awaitable[bool]] | None = None,
 ) -> bool:
-    """Process message and send reply.
+    """Process an inbound message with full broadcast and group support.
     
-    Higher-level helper that processes message and sends reply.
+    Mirrors TS processMessage() from src/web/auto-reply/monitor/process-message.ts
+    and the flow from src/web/auto-reply/monitor/on-message.ts.
+    
+    This is the main entry point that:
+    1. Checks for broadcast groups and dispatches to multiple agents if configured
+    2. Otherwise processes the message normally via the resolved route
     
     Args:
-        session_key: Session key
-        message_text: Message text
-        is_group: Whether this is a group
-        config: Configuration
-        reply_options: Reply options
-        send_callback: Callback to send reply (async function)
+        cfg: OpenClaw configuration
+        msg: Inbound message dict
+        route: Resolved agent route
+        group_history_key: Key for group history storage
+        group_histories: Optional group history map
+        process_message_fn: Function to process message for a specific route
+        
+    Returns:
+        True if message was processed (broadcast or normal), False otherwise
+    """
+    from openclaw.auto_reply.monitor.broadcast import maybe_broadcast_message
     
+    # Default process function if not provided
+    if process_message_fn is None:
+        process_message_fn = _default_process_for_route
+    
+    # Check if this should be broadcast to multiple agents
+    peer_id = msg.get("from", msg.get("peer_id", ""))
+    
+    if await maybe_broadcast_message(
+        cfg=cfg,
+        msg=msg,
+        peer_id=peer_id,
+        route=route,
+        group_history_key=group_history_key,
+        process_message_fn=process_message_fn,
+        group_histories=group_histories,
+    ):
+        return True
+    
+    # Normal single-agent processing
+    return await process_message_fn(msg, route, group_history_key)
+
+
+async def _default_process_for_route(
+    msg: dict[str, Any],
+    route: dict[str, Any],
+    group_history_key: str,
+) -> bool:
+    """Default message processor for a specific route.
+    
+    This is a fallback implementation that calls get_reply_from_config.
+    
+    Args:
+        msg: Inbound message dict
+        route: Resolved agent route
+        group_history_key: Group history key
+        
     Returns:
         True if reply was sent
     """
-    result = await process_message(
-        session_key=session_key,
-        message_text=message_text,
-        is_group=is_group,
-        config=config,
-        reply_options=reply_options
-    )
+    try:
+        from openclaw.auto_reply.reply.get_reply import get_reply_from_config
+        
+        # Build context from message
+        ctx = _build_context_from_message(msg, route)
+        
+        # Get reply
+        reply = await get_reply_from_config(
+            ctx=ctx,
+            cfg=route.get("config"),
+            runtime=route.get("runtime"),
+        )
+        
+        return reply is not None
     
-    if not result.should_reply or not result.reply_payload:
+    except Exception as exc:
+        logger.error(f"Failed to process message: {exc}")
         return False
+
+
+def _build_context_from_message(msg: dict[str, Any], route: dict[str, Any]) -> dict[str, Any]:
+    """Build context dict from message and route.
     
-    if send_callback:
-        await send_callback(result.reply_payload)
-        return True
+    Helper to convert message dict to context format expected by get_reply_from_config.
     
-    return False
+    Args:
+        msg: Inbound message dict
+        route: Resolved route dict
+        
+    Returns:
+        Context dict
+    """
+    return {
+        "Body": msg.get("body", msg.get("text", "")),
+        "RawBody": msg.get("body", msg.get("text", "")),
+        "SessionKey": route.get("sessionKey", ""),
+        "From": msg.get("from", msg.get("sender_id", "")),
+        "To": msg.get("to", ""),
+        "ChatType": msg.get("chatType", msg.get("chat_type", "dm")),
+        "SenderName": msg.get("senderName", msg.get("sender_name")),
+        "MessageId": msg.get("id", msg.get("message_id")),
+        "Channel": msg.get("channel", ""),
+        "GroupId": msg.get("groupId", msg.get("group_id")),
+        "GroupName": msg.get("groupSubject", msg.get("group_name")),
+        "WasMentioned": msg.get("wasMentioned", False),
+    }

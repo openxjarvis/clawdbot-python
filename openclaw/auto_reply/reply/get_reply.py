@@ -21,6 +21,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Awaitable
 
+from openclaw.hooks.internal_hooks import create_internal_hook_event, trigger_internal_hook
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -203,6 +205,8 @@ async def run_agent_turn(
     images: list[str] | None = None,
     on_block_reply: Callable[[ReplyPayload], Awaitable[None]] | None = None,
     on_tool_result: Callable[[ReplyPayload], Awaitable[None]] | None = None,
+    ctx: Any = None,
+    inbound_meta_prompt: str | None = None,
 ) -> ReplyPayload | None:
     """
     Run a single agent turn and return the final reply.
@@ -236,6 +240,8 @@ async def run_agent_turn(
         images=images,
         on_block_reply=on_block_reply,
         on_tool_result=on_tool_result,
+        ctx=ctx,
+        inbound_meta_prompt=inbound_meta_prompt,
     )
 
 
@@ -250,6 +256,8 @@ async def _run_with_agent_session(
     images: list[str] | None = None,
     on_block_reply: Callable[[ReplyPayload], Awaitable[None]] | None = None,
     on_tool_result: Callable[[ReplyPayload], Awaitable[None]] | None = None,
+    ctx: Any = None,
+    inbound_meta_prompt: str | None = None,
 ) -> ReplyPayload | None:
     """Run via pi_mono AgentSession (canonical path)."""
     try:
@@ -258,11 +266,22 @@ async def _run_with_agent_session(
         return await _run_with_gateway_runtime(
             message, session_key, cfg, runtime, images=images,
             on_block_reply=on_block_reply, on_tool_result=on_tool_result,
+            ctx=ctx, inbound_meta_prompt=inbound_meta_prompt,
         )
 
     # Build session from gateway deps
     tools = _resolve_tools(runtime)
-    system_prompt = _resolve_system_prompt(cfg)
+    base_system_prompt = _resolve_system_prompt(cfg)
+    
+    # Inject inbound meta into system prompt (matches TS extraSystemPrompt logic)
+    if inbound_meta_prompt:
+        system_prompt = (
+            f"{base_system_prompt}\n\n{inbound_meta_prompt}"
+            if base_system_prompt
+            else inbound_meta_prompt
+        )
+    else:
+        system_prompt = base_system_prompt
 
     agent_session = AgentSession(
         session_key=session_key,
@@ -311,6 +330,8 @@ async def _run_with_gateway_runtime(
     images: list[str] | None = None,
     on_block_reply: Callable[[ReplyPayload], Awaitable[None]] | None = None,
     on_tool_result: Callable[[ReplyPayload], Awaitable[None]] | None = None,
+    ctx: Any = None,
+    inbound_meta_prompt: str | None = None,
 ) -> ReplyPayload | None:
     """Fallback: run using gateway AgentSession/MultiProviderRuntime directly."""
     try:
@@ -322,7 +343,17 @@ async def _run_with_gateway_runtime(
     # Resolve or create a session object
     session = _get_or_create_session(session_key, runtime)
     tools = _resolve_tools(runtime)
-    system_prompt = _resolve_system_prompt(cfg)
+    base_system_prompt = _resolve_system_prompt(cfg)
+    
+    # Inject inbound meta into system prompt (matches TS extraSystemPrompt logic)
+    if inbound_meta_prompt:
+        system_prompt = (
+            f"{base_system_prompt}\n\n{inbound_meta_prompt}"
+            if base_system_prompt
+            else inbound_meta_prompt
+        )
+    else:
+        system_prompt = base_system_prompt
 
     agent_session = AgentSession(
         session_key=session_key,
@@ -478,6 +509,46 @@ async def get_reply_from_config(
     # ------------------------------------------------------------------
     is_reset, post_reset_body = detect_reset_command(body)
     if is_reset:
+        # Trigger internal hook for reset/new commands (before resetting)
+        try:
+            # Determine command action
+            command_action = "new" if body.strip().lower() in ("/new", "/clear") else "reset"
+            
+            # Get session entry before reset (if available)
+            session_entry = None
+            try:
+                from openclaw.config.sessions import load_session_store, resolve_store_path
+                store_path = resolve_store_path(cfg.get("session", {}).get("store"), {})
+                store = load_session_store(store_path)
+                session_entry = store.get(session_key.lower()) or store.get(session_key) if session_key else None
+            except Exception:
+                pass
+            
+            # Create and trigger hook event
+            hook_event = create_internal_hook_event(
+                "command",
+                command_action,
+                session_key or "",
+                {
+                    "sessionEntry": session_entry,
+                    "previousSessionEntry": session_entry,
+                    "commandSource": ctx.surface if hasattr(ctx, "surface") else "unknown",
+                    "senderId": ctx.From if hasattr(ctx, "From") else "unknown",
+                    "sender_id": ctx.From if hasattr(ctx, "From") else "unknown",
+                    "command_source": ctx.surface if hasattr(ctx, "surface") else "unknown",
+                    "cfg": cfg,
+                }
+            )
+            await trigger_internal_hook(hook_event)
+            
+            # Send hook messages to user if any
+            if hook_event.messages:
+                # Hook messages would be sent via channel here
+                # For now, we log them
+                logger.info(f"Hook messages: {hook_event.messages}")
+        except Exception as err:
+            logger.debug(f"Failed to trigger command hook: {err}")
+        
         await _handle_session_reset(session_key, cfg)
         if not post_reset_body:
             return ReplyPayload(text="Session reset. How can I help you?")
@@ -521,13 +592,91 @@ async def get_reply_from_config(
             logger.warning(f"Skill command /{skill_name} failed: {exc}")
 
     # ------------------------------------------------------------------
-    # 6. Regular agent turn
+    # 6. Build inbound context (matches TS get-reply-run.ts)
+    # ------------------------------------------------------------------
+    from ..inbound_meta import build_inbound_meta_system_prompt, build_inbound_user_context_prefix
+    from .groups import build_group_chat_context, build_group_intro
+    
+    # Build inbound meta for system prompt (trusted metadata)
+    inbound_meta_prompt = build_inbound_meta_system_prompt(ctx)
+    
+    # Build group chat context and intro (matches TS get-reply-run.ts lines 172-186)
+    chat_type = getattr(ctx, "ChatType", None)
+    is_new_session = is_reset  # Approximation: reset triggers count as new session
+    is_group_chat = chat_type == "group"
+    
+    # Always include persistent group chat context (name, participants, reply guidance)
+    group_chat_context = ""
+    if is_group_chat:
+        try:
+            group_chat_context = build_group_chat_context(session_ctx=ctx)
+        except Exception as exc:
+            logger.warning(f"Failed to build group chat context: {exc}")
+    
+    # Behavioral intro (activation mode, lurking, etc.) only on first turn
+    group_intro = ""
+    if is_group_chat and is_new_session:
+        try:
+            group_intro = build_group_intro(
+                cfg=cfg,
+                session_ctx=ctx,
+                session_entry=None,
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to build group intro: {exc}")
+    
+    # Combine extra system prompt components (matches TS extraSystemPrompt)
+    extra_system_prompt_parts = [
+        inbound_meta_prompt,
+        group_chat_context,
+        group_intro,
+    ]
+    extra_system_prompt = "\n\n".join(p for p in extra_system_prompt_parts if p)
+    
+    # Build inbound user context (untrusted context blocks)
+    # Only include certain fields on new sessions (matches TS logic)
+    
+    ctx_for_user_context = ctx
+    if is_new_session:
+        # On new session, conditionally skip history if thread history is present
+        thread_history_body = getattr(ctx, "ThreadHistoryBody", None)
+        if thread_history_body and str(thread_history_body).strip():
+            # Skip InboundHistory and ThreadStarterBody when ThreadHistoryBody exists
+            # Create a modified context without these fields
+            ctx_for_user_context = type(ctx)(**{
+                k: v for k, v in ctx.model_dump().items()
+                if k not in ("InboundHistory", "ThreadStarterBody")
+            })
+        else:
+            # Skip only ThreadStarterBody on new sessions
+            ctx_for_user_context = type(ctx)(**{
+                k: v for k, v in ctx.model_dump().items()
+                if k != "ThreadStarterBody"
+            })
+    else:
+        # On existing sessions, skip ThreadStarterBody
+        ctx_for_user_context = type(ctx)(**{
+            k: v for k, v in ctx.model_dump().items()
+            if k != "ThreadStarterBody"
+        })
+    
+    inbound_user_context = build_inbound_user_context_prefix(ctx_for_user_context)
+    
+    # Prepend inbound user context to the message body
+    effective_body_with_context = (
+        f"{inbound_user_context}\n\n{effective_body}"
+        if inbound_user_context
+        else effective_body
+    )
+    
+    # ------------------------------------------------------------------
+    # 7. Regular agent turn
     # ------------------------------------------------------------------
     images = getattr(ctx, "MediaUrls", None) or []
     images = [i for i in (images or []) if i]
 
     final = await run_agent_turn(
-        message=effective_body,
+        message=effective_body_with_context,
         session_key=session_key,
         cfg=cfg,
         runtime=runtime,
@@ -536,6 +685,8 @@ async def get_reply_from_config(
         images=images if images else None,
         on_block_reply=on_block_reply,
         on_tool_result=on_tool_result,
+        ctx=ctx,
+        inbound_meta_prompt=extra_system_prompt,
     )
 
     if directives.reply_to_id and final:

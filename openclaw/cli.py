@@ -296,6 +296,98 @@ def health_metrics(
         console.print(table)
 
 
+# Hooks commands
+hooks_app = typer.Typer(help="Manage internal agent hooks")
+app.add_typer(hooks_app, name="hooks")
+
+
+@hooks_app.command("list")
+def hooks_list(
+    eligible: bool = typer.Option(False, "--eligible", help="Show only eligible hooks"),
+    json_format: bool = typer.Option(False, "--json", help="Output as JSON"),
+    verbose: bool = typer.Option(False, "-v", "--verbose", help="Show more details"),
+):
+    """List all hooks"""
+    try:
+        from .hooks.hooks_cli import build_hooks_report, format_hooks_list
+        from .config.io import load_config
+        
+        config = load_config()
+        report = build_hooks_report(config)
+        output = format_hooks_list(report, json_output=json_format, eligible_only=eligible, verbose=verbose)
+        console.print(output)
+    except Exception as e:
+        console.print(f"Error: {e}", style="red")
+        raise typer.Exit(1)
+
+
+@hooks_app.command("info")
+def hooks_info(
+    name: str = typer.Argument(..., help="Hook name"),
+    json_format: bool = typer.Option(False, "--json", help="Output as JSON"),
+):
+    """Show detailed information about a hook"""
+    try:
+        from .hooks.hooks_cli import build_hooks_report, format_hook_info
+        from .config.io import load_config
+        
+        config = load_config()
+        report = build_hooks_report(config)
+        output = format_hook_info(report, name, json_output=json_format)
+        console.print(output)
+    except Exception as e:
+        console.print(f"Error: {e}", style="red")
+        raise typer.Exit(1)
+
+
+@hooks_app.command("check")
+def hooks_check(
+    json_format: bool = typer.Option(False, "--json", help="Output as JSON"),
+):
+    """Check hooks eligibility status"""
+    try:
+        from .hooks.hooks_cli import build_hooks_report, format_hooks_check
+        from .config.io import load_config
+        
+        config = load_config()
+        report = build_hooks_report(config)
+        output = format_hooks_check(report, json_output=json_format)
+        console.print(output)
+    except Exception as e:
+        console.print(f"Error: {e}", style="red")
+        raise typer.Exit(1)
+
+
+@hooks_app.command("enable")
+def hooks_enable(
+    name: str = typer.Argument(..., help="Hook name"),
+):
+    """Enable a hook"""
+    try:
+        from .hooks.hooks_cli import enable_hook
+        
+        result = enable_hook(name)
+        console.print(result, style="green")
+    except Exception as e:
+        console.print(f"Error: {e}", style="red")
+        raise typer.Exit(1)
+
+
+@hooks_app.command("disable")
+def hooks_disable(
+    name: str = typer.Argument(..., help="Hook name"),
+):
+    """Disable a hook"""
+    try:
+        from .hooks.hooks_cli import disable_hook
+        
+        result = disable_hook(name)
+        console.print(result, style="yellow")
+    except Exception as e:
+        console.print(f"Error: {e}", style="red")
+        raise typer.Exit(1)
+
+
 # API server commands
 api_app = typer.Typer(help="API server management")
 app.add_typer(api_app, name="api")
@@ -380,6 +472,7 @@ def main(
         console.print("  [cyan]agent[/cyan]   - Agent operations")
         console.print("  [cyan]config[/cyan]  - Configuration management")
         console.print("  [cyan]health[/cyan]  - Health check and monitoring")
+        console.print("  [cyan]hooks[/cyan]   - Manage internal agent hooks")
         console.print("  [cyan]api[/cyan]     - API server management")
         console.print("\nUse [cyan]--help[/cyan] for more information on any command")
 

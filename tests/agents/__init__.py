@@ -1,1 +1,1 @@
-"""Tests for agents module"""
+"""Agent tests"""

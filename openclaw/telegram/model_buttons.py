@@ -169,6 +169,8 @@ def build_models_keyboard(params: ModelsKeyboardParams) -> list[ButtonRow]:
     rows: list[ButtonRow] = []
 
     if not params.models:
+        # Even with no models, show back button
+        rows.append([{"text": "« Back to Providers", "callback_data": "mdl_back"}])
         return rows
 
     # Calculate pagination

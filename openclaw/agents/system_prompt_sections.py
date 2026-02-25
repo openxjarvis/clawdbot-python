@@ -16,20 +16,24 @@ logger = logging.getLogger(__name__)
 # Silent reply token (matches TypeScript SILENT_REPLY_TOKEN from auto-reply/tokens.ts)
 SILENT_REPLY_TOKEN = "◻️"
 
-# Core tool summaries (ported from TypeScript coreToolSummaries)
-# NOTE: Python tool names differ from TS (read_file vs read, bash vs exec, etc.)
+# Core tool summaries (aligned with TypeScript coreToolSummaries lines 225-253)
+# NOTE: Python tool names may differ from TS (read_file vs read, bash vs exec, etc.)
 # because the Python tool registry uses these names. The summaries match TS intent.
 CORE_TOOL_SUMMARIES: dict[str, str] = {
+    "read": "Read file contents",
     "read_file": "Read file contents",
+    "write": "Create or overwrite files",
     "write_file": "Create or overwrite files",
+    "edit": "Make precise edits to files",
     "edit_file": "Make precise edits to files",
     "apply_patch": "Apply multi-file patches",
     "grep": "Search file contents for patterns",
     "find": "Find files by glob pattern",
     "ls": "List directory contents",
+    "exec": "Run shell commands (pty available for TTY-required CLIs)",
     "bash": "Run shell commands (pty available for TTY-required CLIs)",
-    "process": "Manage background bash sessions",
-    "web_search": "Search the web (DuckDuckGo)",
+    "process": "Manage background exec sessions",
+    "web_search": "Search the web (Brave API)",
     "web_fetch": "Fetch and extract readable content from a URL",
     "browser": "Control web browser",
     "canvas": "Present/eval/snapshot the Canvas",
@@ -43,35 +47,67 @@ CORE_TOOL_SUMMARIES: dict[str, str] = {
     "message": "Send messages and channel actions",
     "gateway": "Restart, apply config, or run updates on the running OpenClaw process",
     "agents_list": "List agent ids allowed for sessions_spawn",
-    "telegram_actions": "Perform Telegram-specific actions (edit, delete, react, forward)",
-    "discord_actions": "Perform Discord-specific actions (manage roles, channels, etc.)",
-    "slack_actions": "Perform Slack-specific actions",
-    "whatsapp_actions": "Perform WhatsApp-specific actions",
     "sessions_list": "List other sessions (incl. sub-agents) with filters/last",
     "sessions_history": "Fetch history for another session/sub-agent",
     "sessions_send": "Send a message to another session/sub-agent",
     "sessions_spawn": "Spawn a sub-agent session",
+    "subagents": "List, steer, or kill sub-agent runs for this requester session",
     "session_status": (
         'Show a /status-equivalent status card (usage + time + Reasoning/Verbose/Elevated); '
         'use for model-use questions (📊 session_status); optional per-session model override'
     ),
     "image": "Analyze an image with the configured image model",
+    # Legacy/additional tools (not in TS but present in Python)
+    "telegram_actions": "Perform Telegram-specific actions (edit, delete, react, forward)",
+    "discord_actions": "Perform Discord-specific actions (manage roles, channels, etc.)",
+    "slack_actions": "Perform Slack-specific actions",
+    "whatsapp_actions": "Perform WhatsApp-specific actions",
     "tts": "Convert text to speech and save as audio file",
     "voice_call": "Make and receive voice calls",
+    "memory_search": "Search memory files for relevant information",
+    "memory_get": "Get specific memory content by path and line range",
 }
 
-# Preferred tool display order (matches TypeScript toolOrder)
+# Preferred tool display order (fully aligned with TypeScript toolOrder lines 255-280)
 TOOL_ORDER: list[str] = [
-    "read_file", "write_file", "edit_file", "apply_patch",
-    "grep", "find", "ls",
-    "bash", "process",
-    "web_search", "web_fetch",
-    "browser", "canvas", "nodes", "cron",
-    "message", "gateway", "agents_list",
-    "telegram_actions", "discord_actions", "slack_actions", "whatsapp_actions",
-    "sessions_list", "sessions_history", "sessions_send", "sessions_spawn",
+    "read",
+    "write",
+    "edit",
+    "apply_patch",
+    "grep",
+    "find",
+    "ls",
+    "exec",
+    "process",
+    "web_search",
+    "web_fetch",
+    "browser",
+    "canvas",
+    "nodes",
+    "cron",
+    "message",
+    "gateway",
+    "agents_list",
+    "sessions_list",
+    "sessions_history",
+    "sessions_send",
+    "subagents",  # Added to match TS (line 277)
     "session_status",
-    "image", "tts", "voice_call",
+    "image",
+    # Python-specific tools (not in TS order but keep for compatibility)
+    "read_file",
+    "write_file",
+    "edit_file",
+    "bash",
+    "telegram_actions",
+    "discord_actions",
+    "slack_actions",
+    "whatsapp_actions",
+    "sessions_spawn",
+    "tts",
+    "voice_call",
+    "memory_search",
+    "memory_get",
 ]
 
 

@@ -1,181 +1,236 @@
-"""
-Group message gating with mention patterns.
+"""Group message gating with mention patterns and activation modes.
 
-Determines whether group messages should trigger auto-reply
-based on mention patterns and configuration.
+Determines whether group messages should trigger auto-reply based on
+mention patterns, activation modes, and group policy configuration.
 
-Matches openclaw/src/web/auto-reply/group-gating.ts
+Mirrors TypeScript openclaw/src/web/auto-reply/monitor/group-gating.ts.
 """
 from __future__ import annotations
 
-import re
+import logging
+from typing import Any, TypedDict
+
+from openclaw.auto_reply.group_activation import (
+    parse_activation_command,
+    resolve_group_activation_for,
+)
+from openclaw.auto_reply.group_history import (
+    GroupHistoryEntry,
+    record_pending_group_history_entry,
+)
+from openclaw.auto_reply.reply.mentions import (
+    build_mention_regexes,
+    matches_mention_with_explicit,
+    ExplicitMentionSignal,
+)
+from openclaw.config.group_policy import resolve_channel_group_policy
+
+logger = logging.getLogger(__name__)
 
 
-def build_mention_patterns(config: dict, bot_name: str | None = None) -> list[str]:
-    """
-    Build mention patterns from config.
-    
-    Args:
-        config: Account config with mentionPatterns
-        bot_name: Bot display name for default pattern
-        
-    Returns:
-        List of mention patterns (regex strings)
-    """
-    patterns = []
-    
-    # Get configured patterns
-    if isinstance(config, dict):
-        mention_patterns = config.get('mentionPatterns', [])
-        if isinstance(mention_patterns, list):
-            patterns.extend(mention_patterns)
-    
-    # Add default bot name pattern
-    if bot_name:
-        # Escape special regex characters
-        escaped_name = re.escape(bot_name)
-        patterns.append(f"@{escaped_name}")
-        patterns.append(escaped_name)
-    
-    return patterns
+class GroupGatingResult(TypedDict):
+    """Result of group gating check."""
+    shouldProcess: bool
+    wasMentioned: bool | None
 
 
-def check_mentions(text: str, mention_patterns: list[str]) -> bool:
-    """
-    Check if text contains any mention patterns.
+def _is_owner_sender(
+    owner_list: list[str],
+    sender_id: str | None,
+    sender_e164: str | None,
+) -> bool:
+    """Check if sender is in owner list.
     
-    Args:
-        text: Message text to check
-        mention_patterns: List of regex patterns
-        
-    Returns:
-        True if text contains a mention, False otherwise
+    Mirrors TS isOwnerSender().
     """
-    if not text or not mention_patterns:
+    if not owner_list:
         return False
     
-    text_lower = text.lower()
-    
-    for pattern in mention_patterns:
-        if not pattern:
-            continue
-        
-        try:
-            # Try regex match
-            if re.search(pattern, text_lower, re.IGNORECASE):
-                return True
-        except re.error:
-            # Fallback to simple substring match
-            if pattern.lower() in text_lower:
-                return True
-    
-    return False
-
-
-def check_allow_from(sender_id: str, sender_name: str | None, allow_from: list[str] | None) -> bool:
-    """
-    Check if sender is in allowFrom list.
-    
-    Args:
-        sender_id: Sender identifier
-        sender_name: Sender display name
-        allow_from: List of allowed sender patterns
-        
-    Returns:
-        True if sender is allowed, False otherwise
-    """
-    if not allow_from:
-        return True  # No restrictions
-    
-    if not sender_id:
+    sender = sender_e164 or sender_id or ""
+    if not sender:
         return False
     
-    # Check sender ID
-    if sender_id in allow_from:
-        return True
+    # Normalize E.164 format
+    normalized = sender.strip().replace(" ", "").replace("-", "")
+    if not normalized.startswith("+"):
+        normalized = f"+{normalized}"
     
-    # Check sender name
-    if sender_name and sender_name in allow_from:
-        return True
+    return normalized in owner_list
+
+
+def _has_control_command(text: str) -> bool:
+    """Check if text contains a control command.
     
-    # Check patterns
-    sender_id_lower = sender_id.lower()
-    sender_name_lower = (sender_name or "").lower()
+    Mirrors TS hasControlCommand() concept.
+    Simple check for common control commands.
+    """
+    if not text:
+        return False
     
-    for pattern in allow_from:
-        if not pattern:
-            continue
-        
-        pattern_lower = pattern.lower()
-        
-        # Exact match
-        if pattern_lower == sender_id_lower or pattern_lower == sender_name_lower:
-            return True
-        
-        # Wildcard patterns
-        if "*" in pattern:
-            regex_pattern = pattern.replace("*", ".*")
-            try:
-                if re.match(regex_pattern, sender_id, re.IGNORECASE):
-                    return True
-                if sender_name and re.match(regex_pattern, sender_name, re.IGNORECASE):
-                    return True
-            except re.error:
-                pass
+    text_lower = text.strip().lower()
+    control_commands = [
+        "/new", "/reset", "/clear", "/compact",
+        "/verbose", "/think", "/model", "/status",
+    ]
     
-    return False
+    return any(text_lower.startswith(cmd) for cmd in control_commands)
 
 
 def apply_group_gating(
-    message: dict,
-    config: dict,
-    mention_patterns: list[str] | None = None
-) -> bool:
-    """
-    Check if group message should trigger reply.
+    cfg: dict[str, Any],
+    msg: dict[str, Any],
+    conversation_id: str,
+    group_history_key: str,
+    agent_id: str,
+    session_key: str,
+    channel: str,
+    account_id: str | None = None,
+    group_id: str | None = None,
+    group_histories: dict[str, list[GroupHistoryEntry]] | None = None,
+    group_history_limit: int = 50,
+    owner_list: list[str] | None = None,
+    session_state: dict[str, Any] | None = None,
+) -> GroupGatingResult:
+    """Apply group gating logic to determine if message should be processed.
     
-    Rules:
-    - Always reply to DMs (peer_kind == "dm")
-    - Group messages require mention unless alwaysGroupActivation
-    - Check allowFrom patterns if configured
+    Mirrors TS applyGroupGating() from src/web/auto-reply/monitor/group-gating.ts.
     
     Args:
-        message: Message dict with {text, peer_kind, sender_id, sender_name}
-        config: Account config with auto-reply settings
-        mention_patterns: Mention patterns (built from config if not provided)
+        cfg: OpenClaw configuration
+        msg: Inbound message dict
+        conversation_id: Conversation/group ID
+        group_history_key: Key for group history storage
+        agent_id: Agent ID
+        session_key: Session key
+        channel: Channel ID (e.g., "telegram", "whatsapp")
+        account_id: Optional account ID
+        group_histories: Optional group history map
+        group_history_limit: Maximum history entries to keep
+        owner_list: List of owner identifiers
+        session_state: Optional session state dict
         
     Returns:
-        True if message should trigger reply, False otherwise
+        GroupGatingResult with shouldProcess and wasMentioned flags
     """
-    # Always reply to DMs
-    peer_kind = message.get("peer_kind", "dm")
-    if peer_kind == "dm":
-        return True
+    # DM messages always process (mirrors TS behaviour)
+    chat_type = msg.get("chatType") or msg.get("chat_type") or ""
+    if chat_type.lower() == "dm":
+        return GroupGatingResult(shouldProcess=True, wasMentioned=True)
+
+    # Check group policy allowlist
+    group_id = group_id or msg.get("group_id") or conversation_id
+    group_policy = resolve_channel_group_policy(
+        cfg=cfg,
+        channel=channel,
+        group_id=group_id,
+        account_id=account_id,
+    )
     
-    # Check allowFrom filter
-    allow_from = config.get("allowFrom")
-    if allow_from:
-        sender_id = message.get("sender_id", "")
-        sender_name = message.get("sender_name")
-        if not check_allow_from(sender_id, sender_name, allow_from):
-            return False
+    if group_policy["allowlistEnabled"] and not group_policy["allowed"]:
+        logger.debug(f"Skipping group message {conversation_id} (not in allowlist)")
+        return GroupGatingResult(shouldProcess=False, wasMentioned=None)
     
-    # Check if always active in groups
-    always_group_activation = config.get("alwaysGroupActivation", False)
-    if always_group_activation:
-        return True
+    # Build mention regexes
+    mention_regexes = build_mention_regexes(cfg, agent_id)
     
-    # Check mentions
-    text = message.get("text", "")
-    if not mention_patterns:
-        mention_patterns = build_mention_patterns(config, message.get("bot_name"))
+    # Parse activation command
+    body = msg.get("body", msg.get("text", ""))
+    activation_command = parse_activation_command(body)
     
-    return check_mentions(text, mention_patterns)
+    # Check if sender is owner
+    sender_id = msg.get("sender_id", msg.get("senderId"))
+    sender_e164 = msg.get("sender_e164", msg.get("senderE164"))
+    owner = _is_owner_sender(owner_list or [], sender_id, sender_e164)
+    
+    # Check if should bypass mention (owner + control command)
+    should_bypass_mention = owner and _has_control_command(body)
+    
+    # If owner sends /activation, allow processing
+    if activation_command["hasCommand"] and owner:
+        return GroupGatingResult(shouldProcess=True, wasMentioned=True)
+
+    # If non-owner tries to use /activation, ignore and record history
+    if activation_command["hasCommand"] and not owner:
+        logger.debug(f"Ignoring /activation from non-owner in group {conversation_id}")
+        if group_histories is not None:
+            entry = GroupHistoryEntry(
+                sender=msg.get("sender_name", "Unknown"),
+                body=body,
+                timestamp=msg.get("timestamp"),
+                id=msg.get("id", msg.get("message_id")),
+            )
+            record_pending_group_history_entry(
+                session_key=group_history_key,
+                entry=entry,
+                limit=group_history_limit,
+                history_map=group_histories,
+            )
+        return GroupGatingResult(shouldProcess=False, wasMentioned=None)
+    
+    # Check explicit mention signal from channel
+    explicit_mention: ExplicitMentionSignal | None = None
+    if "was_mentioned" in msg or "wasMentioned" in msg:
+        was_mentioned = msg.get("was_mentioned", msg.get("wasMentioned", False))
+        explicit_mention = ExplicitMentionSignal(
+            hasAnyMention=True,
+            isExplicitlyMentioned=was_mentioned,
+            canResolveExplicit=True,
+        )
+    
+    # Check if mentioned
+    was_mentioned = matches_mention_with_explicit(
+        text=body,
+        mention_regexes=mention_regexes,
+        explicit=explicit_mention,
+    )
+    
+    # Resolve activation mode
+    activation = resolve_group_activation_for(
+        cfg=cfg,
+        agent_id=agent_id,
+        session_key=session_key,
+        channel=channel,
+        account_id=account_id,
+        group_id=group_id,
+        session_state=session_state,
+    )
+    
+    require_mention = activation != "always"
+    
+    # Check implicit mention (reply to bot's message)
+    implicit_mention = False
+    reply_to_sender = msg.get("reply_to_sender", msg.get("replyToSender"))
+    self_id = msg.get("self_id", msg.get("selfE164"))
+    if reply_to_sender and self_id:
+        implicit_mention = reply_to_sender == self_id
+    
+    # Determine if should process
+    effective_was_mentioned = was_mentioned or implicit_mention or should_bypass_mention
+    should_skip = require_mention and not effective_was_mentioned
+    
+    if not should_bypass_mention and should_skip:
+        logger.debug(
+            f"Group message stored for context (no mention detected) in {conversation_id}: {body[:50]}..."
+        )
+        if group_histories is not None:
+            entry = GroupHistoryEntry(
+                sender=msg.get("sender_name", "Unknown"),
+                body=body,
+                timestamp=msg.get("timestamp"),
+                id=msg.get("id", msg.get("message_id")),
+            )
+            record_pending_group_history_entry(
+                session_key=group_history_key,
+                entry=entry,
+                limit=group_history_limit,
+                history_map=group_histories,
+            )
+        return GroupGatingResult(shouldProcess=False, wasMentioned=effective_was_mentioned)
+    
+    return GroupGatingResult(shouldProcess=True, wasMentioned=effective_was_mentioned)
 
 
 __all__ = [
-    "build_mention_patterns",
-    "check_mentions",
-    "check_allow_from",
+    "GroupGatingResult",
     "apply_group_gating",
 ]

@@ -107,19 +107,54 @@ async def handle_compact_command(update: Update, context: ContextTypes.DEFAULT_T
         return
     
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     
     # Send starting message
-    await update.message.reply_text(
+    status_msg = await update.message.reply_text(
         t_user("commands.compact.started", user_id),
         parse_mode="Markdown"
     )
     
-    # TODO: Actually compact session via runtime
-    # For now, mock response
-    await update.message.reply_text(
-        t_user("commands.compact.success", user_id, tokens="1500"),
-        parse_mode="Markdown"
-    )
+    try:
+        # Get runtime from application context
+        runtime = context.application.bot_data.get("agent_runtime")
+        if not runtime:
+            await status_msg.edit_text(
+                "⚠️ Agent runtime not available. Command cannot be executed.",
+                parse_mode="Markdown"
+            )
+            return
+        
+        # Build session key
+        session_key = f"agent:main:telegram:{chat_id}"
+        
+        # Compact session if method exists
+        if hasattr(runtime, "compact_session"):
+            result = await runtime.compact_session(session_key)
+            
+            if result and "tokens_before" in result:
+                saved = result["tokens_before"] - result.get("tokens_after", 0)
+                await status_msg.edit_text(
+                    t_user("commands.compact.success", user_id, tokens=str(saved)),
+                    parse_mode="Markdown"
+                )
+            else:
+                await status_msg.edit_text(
+                    "✅ Session compacted successfully.",
+                    parse_mode="Markdown"
+                )
+        else:
+            await status_msg.edit_text(
+                "ℹ️ Session compaction not supported by current runtime.",
+                parse_mode="Markdown"
+            )
+    
+    except Exception as exc:
+        logger.error("Failed to compact session: %s", exc, exc_info=True)
+        await status_msg.edit_text(
+            f"⚠️ Failed to compact session: {exc}",
+            parse_mode="Markdown"
+        )
 
 
 async def handle_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -128,13 +163,40 @@ async def handle_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     
-    # TODO: Actually stop via runtime
-    # For now, send success message
-    await update.message.reply_text(
-        t_user("commands.stop.success", user_id),
-        parse_mode="Markdown"
-    )
+    try:
+        # Get runtime from application context
+        runtime = context.application.bot_data.get("agent_runtime")
+        if not runtime:
+            await update.message.reply_text(
+                "⚠️ Agent runtime not available. Command cannot be executed.",
+                parse_mode="Markdown"
+            )
+            return
+        
+        # Build session key
+        session_key = f"agent:main:telegram:{chat_id}"
+        
+        # Stop/abort current run if method exists
+        if hasattr(runtime, "abort_run"):
+            await runtime.abort_run(session_key)
+            await update.message.reply_text(
+                t_user("commands.stop.success", user_id),
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                "ℹ️ Stop command not supported by current runtime.",
+                parse_mode="Markdown"
+            )
+    
+    except Exception as exc:
+        logger.error("Failed to stop run: %s", exc, exc_info=True)
+        await update.message.reply_text(
+            f"⚠️ Failed to stop run: {exc}",
+            parse_mode="Markdown"
+        )
 
 
 async def handle_verbose_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -143,21 +205,64 @@ async def handle_verbose_command(update: Update, context: ContextTypes.DEFAULT_T
         return
     
     user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     
-    # Parse argument
-    arg = context.args[0].lower() if context.args else "toggle"
+    try:
+        # Get runtime and session manager from application context
+        runtime = context.application.bot_data.get("agent_runtime")
+        session_manager = context.application.bot_data.get("session_manager")
+        
+        if not runtime or not session_manager:
+            await update.message.reply_text(
+                "⚠️ Runtime not available. Command cannot be executed.",
+                parse_mode="Markdown"
+            )
+            return
+        
+        # Parse argument
+        arg = context.args[0].lower() if context.args else "toggle"
+        
+        # Build session key
+        session_key = f"agent:main:telegram:{chat_id}"
+        
+        # Get or create session metadata
+        session = session_manager.get_session(session_key)
+        if not session:
+            session = await session_manager.create_session(session_key)
+        
+        metadata = session.get("metadata", {})
+        current_verbose = metadata.get("verbose", False)
+        
+        # Determine new state
+        if arg in ["on", "true", "1"]:
+            new_verbose = True
+        elif arg in ["off", "false", "0"]:
+            new_verbose = False
+        else:
+            # Toggle
+            new_verbose = not current_verbose
+        
+        # Update metadata
+        metadata["verbose"] = new_verbose
+        session["metadata"] = metadata
+        
+        # Save session
+        await session_manager.save_session(session_key, session)
+        
+        # Send confirmation
+        if new_verbose:
+            message = t_user("commands.verbose.enabled", user_id)
+        else:
+            message = t_user("commands.verbose.disabled", user_id)
+        
+        await update.message.reply_text(message, parse_mode="Markdown")
     
-    if arg in ["on", "true", "1"]:
-        message = t_user("commands.verbose.enabled", user_id)
-        # TODO: Actually set verbose mode
-    elif arg in ["off", "false", "0"]:
-        message = t_user("commands.verbose.disabled", user_id)
-        # TODO: Actually disable verbose mode
-    else:
-        # Toggle
-        message = t_user("commands.verbose.enabled", user_id)
-    
-    await update.message.reply_text(message, parse_mode="Markdown")
+    except Exception as exc:
+        logger.error("Failed to toggle verbose mode: %s", exc, exc_info=True)
+        await update.message.reply_text(
+            f"⚠️ Failed to toggle verbose mode: {exc}",
+            parse_mode="Markdown"
+        )
 
 
 async def handle_reasoning_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

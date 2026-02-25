@@ -12,6 +12,7 @@ import time
 from typing import Any
 
 from ..get_reply import ReplyPayload
+from openclaw.hooks.internal_hooks import create_internal_hook_event, trigger_internal_hook
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +133,36 @@ async def _handle_session(
         return await _session_info(session_key, cfg)
 
     if sub in ("stop", "abort"):
+        # Trigger internal hook for stop command
+        try:
+            # Get session entry (if available)
+            session_entry = None
+            try:
+                from openclaw.config.sessions import load_session_store, resolve_store_path
+                store_path = resolve_store_path(cfg.get("session", {}).get("store"), {})
+                store = load_session_store(store_path)
+                session_entry = store.get(session_key.lower()) or store.get(session_key) if session_key else None
+            except Exception:
+                pass
+            
+            # Create and trigger hook event
+            hook_event = create_internal_hook_event(
+                "command",
+                "stop",
+                session_key or "",
+                {
+                    "sessionEntry": session_entry,
+                    "commandSource": ctx.surface if hasattr(ctx, "surface") else "unknown",
+                    "senderId": ctx.From if hasattr(ctx, "From") else "unknown",
+                    "sender_id": ctx.From if hasattr(ctx, "From") else "unknown",
+                    "command_source": ctx.surface if hasattr(ctx, "surface") else "unknown",
+                    "cfg": cfg,
+                }
+            )
+            await trigger_internal_hook(hook_event)
+        except Exception as err:
+            logger.debug(f"Failed to trigger command:stop hook: {err}")
+        
         from ..get_reply import set_abort_memory, format_abort_reply_text
         if session_key:
             set_abort_memory(session_key, True)

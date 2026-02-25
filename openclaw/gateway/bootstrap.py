@@ -61,36 +61,38 @@ class GatewayBootstrap:
         self._maintenance_tasks: list[asyncio.Task] = []
         self._close_handlers: list[Any] = []
     
-    async def bootstrap(self, config_path: Path | None = None) -> dict[str, Any]:
+    async def bootstrap(self, config_path: Path | None = None, allow_unconfigured: bool = False) -> dict[str, Any]:
         """
         Run the full bootstrap sequence.
+        
+        Args:
+            config_path: Optional path to configuration file
+            allow_unconfigured: If True, continue even without config (for testing/dev)
         
         Returns:
             Dict with all initialized components
         """
         results = {"steps_completed": 0, "errors": []}
         
-        # Pre-Step: Check for first run and trigger onboarding if needed
-        config_path_resolved = config_path or (Path.home() / ".openclaw" / "config.json")
+        # Pre-Step: Validate configuration exists (matches TS behavior)
+        # Note: config_path is passed from CLI, defaults to openclaw.json not config.json
+        if config_path:
+            config_path_resolved = config_path
+        else:
+            # Check both possible config locations
+            config_path_resolved = Path.home() / ".openclaw" / "openclaw.json"
+            if not config_path_resolved.exists():
+                config_path_resolved = Path.home() / ".openclaw" / "config.json"
         
-        if not config_path_resolved.exists():
-            logger.info("First run detected - no configuration found")
-            logger.info("Starting onboarding wizard...")
-            
-            try:
-                from ..wizard.onboarding import run_onboarding_wizard
-                
-                # Run onboarding wizard
-                result = await run_onboarding_wizard()
-                
-                if result.get("completed"):
-                    logger.info("✅ Onboarding complete! Continuing with bootstrap...")
-                else:
-                    logger.warning("Onboarding skipped or incomplete, using defaults...")
-            except Exception as e:
-                logger.error(f"Onboarding failed: {e}")
-                # If onboarding fails, we should still try to continue with defaults
-                logger.warning("Continuing with default configuration...")
+        if not config_path_resolved.exists() and not allow_unconfigured:
+            error_msg = (
+                "Configuration not found. Please run onboarding first:\n"
+                "  $ uv run openclaw onboard\n"
+                "or use setup command:\n"
+                "  $ uv run openclaw setup --wizard"
+            )
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
         
         # Step 1: Set environment variables
         logger.info("Step 1: Setting environment variables")
@@ -136,13 +138,25 @@ class GatewayBootstrap:
         results["steps_completed"] += 1
         
         # Step 6: Resolve default agent and workspace
-        logger.info("Step 6: Resolving workspace directory")
+        logger.info("Step 6: Resolving default agent and workspace directory")
         
-        # Get workspace from config or use default
-        if self.config and hasattr(self.config, 'agent') and hasattr(self.config.agent, 'workspace'):
-            workspace_dir = Path(self.config.agent.workspace).expanduser().resolve()
-        else:
-            workspace_dir = Path.home() / ".openclaw" / "workspace"
+        # Use new agent scope functions (aligned with TS)
+        try:
+            from openclaw.agents.agent_scope import (
+                resolve_default_agent_id,
+                resolve_agent_workspace_dir,
+            )
+            
+            default_agent_id = resolve_default_agent_id(self.config or {})
+            workspace_dir = resolve_agent_workspace_dir(self.config or {}, default_agent_id)
+            logger.info(f"Default agent: {default_agent_id}, workspace: {workspace_dir}")
+        except Exception as e:
+            logger.warning(f"Failed to use agent scope functions: {e}, falling back to default")
+            # Fallback to legacy behavior
+            if self.config and hasattr(self.config, 'agent') and hasattr(self.config.agent, 'workspace'):
+                workspace_dir = Path(self.config.agent.workspace).expanduser().resolve()
+            else:
+                workspace_dir = Path.home() / ".openclaw" / "workspace"
         
         # Ensure workspace exists with bootstrap files (matching TypeScript behavior)
         try:
@@ -272,10 +286,13 @@ class GatewayBootstrap:
             )
             
             # Register new tools
-            from ..agents.tools.gateway_tool import GatewayTool, AgentsListTool, SessionStatusTool
+            from ..agents.tools.gateway import GatewayTool
             self.tool_registry.register(GatewayTool())
-            self.tool_registry.register(AgentsListTool(config=self.config))
-            self.tool_registry.register(SessionStatusTool(session_manager=self.session_manager))
+            
+            # TODO: Add AgentsListTool and SessionStatusTool when available
+            # from ..agents.tools.gateway import AgentsListTool, SessionStatusTool
+            # self.tool_registry.register(AgentsListTool(config=self.config))
+            # self.tool_registry.register(SessionStatusTool(session_manager=self.session_manager))
             
             tool_count = len(self.tool_registry.list_tools())
             logger.info(f"Registered {tool_count} tools")
@@ -369,7 +386,6 @@ class GatewayBootstrap:
             # Register and start enabled channels from config
             if self.config and self.config.channels:
                 started_count = 0
-                
                 # Telegram
                 if self.config.channels.telegram and self.config.channels.telegram.enabled:
                     try:
@@ -589,6 +605,7 @@ class GatewayBootstrap:
                 raise OSError(f"Server failed to bind on port {port} within 3 s")
 
             logger.info(f"WebSocket server started on port {port}")
+            results["gateway_port"] = port
             results["steps_completed"] += 1
         except Exception as e:
             logger.error(f"Server start failed: {e}")

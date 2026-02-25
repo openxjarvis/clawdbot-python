@@ -10,47 +10,79 @@ logger = logging.getLogger(__name__)
 
 
 class SessionsListTool(AgentTool):
-    """List all sessions"""
+    """List all sessions with access control"""
 
-    def __init__(self, session_manager: SessionManager):
+    def __init__(
+        self,
+        session_manager: SessionManager,
+        current_session_key: str | None = None,
+        cfg: Any = None,
+    ):
         super().__init__()
         self.name = "sessions_list"
-        self.description = "List all available sessions with their message counts"
+        self.description = "List other sessions (incl. sub-agents) with filters/last"
         self.session_manager = session_manager
+        self.current_session_key = current_session_key
+        self.cfg = cfg
 
     def get_schema(self) -> dict[str, Any]:
         return {"type": "object", "properties": {}, "required": []}
 
     async def execute(self, params: dict[str, Any]) -> ToolResult:
-        """List sessions"""
+        """List sessions with visibility guard"""
         try:
+            # Create visibility guard
+            from openclaw.agents.tools.sessions_access import (
+                create_agent_to_agent_policy,
+                create_session_visibility_guard,
+                resolve_session_tools_visibility,
+            )
+            
+            a2a_policy = create_agent_to_agent_policy(self.cfg or {})
+            visibility = resolve_session_tools_visibility(self.cfg or {})
+            
+            guard = await create_session_visibility_guard(
+                action="list",
+                requester_session_key=self.current_session_key or "main",
+                visibility=visibility,
+                a2a_policy=a2a_policy,
+            )
+            
+            check = guard["check"]
+            
+            # List all sessions
             session_ids = self.session_manager.list_sessions()
-
-            sessions_info = []
+            
+            # Filter by access control
+            accessible_sessions = []
             for session_id in session_ids:
-                session = self.session_manager.get_session(session_id)
-                sessions_info.append(
-                    {
+                result = check(session_id)
+                if result.allowed:
+                    session = self.session_manager.get_session(session_id)
+                    accessible_sessions.append({
                         "session_id": session_id,
                         "message_count": len(session.messages),
                         "last_message": (
                             session.messages[-1].timestamp if session.messages else None
                         ),
-                    }
-                )
-
+                    })
+            
             # Format output
-            if sessions_info:
-                output = f"Found {len(sessions_info)} session(s):\n\n"
-                for info in sessions_info:
+            if accessible_sessions:
+                output = f"Found {len(accessible_sessions)} accessible session(s):\n\n"
+                for info in accessible_sessions:
                     output += f"- **{info['session_id']}**: {info['message_count']} messages"
                     if info["last_message"]:
                         output += f" (last: {info['last_message']})"
                     output += "\n"
             else:
-                output = "No sessions found"
+                output = "No accessible sessions found"
 
-            return ToolResult(success=True, content=output, metadata={"sessions": sessions_info})
+            return ToolResult(
+                success=True,
+                content=output,
+                metadata={"sessions": accessible_sessions}
+            )
 
         except Exception as e:
             logger.error(f"Sessions list error: {e}", exc_info=True)
@@ -58,13 +90,20 @@ class SessionsListTool(AgentTool):
 
 
 class SessionsHistoryTool(AgentTool):
-    """Get session history"""
+    """Get session history with access control"""
 
-    def __init__(self, session_manager: SessionManager):
+    def __init__(
+        self,
+        session_manager: SessionManager,
+        current_session_key: str | None = None,
+        cfg: Any = None,
+    ):
         super().__init__()
         self.name = "sessions_history"
-        self.description = "Get conversation history from a session"
+        self.description = "Fetch history for another session/sub-agent"
         self.session_manager = session_manager
+        self.current_session_key = current_session_key
+        self.cfg = cfg
 
     def get_schema(self) -> dict[str, Any]:
         return {
@@ -81,7 +120,7 @@ class SessionsHistoryTool(AgentTool):
         }
 
     async def execute(self, params: dict[str, Any]) -> ToolResult:
-        """Get session history"""
+        """Get session history with access control"""
         session_id = params.get("session_id", "")
         limit = params.get("limit", 50)
 
@@ -89,6 +128,35 @@ class SessionsHistoryTool(AgentTool):
             return ToolResult(success=False, content="", error="session_id required")
 
         try:
+            # Create visibility guard
+            from openclaw.agents.tools.sessions_access import (
+                create_agent_to_agent_policy,
+                create_session_visibility_guard,
+                resolve_session_tools_visibility,
+            )
+            
+            a2a_policy = create_agent_to_agent_policy(self.cfg or {})
+            visibility = resolve_session_tools_visibility(self.cfg or {})
+            
+            guard = await create_session_visibility_guard(
+                action="history",
+                requester_session_key=self.current_session_key or "main",
+                visibility=visibility,
+                a2a_policy=a2a_policy,
+            )
+            
+            check = guard["check"]
+            
+            # Check access
+            access_result = check(session_id)
+            if not access_result.allowed:
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error=access_result.error or "Access denied",
+                )
+            
+            # Get session history
             session = self.session_manager.get_session(session_id)
             messages = session.get_messages(limit=limit)
 
@@ -116,13 +184,20 @@ class SessionsHistoryTool(AgentTool):
 
 
 class SessionsSendTool(AgentTool):
-    """Send message to another session (agent-to-agent communication)"""
+    """Send message to another session with access control"""
 
-    def __init__(self, session_manager: SessionManager):
+    def __init__(
+        self,
+        session_manager: SessionManager,
+        current_session_key: str | None = None,
+        cfg: Any = None,
+    ):
         super().__init__()
         self.name = "sessions_send"
-        self.description = "Send a message to another session for agent-to-agent communication"
+        self.description = "Send a message to another session/sub-agent"
         self.session_manager = session_manager
+        self.current_session_key = current_session_key
+        self.cfg = cfg
 
     def get_schema(self) -> dict[str, Any]:
         return {
@@ -140,15 +215,43 @@ class SessionsSendTool(AgentTool):
         }
 
     async def execute(self, params: dict[str, Any]) -> ToolResult:
-        """Send message to session"""
+        """Send message to session with access control"""
         session_id = params.get("session_id", "")
         message = params.get("message", "")
-        from_session = params.get("from_session", "system")
+        from_session = params.get("from_session", self.current_session_key or "system")
 
         if not session_id or not message:
             return ToolResult(success=False, content="", error="session_id and message required")
 
         try:
+            # Create visibility guard
+            from openclaw.agents.tools.sessions_access import (
+                create_agent_to_agent_policy,
+                create_session_visibility_guard,
+                resolve_session_tools_visibility,
+            )
+            
+            a2a_policy = create_agent_to_agent_policy(self.cfg or {})
+            visibility = resolve_session_tools_visibility(self.cfg or {})
+            
+            guard = await create_session_visibility_guard(
+                action="send",
+                requester_session_key=self.current_session_key or "main",
+                visibility=visibility,
+                a2a_policy=a2a_policy,
+            )
+            
+            check = guard["check"]
+            
+            # Check access
+            access_result = check(session_id)
+            if not access_result.allowed:
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error=access_result.error or "Access denied",
+                )
+            
             # Get target session
             session = self.session_manager.get_session(session_id)
 

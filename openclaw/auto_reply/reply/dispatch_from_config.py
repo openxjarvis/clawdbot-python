@@ -122,8 +122,10 @@ async def _route_reply_to_channel(
 # ---------------------------------------------------------------------------
 
 def _fire_message_received_hooks(ctx: MsgContext, cfg: dict[str, Any]) -> None:
-    """Fire plugin hooks for message_received (fire-and-forget)."""
+    """Fire plugin hooks and internal hooks for message_received (fire-and-forget)."""
     import asyncio
+    
+    # Fire plugin hooks (existing)
     try:
         from openclaw.plugins.hook_runner import get_global_hook_runner
         runner = get_global_hook_runner()
@@ -172,6 +174,79 @@ def _fire_message_received_hooks(ctx: MsgContext, cfg: dict[str, Any]) -> None:
                     asyncio.ensure_future(coro)
                 else:
                     loop.run_until_complete(coro)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    
+    # Fire internal hooks (HOOK.md discovery system)
+    try:
+        from openclaw.hooks.internal_hooks import create_internal_hook_event, trigger_internal_hook
+        
+        session_key = getattr(ctx, "SessionKey", None) or ""
+        if session_key:
+            content = (
+                getattr(ctx, "BodyForCommands", None)
+                or getattr(ctx, "RawBody", None)
+                or getattr(ctx, "Body", "")
+                or ""
+            )
+            timestamp = getattr(ctx, "Timestamp", None)
+            channel_id = (
+                getattr(ctx, "OriginatingChannel", None)
+                or getattr(ctx, "Surface", None)
+                or getattr(ctx, "Provider", None)
+                or ""
+            ).lower()
+            conversation_id = (
+                getattr(ctx, "OriginatingTo", None)
+                or getattr(ctx, "To", None)
+                or getattr(ctx, "From", None)
+            )
+            message_id_for_hook = (
+                getattr(ctx, "MessageSidFull", None)
+                or getattr(ctx, "MessageSid", None)
+            )
+            
+            hook_event = create_internal_hook_event(
+                "message",
+                "received",
+                session_key,
+                {
+                    "from": getattr(ctx, "From", "") or "",
+                    "content": content,
+                    "timestamp": timestamp,
+                    "channelId": channel_id,
+                    "channel_id": channel_id,
+                    "accountId": getattr(ctx, "AccountId", None),
+                    "account_id": getattr(ctx, "AccountId", None),
+                    "conversationId": conversation_id,
+                    "conversation_id": conversation_id,
+                    "messageId": message_id_for_hook,
+                    "message_id": message_id_for_hook,
+                    "metadata": {
+                        "to": getattr(ctx, "To", None),
+                        "provider": getattr(ctx, "Provider", None),
+                        "surface": getattr(ctx, "Surface", None),
+                        "threadId": getattr(ctx, "MessageThreadId", None),
+                        "senderId": getattr(ctx, "SenderId", None),
+                        "senderName": getattr(ctx, "SenderName", None),
+                        "senderUsername": getattr(ctx, "SenderUsername", None),
+                        "senderE164": getattr(ctx, "SenderE164", None),
+                    }
+                }
+            )
+            
+            # Fire and forget
+            async def _trigger():
+                await trigger_internal_hook(hook_event)
+            
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.ensure_future(_trigger())
+                else:
+                    loop.run_until_complete(_trigger())
             except Exception:
                 pass
     except Exception:

@@ -27,7 +27,7 @@ def list_channels(
             if config.channels.telegram:
                 result["telegram"] = {
                     "enabled": config.channels.telegram.enabled,
-                    "configured": bool(config.channels.telegram.bot_token),
+                    "configured": bool(config.channels.telegram.botToken),
                 }
             console.print(json.dumps(result, indent=2))
             return
@@ -39,7 +39,7 @@ def list_channels(
         
         if config.channels.telegram:
             status = "✓ Enabled" if config.channels.telegram.enabled else "✗ Disabled"
-            details = "Configured" if config.channels.telegram.bot_token else "Not configured"
+            details = "Configured" if config.channels.telegram.botToken else "Not configured"
             table.add_row("Telegram", status, details)
         
         if config.channels.whatsapp:

@@ -79,16 +79,16 @@ def markdown_to_html(text: str) -> str:
     # Strikethrough: ~~text~~
     text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
     
-    # Inline code: `code`
-    text = re.sub(r'`([^`]+)`', r'<code>\1</code>', text)
-    
-    # Code blocks: ```code```
+    # Code blocks BEFORE inline code (```code``` must be processed first)
     text = re.sub(
         r'```(?:\w+\n)?(.+?)```',
         r'<pre><code>\1</code></pre>',
         text,
         flags=re.DOTALL
     )
+    
+    # Inline code: `code` (process after code blocks)
+    text = re.sub(r'`([^`]+)`', r'<code>\1</code>', text)
     
     # Links: [text](url)
     text = re.sub(
@@ -123,7 +123,7 @@ def chunk_message(text: str, max_length: int = 4096) -> List[str]:
                 chunks.append(current_chunk.strip())
                 current_chunk = ""
             
-            # If paragraph itself is too long, split by lines
+            # If paragraph itself is too long, split by lines or chars
             if len(paragraph) > max_length:
                 lines = paragraph.split("\n")
                 for line in lines:
@@ -131,6 +131,15 @@ def chunk_message(text: str, max_length: int = 4096) -> List[str]:
                         if current_chunk:
                             chunks.append(current_chunk.strip())
                             current_chunk = ""
+                        
+                        # If single line is still too long, force split by chars
+                        if len(line) > max_length:
+                            while len(line) > max_length:
+                                chunks.append(line[:max_length])
+                                line = line[max_length:]
+                            if line:
+                                current_chunk = line
+                            continue
                     current_chunk += line + "\n"
             else:
                 current_chunk = paragraph + "\n\n"

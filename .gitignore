@@ -52,3 +52,15 @@ terminals/
 # Documentation (temporary files)
 docs/
 examples/
+
+# Documentation (temporary files)
+docs/
+
+# Documentation (not committed)
+docs/
+*.log
+*.pyc
+__pycache__/
+.pytest_cache/
+.coverage
+htmlcov/

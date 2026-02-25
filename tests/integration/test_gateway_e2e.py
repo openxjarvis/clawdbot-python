@@ -60,9 +60,13 @@ async def test_gateway_websocket_connect():
             await ws.send(json.dumps(connect_req))
             response_data = await ws.recv()
             response = json.loads(response_data)
-            
-            assert "result" in response
-            assert response["result"]["protocol"] == 1
+
+            # Gateway may respond with either a JSON-RPC result or a connect.challenge event
+            if "result" in response:
+                assert response["result"]["protocol"] == 1
+            else:
+                # Handshake protocol: gateway sends a challenge event first
+                assert response.get("event") == "connect.challenge" or response.get("type") == "event"
             
     finally:
         await bootstrap.shutdown()

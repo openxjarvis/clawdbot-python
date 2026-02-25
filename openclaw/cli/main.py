@@ -49,24 +49,41 @@ def start(
         if env_path.exists():
             load_dotenv(env_path)
     
-    # Check environment
-    issues = []
-    if not any([os.getenv("ANTHROPIC_API_KEY"), os.getenv("OPENAI_API_KEY"), os.getenv("GOOGLE_API_KEY")]):
-        issues.append("❌ No LLM API key found")
+    # Check configuration (matches TS gateway-cli/run.ts behavior)
+    # Verify config exists and gateway.mode is local
+    config_path = Path.home() / ".openclaw" / "openclaw.json"
+    if not config_path.exists():
+        config_path = Path.home() / ".openclaw" / "config.json"
     
-    # Telegram token check - skip if config file exists (will be loaded from config.json)
-    config_exists = (Path.home() / ".openclaw" / "config.json").exists()
-    if telegram and not os.getenv("TELEGRAM_BOT_TOKEN") and not config_exists:
-        issues.append("⚠️  TELEGRAM_BOT_TOKEN not set (will try loading from config)")
-        # Don't disable telegram, let bootstrap handle it
+    if not config_path.exists():
+        console.print(
+            "\n[red]Error:[/red] Configuration not found.\n\n"
+            "Please run onboarding first:\n"
+            "  [cyan]$ uv run openclaw onboard[/cyan]\n"
+            "or use setup command:\n"
+            "  [cyan]$ uv run openclaw setup --wizard[/cyan]"
+        )
+        raise typer.Exit(1)
     
-    if issues:
-        console.print("\n[yellow]Configuration Issues:[/yellow]")
-        for issue in issues:
-            console.print(f"  {issue}")
-        if any("❌" in issue for issue in issues):
-            console.print("\n[red]Cannot start without an LLM API key.[/red]")
+    # Verify gateway.mode is local (matches TS requirement)
+    try:
+        import json
+        with open(config_path) as f:
+            config_data = json.load(f)
+        
+        gateway_mode = config_data.get("gateway", {}).get("mode")
+        if gateway_mode != "local":
+            console.print(
+                f"\n[red]Error:[/red] Gateway start blocked.\n\n"
+                f"Current gateway.mode: [yellow]{gateway_mode or 'unset'}[/yellow]\n"
+                f"Required: [green]local[/green]\n\n"
+                "Update your config file or run onboarding again:\n"
+                "  [cyan]$ uv run openclaw onboard[/cyan]"
+            )
             raise typer.Exit(1)
+    except json.JSONDecodeError as e:
+        console.print(f"\n[red]Error:[/red] Invalid configuration file: {e}")
+        raise typer.Exit(1)
     
     # Start server
     try:

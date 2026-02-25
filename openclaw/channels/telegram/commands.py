@@ -1,159 +1,254 @@
-"""Telegram command system
+"""Telegram command utilities.
 
-Manages command registration and routing for Telegram bots.
-Matches TypeScript src/telegram/bot-native-commands.ts
+Telegram-specific command normalization, custom command resolution, and sync.
+Fully aligned with TypeScript openclaw/src/config/telegram-custom-commands.ts
+and openclaw/src/telegram/bot-native-commands.ts
 """
-from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
+from __future__ import annotations
+
 import logging
+import re
+from typing import Any, TypedDict
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class CommandSpec:
-    """Command specification"""
-    name: str
+TELEGRAM_COMMAND_NAME_PATTERN = re.compile(r"^[a-z0-9_]{1,32}$")
+
+
+class TelegramCustomCommandInput(TypedDict, total=False):
+    """Telegram custom command input."""
+    command: str | None
+    description: str | None
+
+
+class TelegramCustomCommandIssue(TypedDict):
+    """Telegram custom command validation issue."""
+    index: int
+    field: str
+    message: str
+
+
+class TelegramCustomCommand(TypedDict):
+    """Resolved Telegram custom command."""
+    command: str
     description: str
-    args: List[Dict[str, Any]]
-    scope: str  # "dm", "group", "all"
-    native_name: Optional[str] = None
 
 
-def list_native_commands(cfg: dict) -> List[CommandSpec]:
-    """
-    List native commands from auto-reply registry
+class TelegramCustomCommandsResult(TypedDict):
+    """Result of custom command resolution."""
+    commands: list[TelegramCustomCommand]
+    issues: list[TelegramCustomCommandIssue]
+
+
+def normalize_telegram_command_name(value: str) -> str:
+    """Normalize Telegram command name (mirrors TS normalizeTelegramCommandName)."""
+    trimmed = value.strip()
+    if not trimmed:
+        return ""
     
-    Matches TypeScript listNativeCommandSpecsForConfig()
+    without_slash = trimmed[1:] if trimmed.startswith("/") else trimmed
+    return without_slash.strip().lower().replace("-", "_")
+
+
+def normalize_telegram_command_description(value: str) -> str:
+    """Normalize Telegram command description (mirrors TS normalizeTelegramCommandDescription)."""
+    return value.strip()
+
+
+def resolve_telegram_custom_commands(
+    commands: list[TelegramCustomCommandInput] | None = None,
+    reserved_commands: set[str] | None = None,
+    check_reserved: bool = True,
+    check_duplicates: bool = True,
+) -> TelegramCustomCommandsResult:
+    """Resolve and validate Telegram custom commands (mirrors TS resolveTelegramCustomCommands).
+    
+    Args:
+        commands: List of custom command inputs
+        reserved_commands: Set of reserved command names
+        check_reserved: Whether to check for conflicts with reserved names
+        check_duplicates: Whether to check for duplicate commands
+        
+    Returns:
+        Dict with resolved commands and validation issues
     """
-    try:
-        from ...auto_reply.commands_registry_data import BUILT_IN_COMMANDS
+    entries = commands if isinstance(commands, list) else []
+    reserved = reserved_commands or set()
+    seen = set()
+    resolved: list[TelegramCustomCommand] = []
+    issues: list[TelegramCustomCommandIssue] = []
+    
+    for index, entry in enumerate(entries):
+        normalized = normalize_telegram_command_name(str(entry.get("command", "")))
         
-        commands = []
-        for cmd in BUILT_IN_COMMANDS:
-            # Skip if explicitly disabled for Telegram
-            if not cmd.get("telegram_enabled", True):
-                continue
-            
-            commands.append(CommandSpec(
-                name=cmd.get("native_name", cmd["key"]),
-                description=cmd.get("description", ""),
-                args=cmd.get("args", []),
-                scope=cmd.get("scope", "all"),
-                native_name=cmd.get("native_name"),
-            ))
+        if not normalized:
+            issues.append(
+                TelegramCustomCommandIssue(
+                    index=index,
+                    field="command",
+                    message="Telegram custom command is missing a command name.",
+                )
+            )
+            continue
         
-        logger.info(f"Loaded {len(commands)} native commands")
+        if not TELEGRAM_COMMAND_NAME_PATTERN.match(normalized):
+            issues.append(
+                TelegramCustomCommandIssue(
+                    index=index,
+                    field="command",
+                    message=f"Telegram custom command \"/{normalized}\" is invalid (use a-z, 0-9, underscore; max 32 chars).",
+                )
+            )
+            continue
+        
+        if check_reserved and normalized in reserved:
+            issues.append(
+                TelegramCustomCommandIssue(
+                    index=index,
+                    field="command",
+                    message=f"Telegram custom command \"/{normalized}\" conflicts with a native command.",
+                )
+            )
+            continue
+        
+        if check_duplicates and normalized in seen:
+            issues.append(
+                TelegramCustomCommandIssue(
+                    index=index,
+                    field="command",
+                    message=f"Telegram custom command \"/{normalized}\" is duplicated.",
+                )
+            )
+            continue
+        
+        description = normalize_telegram_command_description(str(entry.get("description", "")))
+        if not description:
+            issues.append(
+                TelegramCustomCommandIssue(
+                    index=index,
+                    field="description",
+                    message=f"Telegram custom command \"/{normalized}\" is missing a description.",
+                )
+            )
+            continue
+        
+        if check_duplicates:
+            seen.add(normalized)
+        
+        resolved.append(
+            TelegramCustomCommand(
+                command=normalized,
+                description=description,
+            )
+        )
+    
+    return TelegramCustomCommandsResult(
+        commands=resolved,
+        issues=issues,
+    )
+
+
+def build_capped_telegram_commands(
+    commands: list[dict[str, str]],
+    max_commands: int = 100,
+) -> list[dict[str, str]]:
+    """Cap Telegram commands list (mirrors TS buildCappedTelegramCommands).
+    
+    Telegram has a limit of 100 commands per bot.
+    
+    Args:
+        commands: List of command dicts with 'command' and 'description'
+        max_commands: Maximum number of commands (default: 100)
+        
+    Returns:
+        Capped list of commands
+    """
+    if len(commands) <= max_commands:
         return commands
     
-    except ImportError:
-        logger.warning("Auto-reply commands registry not found")
-        # Return basic fallback commands
-        return [
-            CommandSpec(
-                name="help",
-                description="Show available commands",
-                args=[],
-                scope="all",
-            ),
-            CommandSpec(
-                name="status",
-                description="Show bot status",
-                args=[],
-                scope="all",
-            ),
-        ]
+    logger.warning(
+        f"Telegram command count ({len(commands)}) exceeds limit ({max_commands}). "
+        f"Truncating to first {max_commands} commands."
+    )
+    
+    return commands[:max_commands]
 
 
-def get_plugin_commands() -> List[CommandSpec]:
-    """
-    Get plugin-provided commands
+async def sync_telegram_commands(
+    bot: Any,
+    cfg: dict[str, Any],
+    account_id: str,
+    skill_commands: list[Any] | None = None,
+) -> bool:
+    """Sync commands with Telegram API (mirrors TS syncTelegramCommands).
     
-    Matches TypeScript getPluginCommandSpecs()
-    """
-    # TODO: Query plugin registry
-    commands = []
+    Builds the complete command list and registers with Telegram.
     
-    try:
-        from ...plugins.loader import get_plugin_registry
+    Args:
+        bot: Telegram bot instance
+        cfg: OpenClaw configuration
+        account_id: Telegram account ID
+        skill_commands: Optional skill command specs
         
-        registry = get_plugin_registry()
-        # Extract commands from plugins
-        # for plugin in registry.get_all_plugins():
-        #     if hasattr(plugin, 'commands'):
-        #         commands.extend(plugin.commands)
-    
-    except Exception as e:
-        logger.debug(f"Plugin commands not available: {e}")
-    
-    return commands
-
-
-def resolve_custom_commands(cfg: dict, account_id: str) -> List[CommandSpec]:
+    Returns:
+        True if sync succeeded
     """
-    Resolve custom commands from config
-    
-    Matches TypeScript resolveTelegramCustomCommands()
-    """
-    commands = []
-    
     try:
-        telegram_cfg = cfg.get("channels", {}).get("telegram", {})
-        accounts = telegram_cfg.get("accounts", {})
-        account = accounts.get(account_id, {})
-        custom = account.get("customCommands", [])
+        from openclaw.auto_reply.commands_registry import list_native_command_specs_for_config
         
-        for cmd in custom:
-            commands.append(CommandSpec(
-                name=cmd["command"],
-                description=cmd.get("description", "Custom command"),
-                args=[],
-                scope="all",
-            ))
+        # Get native commands
+        native_specs = list_native_command_specs_for_config(cfg, skill_commands)
         
-        logger.info(f"Loaded {len(commands)} custom commands for account {account_id}")
+        # Build command list
+        commands = []
+        for spec in native_specs:
+            commands.append({
+                "command": spec["name"],
+                "description": spec["description"][:256],
+            })
+        
+        # Add custom commands (support both camelCase and snake_case config keys)
+        account_cfg = cfg.get("channels", {}).get("telegram", {}).get("accounts", {}).get(account_id, {})
+        custom_commands_raw = account_cfg.get("customCommands") or account_cfg.get("custom_commands")
+        custom_result = resolve_telegram_custom_commands(
+            commands=custom_commands_raw,
+            reserved_commands={spec["name"] for spec in native_specs},
+        )
+        
+        for custom_cmd in custom_result["commands"]:
+            commands.append({
+                "command": custom_cmd["command"],
+                "description": custom_cmd["description"][:256],
+            })
+        
+        # Log validation issues
+        for issue in custom_result["issues"]:
+            logger.warning(f"Custom command issue at index {issue['index']}: {issue['message']}")
+        
+        # Cap to Telegram limit
+        capped_commands = build_capped_telegram_commands(commands)
+        
+        # Register with Telegram
+        await bot.set_my_commands(capped_commands)
+        
+        logger.info(f"Synced {len(capped_commands)} commands with Telegram")
+        return True
     
-    except Exception as e:
-        logger.warning(f"Failed to load custom commands: {e}")
-    
-    return commands
+    except Exception as exc:
+        logger.error(f"Failed to sync Telegram commands: {exc}")
+        return False
 
 
-async def register_commands_with_telegram(bot, cfg: dict, account_id: str):
-    """
-    Register all commands with Telegram Bot API
-    
-    Calls bot.set_my_commands() with all available commands.
-    Matches TypeScript bot.api.setMyCommands() logic.
-    """
-    # Gather all command types
-    native = list_native_commands(cfg)
-    plugins = get_plugin_commands()
-    custom = resolve_custom_commands(cfg, account_id)
-    
-    all_commands = native + plugins + custom
-    
-    if not all_commands:
-        logger.warning("No commands to register")
-        return
-    
-    # Format for Telegram API
-    bot_commands = [
-        {"command": cmd.name, "description": cmd.description[:256]}  # Telegram limit
-        for cmd in all_commands
-    ]
-    
-    try:
-        await bot.set_my_commands(bot_commands)
-        logger.info(f"✅ Registered {len(bot_commands)} commands with Telegram")
-    
-    except Exception as e:
-        logger.error(f"Failed to register commands: {e}")
-
-
-def find_command_spec(command_name: str, commands: List[CommandSpec]) -> Optional[CommandSpec]:
-    """Find command spec by name"""
-    for cmd in commands:
-        if cmd.name == command_name or cmd.native_name == command_name:
-            return cmd
-    return None
+__all__ = [
+    "TELEGRAM_COMMAND_NAME_PATTERN",
+    "TelegramCustomCommandInput",
+    "TelegramCustomCommandIssue",
+    "TelegramCustomCommand",
+    "TelegramCustomCommandsResult",
+    "normalize_telegram_command_name",
+    "normalize_telegram_command_description",
+    "resolve_telegram_custom_commands",
+    "build_capped_telegram_commands",
+    "sync_telegram_commands",
+]

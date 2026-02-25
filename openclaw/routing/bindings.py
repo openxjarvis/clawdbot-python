@@ -15,18 +15,27 @@ def _normalize_binding_channel_id(raw: Optional[str]) -> Optional[str]:
 
 
 def _resolve_default_agent_id_from_cfg(cfg: object) -> str:
-    """Resolve the default agent ID from config."""
-    if hasattr(cfg, "agents") and cfg.agents:  # type: ignore[union-attr]
-        default = getattr(cfg.agents, "default", None)  # type: ignore[union-attr]
-        if default:
-            return str(default).strip()
-    if isinstance(cfg, dict):
-        agents = cfg.get("agents") or {}
-        if isinstance(agents, dict):
-            default = agents.get("default")
+    """
+    Resolve the default agent ID from config.
+    
+    Enhanced to support agents.list[].default (mirrors TS resolveDefaultAgentId)
+    """
+    try:
+        from openclaw.agents.agent_scope import resolve_default_agent_id
+        return resolve_default_agent_id(cfg)
+    except Exception:
+        # Fallback to legacy behavior
+        if hasattr(cfg, "agents") and cfg.agents:  # type: ignore[union-attr]
+            default = getattr(cfg.agents, "default", None)  # type: ignore[union-attr]
             if default:
                 return str(default).strip()
-    return "main"
+        if isinstance(cfg, dict):
+            agents = cfg.get("agents") or {}
+            if isinstance(agents, dict):
+                default = agents.get("default")
+                if default:
+                    return str(default).strip()
+        return "main"
 
 
 def list_bindings(cfg: object) -> List[dict]:

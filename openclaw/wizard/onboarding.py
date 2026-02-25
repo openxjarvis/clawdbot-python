@@ -12,6 +12,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from ..agents.model_catalog import load_model_catalog, ModelCatalogEntry
+from ..agents.agent_paths import resolve_openclaw_agent_dir
 from ..config.loader import load_config, save_config
 from ..config.schema import ClawdbotConfig, AgentConfig, GatewayConfig, ChannelsConfig, AuthConfig
 from .auth import configure_auth, check_env_api_key
@@ -648,16 +650,25 @@ def _prompt_config_action() -> str:
 _PROVIDER_MODELS: dict[str, list[tuple[str, str]]] = {
     "anthropic": [
         ("anthropic/claude-sonnet-4",           "Claude Sonnet 4         (recommended)"),
-        ("anthropic/claude-opus-4-5-20250514",  "Claude Opus 4.5         (most capable)"),
+        ("anthropic/claude-opus-4-5",           "Claude Opus 4.5         (most capable)"),
+        ("anthropic/claude-3-7-sonnet-20250219", "Claude 3.7 Sonnet       (new reasoning)"),
         ("anthropic/claude-3-5-haiku-20241022", "Claude 3.5 Haiku        (fast / cheap)"),
+        ("anthropic/claude-opus-4-0",           "Claude Opus 4.0         (reasoning)"),
+        ("anthropic/claude-haiku-4-5",          "Claude Haiku 4.5        (reasoning)"),
     ],
     "openai": [
-        ("openai/gpt-4o",       "GPT-4o       (recommended)"),
-        ("openai/gpt-4o-mini",  "GPT-4o mini  (fast / cheap)"),
-        ("openai/o1-mini",      "o1-mini      (reasoning)"),
+        ("openai/gpt-4o",       "GPT-4o           (recommended)"),
+        ("openai/gpt-5.2",      "GPT-5.2          (reasoning)"),
+        ("openai/gpt-5-mini",   "GPT-5 Mini       (reasoning)"),
+        ("openai/gpt-4o-mini",  "GPT-4o Mini      (fast / cheap)"),
+        ("openai/o3-mini",      "o3-mini          (reasoning)"),
+        ("openai/gpt-5.3-codex", "GPT-5.3 Codex   (code specialist)"),
     ],
     "gemini": [
         ("google/gemini-3-pro-preview",  "Gemini 3 Pro        (recommended)"),
+        ("google/gemini-2.5-pro",        "Gemini 2.5 Pro      (reasoning)"),
+        ("google/gemini-3-flash-preview", "Gemini 3 Flash      (reasoning)"),
+        ("google/gemini-2.5-flash",      "Gemini 2.5 Flash    (reasoning)"),
         ("google/gemini-2.0-flash",      "Gemini 2.0 Flash    (fast)"),
         ("google/gemini-2.0-flash-lite", "Gemini 2.0 Flash Lite (cheap)"),
     ],
@@ -669,17 +680,70 @@ _PROVIDER_MODELS: dict[str, list[tuple[str, str]]] = {
 }
 
 
-def _pick_model(provider: str, exclude: list[str] | None = None) -> str | None:
+async def _get_provider_models_dynamic(provider: str) -> list[tuple[str, str]]:
+    """Load models for a provider dynamically from model catalog.
+    
+    Returns list of (model_id, display_label) tuples.
+    Falls back to hardcoded _PROVIDER_MODELS if dynamic loading fails.
+    
+    Aligns with TS model-picker.ts which uses loadModelCatalog().
+    """
+    try:
+        catalog = await load_model_catalog(use_cache=False)
+        
+        # Normalize provider name (gemini -> google)
+        catalog_provider = "google" if provider == "gemini" else provider
+        
+        # Filter models for this provider
+        provider_models = [
+            entry for entry in catalog
+            if entry.provider.lower() == catalog_provider.lower()
+        ]
+        
+        if not provider_models:
+            # Fallback to hardcoded
+            return _PROVIDER_MODELS.get(provider, [])
+        
+        # Build display options with metadata
+        options: list[tuple[str, str]] = []
+        for entry in provider_models:
+            # Format: "provider/model-id"
+            full_id = f"{provider}/{entry.id}"
+            
+            # Build display label with metadata
+            label_parts = [entry.name]
+            if entry.context_window:
+                ctx_display = f"{entry.context_window // 1000}k"
+                label_parts.append(f"({ctx_display})")
+            if entry.reasoning:
+                label_parts.append("[reasoning]")
+            
+            label = " ".join(label_parts)
+            options.append((full_id, label))
+        
+        return options if options else _PROVIDER_MODELS.get(provider, [])
+        
+    except Exception as e:
+        logger.debug(f"Dynamic model loading failed for {provider}: {e}")
+        # Fallback to hardcoded
+        return _PROVIDER_MODELS.get(provider, [])
+
+
+async def _pick_model(provider: str, exclude: list[str] | None = None) -> str | None:
     """Show numbered model menu for *provider* and return the chosen model id.
 
     Returns None if the user presses Enter with no input (accept default) or
     chooses an invalid option (falls back to first entry).
+    
+    Now supports dynamic model loading from model catalog (aligns with TS).
     """
-    options = [
-        (mid, hint)
-        for mid, hint in _PROVIDER_MODELS.get(provider, [])
-        if not exclude or mid not in exclude
-    ]
+    # Try dynamic loading first, fallback to hardcoded
+    options = await _get_provider_models_dynamic(provider)
+    
+    # Filter excluded
+    if exclude:
+        options = [(mid, hint) for mid, hint in options if mid not in exclude]
+    
     if not options:
         return None
 
@@ -716,8 +780,8 @@ async def _configure_provider(mode: str) -> Optional[dict]:
                 if use_it != "n":
                     # Still let the user pick a specific model
                     print(f"\nSelect {provider.title()} model:")
-                    primary = _pick_model(provider) or _PROVIDER_MODELS[provider][0][0]
-                    model_value = _ask_fallbacks(provider, primary)
+                    primary = await _pick_model(provider) or _PROVIDER_MODELS[provider][0][0]
+                    model_value = await _ask_fallbacks(provider, primary)
                     return {"provider": provider, "model": model_value}
 
     # Prompt for provider
@@ -748,13 +812,13 @@ async def _configure_provider(mode: str) -> Optional[dict]:
 
     # Select primary model
     print(f"\nSelect primary model for {provider.title()}:")
-    primary = _pick_model(provider) or _PROVIDER_MODELS.get(provider, [("",)])[0][0]
+    primary = await _pick_model(provider) or _PROVIDER_MODELS.get(provider, [("",)])[0][0]
 
-    model_value = _ask_fallbacks(provider, primary)
+    model_value = await _ask_fallbacks(provider, primary)
     return {"provider": provider, "model": model_value}
 
 
-def _ask_fallbacks(provider: str, primary: str) -> str | dict:
+async def _ask_fallbacks(provider: str, primary: str) -> str | dict:
     """Ask if the user wants fallback models. Returns a string (no fallbacks)
     or a dict {primary, fallbacks} suitable for agents.defaults.model."""
     add_fb = input("\nAdd fallback models? [y/N]: ").strip().lower()
@@ -765,7 +829,7 @@ def _ask_fallbacks(provider: str, primary: str) -> str | dict:
     print("\nSelect fallback models (shown in priority order). Enter 'done' to finish.")
     while len(fallbacks) < 3:
         print(f"\nFallback #{len(fallbacks) + 1} for {provider.title()}:")
-        chosen = _pick_model(provider, exclude=[primary] + fallbacks)
+        chosen = await _pick_model(provider, exclude=[primary] + fallbacks)
         if chosen is None:
             break
         fallbacks.append(chosen)

@@ -343,16 +343,30 @@ def _is_soul_file(file: dict) -> bool:
 # Mirrors TypeScript buildEmbeddedSystemPrompt() + resolveBootstrapContextForRun()
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Bootstrap file names (matching TS workspace.ts#L23-31)
+DEFAULT_AGENTS_FILENAME = "AGENTS.md"
+DEFAULT_SOUL_FILENAME = "SOUL.md"
+DEFAULT_TOOLS_FILENAME = "TOOLS.md"
+DEFAULT_IDENTITY_FILENAME = "IDENTITY.md"
+DEFAULT_USER_FILENAME = "USER.md"
+DEFAULT_HEARTBEAT_FILENAME = "HEARTBEAT.md"
+DEFAULT_BOOTSTRAP_FILENAME = "BOOTSTRAP.md"
+DEFAULT_BOOT_FILENAME = "BOOT.md"
+DEFAULT_MEMORY_FILENAME = "MEMORY.md"
+DEFAULT_MEMORY_ALT_FILENAME = "memory.md"
+
+# Bootstrap file names list (excludes BOOT.md which is not loaded via bootstrap)
 _BOOTSTRAP_FILENAMES = [
-    "AGENTS.md",
-    "SOUL.md",
-    "TOOLS.md",
-    "IDENTITY.md",
-    "USER.md",
-    "HEARTBEAT.md",
-    "BOOTSTRAP.md",
-    "MEMORY.md",
+    DEFAULT_AGENTS_FILENAME,
+    DEFAULT_SOUL_FILENAME,
+    DEFAULT_TOOLS_FILENAME,
+    DEFAULT_IDENTITY_FILENAME,
+    DEFAULT_USER_FILENAME,
+    DEFAULT_HEARTBEAT_FILENAME,
+    DEFAULT_BOOTSTRAP_FILENAME,
 ]
+
+# Note: MEMORY.md/memory.md are loaded separately via resolve_memory_bootstrap_entries
 
 # Per-file size limits (bytes) matching TS agents.bootstrap defaults
 _DEFAULT_MAX_CHARS_PER_FILE = 32_000
@@ -384,15 +398,27 @@ def resolve_bootstrap_context_for_run(
     Returns:
         List of dicts with {"path": str, "content": str}.
     """
+    from openclaw.agents.system_prompt_bootstrap import resolve_memory_bootstrap_entries
+    
     # Subagent filter: only AGENTS.md + TOOLS.md for sub-sessions
+    # Matches TS workspace.ts#L470-478 (filterBootstrapFilesForSession)
     is_subagent = session_key and (":sub:" in session_key or ":spawn:" in session_key)
-    allowed = {"AGENTS.md", "TOOLS.md"} if is_subagent else set(_BOOTSTRAP_FILENAMES)
+    allowed = {DEFAULT_AGENTS_FILENAME, DEFAULT_TOOLS_FILENAME} if is_subagent else set(_BOOTSTRAP_FILENAMES)
+    
+    # Build list of files to load (standard + memory files)
+    # Memory files are only loaded for main sessions, not subagents
+    filenames_to_load = list(_BOOTSTRAP_FILENAMES)
+    if not is_subagent:
+        memory_entries = resolve_memory_bootstrap_entries(workspace_dir)
+        filenames_to_load.extend([name for name, _ in memory_entries])
 
     files = []
     total_chars = 0
 
-    for filename in _BOOTSTRAP_FILENAMES:
-        if filename not in allowed:
+    for filename in filenames_to_load:
+        if filename not in allowed and not any(
+            filename.lower() == mem.lower() for mem in [DEFAULT_MEMORY_FILENAME, DEFAULT_MEMORY_ALT_FILENAME]
+        ):
             continue
 
         # Hook override takes precedence

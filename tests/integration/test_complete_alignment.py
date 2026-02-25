@@ -128,18 +128,35 @@ async def test_group_gating_requires_mention():
         "sender_id": "user123"
     }
     
-    result = apply_group_gating(message, config, mention_patterns)
-    assert result is False
-    
+    result = apply_group_gating(
+        cfg=config,
+        msg=message,
+        conversation_id="group1",
+        group_history_key="telegram:group1",
+        agent_id="agent1",
+        session_key="telegram:group1:agent1",
+        channel="telegram",
+    )
+    assert result["shouldProcess"] is False
+
     # Message with mention - should trigger
     message_with_mention = {
         "text": "Hey @bot, can you help?",
         "peer_kind": "group",
-        "sender_id": "user123"
+        "sender_id": "user123",
+        "chatType": "group",
     }
-    
-    result = apply_group_gating(message_with_mention, config, mention_patterns)
-    assert result is True
+
+    result = apply_group_gating(
+        cfg={"groupChat": {"mentionPatterns": ["@bot", "bot"]}},
+        msg=message_with_mention,
+        conversation_id="group1",
+        group_history_key="telegram:group1",
+        agent_id="agent1",
+        session_key="telegram:group1:agent1",
+        channel="telegram",
+    )
+    assert result["shouldProcess"] is True
 
 
 @pytest.mark.integration

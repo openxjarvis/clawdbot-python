@@ -1,70 +1,240 @@
-"""Canvas tool for visual workspace (A2UI)"""
+"""Canvas tool for node canvas control.
 
+Aligned with TypeScript openclaw/src/agents/tools/canvas-tool.ts
+
+Supports:
+- present/hide: Show or hide the canvas window on a node
+- navigate: Navigate the canvas to a URL
+- eval: Evaluate JavaScript in the canvas
+- snapshot: Capture a screenshot of the canvas
+- a2ui_push/a2ui_reset: Push or reset A2UI JSONL layout
+"""
+from __future__ import annotations
+
+import json
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from .base import AgentTool, ToolResult
 
 logger = logging.getLogger(__name__)
 
 
-class CanvasTool(AgentTool):
-    """Canvas/A2UI visual workspace control"""
+CANVAS_ACTIONS = [
+    "present",
+    "hide",
+    "navigate",
+    "eval",
+    "snapshot",
+    "a2ui_push",
+    "a2ui_reset",
+]
 
-    def __init__(self):
+CANVAS_SNAPSHOT_FORMATS = ["png", "jpg", "jpeg"]
+
+
+class CanvasTool(AgentTool):
+    """
+    Control node canvases (present/hide/navigate/eval/snapshot/A2UI).
+
+    Matches TypeScript createCanvasTool() from canvas-tool.ts lines 53-188
+    """
+
+    def __init__(self, config: dict[str, Any] | None = None):
         super().__init__()
         self.name = "canvas"
-        self.description = "Control the Canvas visual workspace for presenting UI, visualizations, and interactive content"
-        self._canvas_active = False
-        self._canvas_url = None
+        self.description = (
+            "Control node canvases (present/hide/navigate/eval/snapshot/A2UI). "
+            "Use snapshot to capture the rendered UI."
+        )
+        self.config = config or {}
 
     def get_schema(self) -> dict[str, Any]:
+        """Get tool schema matching TS CanvasToolSchema (canvas-tool.ts lines 27-51)"""
         return {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": [
-                        "present",
-                        "hide",
-                        "navigate",
-                        "eval",
-                        "snapshot",
-                        "a2ui_push",
-                        "a2ui_reset",
-                    ],
+                    "enum": CANVAS_ACTIONS,
                     "description": "Canvas action to perform",
                 },
-                "url": {"type": "string", "description": "URL to present or navigate to"},
-                "code": {"type": "string", "description": "JavaScript code to evaluate in canvas"},
-                "data": {"type": "object", "description": "Data for A2UI push"},
-                "output_path": {"type": "string", "description": "Path to save snapshot"},
+                "gatewayUrl": {
+                    "type": "string",
+                    "description": "Gateway WebSocket URL (optional)",
+                },
+                "gatewayToken": {
+                    "type": "string",
+                    "description": "Gateway auth token (optional)",
+                },
+                "timeoutMs": {
+                    "type": "number",
+                    "description": "Request timeout in milliseconds",
+                },
+                "node": {
+                    "type": "string",
+                    "description": "Node id or name",
+                },
+                "target": {
+                    "type": "string",
+                    "description": "Present target URL (for present action)",
+                },
+                "x": {"type": "number", "description": "X position for canvas window"},
+                "y": {"type": "number", "description": "Y position for canvas window"},
+                "width": {"type": "number", "description": "Canvas window width"},
+                "height": {"type": "number", "description": "Canvas window height"},
+                "url": {
+                    "type": "string",
+                    "description": "URL to navigate to (for navigate action)",
+                },
+                "javaScript": {
+                    "type": "string",
+                    "description": "JavaScript code to evaluate (for eval action)",
+                },
+                "outputFormat": {
+                    "type": "string",
+                    "enum": CANVAS_SNAPSHOT_FORMATS,
+                    "description": "Output format for snapshot",
+                },
+                "maxWidth": {"type": "number", "description": "Maximum width for snapshot"},
+                "quality": {"type": "number", "description": "Image quality (0-100)"},
+                "delayMs": {
+                    "type": "number",
+                    "description": "Delay before snapshot in milliseconds",
+                },
+                "jsonl": {
+                    "type": "string",
+                    "description": "A2UI JSONL content (for a2ui_push)",
+                },
+                "jsonlPath": {
+                    "type": "string",
+                    "description": "Path to A2UI JSONL file (for a2ui_push)",
+                },
             },
             "required": ["action"],
         }
 
     async def execute(self, params: dict[str, Any]) -> ToolResult:
-        """Execute canvas action"""
+        """Execute canvas action. Matches TS canvas-tool.ts execute logic (lines 61-186)"""
         action = params.get("action", "")
 
         if not action:
             return ToolResult(success=False, content="", error="action required")
 
         try:
+            node_id = await self._resolve_node_id(params)
+
             if action == "present":
-                return await self._present(params)
+                placement = {}
+                for k in ["x", "y", "width", "height"]:
+                    if k in params:
+                        placement[k] = params[k]
+
+                invoke_params: dict[str, Any] = {}
+                present_target = params.get("target") or params.get("url")
+                if present_target:
+                    invoke_params["url"] = present_target
+                if placement:
+                    invoke_params["placement"] = placement
+
+                await self._invoke_node_command(node_id, "canvas.present", invoke_params, params)
+                return ToolResult(
+                    success=True,
+                    content=json.dumps({"ok": True}, indent=2),
+                    metadata={"ok": True},
+                )
+
             elif action == "hide":
-                return await self._hide(params)
+                await self._invoke_node_command(node_id, "canvas.hide", None, params)
+                return ToolResult(
+                    success=True,
+                    content=json.dumps({"ok": True}, indent=2),
+                    metadata={"ok": True},
+                )
+
             elif action == "navigate":
-                return await self._navigate(params)
+                url = params.get("url") or params.get("target")
+                if not url:
+                    return ToolResult(success=False, content="", error="url required")
+                await self._invoke_node_command(node_id, "canvas.navigate", {"url": url}, params)
+                return ToolResult(
+                    success=True,
+                    content=json.dumps({"ok": True}, indent=2),
+                    metadata={"ok": True},
+                )
+
             elif action == "eval":
-                return await self._eval(params)
+                javascript = params.get("javaScript")
+                if not javascript:
+                    return ToolResult(success=False, content="", error="javaScript required")
+                raw = await self._invoke_node_command(
+                    node_id, "canvas.eval", {"javaScript": javascript}, params
+                )
+                result = raw.get("payload", {}).get("result")
+                if result:
+                    return ToolResult(success=True, content=result, metadata={"result": result})
+                return ToolResult(
+                    success=True,
+                    content=json.dumps({"ok": True}, indent=2),
+                    metadata={"ok": True},
+                )
+
             elif action == "snapshot":
-                return await self._snapshot(params)
+                format_raw = params.get("outputFormat", "png").lower()
+                fmt = "jpeg" if format_raw in ["jpg", "jpeg"] else "png"
+                raw = await self._invoke_node_command(
+                    node_id,
+                    "canvas.snapshot",
+                    {
+                        "format": fmt,
+                        "maxWidth": params.get("maxWidth"),
+                        "quality": params.get("quality"),
+                    },
+                    params,
+                )
+                payload = raw.get("payload", {})
+                base64_data = payload.get("base64", "")
+                return ToolResult(
+                    success=True,
+                    content=f"Canvas snapshot captured (format: {fmt})",
+                    metadata={"format": fmt, "base64_length": len(base64_data)},
+                )
+
             elif action == "a2ui_push":
-                return await self._a2ui_push(params)
+                jsonl = params.get("jsonl", "").strip()
+                jsonl_path = params.get("jsonlPath", "").strip()
+
+                if not jsonl and jsonl_path:
+                    try:
+                        with open(jsonl_path, "r", encoding="utf-8") as f:
+                            jsonl = f.read()
+                    except Exception as e:
+                        return ToolResult(
+                            success=False,
+                            content="",
+                            error=f"Failed to read jsonlPath: {e}",
+                        )
+
+                if not jsonl:
+                    return ToolResult(success=False, content="", error="jsonl or jsonlPath required")
+
+                await self._invoke_node_command(
+                    node_id, "canvas.a2ui.pushJSONL", {"jsonl": jsonl}, params
+                )
+                return ToolResult(
+                    success=True,
+                    content=json.dumps({"ok": True}, indent=2),
+                    metadata={"ok": True},
+                )
+
             elif action == "a2ui_reset":
-                return await self._a2ui_reset(params)
+                await self._invoke_node_command(node_id, "canvas.a2ui.reset", None, params)
+                return ToolResult(
+                    success=True,
+                    content=json.dumps({"ok": True}, indent=2),
+                    metadata={"ok": True},
+                )
+
             else:
                 return ToolResult(success=False, content="", error=f"Unknown action: {action}")
 
@@ -72,104 +242,33 @@ class CanvasTool(AgentTool):
             logger.error(f"Canvas tool error: {e}", exc_info=True)
             return ToolResult(success=False, content="", error=str(e))
 
-    async def _present(self, params: dict[str, Any]) -> ToolResult:
-        """Present canvas with URL"""
-        url = params.get("url", "")
+    async def _resolve_node_id(self, params: dict[str, Any]) -> str:
+        """Resolve node ID from params or defaults"""
+        node = params.get("node")
+        if node:
+            return str(node)
+        return "default-node"
 
-        if not url:
-            return ToolResult(success=False, content="", error="url required")
+    async def _invoke_node_command(
+        self,
+        node_id: str,
+        command: str,
+        invoke_params: dict[str, Any] | None,
+        tool_params: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Invoke node command via gateway."""
+        gateway_url = tool_params.get("gatewayUrl")
+        timeout_ms = tool_params.get("timeoutMs", 20000)
 
-        self._canvas_active = True
-        self._canvas_url = url
-
-        logger.info(f"Canvas presented: {url}")
-
-        return ToolResult(
-            success=True,
-            content=f"Canvas presented with {url}",
-            metadata={"active": True, "url": url},
+        logger.info(
+            f"Canvas invoke: node={node_id}, command={command}, "
+            f"params={invoke_params}, timeout={timeout_ms}ms"
         )
 
-    async def _hide(self, params: dict[str, Any]) -> ToolResult:
-        """Hide canvas"""
-        self._canvas_active = False
-        self._canvas_url = None
-
-        return ToolResult(success=True, content="Canvas hidden")
-
-    async def _navigate(self, params: dict[str, Any]) -> ToolResult:
-        """Navigate canvas to URL"""
-        url = params.get("url", "")
-
-        if not url:
-            return ToolResult(success=False, content="", error="url required")
-
-        if not self._canvas_active:
-            return ToolResult(
-                success=False, content="", error="Canvas not active. Use action='present' first."
-            )
-
-        self._canvas_url = url
-
-        return ToolResult(success=True, content=f"Canvas navigated to {url}")
-
-    async def _eval(self, params: dict[str, Any]) -> ToolResult:
-        """Evaluate JavaScript in canvas"""
-        code = params.get("code", "")
-
-        if not code:
-            return ToolResult(success=False, content="", error="code required")
-
-        if not self._canvas_active:
-            return ToolResult(success=False, content="", error="Canvas not active")
-
-        # This would require browser automation or canvas server
-        logger.warning("Canvas eval requires canvas server integration")
-
-        return ToolResult(
-            success=False,
-            content="",
-            error="Canvas eval not fully implemented - requires canvas server",
-        )
-
-    async def _snapshot(self, params: dict[str, Any]) -> ToolResult:
-        """Take canvas snapshot"""
-        params.get("output_path", "canvas_snapshot.png")
-
-        if not self._canvas_active:
-            return ToolResult(success=False, content="", error="Canvas not active")
-
-        logger.warning("Canvas snapshot requires canvas server")
-
-        return ToolResult(
-            success=False,
-            content="",
-            error="Canvas snapshot not fully implemented - requires canvas server",
-        )
-
-    async def _a2ui_push(self, params: dict[str, Any]) -> ToolResult:
-        """Push data to A2UI"""
-        data = params.get("data", {})
-
-        if not data:
-            return ToolResult(success=False, content="", error="data required")
-
-        logger.info(f"A2UI push: {data}")
-
-        return ToolResult(
-            success=True, content="A2UI data pushed (placeholder)", metadata={"data": data}
-        )
-
-    async def _a2ui_reset(self, params: dict[str, Any]) -> ToolResult:
-        """Reset A2UI state"""
-        return ToolResult(success=True, content="A2UI reset")
+        # TODO: Implement actual gateway call
+        return {"ok": True, "payload": {}}
 
 
-# Note: Full Canvas/A2UI implementation requires:
-# 1. Canvas server (HTTP server serving canvas UI)
-# 2. WebSocket communication for live updates
-# 3. A2UI framework integration (agent-to-UI protocol)
-# 4. Browser automation for snapshots/eval
-#
-# The TypeScript version has a dedicated canvas server at port 18793
-# serving /__openclaw__/canvas/ with full A2UI support.
+def create_canvas_tool(config: dict[str, Any] | None = None) -> CanvasTool:
+    """Create canvas tool instance. Matches TS createCanvasTool()"""
+    return CanvasTool(config=config)

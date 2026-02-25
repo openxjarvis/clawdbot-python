@@ -31,7 +31,7 @@ NODE_HOST_FILE = "node.json"
 def resolve_node_host_config_path() -> str:
     try:
         from openclaw.config.paths import resolve_state_dir
-        state_dir = resolve_state_dir()
+        state_dir = str(resolve_state_dir())
     except (ImportError, Exception):
         state_dir = os.path.expanduser("~/.openclaw")
     return os.path.join(state_dir, NODE_HOST_FILE)

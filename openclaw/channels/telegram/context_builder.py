@@ -24,6 +24,12 @@ from openclaw.auto_reply.inbound_context import (
     finalize_inbound_context,
     build_session_key_from_context,
 )
+from openclaw.auto_reply.group_history import (
+    GroupHistoryEntry,
+    get_group_history,
+    build_group_history_context,
+    format_group_history_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -328,35 +334,39 @@ def build_session_key_for_telegram(
 # Group History Context
 # ============================================================================
 
-def build_group_history_context(
-    message: Message,
-    max_history: int = 5,
-) -> list[str]:
-    """
-    Build group history context (placeholder)
+def build_telegram_group_history_context(
+    group_history_key: str,
+    current_message: str,
+    group_histories: dict[str, list[GroupHistoryEntry]] | None = None,
+    history_limit: int = 50,
+    format_entry: Any = None,
+) -> str:
+    """Build group history context from stored history.
     
-    In the full implementation, this would fetch recent group messages
-    to provide context for the agent.
+    Mirrors TS buildPendingHistoryContextFromMap().
     
     Args:
-        message: Telegram message
-        max_history: Maximum history messages to include
+        group_history_key: Key for group history storage
+        current_message: Current message text
+        group_histories: Optional group history map
+        history_limit: Maximum history entries
+        format_entry: Optional custom formatter for entries
         
     Returns:
-        List of context strings
+        Combined message with history context
     """
-    # Placeholder - would need to track group history
-    # For now, just include reply context if present
-    context = []
+    if history_limit <= 0 or group_histories is None:
+        return current_message
     
-    if message.reply_to_message:
-        reply_text = message.reply_to_message.text or message.reply_to_message.caption
-        if reply_text:
-            sender = message.reply_to_message.from_user
-            sender_name = sender.full_name if sender else "Unknown"
-            context.append(f"[Reply to {sender_name}]: {reply_text[:100]}")
+    entries = get_group_history(group_history_key, history_map=group_histories)
+    if not entries:
+        return current_message
     
-    return context
+    return format_group_history_context(
+        entries=entries,
+        current_message=current_message,
+        format_entry=format_entry,
+    )
 
 
 # ============================================================================
@@ -441,6 +451,8 @@ def build_telegram_message_context(
     owner_id: Optional[str] = None,
     allowed_user_ids: Optional[list[str]] = None,
     group_activation_mode: str = "mention",
+    group_histories: dict[str, list[GroupHistoryEntry]] | None = None,
+    history_limit: int = 50,
 ) -> Optional[MsgContext]:
     """
     Build complete message context from Telegram update
@@ -455,6 +467,8 @@ def build_telegram_message_context(
         owner_id: Owner user ID for command authorization
         allowed_user_ids: List of allowed user IDs
         group_activation_mode: "mention" or "always"
+        group_histories: Optional group history map
+        history_limit: Maximum history entries to include
         
     Returns:
         Finalized message context, or None if message should be ignored
@@ -494,9 +508,29 @@ def build_telegram_message_context(
     # Get message text
     text = message.text or message.caption or ""
     
+    # Build group history key for group messages
+    group_history_key = None
+    if chat_type in ["group", "channel"]:
+        group_id = str(message.chat.id)
+        thread_id = thread_info["thread_id"]
+        if thread_id:
+            group_history_key = f"telegram:{group_id}:{thread_id}"
+        else:
+            group_history_key = f"telegram:{group_id}"
+    
+    # Build body with group history context
+    body_with_history = text
+    if group_history_key and group_histories is not None and history_limit > 0:
+        body_with_history = build_telegram_group_history_context(
+            group_history_key=group_history_key,
+            current_message=text,
+            group_histories=group_histories,
+            history_limit=history_limit,
+        )
+    
     # Build base context
     ctx = MsgContext(
-        Body=text,
+        Body=body_with_history,
         RawBody=text,
         SessionKey=session_key,
         From=sender_info["sender_id"],
@@ -519,12 +553,6 @@ def build_telegram_message_context(
         OriginatingChannel="telegram",
         OriginatingTo=bot_username,
     )
-    
-    # Add group history context for group messages
-    if chat_type in ["group", "channel"]:
-        group_history = build_group_history_context(message)
-        if group_history:
-            ctx.UntrustedContext = group_history
     
     # Apply mention gating
     should_process = apply_mention_gating(ctx, group_activation_mode)

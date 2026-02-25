@@ -86,7 +86,7 @@ def resolve_new_state_dir(homedir: Callable[[], str] = _default_homedir) -> str:
 def resolve_state_dir(
     env: Optional[Dict[str, str]] = None,
     homedir: Optional[Callable[[], str]] = None,
-) -> str:
+) -> Path:
     """
     Resolve the active state directory.
 
@@ -103,20 +103,20 @@ def resolve_state_dir(
 
     override = (e.get("OPENCLAW_STATE_DIR") or "").strip() or (e.get("CLAWDBOT_STATE_DIR") or "").strip()
     if override:
-        return _resolve_user_path(override, e, hd)
+        return Path(_resolve_user_path(override, e, hd))
 
     new_dir = _new_state_dir(hd)
     if Path(new_dir).exists():
-        return new_dir
+        return Path(new_dir)
 
     for legacy_dir in _legacy_state_dirs(hd):
         try:
             if Path(legacy_dir).exists():
-                return legacy_dir
+                return Path(legacy_dir)
         except Exception:
             pass
 
-    return new_dir
+    return Path(new_dir)
 
 
 # ---------------------------------------------------------------------------

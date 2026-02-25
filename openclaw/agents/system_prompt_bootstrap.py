@@ -21,6 +21,61 @@ class BootstrapFile(NamedTuple):
     truncated: bool = False
 
 
+def resolve_memory_bootstrap_entries(workspace_dir: Path) -> list[tuple[str, Path]]:
+    """
+    Resolve memory bootstrap files (MEMORY.md or memory.md).
+    
+    Matches TypeScript workspace.ts#L375-409 (resolveMemoryBootstrapEntries).
+    Checks both uppercase and lowercase variants, deduplicates symlinks and
+    case-insensitive filesystem duplicates (macOS/Windows).
+    
+    Args:
+        workspace_dir: Workspace directory
+    
+    Returns:
+        List of (filename, path) tuples for memory files found
+    """
+    candidates = ["MEMORY.md", "memory.md"]
+    entries = []
+    
+    for filename in candidates:
+        path = workspace_dir / filename
+        if path.exists():
+            entries.append((filename, path))
+    
+    # If only one or no memory files found, return as-is
+    if len(entries) <= 1:
+        return entries
+    
+    # Deduplicate symlinks and case-insensitive duplicates
+    seen = set()
+    deduped = []
+    
+    for filename, path in entries:
+        try:
+            # Resolve to real path and normalize case
+            real_path = path.resolve()
+            
+            # Use case-insensitive comparison for deduplication
+            # (handles macOS/Windows case-insensitive filesystems)
+            real_path_lower = str(real_path).lower()
+        except Exception:
+            # If resolution fails, use original path
+            real_path = path
+            real_path_lower = str(path).lower()
+        
+        if real_path_lower not in seen:
+            seen.add(real_path_lower)
+            deduped.append((filename, path))
+        else:
+            logger.debug(
+                f"Skipping duplicate memory file {filename} "
+                f"(duplicate or symlink to {real_path})"
+            )
+    
+    return deduped
+
+
 def load_bootstrap_files(
     workspace_dir: Path,
     max_chars_per_file: int = 20000
@@ -56,6 +111,7 @@ def load_bootstrap_files(
     
     results = []
     
+    # Load standard bootstrap files
     for filename in bootstrap_files:
         file_path = workspace_dir / filename
         
@@ -105,6 +161,52 @@ def load_bootstrap_files(
         
         except Exception as e:
             logger.error(f"Failed to read bootstrap file {filename}: {e}")
+            results.append(BootstrapFile(
+                path=filename,
+                content=f"(Error reading {filename}: {e})",
+                truncated=False
+            ))
+    
+    # Load memory files (MEMORY.md or memory.md with symlink deduplication)
+    memory_entries = resolve_memory_bootstrap_entries(workspace_dir)
+    
+    for filename, file_path in memory_entries:
+        try:
+            content = file_path.read_text(encoding="utf-8")
+            
+            # Apply same truncation logic
+            truncated = False
+            if len(content) > max_chars_per_file:
+                head_chars = int(max_chars_per_file * 0.7)
+                tail_chars = int(max_chars_per_file * 0.2)
+                
+                head = content[:head_chars]
+                tail = content[-tail_chars:]
+                
+                truncation_marker = (
+                    f"\n\n... (truncated: file exceeded {max_chars_per_file} chars; "
+                    f"showing first {head_chars} + last {tail_chars} chars) ...\n\n"
+                )
+                
+                content = head + truncation_marker + tail
+                truncated = True
+            
+            results.append(BootstrapFile(
+                path=filename,
+                content=content,
+                truncated=truncated
+            ))
+            
+            if truncated:
+                logger.warning(
+                    f"Bootstrap file {filename} truncated "
+                    f"(exceeded {max_chars_per_file} chars)"
+                )
+            else:
+                logger.debug(f"Loaded bootstrap file {filename} ({len(content)} chars)")
+        
+        except Exception as e:
+            logger.error(f"Failed to read memory file {filename}: {e}")
             results.append(BootstrapFile(
                 path=filename,
                 content=f"(Error reading {filename}: {e})",

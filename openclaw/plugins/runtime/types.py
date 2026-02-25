@@ -168,7 +168,7 @@ class PluginRuntimeLogging:
 @dataclass
 class PluginRuntimeState:
     """runtime.state — state directory resolution."""
-    resolve_state_dir: Callable[..., str] | None = None
+    resolve_state_dir: Callable[..., Any] | None = None
 
 
 @dataclass

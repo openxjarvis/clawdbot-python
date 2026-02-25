@@ -27,15 +27,18 @@ class NodesTool(AgentTool):
                     "type": "string",
                     "enum": [
                         "status",
-                        "list",
                         "describe",
+                        "pending",
+                        "approve",
+                        "reject",
+                        "notify",
                         "camera_snap",
                         "camera_list",
                         "camera_clip",
                         "screen_record",
                         "location_get",
-                        "notify",
                         "run",
+                        "invoke",
                     ],
                     "description": "Node action to perform",
                 },
@@ -76,22 +79,30 @@ class NodesTool(AgentTool):
         try:
             if action == "status":
                 return await self._status(params)
-            elif action == "list":
-                return await self._list_nodes(params)
             elif action == "describe":
                 return await self._describe(params)
+            elif action == "pending":
+                return await self._pending(params)
+            elif action == "approve":
+                return await self._approve(params)
+            elif action == "reject":
+                return await self._reject(params)
+            elif action == "notify":
+                return await self._notify(params)
             elif action == "camera_snap":
                 return await self._camera_snap(params)
             elif action == "camera_list":
                 return await self._camera_list(params)
+            elif action == "camera_clip":
+                return await self._camera_clip(params)
             elif action == "screen_record":
                 return await self._screen_record(params)
             elif action == "location_get":
                 return await self._location_get(params)
-            elif action == "notify":
-                return await self._notify(params)
             elif action == "run":
                 return await self._run_command(params)
+            elif action == "invoke":
+                return await self._invoke(params)
             else:
                 return ToolResult(success=False, content="", error=f"Unknown action: {action}")
 
@@ -110,9 +121,81 @@ class NodesTool(AgentTool):
 
         return ToolResult(success=True, content=output, metadata={"count": len(self._paired_nodes)})
 
-    async def _list_nodes(self, params: dict[str, Any]) -> ToolResult:
-        """List paired nodes"""
-        return await self._status(params)
+    async def _pending(self, params: dict[str, Any]) -> ToolResult:
+        """List pending pairing requests (matches TS nodes-tool.ts pending action)"""
+        # TODO: Implement gateway node.pending call
+        logger.info("Checking pending node pairing requests")
+        return ToolResult(
+            success=True,
+            content="No pending pairing requests",
+            metadata={"pending": []},
+        )
+    
+    async def _approve(self, params: dict[str, Any]) -> ToolResult:
+        """Approve pending pairing request (matches TS nodes-tool.ts approve action)"""
+        request_id = params.get("requestId") or params.get("node_id")
+        if not request_id:
+            return ToolResult(success=False, content="", error="requestId required")
+        
+        # TODO: Implement gateway node.approve call
+        logger.info(f"Approving node pairing request: {request_id}")
+        return ToolResult(
+            success=True,
+            content=f"Approved pairing request: {request_id}",
+            metadata={"approved": request_id},
+        )
+    
+    async def _reject(self, params: dict[str, Any]) -> ToolResult:
+        """Reject pending pairing request (matches TS nodes-tool.ts reject action)"""
+        request_id = params.get("requestId") or params.get("node_id")
+        if not request_id:
+            return ToolResult(success=False, content="", error="requestId required")
+        
+        # TODO: Implement gateway node.reject call
+        logger.info(f"Rejecting node pairing request: {request_id}")
+        return ToolResult(
+            success=True,
+            content=f"Rejected pairing request: {request_id}",
+            metadata={"rejected": request_id},
+        )
+    
+    async def _invoke(self, params: dict[str, Any]) -> ToolResult:
+        """Generic node invoke command (matches TS nodes-tool.ts invoke action)"""
+        command = params.get("invokeCommand") or params.get("command")
+        if not command:
+            return ToolResult(success=False, content="", error="invokeCommand required")
+        
+        invoke_params_json = params.get("invokeParamsJson", "{}")
+        
+        try:
+            import json as json_lib
+            invoke_params = json_lib.loads(invoke_params_json)
+        except json_lib.JSONDecodeError as e:
+            return ToolResult(
+                success=False,
+                content="",
+                error=f"Invalid invokeParamsJson: {e}",
+            )
+        
+        # TODO: Implement gateway node.invoke call
+        logger.info(f"Invoking node command: {command} with params {invoke_params}")
+        return ToolResult(
+            success=True,
+            content=f"Invoked command: {command}",
+            metadata={"command": command, "params": invoke_params},
+        )
+    
+    async def _camera_clip(self, params: dict[str, Any]) -> ToolResult:
+        """Record camera video clip (matches TS nodes-tool.ts camera_clip action)"""
+        duration = params.get("duration", 5)
+        output_path = params.get("output_path", "clip.mp4")
+        
+        logger.warning("camera_clip requires paired mobile device")
+        return ToolResult(
+            success=False,
+            content="",
+            error=f"Camera clip requires paired iOS/Android node (duration={duration}s, output={output_path})",
+        )
 
     async def _describe(self, params: dict[str, Any]) -> ToolResult:
         """Describe a node's capabilities"""

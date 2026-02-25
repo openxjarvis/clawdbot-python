@@ -1,1 +1,1 @@
-"""Tests for openclaw-python"""
+"""OpenClaw test suite"""

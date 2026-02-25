@@ -372,6 +372,145 @@ def resolve_hooks_gmail_model(
 
 
 # ---------------------------------------------------------------------------
+# Provider lookup helpers — mirrors TS findNormalizedProviderValue/Key
+# ---------------------------------------------------------------------------
+
+def find_normalized_provider_value(
+    entries: dict[str, Any] | None,
+    provider: str,
+) -> Any:
+    """Return the value associated with *provider* in a provider-keyed dict.
+
+    Normalises all keys before comparing.  Mirrors TS findNormalizedProviderValue().
+    """
+    if not entries:
+        return None
+    provider_key = normalize_provider_id(provider)
+    for key, value in entries.items():
+        if normalize_provider_id(key) == provider_key:
+            return value
+    return None
+
+
+def find_normalized_provider_key(
+    entries: dict[str, Any] | None,
+    provider: str,
+) -> str | None:
+    """Return the dict key that matches *provider* after normalisation.
+
+    Mirrors TS findNormalizedProviderKey().
+    """
+    if not entries:
+        return None
+    provider_key = normalize_provider_id(provider)
+    return next(
+        (key for key in entries if normalize_provider_id(key) == provider_key),
+        None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Allow-list helpers
+# ---------------------------------------------------------------------------
+
+def resolve_allowlist_model_key(raw: str, default_provider: str) -> str | None:
+    """Parse *raw* into a canonical model key "provider/model", or None.
+
+    Mirrors TS resolveAllowlistModelKey().
+    """
+    parsed = parse_model_ref(raw, default_provider)
+    if not parsed:
+        return None
+    return model_key(parsed.provider, parsed.model)
+
+
+def build_allowed_model_set(
+    cfg: Any,
+    catalog: list[Any],
+    default_provider: str = DEFAULT_PROVIDER,
+    default_model: str | None = None,
+) -> dict[str, Any]:
+    """Return the full allowed-model set from config + catalog.
+
+    Mirrors TS buildAllowedModelSet().
+    Returns {"allow_any": bool, "allowed_catalog": list, "allowed_keys": set}.
+    """
+    raw_allowlist: list[str] = []
+    if isinstance(cfg, dict):
+        agents_section = cfg.get("agents") or {}
+        if isinstance(agents_section, dict):
+            defaults_section = agents_section.get("defaults") or {}
+            if isinstance(defaults_section, dict):
+                raw_allowlist = list(defaults_section.get("models") or {})
+
+    allow_any = len(raw_allowlist) == 0
+
+    default_ref = (
+        parse_model_ref(default_model.strip(), default_provider)
+        if default_model and default_model.strip()
+        else None
+    )
+    default_key = (
+        model_key(default_ref.provider, default_ref.model) if default_ref else None
+    )
+
+    catalog_keys: set[str] = set(
+        model_key(e.get("provider", "") if isinstance(e, dict) else getattr(e, "provider", ""),
+                  e.get("id", "") if isinstance(e, dict) else getattr(e, "id", ""))
+        for e in catalog
+    )
+
+    if allow_any:
+        if default_key:
+            catalog_keys.add(default_key)
+        return {
+            "allow_any": True,
+            "allowed_catalog": catalog,
+            "allowed_keys": catalog_keys,
+        }
+
+    allowed_keys: set[str] = set()
+    configured_providers: dict[str, Any] = {}
+    if isinstance(cfg, dict):
+        configured_providers = cfg.get("models", {}).get("providers", {}) or {}
+
+    for raw in raw_allowlist:
+        parsed = parse_model_ref(str(raw), default_provider)
+        if not parsed:
+            continue
+        key = model_key(parsed.provider, parsed.model)
+        if is_cli_provider(parsed.provider, cfg):
+            allowed_keys.add(key)
+        elif key in catalog_keys:
+            allowed_keys.add(key)
+        elif find_normalized_provider_key(configured_providers, parsed.provider) is not None:
+            # Explicitly configured provider: allow even if not in catalog
+            allowed_keys.add(key)
+
+    if default_key:
+        allowed_keys.add(default_key)
+
+    allowed_catalog = [
+        e for e in catalog
+        if model_key(
+            e.get("provider", "") if isinstance(e, dict) else getattr(e, "provider", ""),
+            e.get("id", "") if isinstance(e, dict) else getattr(e, "id", ""),
+        ) in allowed_keys
+    ]
+
+    if not allowed_catalog and not allowed_keys:
+        if default_key:
+            catalog_keys.add(default_key)
+        return {
+            "allow_any": True,
+            "allowed_catalog": catalog,
+            "allowed_keys": catalog_keys,
+        }
+
+    return {"allow_any": False, "allowed_catalog": allowed_catalog, "allowed_keys": allowed_keys}
+
+
+# ---------------------------------------------------------------------------
 # CLI provider detection
 # ---------------------------------------------------------------------------
 

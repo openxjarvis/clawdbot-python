@@ -6,18 +6,24 @@ Aligned with TypeScript src/hooks/workspace.ts
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 
 from .types import HookEntry, HookSnapshot, HookSource
 from .loader import load_hooks_from_dir
 
+# Sentinel value to distinguish "not provided" from "explicitly None"
+_UNSET = object()
+
 
 def load_workspace_hook_entries(
-    workspace_dir: Optional[Path] = None,
-    managed_dir: Optional[Path] = None,
-    bundled_dir: Optional[Path] = None,
-    extra_dirs: Optional[list[Path]] = None
+    workspace_dir: str | Path | None = None,
+    config: dict[str, Any] | None = None,
+    managed_hooks_dir: str | Path | None = None,
+    bundled_hooks_dir: str | Path | object = _UNSET,
+    extra_dirs: list[Path] | None = None,
+    **kwargs
 ) -> list[HookEntry]:
     """Load hook entries from multiple sources with priority.
     
@@ -28,19 +34,52 @@ def load_workspace_hook_entries(
     4. Bundled hooks
     
     Args:
-        workspace_dir: Workspace directory
-        managed_dir: Managed hooks directory
-        bundled_dir: Bundled hooks directory
+        workspace_dir: Workspace directory (str or Path)
+        config: OpenClaw configuration (optional)
+        managed_hooks_dir: Managed hooks directory (optional, defaults to ~/.openclaw/hooks)
+        bundled_hooks_dir: Bundled hooks directory (optional, defaults to package bundled hooks)
         extra_dirs: Additional directories
+        **kwargs: Backward compatibility for old parameter names
     
     Returns:
         List of HookEntry objects (merged, deduplicated)
     """
     all_hooks: dict[str, HookEntry] = {}
     
-    # Load bundled hooks (lowest priority)
-    if bundled_dir and bundled_dir.exists():
-        bundled_hooks = load_hooks_from_dir(bundled_dir, "openclaw-bundled")
+    # Convert workspace_dir to Path if string
+    if isinstance(workspace_dir, str):
+        workspace_dir = Path(workspace_dir)
+    
+    # Resolve default directories
+    if managed_hooks_dir is None:
+        managed_hooks_dir = Path.home() / ".openclaw" / "hooks"
+    elif isinstance(managed_hooks_dir, str):
+        managed_hooks_dir = Path(managed_hooks_dir)
+    
+    # Handle bundled_hooks_dir: None means explicitly disabled, _UNSET means use default
+    if bundled_hooks_dir is _UNSET:
+        # Not explicitly set - use default
+        bundled_hooks_dir = Path(__file__).parent / "bundled"
+    elif bundled_hooks_dir is None:
+        # Explicitly disabled
+        pass  # Keep as None
+    elif isinstance(bundled_hooks_dir, str):
+        bundled_hooks_dir = Path(bundled_hooks_dir)
+    else:
+        bundled_hooks_dir = Path(bundled_hooks_dir) if bundled_hooks_dir else None
+    
+    # Get extra directories from config if provided
+    if config and not extra_dirs:
+        hooks_config = config.get("hooks", {})
+        internal_config = hooks_config.get("internal", {})
+        load_config = internal_config.get("load", {})
+        extra_dirs_config = load_config.get("extraDirs") or load_config.get("extra_dirs")
+        if extra_dirs_config:
+            extra_dirs = [Path(d) for d in extra_dirs_config]
+    
+    # Load bundled hooks (lowest priority) - only if not explicitly disabled
+    if bundled_hooks_dir is not None and bundled_hooks_dir.exists():
+        bundled_hooks = load_hooks_from_dir(bundled_hooks_dir, "openclaw-bundled")
         for entry in bundled_hooks:
             all_hooks[entry.hook.name] = entry
     
@@ -53,14 +92,14 @@ def load_workspace_hook_entries(
                     all_hooks[entry.hook.name] = entry
     
     # Load managed hooks
-    if managed_dir and managed_dir.exists():
-        managed_hooks = load_hooks_from_dir(managed_dir, "openclaw-managed")
+    if managed_hooks_dir and managed_hooks_dir.exists():
+        managed_hooks = load_hooks_from_dir(managed_hooks_dir, "openclaw-managed")
         for entry in managed_hooks:
             all_hooks[entry.hook.name] = entry
     
     # Load workspace hooks (highest priority)
     if workspace_dir:
-        workspace_hooks_dir = workspace_dir / "hooks"
+        workspace_hooks_dir = workspace_dir / ".openclaw" / "hooks"
         if workspace_hooks_dir.exists():
             workspace_hooks = load_hooks_from_dir(workspace_hooks_dir, "openclaw-workspace")
             for entry in workspace_hooks:
@@ -99,3 +138,9 @@ def build_workspace_hook_snapshot(
         resolved_hooks=resolved_hooks,
         version=1
     )
+
+
+__all__ = [
+    "load_workspace_hook_entries",
+    "build_workspace_hook_snapshot",
+]

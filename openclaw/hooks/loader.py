@@ -6,11 +6,18 @@ Aligned with TypeScript src/hooks/loader.ts
 
 from __future__ import annotations
 
+import importlib.util
+import logging
+import sys
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Any
 import yaml
 
 from .types import Hook, HookEntry, HookSource, OpenClawHookMetadata, HookInvocationPolicy
+from .internal_hooks import register_internal_hook, InternalHookHandler
+
+logger = logging.getLogger(__name__)
 
 
 def parse_hook_frontmatter(content: str) -> tuple[dict[str, Any], str]:
@@ -49,27 +56,51 @@ def extract_hook_metadata(frontmatter: dict) -> Optional[OpenClawHookMetadata]:
         frontmatter: Parsed frontmatter dictionary
     
     Returns:
-        OpenClawHookMetadata if 'openclaw' key present, None otherwise
+        OpenClawHookMetadata if metadata found, None otherwise
+        
+    Supports three formats:
+    1. Nested: metadata.openclaw.events (bundled hooks)
+    2. openclaw: events at frontmatter.openclaw (some hooks)
+    3. Top-level: events/requires/emoji/homepage at root (simple hooks)
     """
-    openclaw_data = frontmatter.get("openclaw")
-    if not openclaw_data or not isinstance(openclaw_data, dict):
-        return None
+    # Try nested openclaw metadata first (metadata.openclaw.*)
+    openclaw_data = frontmatter.get("metadata", {}).get("openclaw") if "metadata" in frontmatter else frontmatter.get("openclaw")
     
-    events = openclaw_data.get("events", [])
-    if not isinstance(events, list):
-        events = [events] if events else []
+    if openclaw_data and isinstance(openclaw_data, dict):
+        events = openclaw_data.get("events", [])
+        if not isinstance(events, list):
+            events = [events] if events else []
+        
+        return OpenClawHookMetadata(
+            events=events,
+            always=openclaw_data.get("always", False),
+            hook_key=openclaw_data.get("hookKey"),
+            emoji=openclaw_data.get("emoji"),
+            homepage=openclaw_data.get("homepage"),
+            export=openclaw_data.get("export", "default"),
+            os=openclaw_data.get("os"),
+            requires=openclaw_data.get("requires"),
+            install=openclaw_data.get("install")
+        )
     
-    return OpenClawHookMetadata(
-        events=events,
-        always=openclaw_data.get("always", False),
-        hook_key=openclaw_data.get("hookKey"),
-        emoji=openclaw_data.get("emoji"),
-        homepage=openclaw_data.get("homepage"),
-        export=openclaw_data.get("export", "default"),
-        os=openclaw_data.get("os"),
-        requires=openclaw_data.get("requires"),
-        install=openclaw_data.get("install")
-    )
+    # Fallback: try top-level fields (simple format)
+    events = frontmatter.get("events", [])
+    if events:
+        if not isinstance(events, list):
+            events = [events]
+        return OpenClawHookMetadata(
+            events=events,
+            always=frontmatter.get("always", False),
+            hook_key=frontmatter.get("hookKey"),
+            emoji=frontmatter.get("emoji"),
+            homepage=frontmatter.get("homepage"),
+            export=frontmatter.get("export", "default"),
+            os=frontmatter.get("os"),
+            requires=frontmatter.get("requires"),
+            install=frontmatter.get("install")
+        )
+    
+    return None
 
 
 def load_hook_from_dir(hook_dir: Path, source: HookSource) -> Optional[HookEntry]:
@@ -114,6 +145,10 @@ def load_hook_from_dir(hook_dir: Path, source: HookSource) -> Optional[HookEntry
         if handler_file_path.exists():
             handler_path = str(handler_file_path)
             break
+    
+    # Skip hooks without a handler file
+    if not handler_path:
+        return None
     
     # Create hook
     hook = Hook(
@@ -198,3 +233,214 @@ def format_hooks_for_display(hooks: list[HookEntry]) -> str:
         lines.append("")
     
     return "\n".join(lines)
+
+
+def _import_handler_module(handler_path: str) -> Any:
+    """Dynamically import a handler module.
+    
+    Args:
+        handler_path: Path to handler module
+    
+    Returns:
+        Imported module
+    
+    Raises:
+        ImportError: If module cannot be imported
+    """
+    handler_path_obj = Path(handler_path)
+    
+    # Create a unique module name with timestamp for cache-busting
+    module_name = f"openclaw_hook_{handler_path_obj.stem}_{int(time.time() * 1000)}"
+    
+    # Load the module
+    spec = importlib.util.spec_from_file_location(module_name, handler_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load spec for {handler_path}")
+    
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    
+    return module
+
+
+async def load_internal_hooks(
+    cfg: dict[str, Any],
+    workspace_dir: str,
+    opts: dict[str, Any] | None = None,
+) -> int:
+    """Load and register all hook handlers.
+    
+    Loads hooks from both:
+    1. Directory-based discovery (bundled, managed, workspace)
+    2. Legacy config handlers (backwards compatibility)
+    
+    Args:
+        cfg: OpenClaw configuration
+        workspace_dir: Workspace directory for hook discovery
+        opts: Optional options (managedHooksDir, bundledHooksDir)
+    
+    Returns:
+        Number of handlers successfully loaded
+    
+    Example:
+        >>> config = await load_config()
+        >>> workspace_dir = resolve_agent_workspace_dir(config, agent_id)
+        >>> count = await load_internal_hooks(config, workspace_dir)
+        >>> print(f"Loaded {count} hook handlers")
+    """
+    opts = opts or {}
+    
+    # Check if hooks are enabled
+    hooks_config = cfg.get("hooks", {})
+    internal_config = hooks_config.get("internal", {})
+    if not internal_config.get("enabled"):
+        return 0
+    
+    loaded_count = 0
+    
+    # 1. Load hooks from directories (new system)
+    try:
+        from .workspace import load_workspace_hook_entries
+        
+        hook_entries = load_workspace_hook_entries(
+            workspace_dir,
+            config=cfg,
+            managed_hooks_dir=opts.get("managed_hooks_dir") or opts.get("managedHooksDir"),
+            bundled_hooks_dir=opts.get("bundled_hooks_dir") or opts.get("bundledHooksDir"),
+        )
+        
+        # Filter by eligibility (we'll implement this in config.py)
+        # For now, accept all hooks
+        try:
+            from .config import should_include_hook, resolve_hook_config
+            eligible = [entry for entry in hook_entries if should_include_hook(entry=entry, config=cfg)]
+        except ImportError:
+            # config.py not yet implemented, accept all
+            eligible = hook_entries
+            resolve_hook_config = lambda cfg, name: internal_config.get("entries", {}).get(name)
+        
+        for entry in eligible:
+            hook_config = resolve_hook_config(cfg, entry.hook.name)
+            
+            # Skip if explicitly disabled in config
+            if hook_config and hook_config.get("enabled") is False:
+                continue
+            
+            try:
+                # Import handler module
+                if not entry.hook.handler_path:
+                    logger.warning(f"Hook '{entry.hook.name}' has no handler path")
+                    continue
+                
+                mod = _import_handler_module(entry.hook.handler_path)
+                
+                # Get handler function (default or named export)
+                export_name = entry.metadata.export if entry.metadata else "default"
+                handler = getattr(mod, export_name, None)
+                
+                if handler is None:
+                    logger.error(f"Handler '{export_name}' from {entry.hook.name} not found")
+                    continue
+                
+                if not callable(handler):
+                    logger.error(f"Handler '{export_name}' from {entry.hook.name} is not callable")
+                    continue
+                
+                # Register for all events listed in metadata
+                events = entry.metadata.events if entry.metadata else []
+                if not events:
+                    logger.warning(f"Hook '{entry.hook.name}' has no events defined in metadata")
+                    continue
+                
+                for event in events:
+                    register_internal_hook(event, handler)
+                
+                export_suffix = f" (export: {export_name})" if export_name != "default" else ""
+                logger.info(
+                    f"Registered hook: {entry.hook.name} -> {', '.join(events)}{export_suffix}"
+                )
+                loaded_count += 1
+            except Exception as err:
+                logger.error(
+                    f"Failed to load hook {entry.hook.name}: {err}",
+                    exc_info=True
+                )
+    except Exception as err:
+        logger.error(
+            f"Failed to load directory-based hooks: {err}",
+            exc_info=True
+        )
+    
+    # 2. Load legacy config handlers (backwards compatibility)
+    handlers_config = internal_config.get("handlers", [])
+    for handler_config in handlers_config:
+        try:
+            # Legacy handler paths: keep them workspace-relative
+            raw_module = handler_config.get("module", "").strip()
+            if not raw_module:
+                logger.error("Handler module path is empty")
+                continue
+            
+            # Convert to Path for validation
+            workspace_path = Path(workspace_dir).resolve()
+            if Path(raw_module).is_absolute():
+                logger.error(
+                    f"Handler module path must be workspace-relative (got absolute path): {raw_module}"
+                )
+                continue
+            
+            module_path = (workspace_path / raw_module).resolve()
+            
+            # Check that module_path is within workspace_dir
+            try:
+                module_path.relative_to(workspace_path)
+            except ValueError:
+                logger.error(f"Handler module path must stay within workspaceDir: {raw_module}")
+                continue
+            
+            # Import the module
+            mod = _import_handler_module(str(module_path))
+            
+            # Get the handler function
+            export_name = handler_config.get("export", "default")
+            handler = getattr(mod, export_name, None)
+            
+            if handler is None:
+                logger.error(f"Handler '{export_name}' from {module_path} not found")
+                continue
+            
+            if not callable(handler):
+                logger.error(f"Handler '{export_name}' from {module_path} is not callable")
+                continue
+            
+            event = handler_config.get("event")
+            if not event:
+                logger.error(f"Handler from {module_path} has no event defined")
+                continue
+            
+            register_internal_hook(event, handler)
+            
+            export_suffix = f"#{export_name}" if export_name != "default" else ""
+            logger.info(
+                f"Registered hook (legacy): {event} -> {module_path}{export_suffix}"
+            )
+            loaded_count += 1
+        except Exception as err:
+            module_ref = handler_config.get("module", "unknown")
+            logger.error(
+                f"Failed to load hook handler from {module_ref}: {err}",
+                exc_info=True
+            )
+    
+    return loaded_count
+
+
+__all__ = [
+    "parse_hook_frontmatter",
+    "extract_hook_metadata",
+    "load_hook_from_dir",
+    "load_hooks_from_dir",
+    "format_hooks_for_display",
+    "load_internal_hooks",
+]

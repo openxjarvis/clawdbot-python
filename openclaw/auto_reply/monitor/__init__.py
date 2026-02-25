@@ -1,3 +1,1 @@
-"""Auto-Reply monitoring and message processing."""
-
-from __future__ import annotations
+"""Monitor module for OpenClaw auto-reply."""
