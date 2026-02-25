@@ -258,6 +258,7 @@ class CanvasTool(AgentTool):
     ) -> dict[str, Any]:
         """Invoke node command via gateway."""
         gateway_url = tool_params.get("gatewayUrl")
+        gateway_token = tool_params.get("gatewayToken")
         timeout_ms = tool_params.get("timeoutMs", 20000)
 
         logger.info(
@@ -265,8 +266,33 @@ class CanvasTool(AgentTool):
             f"params={invoke_params}, timeout={timeout_ms}ms"
         )
 
-        # TODO: Implement actual gateway call
-        return {"ok": True, "payload": {}}
+        try:
+            # Create RPC client
+            from openclaw.gateway.rpc_client import GatewayRPCClient
+            
+            if gateway_url:
+                client = GatewayRPCClient(url=gateway_url, auth_token=gateway_token)
+            else:
+                from openclaw.gateway.rpc_client import create_client
+                client = await create_client()
+            
+            # Call node.invoke with the canvas command
+            result = await client.call("node.invoke", {
+                "nodeId": node_id,
+                "command": command,
+                "params": invoke_params or {},
+                "timeoutMs": timeout_ms,
+            })
+            
+            return result
+        
+        except Exception as e:
+            logger.error(f"Canvas invoke failed: {e}", exc_info=True)
+            return {
+                "ok": False,
+                "error": str(e),
+                "payload": {},
+            }
 
 
 def create_canvas_tool(config: dict[str, Any] | None = None) -> CanvasTool:

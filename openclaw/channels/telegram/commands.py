@@ -195,16 +195,31 @@ async def sync_telegram_commands(
         True if sync succeeded
     """
     try:
+        from telegram import BotCommand
         from openclaw.auto_reply.commands_registry import list_native_command_specs_for_config
         
         # Get native commands
-        native_specs = list_native_command_specs_for_config(cfg, skill_commands)
+        native_specs = list_native_command_specs_for_config(cfg, skill_commands, provider="telegram")
         
-        # Build command list
+        # Build command list with normalization and validation (mirrors TS lines 346-361)
         commands = []
         for spec in native_specs:
+            name = spec["name"]  # native_name
+            if not name:
+                continue
+            
+            normalized = normalize_telegram_command_name(name)
+            
+            # Validate against Telegram pattern
+            if not TELEGRAM_COMMAND_NAME_PATTERN.match(normalized):
+                logger.warning(
+                    f"Native command '{name}' is invalid for Telegram "
+                    f"(resolved to '{normalized}'). Skipping."
+                )
+                continue
+            
             commands.append({
-                "command": spec["name"],
+                "command": normalized,
                 "description": spec["description"][:256],
             })
         
@@ -213,7 +228,7 @@ async def sync_telegram_commands(
         custom_commands_raw = account_cfg.get("customCommands") or account_cfg.get("custom_commands")
         custom_result = resolve_telegram_custom_commands(
             commands=custom_commands_raw,
-            reserved_commands={spec["name"] for spec in native_specs},
+            reserved_commands={cmd["command"] for cmd in commands},
         )
         
         for custom_cmd in custom_result["commands"]:
@@ -229,10 +244,20 @@ async def sync_telegram_commands(
         # Cap to Telegram limit
         capped_commands = build_capped_telegram_commands(commands)
         
-        # Register with Telegram
-        await bot.set_my_commands(capped_commands)
+        # Convert to BotCommand objects (python-telegram-bot requirement)
+        bot_commands = [
+            BotCommand(command=cmd["command"], description=cmd["description"])
+            for cmd in capped_commands
+        ]
         
-        logger.info(f"Synced {len(capped_commands)} commands with Telegram")
+        # Register with Telegram API
+        if len(bot_commands) == 0:
+            logger.info("No commands to register, skipping sync")
+            return True
+        
+        await bot.set_my_commands(bot_commands)
+        
+        logger.info(f"Synced {len(bot_commands)} commands with Telegram")
         return True
     
     except Exception as exc:

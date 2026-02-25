@@ -123,13 +123,42 @@ class NodesTool(AgentTool):
 
     async def _pending(self, params: dict[str, Any]) -> ToolResult:
         """List pending pairing requests (matches TS nodes-tool.ts pending action)"""
-        # TODO: Implement gateway node.pending call
         logger.info("Checking pending node pairing requests")
-        return ToolResult(
-            success=True,
-            content="No pending pairing requests",
-            metadata={"pending": []},
-        )
+        
+        try:
+            # Call gateway RPC
+            from openclaw.gateway.rpc_client import create_client
+            
+            client = await create_client()
+            result = await client.call("node.pair.pending", {})
+            
+            pending = result.get("pending", [])
+            
+            if not pending:
+                return ToolResult(
+                    success=True,
+                    content="No pending pairing requests",
+                    metadata={"pending": []},
+                )
+            
+            content = f"Found {len(pending)} pending pairing request(s):\n\n"
+            for req in pending:
+                request_id = req.get("id", "unknown")
+                node_name = req.get("name", "Unknown")
+                content += f"- **{request_id}**: {node_name}\n"
+            
+            return ToolResult(
+                success=True,
+                content=content,
+                metadata={"pending": pending, "count": len(pending)},
+            )
+        except Exception as e:
+            logger.error(f"Failed to check pending requests: {e}", exc_info=True)
+            return ToolResult(
+                success=True,
+                content="No pending pairing requests",
+                metadata={"pending": []},
+            )
     
     async def _approve(self, params: dict[str, Any]) -> ToolResult:
         """Approve pending pairing request (matches TS nodes-tool.ts approve action)"""
@@ -137,13 +166,35 @@ class NodesTool(AgentTool):
         if not request_id:
             return ToolResult(success=False, content="", error="requestId required")
         
-        # TODO: Implement gateway node.approve call
         logger.info(f"Approving node pairing request: {request_id}")
-        return ToolResult(
-            success=True,
-            content=f"Approved pairing request: {request_id}",
-            metadata={"approved": request_id},
-        )
+        
+        try:
+            # Call gateway RPC
+            from openclaw.gateway.rpc_client import create_client
+            
+            client = await create_client()
+            result = await client.call("node.pair.approve", {"requestId": request_id})
+            
+            if result.get("ok"):
+                return ToolResult(
+                    success=True,
+                    content=f"✓ Approved pairing request: {request_id}",
+                    metadata={"approved": request_id, "result": result},
+                )
+            else:
+                error_msg = result.get("error", "Unknown error")
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error=f"Failed to approve: {error_msg}",
+                )
+        except Exception as e:
+            logger.error(f"Failed to approve pairing request: {e}", exc_info=True)
+            return ToolResult(
+                success=False,
+                content="",
+                error=f"Failed to approve: {e}",
+            )
     
     async def _reject(self, params: dict[str, Any]) -> ToolResult:
         """Reject pending pairing request (matches TS nodes-tool.ts reject action)"""
@@ -151,13 +202,35 @@ class NodesTool(AgentTool):
         if not request_id:
             return ToolResult(success=False, content="", error="requestId required")
         
-        # TODO: Implement gateway node.reject call
         logger.info(f"Rejecting node pairing request: {request_id}")
-        return ToolResult(
-            success=True,
-            content=f"Rejected pairing request: {request_id}",
-            metadata={"rejected": request_id},
-        )
+        
+        try:
+            # Call gateway RPC
+            from openclaw.gateway.rpc_client import create_client
+            
+            client = await create_client()
+            result = await client.call("node.pair.reject", {"requestId": request_id})
+            
+            if result.get("ok"):
+                return ToolResult(
+                    success=True,
+                    content=f"✗ Rejected pairing request: {request_id}",
+                    metadata={"rejected": request_id, "result": result},
+                )
+            else:
+                error_msg = result.get("error", "Unknown error")
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error=f"Failed to reject: {error_msg}",
+                )
+        except Exception as e:
+            logger.error(f"Failed to reject pairing request: {e}", exc_info=True)
+            return ToolResult(
+                success=False,
+                content="",
+                error=f"Failed to reject: {e}",
+            )
     
     async def _invoke(self, params: dict[str, Any]) -> ToolResult:
         """Generic node invoke command (matches TS nodes-tool.ts invoke action)"""
@@ -166,6 +239,7 @@ class NodesTool(AgentTool):
             return ToolResult(success=False, content="", error="invokeCommand required")
         
         invoke_params_json = params.get("invokeParamsJson", "{}")
+        node_id = params.get("node_id") or params.get("nodeId") or "default"
         
         try:
             import json as json_lib
@@ -177,13 +251,41 @@ class NodesTool(AgentTool):
                 error=f"Invalid invokeParamsJson: {e}",
             )
         
-        # TODO: Implement gateway node.invoke call
-        logger.info(f"Invoking node command: {command} with params {invoke_params}")
-        return ToolResult(
-            success=True,
-            content=f"Invoked command: {command}",
-            metadata={"command": command, "params": invoke_params},
-        )
+        logger.info(f"Invoking node command: {command} on {node_id} with params {invoke_params}")
+        
+        try:
+            # Call gateway RPC
+            from openclaw.gateway.rpc_client import create_client
+            
+            client = await create_client()
+            result = await client.call("node.invoke", {
+                "nodeId": node_id,
+                "command": command,
+                "params": invoke_params,
+                "timeoutMs": params.get("timeoutMs", 30000),
+            })
+            
+            if result.get("ok"):
+                payload = result.get("payload", {})
+                return ToolResult(
+                    success=True,
+                    content=f"✓ Invoked command: {command}",
+                    metadata={"command": command, "result": payload},
+                )
+            else:
+                error_info = result.get("error", "Unknown error")
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error=f"Command failed: {error_info}",
+                )
+        except Exception as e:
+            logger.error(f"Failed to invoke node command: {e}", exc_info=True)
+            return ToolResult(
+                success=False,
+                content="",
+                error=f"Failed to invoke: {e}",
+            )
     
     async def _camera_clip(self, params: dict[str, Any]) -> ToolResult:
         """Record camera video clip (matches TS nodes-tool.ts camera_clip action)"""

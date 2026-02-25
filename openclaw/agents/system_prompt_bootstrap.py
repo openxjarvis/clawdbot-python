@@ -23,11 +23,11 @@ class BootstrapFile(NamedTuple):
 
 def resolve_memory_bootstrap_entries(workspace_dir: Path) -> list[tuple[str, Path]]:
     """
-    Resolve memory bootstrap files (MEMORY.md or memory.md).
+    Resolve memory bootstrap files (MEMORY.md, memory.md, memory/*.md).
     
     Matches TypeScript workspace.ts#L375-409 (resolveMemoryBootstrapEntries).
-    Checks both uppercase and lowercase variants, deduplicates symlinks and
-    case-insensitive filesystem duplicates (macOS/Windows).
+    Checks both uppercase and lowercase variants, memory directory, deduplicates 
+    symlinks and case-insensitive filesystem duplicates (macOS/Windows).
     
     Args:
         workspace_dir: Workspace directory
@@ -35,6 +35,7 @@ def resolve_memory_bootstrap_entries(workspace_dir: Path) -> list[tuple[str, Pat
     Returns:
         List of (filename, path) tuples for memory files found
     """
+    # Check standard memory files in workspace root
     candidates = ["MEMORY.md", "memory.md"]
     entries = []
     
@@ -42,6 +43,18 @@ def resolve_memory_bootstrap_entries(workspace_dir: Path) -> list[tuple[str, Pat
         path = workspace_dir / filename
         if path.exists():
             entries.append((filename, path))
+    
+    # Check memory directory for additional memory files
+    memory_dir = workspace_dir / "memory"
+    if memory_dir.is_dir():
+        try:
+            for md_file in sorted(memory_dir.glob("*.md")):
+                if md_file.is_file():
+                    # Use relative path from workspace for filename
+                    relative_name = f"memory/{md_file.name}"
+                    entries.append((relative_name, md_file))
+        except Exception as e:
+            logger.warning(f"Failed to scan memory directory: {e}")
     
     # If only one or no memory files found, return as-is
     if len(entries) <= 1:

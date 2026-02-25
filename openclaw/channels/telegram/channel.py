@@ -56,7 +56,10 @@ class TelegramChannel(ChannelPlugin):
         self._command_executor: Optional[ChatCommandExecutor] = None
         self._owner_id: Optional[str] = None
         self._config: Optional[dict] = None
+        self._cfg: dict[str, Any] = {}
         self._account_id: Optional[str] = None
+        self._agent_runtime: Any = None
+        self._session_manager: Any = None
         self._dedupe = TelegramUpdateDedupe()
         self._conflict_backoff = _CONFLICT_BACKOFF_INITIAL
         self._conflict_retry_task: Optional[asyncio.Task] = None
@@ -165,6 +168,7 @@ class TelegramChannel(ChannelPlugin):
         # Get owner ID for command permissions
         self._owner_id = config.get("ownerId") or config.get("owner_id")
         self._config = config
+        self._cfg = config  # Alias for compatibility
 
         logger.info("Starting Telegram channel...")
 
@@ -176,14 +180,6 @@ class TelegramChannel(ChannelPlugin):
         # Create application
         self._app = Application.builder().token(self._bot_token).build()
 
-        # Add command handlers
-        self._app.add_handler(CommandHandler("start", self._handle_start_command))
-        self._app.add_handler(CommandHandler("help", self._handle_help_command))
-        self._app.add_handler(CommandHandler("new", self._handle_new_command))
-        self._app.add_handler(CommandHandler("reset", self._handle_reset_command))
-        self._app.add_handler(CommandHandler("status", self._handle_status_command))
-        self._app.add_handler(CommandHandler("model", self._handle_model_command))
-        
         # Register i18n language switching handlers
         register_lang_handlers(self._app)
         
@@ -258,6 +254,10 @@ class TelegramChannel(ChannelPlugin):
         await self._app.bot.delete_webhook(drop_pending_updates=True)
         logger.info("Cleared webhook and pending updates")
 
+        # Register dynamic command handlers (all native commands from registry)
+        # Must be after bot initialization so we have account_id and cfg
+        await self._register_dynamic_command_handlers()
+        
         # Register bot commands with Telegram
         await self._register_bot_commands()
 
@@ -1082,6 +1082,74 @@ class TelegramChannel(ChannelPlugin):
 
         # Process as normal message
         await self._process_normal_text_message(message, update, context)
+    
+    async def _register_dynamic_command_handlers(self) -> None:
+        """Register all native command handlers dynamically (mirrors TS bot-native-commands.ts:438-647)."""
+        try:
+            from openclaw.auto_reply.commands_registry_data import list_native_command_specs_for_config
+            from openclaw.auto_reply.skill_commands import list_skill_commands_for_agents
+            from openclaw.channels.telegram.commands import normalize_telegram_command_name, TELEGRAM_COMMAND_NAME_PATTERN
+            from openclaw.channels.telegram.command_pipeline import handle_native_command
+            
+            # Get skill commands if enabled
+            skill_commands = []
+            try:
+                skill_commands = list_skill_commands_for_agents(self._cfg)
+                logger.info(f"Loaded {len(skill_commands)} skill commands for registration")
+            except Exception as exc:
+                logger.warning(f"Failed to load skill commands: {exc}")
+            
+            # Get all native commands from registry
+            native_specs = list_native_command_specs_for_config(
+                self._cfg,
+                skill_commands,
+                provider="telegram"
+            )
+            
+            logger.info(f"Registering {len(native_specs)} native command handlers dynamically")
+            
+            # Register handler for each command
+            registered_count = 0
+            for spec in native_specs:
+                name = spec.name or spec.native_name
+                if not name:
+                    continue
+                
+                normalized = normalize_telegram_command_name(name)
+                if not TELEGRAM_COMMAND_NAME_PATTERN.match(normalized):
+                    logger.warning(f"Skipping invalid command name: {normalized}")
+                    continue
+                
+                # Create handler closure that captures the spec
+                async def create_command_handler(command_spec):
+                    async def command_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+                        await handle_native_command(
+                            update=update,
+                            context=ctx,
+                            command_spec=command_spec,
+                            bot=self._app.bot,
+                            cfg=self._cfg,
+                            account_id=self._account_id,
+                            message_handler=self._message_handler,
+                            channel_id=self.id,
+                        )
+                    return command_handler
+                
+                handler = await create_command_handler(spec)
+                self._app.add_handler(CommandHandler(normalized, handler))
+                registered_count += 1
+                logger.debug(f"Registered command handler: /{normalized}")
+            
+            logger.info(f"Successfully registered {registered_count} command handlers")
+        
+        except Exception as exc:
+            logger.error(f"Failed to register dynamic command handlers: {exc}")
+            # Fallback to minimal hardcoded handlers
+            logger.info("Falling back to hardcoded command handlers")
+            self._app.add_handler(CommandHandler("start", self._handle_start_command))
+            self._app.add_handler(CommandHandler("help", self._handle_help_command))
+            self._app.add_handler(CommandHandler("model", self._handle_model_command))
+            self._app.add_handler(CommandHandler("status", self._handle_status_command))
 
     async def _register_bot_commands(self):
         """Register bot commands with Telegram API using dynamic registration."""

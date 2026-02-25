@@ -169,12 +169,44 @@ class GatewayTool(AgentTool):
             )
         
         session_key = params.get("sessionKey", "").strip() or self.agent_session_key or ""
-        delay_ms = params.get("delayMs")
+        delay_ms = params.get("delayMs", 2000)
         reason = params.get("reason", "").strip()[:200] if params.get("reason") else None
         note = params.get("note", "").strip() if params.get("note") else None
         
-        # TODO: Write restart sentinel
-        # TODO: Schedule SIGUSR1 restart
+        # Write restart sentinel for recovery after restart
+        try:
+            from pathlib import Path
+            import json as json_lib
+            
+            sentinel_dir = Path.home() / ".openclaw" / "gateway"
+            sentinel_dir.mkdir(parents=True, exist_ok=True)
+            sentinel_path = sentinel_dir / "restart-sentinel.json"
+            
+            sentinel_data = {
+                "timestamp": int(time.time() * 1000),
+                "sessionKey": session_key,
+                "reason": reason,
+                "note": note,
+            }
+            
+            with open(sentinel_path, "w") as f:
+                json_lib.dump(sentinel_data, f, indent=2)
+            
+            logger.info(f"Wrote restart sentinel to {sentinel_path}")
+        except Exception as e:
+            logger.warning(f"Failed to write restart sentinel: {e}")
+        
+        # Schedule restart via gateway RPC
+        try:
+            from openclaw.gateway.rpc_client import create_client
+            
+            client = await create_client()
+            await client.call("gateway.restart", {
+                "delayMs": delay_ms,
+                "reason": reason,
+            })
+        except Exception as e:
+            logger.warning(f"Failed to schedule restart via RPC: {e}")
         
         logger.info(
             f"Gateway restart requested: delayMs={delay_ms}, reason={reason}, note={note}"
@@ -183,8 +215,9 @@ class GatewayTool(AgentTool):
         scheduled = {
             "ok": True,
             "action": "restart",
-            "delayMs": delay_ms or 2000,
+            "delayMs": delay_ms,
             "reason": reason,
+            "note": note,
         }
         
         return ToolResult(
@@ -313,17 +346,36 @@ class GatewayTool(AgentTool):
         Returns:
             RPC result
         """
-        # TODO: Implement actual gateway RPC call
-        gateway_url = tool_params.get("gatewayUrl", "ws://127.0.0.1:18789")
+        gateway_url = tool_params.get("gatewayUrl")
         gateway_token = tool_params.get("gatewayToken")
         timeout_ms = tool_params.get("timeoutMs", 20000)
         
         logger.info(
-            f"Gateway RPC: method={method}, url={gateway_url}, timeout={timeout_ms}ms"
+            f"Gateway RPC: method={method}, timeout={timeout_ms}ms"
         )
         
-        # Placeholder - actual implementation would call gateway
-        return {"ok": True, "method": method, "params": rpc_params}
+        try:
+            # Create RPC client (uses config if gateway_url not provided)
+            from openclaw.gateway.rpc_client import GatewayRPCClient
+            
+            if gateway_url:
+                client = GatewayRPCClient(url=gateway_url, auth_token=gateway_token)
+            else:
+                from openclaw.gateway.rpc_client import create_client
+                client = await create_client()
+            
+            # Call the gateway method
+            result = await client.call(method, rpc_params)
+            
+            # Wrap result in standard format
+            return {"ok": True, "result": result}
+        
+        except Exception as e:
+            logger.error(f"Gateway RPC call failed: {e}", exc_info=True)
+            return {
+                "ok": False,
+                "error": str(e),
+            }
 
 
 def create_gateway_tool(

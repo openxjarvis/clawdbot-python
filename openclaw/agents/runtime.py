@@ -1,12 +1,33 @@
 from __future__ import annotations
 
 """
-Enhanced Agent runtime with multi-provider support
+DEPRECATED: Legacy MultiProviderRuntime implementation.
+
+This module is deprecated in favor of PiAgentRuntime (openclaw.gateway.pi_runtime).
+The MultiProviderRuntime class is kept for backwards compatibility only and will be 
+removed in a future version.
+
+⚠️  For all new code, use PiAgentRuntime instead:
+    from openclaw.gateway.pi_runtime import PiAgentRuntime
+
+Migration Guide:
+- Replace MultiProviderRuntime with PiAgentRuntime
+- PiAgentRuntime provides the same interface with better performance
+- See openclaw.gateway.pi_runtime for detailed API documentation
 """
 
 import asyncio
 import logging
+import warnings
 from collections.abc import AsyncIterator
+
+# Issue deprecation warning when this module is imported
+warnings.warn(
+    "MultiProviderRuntime is deprecated and will be removed in a future version. "
+    "Use PiAgentRuntime from openclaw.gateway.pi_runtime instead.",
+    DeprecationWarning,
+    stacklevel=2,
+)
 
 from ..events import Event, EventType
 from .auth import AuthProfile, ProfileStore, RotationManager

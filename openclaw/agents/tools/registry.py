@@ -205,21 +205,54 @@ class ToolRegistry:
         }
 
     def get_tools_by_profile(self, profile: str = "full") -> list[AgentTool]:
-        """Get tools filtered by profile"""
-        # TODO: Implement profile-based filtering
-        if profile == "minimal":
-            return [self.get("read_file"), self.get("web_fetch")]
+        """
+        Get tools filtered by profile (owner-only, agent-specific, etc.)
+        
+        Matches TypeScript tool filtering in agents/tools/registry.ts
+        
+        Args:
+            profile: Profile name - "all", "owner", "agent:agentId", "minimal", "coding", "messaging", or "full"
+        
+        Returns:
+            List of tools matching the profile
+        """
+        # Handle special profiles
+        if profile == "all":
+            return self.list_tools()
+        
+        elif profile == "owner":
+            # Owner-only tools: sensitive operations like gateway, config, system management
+            owner_tool_names = {
+                "gateway", "agents_list", "sessions_spawn", "sessions_send",
+                "cron", "process", "voice_call", "nodes",
+            }
+            return [tool for tool in self.list_tools() if tool.name in owner_tool_names]
+        
+        elif profile.startswith("agent:"):
+            # Agent-specific tools: filtered based on agent configuration
+            # For now, return all non-owner tools (can be extended with agent-specific logic)
+            owner_tool_names = {"gateway", "agents_list", "cron", "process", "voice_call"}
+            return [tool for tool in self.list_tools() if tool.name not in owner_tool_names]
+        
+        elif profile == "minimal":
+            # Minimal profile: basic read and web operations
+            minimal_names = {"read_file", "web_fetch"}
+            return [tool for tool in self.list_tools() if tool.name in minimal_names]
+        
         elif profile == "coding":
-            return [
-                self.get("read_file"),
-                self.get("write_file"),
-                self.get("edit_file"),
-                self.get("bash"),
-                self.get("web_fetch"),
-            ]
+            # Coding profile: file operations + bash + web
+            coding_names = {
+                "read_file", "write_file", "edit_file", "bash", 
+                "web_fetch", "web_search", "grep", "ls"
+            }
+            return [tool for tool in self.list_tools() if tool.name in coding_names]
+        
         elif profile == "messaging":
-            return [self.get("web_fetch"), self.get("web_search")]
-        else:  # full
+            # Messaging profile: web + channel actions
+            messaging_names = {"web_fetch", "web_search", "message", "image"}
+            return [tool for tool in self.list_tools() if tool.name in messaging_names]
+        
+        else:  # "full" or default
             return self.list_tools()
 
 

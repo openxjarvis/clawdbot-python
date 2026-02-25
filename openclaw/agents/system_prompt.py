@@ -433,16 +433,30 @@ def resolve_bootstrap_context_for_run(
             except Exception:
                 continue
 
-        # Per-file size limit
+        # Per-file size limit with 70/20 truncation strategy (matching TS)
         if len(content) > max_chars_per_file:
-            content = content[:max_chars_per_file] + "\n…[truncated]"
+            head_chars = int(max_chars_per_file * 0.7)
+            tail_chars = int(max_chars_per_file * 0.2)
+            head = content[:head_chars]
+            tail = content[-tail_chars:]
+            marker = f"\n\n... (truncated {len(content) - max_chars_per_file} chars) ...\n\n"
+            content = head + marker + tail
 
         # Total budget
         if total_chars + len(content) > total_max_chars:
             remaining = total_max_chars - total_chars
             if remaining <= 0:
                 break
-            content = content[:remaining] + "\n…[truncated]"
+            # Apply 70/20 strategy for total budget truncation too
+            if remaining > 100:  # Only use 70/20 if we have reasonable space
+                head_chars = int(remaining * 0.7)
+                tail_chars = int(remaining * 0.2)
+                head = content[:head_chars]
+                tail = content[-tail_chars:]
+                marker = f"\n\n... (truncated {len(content) - remaining} chars) ...\n\n"
+                content = head + marker + tail
+            else:
+                content = content[:remaining] + "\n…[truncated]"
 
         files.append({"path": filename, "content": content})
         total_chars += len(content)
@@ -500,12 +514,17 @@ def build_embedded_system_prompt(
         hook_overrides=hook_overrides,
     )
 
+    # Format skills into prompt text if provided
+    skills_prompt_text = None
+    if skills:
+        skills_prompt_text = format_skills_for_prompt(skills)
+
     return build_agent_system_prompt(
         workspace_dir=workspace_dir,
         tool_names=tool_names,
         tool_summaries=tool_summaries,
         context_files=context_files,
-        skills=skills,
+        skills_prompt=skills_prompt_text,
         user_timezone=user_timezone,
         runtime_info=runtime_info,
         prompt_mode=prompt_mode,
