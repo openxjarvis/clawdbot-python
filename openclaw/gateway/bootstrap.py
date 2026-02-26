@@ -207,7 +207,7 @@ class GatewayBootstrap:
                 "cfg": self.config.model_dump() if self.config else {},
                 "plugin_registry": self.plugin_registry,
                 "workspace_dir": workspace_dir,
-                "default_workspace_dir": default_workspace_dir,
+                "default_workspace_dir": str(workspace_dir),
                 "log_browser": logger,
                 "log_hooks": logger,
                 "deps": None,  # Will be set up later
