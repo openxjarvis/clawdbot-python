@@ -70,9 +70,9 @@ def load_workspace_hook_entries(
     
     # Get extra directories from config if provided
     if config and not extra_dirs:
-        hooks_config = config.get("hooks", {})
-        internal_config = hooks_config.get("internal", {})
-        load_config = internal_config.get("load", {})
+        hooks_config = config.get("hooks") or {}
+        internal_config = hooks_config.get("internal") or {}
+        load_config = internal_config.get("load") or {}
         extra_dirs_config = load_config.get("extraDirs") or load_config.get("extra_dirs")
         if extra_dirs_config:
             extra_dirs = [Path(d) for d in extra_dirs_config]
