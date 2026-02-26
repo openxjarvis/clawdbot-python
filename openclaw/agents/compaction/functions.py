@@ -579,3 +579,30 @@ def resolve_context_window_tokens(model: dict[str, Any] | None = None) -> int:
         if isinstance(cw, (int, float)) and cw > 0:
             return max(1, int(cw))
     return DEFAULT_CONTEXT_TOKENS
+
+
+def should_compact(
+    context_tokens: int,
+    context_window: int,
+    settings: dict
+) -> bool:
+    """
+    Check if compaction should be triggered.
+    
+    Aligned with TS: openclaw/src/agents/compaction.ts:shouldCompact()
+    
+    Args:
+        context_tokens: Current context token count
+        context_window: Maximum context window size
+        settings: Compaction settings dict with 'enabled' and 'reserveTokens'
+        
+    Returns:
+        True if compaction should be triggered
+    """
+    if not settings.get('enabled', True):
+        return False
+    
+    reserve_tokens = settings.get('reserveTokens', 16384)
+    threshold = context_window - reserve_tokens
+    
+    return context_tokens > threshold

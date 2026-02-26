@@ -188,7 +188,7 @@ async def start_gateway_sidecars(params: dict) -> dict:
     
     # 2. Start Browser Control Server
     try:
-        browser_control = await start_browser_control_server_if_enabled(cfg)
+        browser_control = await start_browser_control_server_if_enabled(cfg or {})
         results["browser_control"] = browser_control
         if browser_control:
             log_browser.info(f"Browser Control Server started on port {browser_control['port']}")

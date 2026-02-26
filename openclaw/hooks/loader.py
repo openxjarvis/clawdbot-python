@@ -310,6 +310,10 @@ async def load_internal_hooks(
             bundled_hooks_dir=opts.get("bundled_hooks_dir") or opts.get("bundledHooksDir"),
         )
         
+        # Ensure hook_entries is not None (Bug fix for NoneType iteration)
+        if hook_entries is None:
+            hook_entries = []
+        
         # Filter by eligibility (we'll implement this in config.py)
         # For now, accept all hooks
         try:
@@ -318,6 +322,7 @@ async def load_internal_hooks(
         except ImportError:
             # config.py not yet implemented, accept all
             eligible = hook_entries
+            internal_config = cfg.get("hooks", {}).get("internal", {}) if cfg else {}
             resolve_hook_config = lambda cfg, name: internal_config.get("entries", {}).get(name)
         
         for entry in eligible:

@@ -297,3 +297,41 @@ def merge_session_entry(existing: SessionEntry | None, patch: dict[str, Any]) ->
     # Update timestamp
     existing_dict["updatedAt"] = int(__import__("time").time() * 1000)
     return SessionEntry(**existing_dict)
+
+
+async def update_session_entry_tokens(
+    session_manager,
+    session_id: str,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    context_tokens: int | None = None,
+) -> None:
+    """
+    Update token statistics in SessionEntry.
+    
+    Args:
+        session_manager: SessionManager instance
+        session_id: Session UUID
+        input_tokens: Input tokens from API response
+        output_tokens: Output tokens from API response
+        context_tokens: Estimated context tokens
+    """
+    import time
+    
+    entry = session_manager.get_entry_by_id(session_id)
+    if not entry:
+        return
+    
+    # Update token statistics
+    entry.inputTokens = (entry.inputTokens or 0) + input_tokens
+    entry.outputTokens = (entry.outputTokens or 0) + output_tokens
+    entry.totalTokens = (entry.totalTokens or 0) + input_tokens + output_tokens
+    
+    if context_tokens is not None:
+        entry.contextTokens = context_tokens
+    
+    entry.totalTokensFresh = True
+    entry.updatedAt = int(time.time() * 1000)
+    
+    # Save updated entry
+    await session_manager.save_entry(entry)

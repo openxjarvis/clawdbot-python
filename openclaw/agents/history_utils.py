@@ -5,7 +5,9 @@ Aligned with openclaw/src/agents/pi-embedded-runner/run/attempt.ts
 """
 from __future__ import annotations
 
+import json
 import logging
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -324,3 +326,45 @@ def validate_message_sequence(messages: list[dict[str, Any]]) -> tuple[bool, str
         last_role = role
     
     return True, None
+
+
+def read_session_transcript(
+    transcript_path: Path | str,
+    limit: int | None = None
+) -> list[dict[str, Any]]:
+    """
+    Read session transcript from JSONL file with optional limit.
+    
+    Args:
+        transcript_path: Path to the JSONL transcript file
+        limit: Maximum number of messages to return (from end)
+        
+    Returns:
+        List of messages
+    """
+    if isinstance(transcript_path, str):
+        transcript_path = Path(transcript_path)
+    
+    if not transcript_path.exists():
+        return []
+    
+    messages = []
+    try:
+        with open(transcript_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        messages.append(json.loads(line))
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"Failed to parse JSONL line: {e}")
+                        continue
+    except Exception as e:
+        logger.error(f"Failed to read transcript {transcript_path}: {e}")
+        return []
+    
+    # Apply limit (keep last N messages)
+    if limit and len(messages) > limit:
+        messages = messages[-limit:]
+    
+    return messages

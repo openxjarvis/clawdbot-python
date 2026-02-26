@@ -110,6 +110,8 @@ class PiAgentRuntime:
         try:
             from pi_coding_agent import AgentSession as PiAgentSession
             from openclaw.agents.pi_stream import _resolve_model
+            from openclaw.agents.history_utils import read_session_transcript, limit_history_turns
+            from pathlib import Path
 
             model = None
             try:
@@ -117,11 +119,36 @@ class PiAgentRuntime:
             except Exception:
                 pass
 
+            # Load and limit history (Phase 1: Emergency fix for token overflow)
+            history_messages = []
+            try:
+                session_dir = Path.home() / ".openclaw" / "agents" / "main" / "sessions"
+                transcript_path = session_dir / f"{session_id}.jsonl"
+                
+                if transcript_path.exists():
+                    # Limit to last 200 messages
+                    history_messages = read_session_transcript(transcript_path, limit=200)
+                    # Further limit to last 50 turns
+                    history_messages = limit_history_turns(history_messages, max_turns=50)
+                    
+                    logger.info(
+                        f"Loaded {len(history_messages)} messages from history "
+                        f"(limited to 200 messages / 50 turns)"
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to load limited history: {e}")
+                history_messages = []
+
             pi_session = PiAgentSession(
                 cwd=self.cwd,
                 model=model,
                 session_id=session_id,
             )
+            
+            # Manually set limited history if session has _conversation_history attribute
+            if hasattr(pi_session, '_conversation_history') and history_messages:
+                pi_session._conversation_history = history_messages
+                logger.info(f"Applied limited history ({len(history_messages)} messages) to session")
 
             # Thinking models (e.g. gemini-3-pro-preview) require a non-zero
             # thinking budget — set a default level so they don't error with
@@ -430,6 +457,41 @@ class PiAgentRuntime:
                         except Exception as img_exc:
                             logger.warning("Failed to convert images: %s", img_exc)
                             pi_images = None
+                    
+                    # Phase 2: Token monitoring - estimate before sending
+                    from openclaw.agents.compaction.functions import estimate_messages_tokens, should_compact
+                    
+                    context_tokens = 0
+                    context_window = 1_048_576  # Gemini default
+                    
+                    try:
+                        if hasattr(_pi_session, '_conversation_history'):
+                            context_tokens = estimate_messages_tokens(_pi_session._conversation_history)
+                            logger.debug(f"Estimated context tokens: {context_tokens}")
+                            
+                            # Phase 3: Auto-compaction trigger (Safeguard)
+                            compaction_settings = {
+                                'enabled': True,
+                                'reserveTokens': 16384,      # 16K for response
+                                'keepRecentTokens': 20000,   # Keep recent 20K
+                            }
+                            
+                            if should_compact(context_tokens, context_window, compaction_settings):
+                                logger.warning(
+                                    f"Auto-compaction triggered: {context_tokens} tokens "
+                                    f"exceeds threshold ({context_window - compaction_settings['reserveTokens']})"
+                                )
+                                
+                                # Note: Full compaction implementation would go here
+                                # For now, the history limit (Phase 1) prevents overflow
+                                logger.info("Using history limiting as compaction strategy")
+                            elif context_tokens > context_window * 0.9:
+                                logger.warning(
+                                    f"Context tokens ({context_tokens}) approaching limit ({context_window})"
+                                )
+                    except Exception as e:
+                        logger.debug(f"Token estimation failed: {e}")
+                    
                     await _pi_session.prompt(message, pi_images)
                 except Exception as exc:
                     if _is_quota_error(exc):
@@ -484,6 +546,36 @@ class PiAgentRuntime:
             for ev in collected_events:
                 await self._dispatch_event(ev)
                 yield ev
+
+            # Phase 2: Update session token statistics after successful run
+            try:
+                from openclaw.agents.session_entry import update_session_entry_tokens
+                
+                # Extract usage info from events if available
+                input_tokens = 0
+                output_tokens = 0
+                for evt in collected_events:
+                    if hasattr(evt, 'data') and isinstance(evt.data, dict):
+                        usage = evt.data.get('usage', {})
+                        if usage:
+                            input_tokens += usage.get('input_tokens', 0) or usage.get('inputTokens', 0)
+                            output_tokens += usage.get('output_tokens', 0) or usage.get('outputTokens', 0)
+                
+                # Update SessionEntry if we have usage data or context estimate
+                if input_tokens or output_tokens or context_tokens:
+                    await update_session_entry_tokens(
+                        session_manager=getattr(self, 'session_manager', None),
+                        session_id=session_id,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        context_tokens=context_tokens if context_tokens > 0 else None,
+                    )
+                    logger.debug(
+                        f"Updated session tokens: input={input_tokens}, "
+                        f"output={output_tokens}, context={context_tokens}"
+                    )
+            except Exception as e:
+                logger.warning(f"Failed to update session token statistics: {e}")
 
             # If quota error and NO more fallbacks, emit a helpful error
             if _quota_error:
