@@ -143,8 +143,10 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 def _append_config_audit(config_path: Path, event: str, details: str = "") -> None:
     """Append an entry to config-audit.jsonl (matches TS config/io.ts audit log)."""
-    audit_file = config_path.parent / "config-audit.jsonl"
+    # TS writes to stateDir/logs/config-audit.jsonl, not next to the config file
+    audit_file = Path.home() / ".openclaw" / "logs" / "config-audit.jsonl"
     try:
+        audit_file.parent.mkdir(parents=True, exist_ok=True)
         entry = json.dumps({
             "ts": datetime.now(UTC).isoformat(),
             "event": event,

@@ -18,6 +18,44 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def _resolve_workspace_dir(cfg: Any, context: dict) -> str:
+    """Resolve the agent workspace directory for session-memory saving.
+
+    Mirrors TS handler.ts: uses agent scope to find the right workspace.
+    Priority:
+      1. context["workspaceDir"] if explicitly provided
+      2. resolve_agent_workspace_dir(cfg, agent_id) from agent_scope
+      3. fallback to default ~/.openclaw/workspace
+    """
+    # 1. Explicit context override
+    ctx_dir = context.get("workspaceDir") or context.get("workspace_dir")
+    if ctx_dir:
+        return str(ctx_dir)
+
+    # 2. Agent scope resolution
+    try:
+        from openclaw.agents.agent_scope import (
+            resolve_agent_workspace_dir,
+            resolve_default_agent_id,
+        )
+        # Try to get agent_id from session key in the event context
+        session_key = context.get("sessionKey") or context.get("session_key") or ""
+        if session_key:
+            from openclaw.routing.session_key import resolve_agent_id_from_session_key
+            agent_id = resolve_agent_id_from_session_key(session_key)
+        else:
+            agent_id = resolve_default_agent_id(cfg) if cfg else "main"
+
+        return str(resolve_agent_workspace_dir(cfg or {}, agent_id))
+    except Exception as exc:
+        logger.debug("session-memory: could not resolve workspace via agent scope: %s", exc)
+
+    # 3. Fallback: check config dict then hardcoded default
+    if cfg and isinstance(cfg, dict) and cfg.get("workspace", {}).get("dir"):
+        return str(cfg["workspace"]["dir"])
+    return os.path.expanduser("~/.openclaw/workspace")
+
+
 async def get_recent_session_content(
     session_file_path: str,
     message_count: int = 15
@@ -222,12 +260,9 @@ async def save_session_to_memory(event: Any) -> None:
         
         context = event.context or {}
         cfg = context.get("cfg")
-        
-        # Resolve workspace directory
-        # TODO: Import proper agent scope resolution
-        workspace_dir = os.path.expanduser("~/.openclaw/workspace")
-        if cfg and cfg.get("workspace", {}).get("dir"):
-            workspace_dir = cfg["workspace"]["dir"]
+
+        # Resolve workspace directory using proper agent scope (mirrors TS handler.ts)
+        workspace_dir = _resolve_workspace_dir(cfg, context)
         
         memory_dir = Path(workspace_dir) / "memory"
         memory_dir.mkdir(parents=True, exist_ok=True)

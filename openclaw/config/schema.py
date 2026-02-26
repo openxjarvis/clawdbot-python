@@ -29,6 +29,19 @@ class AuthConfig(BaseModel):
     trusted_proxy: dict[str, Any] | None = Field(default=None, alias="trustedProxy")
 
 
+class GatewayNodesConfig(BaseModel):
+    """Gateway nodes configuration"""
+    browser: dict[str, Any] | None = Field(default=None)
+    allow_commands: list[str] | None = Field(default=None, alias="allowCommands")
+    deny_commands: list[str] | None = Field(default=None, alias="denyCommands")
+
+
+class GatewayTailscaleConfig(BaseModel):
+    """Gateway Tailscale configuration"""
+    mode: str = Field(default="off")  # "off" | "serve" | "funnel"
+    reset_on_exit: bool = Field(default=False, alias="resetOnExit")
+
+
 class GatewayConfig(BaseModel):
     """Gateway server configuration (aligned with TypeScript)"""
     port: int = Field(default=18789)
@@ -39,6 +52,8 @@ class GatewayConfig(BaseModel):
     enable_web_ui: bool = Field(default=True, alias="enableWebUI")
     web_ui_port: int = Field(default=8080, alias="webUIPort")
     web_ui_base_path: str = Field(default="/", alias="webUIBasePath")
+    nodes: GatewayNodesConfig | None = Field(default=None)
+    tailscale: GatewayTailscaleConfig | None = Field(default=None)
 
 
 class ExecToolConfig(BaseModel):
@@ -328,10 +343,24 @@ class MetaConfig(BaseModel):
     last_touched_at: str | None = Field(default=None, alias="lastTouchedAt")
 
 
+class MessagesConfig(BaseModel):
+    """Messages configuration (TS alignment)"""
+    ack_reaction_scope: str | None = Field(default="group-mentions", alias="ackReactionScope")
+
+
+class CommandsConfig(BaseModel):
+    """Commands configuration (TS alignment)"""
+    native: str | None = Field(default="auto")
+    native_skills: str | None = Field(default="auto", alias="nativeSkills")
+
+
 class WizardConfig(BaseModel):
     """Wizard run tracking"""
     last_run_at: str | None = Field(default=None, alias="lastRunAt")
     last_run_version: str | None = Field(default=None, alias="lastRunVersion")
+    last_run_commit: str | None = Field(default=None, alias="lastRunCommit")
+    last_run_command: str | None = Field(default=None, alias="lastRunCommand")
+    last_run_mode: str | None = Field(default=None, alias="lastRunMode")
 
 
 class LoggingConfig(BaseModel):
@@ -367,9 +396,19 @@ class CronConfig(BaseModel):
     enabled: bool = Field(default=True)
 
 
+class InternalHooksConfig(BaseModel):
+    """Internal hooks configuration"""
+    enabled: bool = Field(default=True)
+    handlers: dict[str, Any] | None = Field(default=None)
+    entries: dict[str, Any] | None = Field(default=None)
+    load: dict[str, Any] | None = Field(default=None)
+    installs: dict[str, Any] | None = Field(default=None)
+
+
 class HooksConfig(BaseModel):
     """Hooks configuration"""
     enabled: bool = Field(default=True)
+    internal: InternalHooksConfig | None = Field(default=None)
 
 
 class ShellEnvConfig(BaseModel):
@@ -436,8 +475,8 @@ class ClawdbotConfig(BaseModel):
     bindings: list[dict[str, Any]] | None = Field(default=None)
     broadcast: dict[str, Any] | None = Field(default=None)
     audio: dict[str, Any] | None = Field(default=None)
-    messages: dict[str, Any] | None = Field(default=None)
-    commands: dict[str, Any] | None = Field(default=None)
+    messages: MessagesConfig | None = Field(default=None)
+    commands: CommandsConfig | None = Field(default=None)
     approvals: dict[str, Any] | None = Field(default=None)
     session: dict[str, Any] | None = Field(default=None)
     web: dict[str, Any] | None = Field(default=None)

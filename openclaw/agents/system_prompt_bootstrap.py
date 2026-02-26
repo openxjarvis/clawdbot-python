@@ -22,61 +22,47 @@ class BootstrapFile(NamedTuple):
 
 
 def resolve_memory_bootstrap_entries(workspace_dir: Path) -> list[tuple[str, Path]]:
-    """
-    Resolve memory bootstrap files (MEMORY.md, memory.md, memory/*.md).
-    
-    Matches TypeScript workspace.ts#L375-409 (resolveMemoryBootstrapEntries).
-    Checks both uppercase and lowercase variants, memory directory, deduplicates 
-    symlinks and case-insensitive filesystem duplicates (macOS/Windows).
-    
+    """Resolve memory bootstrap files injected into the system prompt.
+
+    Aligned with TypeScript workspace.ts loadWorkspaceBootstrapFiles():
+    - Only MEMORY.md and memory.md (root-level) are auto-injected.
+    - Daily memory/*.md files are NOT auto-injected — they are accessed
+      on-demand via memory_search / memory_get tools to preserve context
+      budget.
+
+    Deduplicates symlinks and case-insensitive filesystem duplicates
+    (macOS/Windows).
+
     Args:
         workspace_dir: Workspace directory
-    
+
     Returns:
         List of (filename, path) tuples for memory files found
     """
-    # Check standard memory files in workspace root
     candidates = ["MEMORY.md", "memory.md"]
     entries = []
-    
+
     for filename in candidates:
         path = workspace_dir / filename
         if path.exists():
             entries.append((filename, path))
-    
-    # Check memory directory for additional memory files
-    memory_dir = workspace_dir / "memory"
-    if memory_dir.is_dir():
-        try:
-            for md_file in sorted(memory_dir.glob("*.md")):
-                if md_file.is_file():
-                    # Use relative path from workspace for filename
-                    relative_name = f"memory/{md_file.name}"
-                    entries.append((relative_name, md_file))
-        except Exception as e:
-            logger.warning(f"Failed to scan memory directory: {e}")
-    
+
     # If only one or no memory files found, return as-is
     if len(entries) <= 1:
         return entries
-    
+
     # Deduplicate symlinks and case-insensitive duplicates
     seen = set()
     deduped = []
-    
+
     for filename, path in entries:
         try:
-            # Resolve to real path and normalize case
             real_path = path.resolve()
-            
-            # Use case-insensitive comparison for deduplication
-            # (handles macOS/Windows case-insensitive filesystems)
             real_path_lower = str(real_path).lower()
         except Exception:
-            # If resolution fails, use original path
             real_path = path
             real_path_lower = str(path).lower()
-        
+
         if real_path_lower not in seen:
             seen.add(real_path_lower)
             deduped.append((filename, path))

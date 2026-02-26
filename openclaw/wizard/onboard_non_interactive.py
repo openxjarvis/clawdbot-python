@@ -100,11 +100,9 @@ async def run_non_interactive_onboarding(
         logger.error(f"Failed to save config: {e}")
         return {"success": False, "error": str(e)}
     
-    # Mark onboarding complete
-    if workspace:
-        marker = workspace / ".openclaw" / "onboarding-complete"
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text('{"completed_at": "' + str(Path.ctime(marker)) + '"}')
+    # TS alignment: onboarding completion is tracked via workspace-state.json,
+    # not via a separate onboarding-complete marker file
+    # (see openclaw/agents/ensure_workspace.py for workspace-state.json management)
     
     print("\n✅ Non-interactive onboarding complete!")
     print("\n🚀 Next steps:")

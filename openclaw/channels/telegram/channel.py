@@ -222,8 +222,14 @@ class TelegramChannel(ChannelPlugin):
         
         # Get bot info after initialization
         bot_info = await self._app.bot.get_me()
-        account_id = str(bot_info.id)
-        logger.info(f"Bot initialized: @{bot_info.username} (ID: {account_id})")
+        # Resolve account_id: use configured accountId if present, else "default" (matches TS resolveAccountId())
+        cfg_account_id = (
+            (config or {}).get("accountId")
+            or (config or {}).get("account_id")
+            or ""
+        )
+        account_id = str(cfg_account_id).strip() if cfg_account_id else ""
+        logger.info(f"Bot initialized: @{bot_info.username} (account_id: {account_id})")
         
         # Create a minimal config dict for command handler
         cmd_config = {
@@ -1160,7 +1166,7 @@ class TelegramChannel(ChannelPlugin):
             await register_telegram_native_commands(
                 bot=self._app.bot,
                 cfg=self._config or {},
-                account_id=self._account_id or "default",
+                account_id=self._account_id or "",
                 native_enabled=True,
                 native_skills_enabled=True,
             )

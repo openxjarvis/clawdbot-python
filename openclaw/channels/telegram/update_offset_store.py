@@ -18,6 +18,12 @@ logger = logging.getLogger(__name__)
 _BASE_DIR = Path.home() / ".openclaw" / "telegram"
 
 
+def ensure_telegram_dir() -> Path:
+    """Ensure telegram directory exists (TS alignment)"""
+    _BASE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return _BASE_DIR
+
+
 def _offset_path(account_id: str) -> Path:
     return _BASE_DIR / f"update-offset-{account_id}.json"
 

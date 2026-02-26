@@ -139,6 +139,13 @@ def setup_logging(
         file_handler.setLevel(getattr(logging, file_level.upper()))
         file_handler.setFormatter(JSONFormatter())
         root_logger.addHandler(file_handler)
+        
+        # Error log file handler (TS alignment - gateway.err.log)
+        err_log_path = log_path.parent / "gateway.err.log"
+        err_handler = logging.FileHandler(err_log_path)
+        err_handler.setLevel(logging.ERROR)  # Only ERROR and above
+        err_handler.setFormatter(JSONFormatter())
+        root_logger.addHandler(err_handler)
 
     # Reduce noise from third-party libraries
     logging.getLogger("httpx").setLevel(logging.WARNING)

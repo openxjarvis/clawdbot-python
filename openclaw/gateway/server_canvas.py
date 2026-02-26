@@ -35,22 +35,23 @@ async def start_canvas_host_server(
             return None
     
     try:
+        from ..canvas_host.server import CanvasHostServer
+        
         logger.info(f"Starting Canvas Host Server on port {port}")
         
-        # TODO: Implement actual Canvas HTTP server
-        # This would serve:
-        # - Canvas UI assets
-        # - WebSocket for live updates
-        # - A2UI protocol endpoints
+        # Create and start canvas server (TS alignment)
+        canvas_server = CanvasHostServer()
+        await canvas_server.start(port=port)
         
-        logger.info(f"Canvas Host Server started on port {port}")
+        logger.info(f"Canvas Host Server started on port {canvas_server.port}")
         
         return {
             "enabled": True,
-            "port": port,
-            "url": f"http://localhost:{port}",
+            "port": canvas_server.port,
+            "url": f"http://localhost:{canvas_server.port}",
+            "server": canvas_server,
         }
         
     except Exception as e:
-        logger.error(f"Failed to start Canvas Host Server: {e}")
+        logger.error(f"Failed to start Canvas Host Server: {e}", exc_info=True)
         return None

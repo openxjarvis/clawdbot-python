@@ -16,6 +16,7 @@ from .command_parsing import parse_command_args, build_command_text_from_args
 from .command_menus import resolve_command_arg_menu, build_inline_keyboard_for_menu
 from .command_inbound_context import finalize_inbound_context
 from .command_dispatcher import dispatch_reply_with_buffered_dispatcher
+from .command_config import handle_config_command, parse_config_command
 
 logger = logging.getLogger(__name__)
 
@@ -81,8 +82,33 @@ async def handle_native_command(
         )
         return
     
-    # 4. Parse arguments
+    # 4. Handle built-in intercepted commands (/config, /debug)
+    command_key = command_spec.get("key") or command_spec.get("native_name", "")
     raw_text = " ".join(context.args) if context.args else ""
+
+    if command_key == "config":
+        result = await handle_config_command(
+            command_body=raw_text,
+            is_authorized_sender=bool(auth.get("command_authorized")),
+            channel_id=channel_id,
+            cfg=cfg,
+        )
+        if result is not None:
+            reply_text = result.get("reply_text")
+            if reply_text:
+                try:
+                    from telegram.constants import ParseMode
+                    await context.bot.send_message(
+                        chat_id=auth["chat_id"],
+                        text=reply_text,
+                        parse_mode=ParseMode.HTML if "<" in reply_text else None,
+                        message_thread_id=auth["resolved_thread_id"] if auth.get("is_forum") else None,
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to send /config reply: %s", exc)
+            return
+
+    # 5. Parse arguments
     command_args = parse_command_args(command_spec, raw_text)
     
     # 5. Check for menu (if arg choices available and arg missing)

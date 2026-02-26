@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from ..session import SessionManager
 
 logger = logging.getLogger(__name__)
-from .browser import BrowserTool
+from openclaw.browser.tools.browser_tool import UnifiedBrowserTool as BrowserTool
 from .canvas import CanvasTool
 from .channel_actions import (
     DiscordActionsTool,

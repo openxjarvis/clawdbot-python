@@ -79,8 +79,8 @@ class PairingStore:
     Persistent storage for pairing requests
     
     Stores pending pairing requests in JSON files:
-    - ~/.openclaw/oauth/telegram-pairing.json
-    - ~/.openclaw/oauth/discord-pairing.json
+    - ~/.openclaw/credentials/telegram-pairing.json
+    - ~/.openclaw/credentials/discord-pairing.json
     - etc.
     """
     
@@ -91,9 +91,9 @@ class PairingStore:
     
     def _resolve_store_path(self) -> Path:
         """Resolve store file path for channel"""
-        oauth_dir = Path.home() / ".openclaw" / "oauth"
+        credentials_dir = Path.home() / ".openclaw" / "credentials"
         safe_channel = self._safe_channel_key(self.channel)
-        return oauth_dir / f"{safe_channel}-pairing.json"
+        return credentials_dir / f"{safe_channel}-pairing.json"
     
     def _safe_channel_key(self, channel: str) -> str:
         """Sanitize channel ID for use in filenames"""

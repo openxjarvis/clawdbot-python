@@ -232,7 +232,7 @@ def doctor(
             })
 
     # Check 3: Workspace
-    workspace = Path.home() / ".openclaw"
+    workspace = Path.home() / ".openclaw" / "workspace"
     if not workspace.exists():
         warnings.append(f"Workspace not found at {workspace}")
         fixes.append(("create_workspace", f"mkdir -p {workspace}"))

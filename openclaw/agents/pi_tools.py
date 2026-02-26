@@ -35,6 +35,58 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+class _WorkspaceGuardedTool:
+    """Wraps a write/edit tool to reject paths outside the workspace root.
+
+    Mirrors TypeScript wrapToolWorkspaceRootGuard() from pi-tools.ts.
+    When workspace_only=True is passed to create_openclaw_coding_tools(), all
+    write and edit tool calls pass through this guard.
+    """
+
+    def __init__(self, inner: Any, workspace_root: Path) -> None:
+        self._inner = inner
+        self._workspace_root = workspace_root.resolve()
+        self.name: str = getattr(inner, "name", str(inner))
+        self.description: str = getattr(inner, "description", "")
+
+    def schema(self) -> dict:
+        if hasattr(self._inner, "schema"):
+            return self._inner.schema()
+        if hasattr(self._inner, "parameters"):
+            return self._inner.parameters
+        return {"type": "object", "properties": {}}
+
+    def _check_path(self, path_arg: Any) -> Optional[str]:
+        """Return an error string if path_arg is outside the workspace root."""
+        if not path_arg:
+            return None
+        try:
+            resolved = Path(str(path_arg)).expanduser().resolve()
+            if not str(resolved).startswith(str(self._workspace_root)):
+                return (
+                    f"Access denied: {path_arg!r} is outside the workspace "
+                    f"({self._workspace_root}). Only files within the workspace may be written."
+                )
+        except Exception:
+            pass
+        return None
+
+    async def execute(self, **kwargs: Any) -> Any:
+        # Check common path kwargs
+        for key in ("path", "file_path", "filename"):
+            err = self._check_path(kwargs.get(key))
+            if err:
+                return err
+
+        fn = getattr(self._inner, "execute", None) or getattr(self._inner, "run", None)
+        if fn is None:
+            return f"Tool {self.name} has no execute/run method"
+        import asyncio
+        if asyncio.iscoroutinefunction(fn):
+            return await fn(**kwargs)
+        return fn(**kwargs)
+
+
 def create_openclaw_coding_tools(
     cwd: str | Path | None = None,
     allowed_dirs: list[str] | None = None,
@@ -46,6 +98,7 @@ def create_openclaw_coding_tools(
     enable_grep: bool = True,
     enable_find: bool = True,
     enable_ls: bool = True,
+    workspace_only: bool = False,
 ) -> list[Any]:
     """Create the standard openclaw coding tool set from pi_coding_agent.
 
@@ -54,6 +107,9 @@ def create_openclaw_coding_tools(
         allowed_dirs: Directories tools are allowed to access (None = unrestricted).
         denied_commands: Bash commands that are denied.
         enable_*: Toggle individual tools.
+        workspace_only: When True, wrap write/edit tools with a path guard that
+            rejects writes outside the cwd (workspace root). Mirrors TS
+            ``wrapToolWorkspaceRootGuard()`` / ``fsConfig.workspaceOnly``.
 
     Returns:
         List of pi_coding_agent tool instances.
@@ -73,7 +129,11 @@ def create_openclaw_coding_tools(
         return []
 
     cwd_str = str(cwd) if cwd else None
+    workspace_root = Path(cwd_str).expanduser().resolve() if cwd_str else None
     tools = []
+
+    # Tools that write/edit files get the workspace guard when workspace_only=True
+    write_tool_names = {"write", "edit"}
 
     tool_factories = [
         ("read", enable_read, create_read_tool, {}),
@@ -89,15 +149,19 @@ def create_openclaw_coding_tools(
         if not enabled:
             continue
         try:
-            kwargs: dict[str, Any] = {}
             if cwd_str:
-                # Try cwd parameter first; fall back if not supported
                 try:
                     tool = factory(cwd=cwd_str, **extra_kwargs)
                 except TypeError:
                     tool = factory(**extra_kwargs)
             else:
                 tool = factory(**extra_kwargs)
+
+            # Apply workspace-only guard to write/edit tools
+            if workspace_only and workspace_root and name in write_tool_names:
+                tool = _WorkspaceGuardedTool(tool, workspace_root)
+                logger.debug(f"Applied workspace guard to tool: {name}")
+
             tools.append(tool)
             logger.debug(f"Created pi_coding_agent tool: {name}")
         except Exception as exc:

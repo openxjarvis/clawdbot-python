@@ -36,9 +36,12 @@ from .default_operations import (
 )
 
 
-def create_coding_tools(cwd: str, operations: dict | None = None) -> list[AgentToolBase]:
-    """
-    Create coding tools (read, bash, edit, write, grep, find, ls).
+def create_coding_tools(
+    cwd: str,
+    operations: dict | None = None,
+    workspace_only: bool = False,
+) -> list[AgentToolBase]:
+    """Create coding tools (read, bash, edit, write, grep, find, ls).
 
     Prefers pi_coding_agent tools when available; falls back to legacy
     openclaw implementations.
@@ -46,13 +49,15 @@ def create_coding_tools(cwd: str, operations: dict | None = None) -> list[AgentT
     Args:
         cwd: Current working directory.
         operations: Optional dict of operation implementations (legacy path).
+        workspace_only: When True, wrap write/edit tools with a workspace-only
+            path guard (mirrors TS ``fsConfig.workspaceOnly``).
 
     Returns:
         List of configured tools.
     """
     try:
         from openclaw.agents.pi_tools import create_openclaw_coding_tools
-        pi_tools = create_openclaw_coding_tools(cwd=cwd)
+        pi_tools = create_openclaw_coding_tools(cwd=cwd, workspace_only=workspace_only)
         if pi_tools:
             return pi_tools  # type: ignore[return-value]
     except Exception:

@@ -250,13 +250,10 @@ class SessionManager:
         self.agent_id = normalize_agent_id(agent_id)
         self._sessions: dict[str, Session] = {}
 
-        # Create workspace directory (legacy)
+        # Create workspace directory
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
 
-        # Create .sessions sub-directory for workspace-scoped sessions
-        (self.workspace_dir / ".sessions").mkdir(parents=True, exist_ok=True)
-        
-        # New OpenClaw standard path: ~/.openclaw/agents/{agentId}/sessions/
+        # Canonical path: ~/.openclaw/agents/{agentId}/sessions/ (matches TS)
         openclaw_home = Path.home() / ".openclaw"
         self._sessions_dir = openclaw_home / "agents" / self.agent_id / "sessions"
         self._sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -265,7 +262,7 @@ class SessionManager:
         self._sessions_file = self._sessions_dir / "sessions.json"
         self._legacy_session_map_file = self._sessions_dir / "session_map.json"
         
-        # Also check old workspace location for migration
+        # Keep references for migration reads (read-only, no mkdir)
         self._legacy_sessions_dir = self.workspace_dir / ".sessions"
         self._legacy_sessions_file = self._legacy_sessions_dir / "sessions.json"
         self._legacy_legacy_map_file = self._legacy_sessions_dir / "session_map.json"
@@ -277,9 +274,6 @@ class SessionManager:
         
         # Lock file for concurrent access protection
         self._lock_file = self._sessions_file.with_suffix(".json.lock")
-        
-        # Also create legacy .sessions directory for backward compatibility
-        (self.workspace_dir / ".sessions").mkdir(parents=True, exist_ok=True)
 
         # Load initial session store
         self._session_store = self._load_session_store()
@@ -579,7 +573,8 @@ class SessionManager:
             self._sessions[session_id] = Session(
                 session_id,
                 self.workspace_dir,
-                session_key=session_key  # Pass session_key for reference
+                session_key=session_key,
+                sessions_dir_override=self._sessions_dir,
             )
         
         return self._sessions[session_id]
@@ -610,14 +605,11 @@ class SessionManager:
         if sid in self._sessions:
             return self._sessions[sid]
 
-        sessions_dir = self.workspace_dir / ".sessions"
-        sessions_dir.mkdir(parents=True, exist_ok=True)
-
         session = Session(
             session_id=sid,
             workspace_dir=self.workspace_dir,
             session_key=sid,
-            sessions_dir_override=sessions_dir,
+            sessions_dir_override=self._sessions_dir,
         )
         self._sessions[sid] = session
         # Persist immediately so list_sessions() can discover it.
@@ -650,7 +642,11 @@ class SessionManager:
             Session instance
         """
         if session_id not in self._sessions:
-            self._sessions[session_id] = Session(session_id, self.workspace_dir)
+            self._sessions[session_id] = Session(
+                session_id,
+                self.workspace_dir,
+                sessions_dir_override=self._sessions_dir,
+            )
         return self._sessions[session_id]
 
     def list_sessions(self) -> list[str]:
@@ -663,10 +659,9 @@ class SessionManager:
         Returns:
             Sorted list of session keys.
         """
-        sessions_dir = self.workspace_dir / ".sessions"
         disk_sessions: set[str] = set()
-        if sessions_dir.exists():
-            for f in sessions_dir.glob("*.json"):
+        if self._sessions_dir.exists():
+            for f in self._sessions_dir.glob("*.json"):
                 # Exclude index/map files
                 if f.name not in ("session_map.json", "sessions.json"):
                     disk_sessions.add(f.stem)

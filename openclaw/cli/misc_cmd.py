@@ -77,7 +77,7 @@ def register_misc_commands(app: typer.Typer):
             
             console.print("[cyan]Starting onboarding wizard...[/cyan]\n")
             
-            workspace_dir = Path(workspace) if workspace else Path.home() / ".openclaw"
+            workspace_dir = Path(workspace) if workspace else Path.home() / ".openclaw" / "workspace"
             
             result = asyncio.run(run_onboarding_wizard(
                 workspace_dir=workspace_dir,

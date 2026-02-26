@@ -276,6 +276,38 @@ async def run_onboarding_wizard(
         print("Configuration not saved. Exiting...")
         return {"completed": False, "skipped": True, "reason": "User chose not to save"}
     
+    # Add TS-aligned configuration fields (wizard, messages, commands, hooks)
+    from datetime import datetime, timezone
+    from openclaw.config.schema import WizardConfig, MessagesConfig, CommandsConfig, HooksConfig, InternalHooksConfig
+    
+    if not claw_config.wizard:
+        claw_config.wizard = WizardConfig(
+            lastRunAt=datetime.now(timezone.utc).isoformat(),
+            lastRunVersion="0.6.0",
+            lastRunCommand="onboard",
+            lastRunMode=mode
+        )
+    
+    if not claw_config.messages:
+        claw_config.messages = MessagesConfig(ackReactionScope="group-mentions")
+    
+    if not claw_config.commands:
+        claw_config.commands = CommandsConfig(native="auto", nativeSkills="auto")
+    
+    if not claw_config.hooks:
+        claw_config.hooks = HooksConfig(
+            enabled=True,
+            internal=InternalHooksConfig(
+                enabled=True,
+                entries={
+                    "boot-md": {"enabled": True},
+                    "bootstrap-extra-files": {"enabled": True},
+                    "command-logger": {"enabled": True},
+                    "session-memory": {"enabled": True},
+                }
+            )
+        )
+    
     try:
         save_config(claw_config)
         print("✓ Configuration saved!")
@@ -288,7 +320,36 @@ async def run_onboarding_wizard(
     if workspace_dir:
         mark_onboarding_complete(workspace_dir)
     else:
-        mark_onboarding_complete(Path.home() / ".openclaw")
+        mark_onboarding_complete(Path.home() / ".openclaw" / "workspace")
+    
+    # Step 9.2: Ensure root directories (identity, delivery-queue, canvas, completions, logs)
+    print("\n" + "~" * 60)
+    print("Initializing directories...")
+    print("~" * 60)
+    
+    try:
+        from ..agents.ensure_root_dirs import ensure_root_directories
+        
+        # Determine OpenClaw root directory (parent of workspace)
+        root_dir = workspace_dir.parent if workspace_dir else (Path.home() / ".openclaw")
+        
+        # Ensure all root directories
+        root_result = ensure_root_directories(root_dir)
+        
+        if "identity" in root_result and "device_id" in root_result["identity"]:
+            print(f"✓ Created device identity: {root_result['identity']['device_id']}")
+        if "delivery_queue" in root_result:
+            print("✓ Created delivery queue directory")
+        if "completions" in root_result:
+            print("✓ Created shell completion scripts")
+        if "canvas" in root_result:
+            print("✓ Created canvas with index.html")
+        if "logs" in root_result:
+            print("✓ Created log directories")
+            
+    except Exception as e:
+        logger.warning(f"Failed to ensure root directories: {e}")
+        print("⚠ Could not create some directories (non-fatal)")
     
     # Step 9.3: Populate workspace with user information
     if hasattr(claw_config, '_user_info') and claw_config._user_info:
@@ -948,22 +1009,15 @@ async def _configure_channels(mode: str) -> Optional[dict]:
 
 
 def mark_onboarding_complete(workspace_dir: Path) -> None:
-    """Mark onboarding as complete and update workspace-state.json"""
-    marker_file = workspace_dir / ".openclaw" / "onboarding-complete"
-    marker_file.parent.mkdir(parents=True, exist_ok=True)
-    
+    """Mark onboarding as complete by writing workspace-state.json.
+
+    Matches TypeScript behavior: only writes onboardingCompletedAt into
+    workspace-state.json. Does NOT write a separate onboarding-complete
+    marker file (that was a Python-only addition not present in TS).
+    """
     now_iso = datetime.now().isoformat()
-    
-    marker_data = {
-        "completed_at": now_iso,
-        "version": "0.6.0",
-    }
-    
-    marker_file.write_text(json.dumps(marker_data, indent=2))
-    logger.info(f"Onboarding marked complete: {marker_file}")
-    
-    # Write workspace-state.json (matches TypeScript onboardingCompletedAt tracking)
     write_workspace_state(workspace_dir, onboarding_completed_at=now_iso)
+    logger.info("Onboarding marked complete in workspace-state.json: %s", workspace_dir)
 
 
 def write_workspace_state(
@@ -971,43 +1025,24 @@ def write_workspace_state(
     bootstrap_seeded_at: Optional[str] = None,
     onboarding_completed_at: Optional[str] = None,
 ) -> None:
+    """Write or update workspace-state.json.
+
+    Delegates to ensure_workspace.write_workspace_state() which uses the
+    correct path: {workspaceDir}/.openclaw/workspace-state.json — matching
+    TypeScript workspace.ts WORKSPACE_STATE_DIRNAME = ".openclaw".
     """
-    Write or update workspace-state.json.
-    
-    Matches TypeScript workspace-state.json tracking:
-    - bootstrapSeededAt: when AGENTS.md / SOUL.md / etc were first seeded
-    - onboardingCompletedAt: when onboarding wizard completed
-    """
-    state_file = workspace_dir / "workspace-state.json"
-    state_file.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Load existing state
-    existing: dict = {}
-    if state_file.exists():
-        try:
-            existing = json.loads(state_file.read_text())
-        except Exception:
-            existing = {}
-    
-    # Merge updates
-    if bootstrap_seeded_at is not None:
-        existing["bootstrapSeededAt"] = bootstrap_seeded_at
-    if onboarding_completed_at is not None:
-        existing["onboardingCompletedAt"] = onboarding_completed_at
-    
-    state_file.write_text(json.dumps(existing, indent=2))
-    logger.debug(f"Updated workspace-state.json: {state_file}")
+    from openclaw.agents.ensure_workspace import write_workspace_state as _ws_write
+    _ws_write(
+        workspace_dir,
+        bootstrap_seeded_at=bootstrap_seeded_at,
+        onboarding_completed_at=onboarding_completed_at,
+    )
 
 
 def is_first_run(workspace_dir: Path) -> bool:
+    """Check if this is the first run (onboarding not yet completed).
+
+    Matches TypeScript: checks onboardingCompletedAt in workspace-state.json.
     """
-    Check if this is the first run
-    
-    Args:
-        workspace_dir: Workspace directory
-        
-    Returns:
-        True if first run
-    """
-    marker_file = workspace_dir / ".openclaw" / "onboarding-complete"
-    return not marker_file.exists()
+    from openclaw.agents.ensure_workspace import is_workspace_onboarding_completed
+    return not is_workspace_onboarding_completed(workspace_dir)

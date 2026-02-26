@@ -122,6 +122,13 @@ class GatewayBootstrap:
             logger.warning(f"Legacy migration skipped: {e}")
         results["steps_completed"] += 1
         
+        # Step 3.5: Run gateway update check (writes ~/.openclaw/update-check.json)
+        try:
+            from ..infra.update_startup import run_gateway_update_check
+            asyncio.ensure_future(run_gateway_update_check(self.config or {}))
+        except Exception as exc:
+            logger.debug("update-check: skipped: %s", exc)
+
         # Step 4: Start diagnostic heartbeat
         logger.info("Step 4: Starting diagnostic heartbeat")
         try:
@@ -185,9 +192,34 @@ class GatewayBootstrap:
             plugin_manager = PluginManager()
             discovered = plugin_manager.discover_plugins()
             logger.info(f"Discovered {len(discovered)} plugins")
+            self.plugin_registry = discovered  # Store for sidecar services
         except Exception as e:
             logger.warning(f"Plugin loading skipped: {e}")
+            self.plugin_registry = {}
         results["steps_completed"] += 1
+        
+        # Step 7.5: Start gateway sidecar services (TS alignment)
+        logger.info("Step 7.5: Starting gateway sidecar services")
+        try:
+            from .server_startup import start_gateway_sidecars
+            
+            sidecar_params = {
+                "cfg": self.config.model_dump() if self.config else {},
+                "plugin_registry": self.plugin_registry,
+                "workspace_dir": workspace_dir,
+                "default_workspace_dir": default_workspace_dir,
+                "log_browser": logger,
+                "log_hooks": logger,
+                "deps": None,  # Will be set up later
+            }
+            
+            sidecar_results = await start_gateway_sidecars(sidecar_params)
+            results["sidecar_services"] = sidecar_results
+            logger.info(f"Sidecar services initialized: {list(sidecar_results.keys())}")
+        except Exception as e:
+            logger.error(f"Failed to start sidecar services: {e}", exc_info=True)
+            results["errors"].append(f"sidecar_services: {e}")
+        results["steps_completed"] += 0.5
         
         # Step 8: Create agent runtime — uses pi_coding_agent.AgentSession
         logger.info("Step 8: Creating agent runtime (pi_coding_agent)")
@@ -664,45 +696,23 @@ class GatewayBootstrap:
         return results
 
     async def _run_boot_once(self, workspace_dir: Path) -> None:
-        """Run BOOT.md if it exists and hasn't been run yet.
+        """Delegate to gateway.boot.run_boot_once() via agent command.
 
-        Mirrors TypeScript runBootOnce() – executes the bootstrap script
-        once per workspace setup.
+        Mirrors TypeScript runBootOnce() — runs BOOT.md through the agent
+        runtime (not shell code blocks).  The runtime may not be ready yet
+        at this point in the bootstrap sequence, so failures are logged as
+        debug and the boot-md hook will retry on gateway:startup.
         """
-        boot_md = workspace_dir / "BOOT.md"
-        boot_state = workspace_dir / ".openclaw" / "boot-ran"
+        from openclaw.gateway.boot import run_boot_once
 
-        if not boot_md.exists() or boot_state.exists():
-            return
-
-        logger.info(f"Running BOOT.md: {boot_md}")
-        content = boot_md.read_text(encoding="utf-8")
-
-        # Extract shell code blocks and run them
-        import re
-        code_blocks = re.findall(r"```(?:sh|bash|shell)\n(.*?)```", content, re.DOTALL)
-        for block in code_blocks:
-            block = block.strip()
-            if not block:
-                continue
-            try:
-                proc = await asyncio.create_subprocess_shell(
-                    block,
-                    cwd=str(workspace_dir),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
-                if proc.returncode != 0:
-                    logger.warning(f"BOOT.md block exited {proc.returncode}: {stderr.decode()[:200]}")
-            except asyncio.TimeoutError:
-                logger.warning("BOOT.md block timed out")
-            except Exception as exc:
-                logger.warning(f"BOOT.md block failed: {exc}")
-
-        # Mark as run
-        boot_state.parent.mkdir(parents=True, exist_ok=True)
-        boot_state.write_text("done")
+        cfg = self.config or {}
+        result = await run_boot_once(cfg=cfg, workspace_dir=workspace_dir)
+        if result.status == "ran":
+            logger.info("BOOT.md executed via agent command")
+        elif result.status == "skipped":
+            logger.debug("BOOT.md skipped: %s", result.reason)
+        else:
+            logger.debug("BOOT.md run result: %s — %s", result.status, result.reason)
     
     def _set_env_vars(self) -> None:
         """Set required environment variables.

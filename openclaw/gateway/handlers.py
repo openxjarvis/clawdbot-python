@@ -70,6 +70,28 @@ def set_global_instances(session_manager, tool_registry, channel_registry, agent
     _plugin_manager = None
 
 
+def _get_current_config() -> dict:
+    """Return the currently loaded OpenClaw config as a dict.
+
+    Used by agents.files.* handlers to resolve workspace directories via
+    resolve_agent_workspace_dir(), matching TS resolveAgentWorkspaceFileOrRespondError().
+    """
+    try:
+        from openclaw.gateway.config_service import get_config_service
+        svc = get_config_service()
+        if svc:
+            cfg = svc.get_config()
+            if isinstance(cfg, dict):
+                return cfg
+            if hasattr(cfg, "model_dump"):
+                return cfg.model_dump()
+            if hasattr(cfg, "dict"):
+                return cfg.dict()
+    except Exception:
+        pass
+    return {}
+
+
 def _get_plugin_manager(connection: Any):
     """Get or lazily initialize plugin manager."""
     global _plugin_manager
@@ -738,37 +760,81 @@ async def handle_agent_queue_status(connection: Any, params: dict[str, Any]) -> 
 
 @register_handler("agents.files.list")
 async def handle_agents_files_list(connection: Any, params: dict[str, Any]) -> list[str]:
-    """List agent files"""
-    from pathlib import Path
-    agent_dir = Path.home() / ".openclaw" / "agents"
-    if not agent_dir.exists():
+    """List agent workspace files — mirrors TS agents.files.list."""
+    from openclaw.agents.agent_scope import resolve_agent_workspace_dir
+    agent_id = params.get("agentId") or params.get("agent_id") or "main"
+    cfg = _get_current_config()
+    workspace_dir = resolve_agent_workspace_dir(cfg, agent_id)
+    if not workspace_dir.exists():
         return []
-    return [f.name for f in agent_dir.iterdir() if f.is_file()]
+    return [f.name for f in workspace_dir.iterdir() if f.is_file()]
 
 
 @register_handler("agents.files.get")
 async def handle_agents_files_get(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Get agent file content"""
+    """Get agent workspace file content — mirrors TS agents.files.get."""
     from pathlib import Path
-    filename = params.get("filename", "")
-    agent_dir = Path.home() / ".openclaw" / "agents"
-    filepath = agent_dir / filename
+    from openclaw.agents.agent_scope import resolve_agent_workspace_dir
+    filename = params.get("name") or params.get("filename", "")
+    agent_id = params.get("agentId") or params.get("agent_id") or "main"
+    cfg = _get_current_config()
+    workspace_dir = resolve_agent_workspace_dir(cfg, agent_id)
+    filepath = workspace_dir / filename
     if filepath.exists():
-        return {"filename": filename, "content": filepath.read_text(encoding="utf-8")}
-    raise FileNotFoundError(f"Agent file not found: {filename}")
+        content = filepath.read_text(encoding="utf-8")
+        stat = filepath.stat()
+        return {
+            "agentId": agent_id,
+            "workspace": str(workspace_dir),
+            "file": {
+                "name": filename,
+                "path": str(filepath),
+                "missing": False,
+                "size": stat.st_size,
+                "updatedAtMs": int(stat.st_mtime * 1000),
+                "content": content,
+            },
+        }
+    return {
+        "agentId": agent_id,
+        "workspace": str(workspace_dir),
+        "file": {"name": filename, "path": str(filepath), "missing": True},
+    }
 
 
 @register_handler("agents.files.set")
 async def handle_agents_files_set(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Set agent file content"""
+    """Set agent workspace file content — mirrors TS agents.files.set.
+
+    Resolves the true workspace directory for the requested agent (using
+    resolve_agent_workspace_dir) instead of hardcoding ~/.openclaw/agents/.
+    """
     from pathlib import Path
-    filename = params.get("filename", "")
-    content = params.get("content", "")
-    agent_dir = Path.home() / ".openclaw" / "agents"
-    agent_dir.mkdir(parents=True, exist_ok=True)
-    filepath = agent_dir / filename
+    from openclaw.agents.agent_scope import resolve_agent_workspace_dir
+    filename = params.get("name") or params.get("filename", "")
+    content = str(params.get("content", ""))
+    agent_id = params.get("agentId") or params.get("agent_id") or "main"
+    if not filename:
+        raise ValueError("agents.files.set: 'name' param is required")
+    cfg = _get_current_config()
+    workspace_dir = resolve_agent_workspace_dir(cfg, agent_id)
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    filepath = workspace_dir / filename
     filepath.write_text(content, encoding="utf-8")
-    return {"filename": filename, "written": True}
+    stat = filepath.stat()
+    return {
+        "ok": True,
+        "agentId": agent_id,
+        "workspace": str(workspace_dir),
+        "file": {
+            "name": filename,
+            "path": str(filepath),
+            "missing": False,
+            "size": stat.st_size,
+            "updatedAtMs": int(stat.st_mtime * 1000),
+            "content": content,
+        },
+    }
 
 
 @register_handler("browser.request")

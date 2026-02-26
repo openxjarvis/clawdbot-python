@@ -29,14 +29,15 @@ PAIRING_PENDING_MAX: int = 3
 # ── Path helpers ────────────────────────────────────────────────────────────
 
 def _resolve_credentials_dir() -> Path:
-    """Return the credentials/oauth directory (mirrors resolveCredentialsDir)."""
+    """Return the credentials directory (mirrors TS resolveOAuthDir → stateDir/credentials)."""
     from openclaw.config.paths import resolve_state_dir
     state_dir = resolve_state_dir()
-    # TS resolveOAuthDir returns stateDir/oauth (or OPENCLAW_OAUTH_DIR override)
+    # Respect explicit override first (env var kept for compatibility)
     oauth_override = os.environ.get("OPENCLAW_OAUTH_DIR", "").strip()
     if oauth_override:
         return Path(oauth_override).expanduser().resolve()
-    return Path(state_dir) / "oauth"
+    # TS uses stateDir/credentials (src/config/paths.ts resolveOAuthDir)
+    return Path(state_dir) / "credentials"
 
 
 def _safe_channel_key(channel: str) -> str:
@@ -76,10 +77,14 @@ def _resolve_allow_from_path(channel: str, account_id: str | None = None) -> Pat
     """Return path to allowFrom file, optionally scoped to an account.
 
     Mirrors TS resolveAllowFromPath().
+    
+    TS alignment: "default" account_id is treated as empty/None, resulting in
+    telegram-allowFrom.json instead of telegram-default-allowFrom.json.
     """
     base = _safe_channel_key(channel)
     normalized = (account_id or "").strip()
-    if not normalized:
+    # TS alignment: treat "default" as empty (openclaw/src/pairing/pairing-store.ts)
+    if not normalized or normalized.lower() == "default":
         return _resolve_credentials_dir() / f"{base}-allowFrom.json"
     return _resolve_credentials_dir() / f"{base}-{_safe_account_key(normalized)}-allowFrom.json"
 

@@ -246,7 +246,7 @@ class UnifiedBrowserTool(AgentTool):
                         "startRef": {"type": "string"},
                         "endRef": {"type": "string"},
                         "values": {"type": "array", "items": {"type": "string"}},
-                        "fields": {"type": "array"},
+                        "fields": {"type": "array", "items": {"type": "string"}},
                         "width": {"type": "number"},
                         "height": {"type": "number"},
                         "timeMs": {"type": "number"},
@@ -419,9 +419,9 @@ class UnifiedBrowserTool(AgentTool):
         raise RuntimeError(f"Node not found: {requested}")
 
     async def _list_nodes(self) -> list[dict[str, Any]]:
-        """List nodes via gateway"""
-        # TODO: Implement gateway node.list call
-        return []
+        """List nodes via gateway RPC. Mirrors TS listNodes() from nodes-utils.ts."""
+        from openclaw.agents.tools.nodes_utils import list_nodes
+        return await list_nodes({})
 
     def _resolve_browser_base_url(
         self,
@@ -558,12 +558,23 @@ class UnifiedBrowserTool(AgentTool):
             return ToolResult(success=True, content=f"FILE:{result['path']}", metadata=result)
 
         elif action == "upload":
-            paths = params.get("paths", [])
-            if not paths:
+            raw_paths = params.get("paths", [])
+            if not raw_paths:
                 return ToolResult(success=False, content="", error="paths required")
+            # Validate paths are within upload dir (mirrors TS resolvePathsWithinRoot)
+            from openclaw.browser.paths import DEFAULT_UPLOAD_DIR, resolve_paths_within_root
+            DEFAULT_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+            path_result = resolve_paths_within_root(
+                root_dir=DEFAULT_UPLOAD_DIR,
+                requested_paths=[str(p) for p in raw_paths],
+                scope_label=f"uploads directory ({DEFAULT_UPLOAD_DIR})",
+            )
+            if not path_result["ok"]:
+                return ToolResult(success=False, content="", error=path_result["error"])  # type: ignore[index]
+            normalized_paths = path_result["paths"]  # type: ignore[index]
             result = await client.browser_arm_file_chooser(
                 base_url,
-                paths=paths,
+                paths=normalized_paths,
                 ref=params.get("ref"),
                 input_ref=params.get("inputRef"),
                 element=params.get("element"),
@@ -594,12 +605,26 @@ class UnifiedBrowserTool(AgentTool):
             except Exception as err:
                 msg = str(err)
                 if "404:" in msg and "tab not found" in msg and profile == "chrome":
+                    # Fetch tabs to give a better error (mirrors TS lines 787-805)
+                    try:
+                        tabs = await client.browser_tabs(base_url, profile=profile)
+                    except Exception:
+                        tabs = []
+                    if not tabs:
+                        return ToolResult(
+                            success=False,
+                            content="",
+                            error=(
+                                "No Chrome tabs are attached via the OpenClaw Browser Relay extension. "
+                                "Click the toolbar icon on the tab you want to control (badge ON), then retry."
+                            ),
+                        )
                     return ToolResult(
                         success=False,
                         content="",
                         error=(
-                            "Chrome extension relay tab not found. "
-                            "Click the OpenClaw Browser Relay toolbar icon to attach a tab."
+                            "Chrome tab not found (stale targetId?). "
+                            'Run action=tabs profile="chrome" and use one of the returned targetIds.'
                         ),
                     )
                 raise
@@ -688,7 +713,7 @@ class UnifiedBrowserTool(AgentTool):
         else:
             return ToolResult(success=False, content="", error=f"Unknown action: {action}")
 
-        result = await self._call_browser_proxy(
+        result, _files = await self._call_browser_proxy(
             node_id=node_target["nodeId"],
             method=method,
             path=path,
@@ -704,7 +729,23 @@ class UnifiedBrowserTool(AgentTool):
         elif action == "snapshot":
             return self._format_snapshot_result(result)
         elif action == "screenshot":
-            return ToolResult(success=True, content=f"MEDIA:{result.get('path', '')}", metadata=result)
+            # Use imageResultFromFile so the LLM gets the image block
+            # (proxy files already persisted in _call_browser_proxy)
+            from openclaw.agents.tools.common_results import image_result_from_file
+            path_val = result.get("path", "") if isinstance(result, dict) else ""
+            if path_val:
+                agent_result = await image_result_from_file(
+                    label="browser:screenshot",
+                    path=path_val,
+                    details=result,
+                )
+                text_parts = [c.text for c in agent_result.content if hasattr(c, "text")]
+                return ToolResult(
+                    success=True,
+                    content="\n".join(text_parts),
+                    metadata=agent_result.details if isinstance(agent_result.details, dict) else result,
+                )
+            return ToolResult(success=True, content=f"MEDIA:{path_val}", metadata=result)
         else:
             return ToolResult(success=True, content=json.dumps(result, indent=2), metadata=result)
 
@@ -717,8 +758,18 @@ class UnifiedBrowserTool(AgentTool):
         body: Any | None = None,
         timeout_ms: int | None = None,
         profile: str | None = None,
-    ) -> dict[str, Any]:
-        """Call browser proxy via gateway node.invoke. Matches TS callBrowserProxy()"""
+    ) -> tuple[Any, list[dict[str, Any]]]:
+        """Call browser proxy via gateway node.invoke.
+
+        Mirrors TS callBrowserProxy() from browser-tool.ts.
+        Returns (result, files) where files is a list of BrowserProxyFile dicts
+        that need to be saved locally via persist_browser_proxy_files().
+        """
+        from openclaw.browser.proxy_files import (
+            persist_browser_proxy_files,
+            apply_browser_proxy_paths,
+        )
+
         gateway_timeout_ms = max(1, int(timeout_ms)) if timeout_ms and timeout_ms > 0 else 20000
 
         payload = await self._call_gateway_tool(
@@ -738,14 +789,22 @@ class UnifiedBrowserTool(AgentTool):
             timeout_ms=gateway_timeout_ms,
         )
 
-        result = payload.get("payload") or (
+        parsed = payload.get("payload") or (
             json.loads(payload["payloadJSON"]) if payload.get("payloadJSON") else None
         )
 
-        if not result or not isinstance(result, dict) or "result" not in result:
+        if not parsed or not isinstance(parsed, dict) or "result" not in parsed:
             raise RuntimeError("browser proxy failed")
 
-        return result["result"]
+        result = parsed["result"]
+        files: list[dict[str, Any]] = parsed.get("files") or []
+
+        # Persist proxy files and apply path mapping
+        mapping = await persist_browser_proxy_files(files)
+        if mapping:
+            apply_browser_proxy_paths(result, mapping)
+
+        return result, files
 
     async def _call_gateway_tool(
         self,
@@ -753,8 +812,14 @@ class UnifiedBrowserTool(AgentTool):
         params: dict[str, Any],
         timeout_ms: int = 20000,
     ) -> dict[str, Any]:
-        """Call gateway RPC method (placeholder - needs gateway integration)"""
-        raise NotImplementedError("Gateway integration not yet implemented")
+        """Call gateway RPC method via WebSocket client.
+
+        Mirrors TS callGatewayTool() from tools/gateway.ts.
+        """
+        from openclaw.gateway.rpc_client import create_client
+        client = await create_client()
+        result = await client.call(method, params)
+        return result if isinstance(result, dict) else {"payload": result}
 
     async def _handle_snapshot(
         self,
@@ -903,8 +968,13 @@ class UnifiedBrowserTool(AgentTool):
         base_url: str | None,
         profile: str | None,
     ) -> ToolResult:
-        """Handle screenshot action. Matches TS screenshot case lines 581-613"""
+        """Handle screenshot action. Matches TS screenshot case (browser-tool.ts lines 581-613).
+
+        Uses imageResultFromFile() so the LLM gets the actual image content block
+        and channel delivery sends the photo to Telegram/Discord/etc.
+        """
         from openclaw.browser import client
+        from openclaw.agents.tools.common_results import image_result_from_file
 
         img_type = "jpeg" if params.get("type") == "jpeg" else "png"
         result = await client.browser_screenshot_action(
@@ -917,7 +987,20 @@ class UnifiedBrowserTool(AgentTool):
             profile=profile,
         )
 
-        return ToolResult(success=True, content=f"MEDIA:{result.get('path', '')}", metadata=result)
+        path = result.get("path", "")
+        if path:
+            agent_result = await image_result_from_file(
+                label="browser:screenshot",
+                path=path,
+                details=result,
+            )
+            text_parts = [c.text for c in agent_result.content if hasattr(c, "text")]
+            return ToolResult(
+                success=True,
+                content="\n".join(text_parts),
+                metadata=agent_result.details if isinstance(agent_result.details, dict) else result,
+            )
+        return ToolResult(success=True, content=f"MEDIA:{path}", metadata=result)
 
     def _wrap_browser_external_json(
         self,
