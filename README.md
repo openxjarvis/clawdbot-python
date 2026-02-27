@@ -10,7 +10,7 @@
 
 ## What is This?
 
-**OpenXJarvis** is a complete Python implementation of [OpenClaw](https://github.com/openclaw/openclaw) — continuously aligned with the TypeScript reference. Think of it as your personal AI operating system: an autonomous agent platform that connects messaging channels (Telegram, WhatsApp, Discord, Slack, IRC, Signal, Google Chat, iMessage), integrates with cutting-edge LLM providers (GPT-5.2, Claude Opus 4.6, Gemini 3.1 Pro, Grok 4, DeepSeek V3.2, GLM-5, Qwen 3.5), manages persistent memory and long-term context, schedules autonomous tasks via cron, and provides a beautiful Web UI for agent orchestration.
+**OpenXJarvis** is a complete Python implementation of [OpenClaw](https://github.com/openclaw/openclaw) — continuously aligned with the TypeScript reference. Think of it as your personal AI operating system: an autonomous agent platform that connects messaging channels (Telegram, WhatsApp, Discord, Slack, IRC, Signal, Google Chat, iMessage), integrates with cutting-edge LLM providers (OpenAI GPT-5.2/5.3, Claude Opus 4.5/4.6, Google Gemini 3.x/2.5, AWS Bedrock, Ollama), manages persistent memory and long-term context, schedules autonomous tasks via cron, and provides a beautiful Web UI for agent orchestration.
 
 **Why "Jarvis"?** Because this isn't just another chatbot framework or AI assistant wrapper. This is a production-grade agent framework — a self-hosted personal AI that learns, remembers, and operates autonomously. Every feature, every alignment improvement, every new capability lands here.
 
@@ -35,9 +35,9 @@
 | Web UI | ✅ **Production Ready** | Full feature parity with TypeScript |
 | Cron Scheduler | ✅ **Production Ready** | Autonomous task execution working |
 
-**Latest test:** Telegram bot + Gemini 2.5 Pro Preview running complex multi-tool workflows (web search, file operations, reasoning) — rock solid. 🚀
+**Latest test:** Telegram bot + Gemini 3 Pro Preview running complex multi-tool workflows (web search, file operations, reasoning) — rock solid. 🚀
 
-**Model Updates (Feb 2026):** Support for latest frontier models including GPT-5.2, Claude Opus 4.6, Gemini 3.1 Pro (Feb 19), GLM-5 (Feb 2026 🆕), Grok 4, DeepSeek V3.2, and Qwen 3.5.
+**Model Updates (Feb 2026):** Full support for GPT-5.2/5.3 Codex, Claude Opus 4.5/4.6, Gemini 3 Pro/Flash Preview, Gemini 2.5 Pro/Flash. Additional providers (Zhipu GLM-5, xAI Grok, DeepSeek, Qwen) planned for Q2 2026.
 
 ---
 
@@ -516,33 +516,28 @@ This Python implementation tracks [OpenClaw TypeScript](https://github.com/openc
 
 | Provider | Status in Python | Latest Models (Feb 2026) |
 |----------|------------------|--------------------------|
-| **OpenAI** | ✅ Implemented | **GPT-5.2 Pro** (#1 overall), GPT-5.2 Codex, GPT-4.5, o3, o4-mini |
-| **Anthropic Claude** | ✅ Implemented | **Claude Opus 4.6** (strongest coding), Claude Opus 4.5, Claude Sonnet 4.5 |
-| **Google Gemini** | ✅ **Production** | **Gemini 3.1 Pro** (Feb 19, 2026 🆕), Gemini 2.5 Pro, Gemini 2.0 Flash |
-| **xAI Grok** | ✅ Implemented | **Grok 4 Heavy**, Grok 3, Grok 3 mini |
-| **DeepSeek** | ✅ Implemented | **DeepSeek V3.2-Speciale** (best cost/perf), DeepSeek-R1 |
-| **Zhipu AI** | ✅ Implemented | **GLM-5** (745B MoE, Feb 2026 🆕), GLM-4.7 |
-| **Alibaba Qwen** | ✅ Implemented | **Qwen 3.5** (397B open-weight) |
-| **Ollama** | ✅ Implemented | Local LLMs (Llama 4, Mistral, Qwen, etc.) |
-| **Together AI** | ✅ Implemented | 100+ open-source models |
-| **Hugging Face** | ✅ Implemented | Inference API models |
-| **Replicate** | ✅ Implemented | Cloud-hosted models |
-| **Groq** | ✅ Implemented | Ultra-fast inference |
-| **MiniMax** | 📋 Planned | MiniMax-M2.1, MiniMax-VL-01 |
-| **Moonshot** | 📋 Planned | Moonshot AI models |
-| **Venice AI** | 📋 Planned | Privacy-focused AI |
-| **Xiaomi** | 📋 Planned | Mimo-v2 models |
-| **Qianfan** | 📋 Planned | Baidu AI Cloud (DeepSeek V3.2) |
-| **NVIDIA NIM** | 📋 Planned | NVIDIA optimized models |
-| **Cloudflare AI Gateway** | 📋 Planned | Gateway proxy support |
-| **vLLM** | 📋 Planned | Self-hosted LLM serving |
+| **OpenAI** | ✅ **Implemented** | GPT-5.2, GPT-5.3 Codex, GPT-5 Mini, GPT-4o, o3-mini |
+| **Anthropic** | ✅ **Implemented** | Claude Opus 4.6, Claude Opus 4.5, Claude Sonnet 4, Claude 3.7 Sonnet, Claude 3.5 Haiku |
+| **Google Gemini** | ✅ **Implemented** | Gemini 3 Pro/Flash Preview (Feb 2026 🆕), Gemini 2.5 Pro/Flash, Gemini 2.0 Flash |
+| **AWS Bedrock** | ✅ **Implemented** | Claude 3.x, Llama 3.3, Mistral, Command R+, Titan |
+| **Ollama** | ✅ **Implemented** | Llama 3.3, DeepSeek-Coder, Mistral, CodeLlama, Qwen (local) |
+| **xAI (Grok)** | 🚧 Q2 2026 | Grok 4, Grok 3 |
+| **Zhipu AI** | 🚧 Q2 2026 | GLM-5 (745B MoE), GLM-4.7 |
+| **DeepSeek** | 🚧 Q2 2026 | DeepSeek V3.2 (671B MoE), DeepSeek-R1 |
+| **Alibaba** | 🚧 Q2 2026 | Qwen 3.5 Max, QwQ-32B-Preview |
+| **Together AI** | 📋 Future | 100+ open-source models |
+| **Hugging Face** | 📋 Future | Inference API models |
+| **Replicate** | 📋 Future | Cloud-hosted models |
+| **Groq** | 📋 Future | Ultra-fast inference |
+| **MiniMax** | 📋 Future | MiniMax-M2.1, MiniMax-VL-01 |
+| **Moonshot** | 📋 Future | Moonshot AI models |
 
 **Recommended Models (Feb 2026):**
-- 🏆 GPT-5.2 Pro — Best overall performance
-- 💻 Claude Opus 4.6 / GLM-4.7 — Top coding assistants
-- 💰 Gemini 3.1 Pro / DeepSeek V3.2 — Best value
-- 🧠 Grok 4 / GLM-5 — Advanced reasoning
-- 🇨🇳 GLM-5 by Zhipu AI — Leading Chinese AI
+- 🏆 **GPT-5.2** — Best overall performance
+- 💻 **Claude Opus 4.6** / **GPT-5.3 Codex** — Top coding assistants  
+- 💰 **Gemini 3 Flash** / **Gemini 2.5 Flash** — Best value
+- 🧠 **Claude Opus 4.5** / **Gemini 3 Pro** — Advanced reasoning
+- 🚀 **Gemini 3 Pro/Flash Preview** — Latest from Google (Feb 2026 🆕)
 
 ### API Formats Supported
 
@@ -566,10 +561,18 @@ This Python implementation tracks [OpenClaw TypeScript](https://github.com/openc
 
 ## Related Projects & Ecosystem
 
+### Core Infrastructure
 - **OpenClaw TypeScript:** [github.com/openclaw/openclaw](https://github.com/openclaw/openclaw) — upstream reference implementation
 - **pi-mono-python:** [github.com/openxjarvis/pi-mono-python](https://github.com/openxjarvis/pi-mono-python) — core agent infrastructure
-- **Community:** Join the discussion for AI agents, LLM orchestration, multi-channel bots, and autonomous AI development
 
+### Agent Skills Collections
+- **Awesome Claude Skills:** [github.com/ComposioHQ/awesome-claude-skills](https://github.com/ComposioHQ/awesome-claude-skills) — curated Claude skills with app automation (38k+ stars)
+- **Antigravity Awesome Skills:** [github.com/sickn33/antigravity-awesome-skills](https://github.com/sickn33/antigravity-awesome-skills) — 950+ agentic skills for Claude Code, Gemini CLI, Cursor (16k+ stars)
+- **Awesome Agent Skills:** [github.com/VoltAgent/awesome-agent-skills](https://github.com/VoltAgent/awesome-agent-skills) — 380+ skills from official dev teams (Anthropic, Google, Vercel, Microsoft) (8.5k+ stars)
+- **Awesome OpenClaw Skills:** [github.com/VoltAgent/awesome-openclaw-skills](https://github.com/VoltAgent/awesome-openclaw-skills) — 2,868+ OpenClaw skills from ClawHub registry (21k+ stars)
+
+### Community
+- Join the discussion for AI agents, LLM orchestration, multi-channel bots, and autonomous AI development
 ## Topics
 
 `python` `ai-agent` `llm` `chatbot` `telegram-bot` `discord-bot` `autonomous-agent` `ai-assistant` `openai-api` `anthropic-claude` `google-gemini` `self-hosted` `websocket` `cron-scheduler` `agent-framework` `ai-gateway` `multi-channel` `session-management` `memory-management` `agent-orchestration`
