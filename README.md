@@ -10,7 +10,7 @@
 
 ## What is This?
 
-**OpenXJarvis** is a complete Python implementation of [OpenClaw](https://github.com/openclaw/openclaw) — continuously aligned with the TypeScript reference. Think of it as your personal AI operating system: connect messaging channels (Telegram, WhatsApp, Discord, Slack, IRC, Signal, Google Chat, iMessage), plug in cutting-edge models (GPT-5.2, Claude Opus 4.6, Gemini 3.1 Pro, Grok 4, DeepSeek V3.2, Qwen 3.5), manage persistent memory, schedule autonomous tasks, and control everything through a beautiful Web UI or CLI.
+**OpenXJarvis** is a complete Python implementation of [OpenClaw](https://github.com/openclaw/openclaw) — continuously aligned with the TypeScript reference. Think of it as your personal AI operating system: connect messaging channels (Telegram, WhatsApp, Discord, Slack, IRC, Signal, Google Chat, iMessage), plug in cutting-edge models (GPT-5.2, Claude Opus 4.6, Gemini 3.1 Pro, Grok 4, DeepSeek V3.2, GLM-5, Qwen 3.5), manage persistent memory, schedule autonomous tasks, and control everything through a beautiful Web UI or CLI.
 
 **Why "Jarvis"?** Because this isn't just another chatbot framework. This is your digital companion — always learning, always improving, evolving in lockstep with OpenClaw's rapid development. Every feature, every alignment improvement, every new capability lands here.
 
@@ -22,7 +22,7 @@
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| **Telegram + Gemini 2.5** | ✅ **Production Ready** | Fully tested and operational |
+| **Telegram + Gemini ** | ✅ **Production Ready** | Fully tested and operational |
 | WhatsApp | 🧪 Verification in progress | QR link integration complete |
 | Discord | 🧪 Verification in progress | Bot API integration complete |
 | Slack | 🧪 Verification in progress | Socket Mode integration complete |
@@ -37,7 +37,7 @@
 
 **Latest test:** Telegram bot + Gemini 2.5 Pro Preview running complex multi-tool workflows (web search, file operations, reasoning) — rock solid. 🚀
 
-**Model Updates (Feb 2026):** Support for latest frontier models including GPT-5.2, Claude Opus 4.6, Gemini 3.1 Pro (released Feb 19), Grok 4, DeepSeek V3.2, and Qwen 3.5.
+**Model Updates (Feb 2026):** Support for latest frontier models including GPT-5.2, Claude Opus 4.6, Gemini 3.1 Pro (Feb 19), GLM-5 (Feb 2026 🆕), Grok 4, DeepSeek V3.2, and Qwen 3.5.
 
 ---
 
@@ -521,6 +521,7 @@ This Python implementation tracks [OpenClaw TypeScript](https://github.com/openc
 | **Google Gemini** | ✅ **Production** | **Gemini 3.1 Pro** (Feb 19, 2026 🆕), Gemini 2.5 Pro, Gemini 2.0 Flash |
 | **xAI Grok** | ✅ Implemented | **Grok 4 Heavy**, Grok 3, Grok 3 mini |
 | **DeepSeek** | ✅ Implemented | **DeepSeek V3.2-Speciale** (best cost/perf), DeepSeek-R1 |
+| **Zhipu AI** | ✅ Implemented | **GLM-5** (745B MoE, Feb 2026 🆕), GLM-4.7 |
 | **Alibaba Qwen** | ✅ Implemented | **Qwen 3.5** (397B open-weight) |
 | **Ollama** | ✅ Implemented | Local LLMs (Llama 4, Mistral, Qwen, etc.) |
 | **Together AI** | ✅ Implemented | 100+ open-source models |
