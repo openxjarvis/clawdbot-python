@@ -539,10 +539,11 @@ This Python implementation tracks [OpenClaw TypeScript](https://github.com/openc
 
 **Performance Leaders (Feb 2026):**
 - 🏆 **Best Overall:** GPT-5.2 Pro (93.2% GPQA Diamond)
-- 💻 **Best Coding:** Claude Opus 4.6 (72.5% SWE-Bench) / DeepSeek V3.2 (77.8%)
+- 💻 **Best Coding:** Claude Opus 4.6 (72.5% SWE-Bench) / GLM-4.7 (73.8% SWE-Bench, 66.7% multilingual)
 - 💰 **Best Value:** Gemini 3.1 Pro ($2/$12 per MT), DeepSeek V3.2 (~1/30th cost of GPT-5)
-- 🧠 **Best Reasoning:** Grok 4 Heavy (50% Humanity's Last Exam)
-- 📚 **Longest Context:** Llama 4 Scout (10M tokens)
+- 🧠 **Best Reasoning:** Grok 4 Heavy (50% HLE) / GLM-5 (745B MoE with advanced reasoning)
+- 📚 **Longest Context:** Llama 4 Scout (10M tokens) / GLM-5 (200K + efficient DSA)
+- 🇨🇳 **Best China-Indigenous:** GLM-5 (trained on Huawei Ascend, full US-independence)
 
 ### API Formats Supported
 
