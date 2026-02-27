@@ -543,7 +543,7 @@ This Python implementation tracks [OpenClaw TypeScript](https://github.com/openc
 - 💰 **Best Value:** Gemini 3.1 Pro ($2/$12 per MT), DeepSeek V3.2 (~1/30th cost of GPT-5)
 - 🧠 **Best Reasoning:** Grok 4 Heavy (50% HLE) / GLM-5 (745B MoE with advanced reasoning)
 - 📚 **Longest Context:** Llama 4 Scout (10M tokens) / GLM-5 (200K + efficient DSA)
-- 🇨🇳 **Best China-Indigenous:** GLM-5 (trained on Huawei Ascend, full US-independence)
+- 🇨🇳 **Leading Chinese AI:** GLM-5 by Zhipu AI (745B MoE flagship, Feb 2026)
 
 ### API Formats Supported
 
