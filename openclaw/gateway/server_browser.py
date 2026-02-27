@@ -31,9 +31,10 @@ async def start_browser_control_server_if_enabled(
     """
     # Check if enabled in config
     if config:
-        browser_config = config.get("browser", {})
-        if not browser_config.get("controlServer", {}).get("enabled", False):
-            logger.info("Browser Control Server disabled in config")
+        browser_config = config.get("browser") or {}
+        control_server_config = browser_config.get("controlServer") or {}
+        if not control_server_config.get("enabled", False):
+            logger.debug("Browser Control Server disabled in config")
             return None
     
     try:

@@ -59,10 +59,18 @@ def resolve_context_window_info(
     """
     # Priority 1: Check cfg.models.providers.{provider}.models[].contextWindow
     if cfg:
-        models_config = cfg.get("models", {})
-        providers_config = models_config.get("providers", {})
-        provider_config = providers_config.get(provider, {})
-        models_list = provider_config.get("models", [])
+        models_config = cfg.get("models") or {}
+        if not isinstance(models_config, dict):
+            models_config = {}
+        providers_config = models_config.get("providers") or {}
+        if not isinstance(providers_config, dict):
+            providers_config = {}
+        provider_config = providers_config.get(provider) or {}
+        if not isinstance(provider_config, dict):
+            provider_config = {}
+        models_list = provider_config.get("models") or []
+        if not isinstance(models_list, list):
+            models_list = []
         
         for model_entry in models_list:
             if not isinstance(model_entry, dict):

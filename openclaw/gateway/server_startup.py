@@ -184,7 +184,7 @@ async def start_gateway_sidecars(params: dict) -> dict:
         if loaded_count > 0:
             log_hooks.info(f"loaded {loaded_count} internal hook handler{'s' if loaded_count > 1 else ''}")
     except Exception as e:
-        log_hooks.error(f"failed to load hooks: {e}")
+        log_hooks.error(f"failed to load hooks: {e}", exc_info=True)
     
     # 2. Start Browser Control Server
     try:

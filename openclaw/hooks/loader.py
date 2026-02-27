@@ -291,6 +291,10 @@ async def load_internal_hooks(
     """
     opts = opts or {}
     
+    # Ensure cfg is not None
+    if cfg is None:
+        cfg = {}
+    
     # Check if hooks are enabled
     hooks_config = cfg.get("hooks", {})
     internal_config = hooks_config.get("internal", {})
@@ -378,7 +382,7 @@ async def load_internal_hooks(
         )
     
     # 2. Load legacy config handlers (backwards compatibility)
-    handlers_config = internal_config.get("handlers", [])
+    handlers_config = internal_config.get("handlers") or []
     for handler_config in handlers_config:
         try:
             # Legacy handler paths: keep them workspace-relative

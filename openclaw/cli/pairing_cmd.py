@@ -78,7 +78,7 @@ def approve_pairing_request(
     channel: str = typer.Argument(..., help="Channel name (telegram, discord, etc)"),
     code: str = typer.Argument(..., help="Pairing code to approve"),
     account: str = typer.Option("", "--account", help="Account ID (for multi-account channels)"),
-    notify: bool = typer.Option(False, "--notify", help="Notify the requester on the same channel"),
+    notify: bool = typer.Option(True, "--notify/--no-notify", help="Notify the requester on the same channel"),
 ):
     """Approve a pairing request"""
     try:

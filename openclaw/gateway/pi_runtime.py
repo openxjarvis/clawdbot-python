@@ -478,6 +478,7 @@ class PiAgentRuntime:
         from openclaw.events import Event, EventType
 
         last_error: Exception | None = None
+        context_tokens = 0  # Initialize here so it's accessible in the entire loop scope
 
         for attempt, candidate_model in enumerate(candidates):
             is_fallback = attempt > 0
@@ -493,6 +494,7 @@ class PiAgentRuntime:
             try:
                 pi_session = self._get_or_create_pi_session(session_id, extra_tools)
             except Exception as exc:
+                logger.error(f"Session creation failed: {exc}", exc_info=True)
                 yield Event(
                     type=EventType.ERROR,
                     source="pi-runtime",
@@ -631,6 +633,7 @@ class PiAgentRuntime:
                 _images: list[str] | None = images,
             ) -> None:
                 try:
+                    logger.debug(f"[{session_id[:8]}] Starting _run_prompt with message length: {len(message)}")
                     pi_images = None
                     if _images:
                         try:
@@ -695,6 +698,8 @@ class PiAgentRuntime:
                     else:
                         logger.debug(f"Context window: {context_window} tokens (source: {guard_result.source})")
                     
+                    # Use nonlocal to modify the outer scope variable
+                    nonlocal context_tokens
                     context_tokens = 0
                     
                     try:
@@ -704,8 +709,8 @@ class PiAgentRuntime:
                                 from openclaw.agents.context_pruning.pruner import prune_context_messages
                                 from openclaw.agents.context_pruning.cache_ttl import read_last_cache_ttl_timestamp
                                 
-                                # Get context pruning settings from config
-                                agents_config = self.config.get('agents', {})
+                                # Get context pruning settings from config (ensure config is not None)
+                                agents_config = (self.config or {}).get('agents', {})
                                 defaults = agents_config.get('defaults', {})
                                 pruning_config = defaults.get('contextPruning', {})
                                 
@@ -755,8 +760,8 @@ class PiAgentRuntime:
                             logger.debug(f"Estimated context tokens: {context_tokens}")
                             
                             # Phase 3: Auto-compaction trigger (Safeguard)
-                            # Get compaction settings from config
-                            agents_config = self.config.get('agents', {})
+                            # Get compaction settings from config (ensure config is not None)
+                            agents_config = (self.config or {}).get('agents', {})
                             defaults = agents_config.get('defaults', {})
                             compaction_config = defaults.get('compaction', {})
                             
@@ -780,7 +785,7 @@ class PiAgentRuntime:
                                         context_window=context_window,
                                         compaction_settings=compaction_settings,
                                     )
-                                    if compaction_result:
+                                    if compaction_result and isinstance(compaction_result, dict):
                                         summary = compaction_result.get('summary', '')
                                         logger.info(f"Compaction completed: {summary[:100]}...")
                                     else:
@@ -795,8 +800,11 @@ class PiAgentRuntime:
                     except Exception as e:
                         logger.debug(f"Token estimation failed: {e}")
                     
+                    logger.debug(f"[{session_id[:8]}] Calling pi_session.prompt")
                     await _pi_session.prompt(message, pi_images)
+                    logger.debug(f"[{session_id[:8]}] pi_session.prompt completed")
                 except Exception as exc:
+                    logger.error(f"[{session_id[:8]}] _run_prompt error: {exc}", exc_info=True)
                     if _is_quota_error(exc):
                         _quota_error.append(exc)
                     else:
@@ -815,10 +823,14 @@ class PiAgentRuntime:
 
             try:
                 while True:
-                    event = await event_queue.get()
-                    if event is _SENTINEL:
+                    try:
+                        event = await event_queue.get()
+                        if event is _SENTINEL:
+                            break
+                        collected_events.append(event)
+                    except Exception as queue_exc:
+                        logger.error(f"[{session_id[:8]}] Event queue get error: {queue_exc}", exc_info=True)
                         break
-                    collected_events.append(event)
             finally:
                 unsub()
                 if not prompt_task.done():
@@ -847,8 +859,17 @@ class PiAgentRuntime:
                 )
 
             for ev in collected_events:
-                await self._dispatch_event(ev)
-                yield ev
+                try:
+                    await self._dispatch_event(ev)
+                    yield ev
+                except Exception as dispatch_exc:
+                    logger.error(f"[{session_id[:8]}] Event dispatch error: {dispatch_exc}", exc_info=True)
+                    yield Event(
+                        type=EventType.ERROR,
+                        source="pi-runtime",
+                        session_id=session_id,
+                        data={"message": f"Event dispatch failed: {dispatch_exc}"},
+                    )
 
             # Phase 2: Update session token statistics after successful run
             try:

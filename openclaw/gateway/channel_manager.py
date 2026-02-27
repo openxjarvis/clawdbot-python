@@ -901,43 +901,54 @@ class ChannelManager:
                     system_prompt=self.system_prompt,
                     images=inbound_images,
                 ):
-                    evt_type = getattr(event, "type", "")
-                    event_data: dict = {}
-                    if hasattr(event, "data") and isinstance(event.data, dict):
-                        event_data = event.data
+                    try:
+                        evt_type = getattr(event, "type", "")
+                        event_data: dict = {}
+                        if hasattr(event, "data"):
+                            if event.data is None:
+                                event_data = {}
+                            elif isinstance(event.data, dict):
+                                event_data = event.data
+                            else:
+                                logger.warning(f"[{channel_id}] Unexpected event.data type: {type(event.data)}")
+                                event_data = {}
 
-                    if evt_type in (EventType.TEXT, EventType.TEXT_DELTA, "text", "text_delta"):
-                        text_chunk = event_data.get("text") or event_data.get("delta") or ""
-                        if isinstance(text_chunk, dict):
-                            text_chunk = text_chunk.get("text", "")
-                        text_chunk = str(text_chunk) if text_chunk else ""
-                        if text_chunk:
-                            response_text += text_chunk
-                            logger.debug(f"[{channel_id}] delta: {text_chunk[:80]!r}")
+                        if evt_type in (EventType.TEXT, EventType.TEXT_DELTA, "text", "text_delta"):
+                            text_chunk = event_data.get("text") or event_data.get("delta") or ""
+                            if isinstance(text_chunk, dict):
+                                text_chunk = text_chunk.get("text", "")
+                            text_chunk = str(text_chunk) if text_chunk else ""
+                            if text_chunk:
+                                response_text += text_chunk
+                                logger.debug(f"[{channel_id}] delta: {text_chunk[:80]!r}")
 
-                    elif evt_type in (EventType.ERROR, "error", "agent.error"):
-                        error_msg = event_data.get("message", "Unknown error")
-                        logger.error(f"[{channel_id}] Agent error: {error_msg}")
+                        elif evt_type in (EventType.ERROR, "error", "agent.error"):
+                            error_msg = event_data.get("message", "Unknown error")
+                            logger.error(f"[{channel_id}] Agent error: {error_msg}")
+                            has_error = True
+
+                        elif evt_type in (EventType.AGENT_FILE_GENERATED, "agent.file_generated"):
+                            file_path = event_data.get("file_path")
+                            file_type = event_data.get("file_type", "document")
+                            caption = event_data.get("caption", "")
+                            if file_path and Path(file_path).exists():
+                                logger.info(f"[{channel_id}] Sending generated file: {file_path}")
+                                try:
+                                    await channel.send_media(
+                                        target=message.chat_id,
+                                        media_url=file_path,
+                                        media_type=file_type,
+                                        caption=caption,
+                                    )
+                                    logger.info(f"[{channel_id}] Sent file: {Path(file_path).name}")
+                                except Exception as e:
+                                    logger.error(f"Failed to send file: {e}", exc_info=True)
+                            else:
+                                logger.warning(f"[{channel_id}] File missing: {file_path}")
+                    except Exception as evt_err:
+                        logger.error(f"[{channel_id}] Event processing error: {evt_err}", exc_info=True)
                         has_error = True
-
-                    elif evt_type in (EventType.AGENT_FILE_GENERATED, "agent.file_generated"):
-                        file_path = event_data.get("file_path")
-                        file_type = event_data.get("file_type", "document")
-                        caption = event_data.get("caption", "")
-                        if file_path and Path(file_path).exists():
-                            logger.info(f"[{channel_id}] Sending generated file: {file_path}")
-                            try:
-                                await channel.send_media(
-                                    target=message.chat_id,
-                                    media_url=file_path,
-                                    media_type=file_type,
-                                    caption=caption,
-                                )
-                                logger.info(f"[{channel_id}] Sent file: {Path(file_path).name}")
-                            except Exception as e:
-                                logger.error(f"Failed to send file: {e}", exc_info=True)
-                        else:
-                            logger.warning(f"[{channel_id}] File missing: {file_path}")
+                        continue
 
                 logger.info(f"[{channel_id}] Accumulated response length: {len(response_text)}")
 
