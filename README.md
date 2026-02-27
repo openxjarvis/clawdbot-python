@@ -1,18 +1,18 @@
 # OpenXJarvis (openclaw-python)
 
 > **Jarvis lives here.** A pure Python clone of OpenClaw — the most powerful personal AI gateway you can run.
- A Python implementation of the OpenClaw AI assistant  — aligned with the TypeScript reference implementation
-
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![MIT License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Tested: Telegram + Gemini](https://img.shields.io/badge/Tested-Telegram%20%2B%20Gemini-green.svg)](#tested-configurations)
 
+**Keywords:** AI agent framework · autonomous agent · LLM gateway · multi-channel chatbot · self-hosted AI assistant · Python AI · Telegram bot · Discord bot · personal AI · agent orchestration
+
 ## What is This?
 
-**OpenXJarvis** is a complete Python implementation of [OpenClaw](https://github.com/openclaw/openclaw) — continuously aligned with the TypeScript reference. Think of it as your personal AI operating system: connect messaging channels (Telegram, WhatsApp, Discord, Slack, IRC, Signal, Google Chat, iMessage), plug in cutting-edge models (GPT-5.2, Claude Opus 4.6, Gemini 3.1 Pro, Grok 4, DeepSeek V3.2, GLM-5, Qwen 3.5), manage persistent memory, schedule autonomous tasks, and control everything through a beautiful Web UI or CLI.
+**OpenXJarvis** is a complete Python implementation of [OpenClaw](https://github.com/openclaw/openclaw) — continuously aligned with the TypeScript reference. Think of it as your personal AI operating system: an autonomous agent platform that connects messaging channels (Telegram, WhatsApp, Discord, Slack, IRC, Signal, Google Chat, iMessage), integrates with cutting-edge LLM providers (GPT-5.2, Claude Opus 4.6, Gemini 3.1 Pro, Grok 4, DeepSeek V3.2, GLM-5, Qwen 3.5), manages persistent memory and long-term context, schedules autonomous tasks via cron, and provides a beautiful Web UI for agent orchestration.
 
-**Why "Jarvis"?** Because this isn't just another chatbot framework. This is your digital companion — always learning, always improving, evolving in lockstep with OpenClaw's rapid development. Every feature, every alignment improvement, every new capability lands here.
+**Why "Jarvis"?** Because this isn't just another chatbot framework or AI assistant wrapper. This is a production-grade agent framework — a self-hosted personal AI that learns, remembers, and operates autonomously. Every feature, every alignment improvement, every new capability lands here.
 
 **This project stays synchronized with OpenClaw.** We track upstream changes and continuously merge improvements. You're not choosing between Python and TypeScript — you're choosing the same powerful platform in your preferred language.
 
@@ -564,6 +564,16 @@ This Python implementation tracks [OpenClaw TypeScript](https://github.com/openc
 | Audio transcription | 📋 Planned | Whisper integration |
 
 ---
+
+## Related Projects & Ecosystem
+
+- **OpenClaw TypeScript:** [github.com/openclaw/openclaw](https://github.com/openclaw/openclaw) — upstream reference implementation
+- **pi-mono-python:** [github.com/openxjarvis/pi-mono-python](https://github.com/openxjarvis/pi-mono-python) — core agent infrastructure
+- **Community:** Join the discussion for AI agents, LLM orchestration, multi-channel bots, and autonomous AI development
+
+## Topics
+
+`python` `ai-agent` `llm` `chatbot` `telegram-bot` `discord-bot` `autonomous-agent` `ai-assistant` `openai-api` `anthropic-claude` `google-gemini` `self-hosted` `websocket` `cron-scheduler` `agent-framework` `ai-gateway` `multi-channel` `session-management` `memory-management` `agent-orchestration`
 
 ## Remote Repository
 
