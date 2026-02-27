@@ -37,7 +37,7 @@
 
 **Latest test:** Telegram bot + Gemini 3 Pro Preview running complex multi-tool workflows (web search, file operations, reasoning) — rock solid. 🚀
 
-**Model Updates (Feb 2026):** Full support for GPT-5.2/5.3 Codex, Claude Opus 4.5/4.6, Gemini 3 Pro/Flash Preview, Gemini 2.5 Pro/Flash. Additional providers (Zhipu GLM-5, xAI Grok, DeepSeek, Qwen) planned for Q2 2026.
+**Model Updates (Feb 2026):** Full support for GPT-5.2/5.3 Codex, Claude Opus 4.5/4.6, Gemini 3 Pro/Flash Preview, Gemini 2.5 Pro/Flash. Additional providers (Zhipu GLM-5, xAI Grok, DeepSeek, Qwen) coming soon.
 
 ---
 
