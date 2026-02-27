@@ -249,6 +249,7 @@ class GatewayBootstrap:
                 model=primary_model,
                 fallback_models=fallback_models,
                 cwd=workspace_dir,
+                config=cfg,
             )
 
             # Also keep a legacy reference for any code that checks type

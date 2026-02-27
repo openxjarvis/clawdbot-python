@@ -18,6 +18,10 @@ class AgentConfig(BaseModel):
     model: str | ModelConfig = Field(default="anthropic/claude-opus-4-5-20250514")
     thinking: str | None = Field(default=None)
     verbose: bool = Field(default=False)
+    compaction: CompactionConfig | None = Field(default=None)
+    contextPruning: ContextPruningConfig | None = Field(default=None)
+    maxHistoryTurns: int = Field(default=50, ge=1)
+    maxHistoryShare: float = Field(default=0.5, ge=0.1, le=0.9)
 
 
 class AuthConfig(BaseModel):
@@ -88,6 +92,47 @@ class ToolsConfig(BaseModel):
     sessions: SessionsToolsConfig | None = Field(default=None)
 
 
+class SoftTrimConfig(BaseModel):
+    """Soft trim configuration for context pruning"""
+    maxChars: int = Field(default=4000)
+    headChars: int = Field(default=1500)
+    tailChars: int = Field(default=1500)
+
+
+class HardClearConfig(BaseModel):
+    """Hard clear configuration for context pruning"""
+    enabled: bool = Field(default=True)
+    placeholder: str = Field(default="[Old tool result content cleared]")
+
+
+class ContextPruningToolsConfig(BaseModel):
+    """Tools configuration for context pruning"""
+    prunable: list[str] = Field(default_factory=lambda: ["Read", "Grep", "Shell"])
+
+
+class ContextPruningConfig(BaseModel):
+    """Context pruning configuration - mirrors TypeScript AgentContextPruningConfig"""
+    mode: str = Field(default="off")  # "off" | "cache-ttl"
+    ttl: str | None = Field(default="5m")
+    softTrimRatio: float = Field(default=0.3, ge=0.0, le=1.0)
+    hardClearRatio: float = Field(default=0.5, ge=0.0, le=1.0)
+    keepLastAssistants: int = Field(default=3, ge=0)
+    softTrim: SoftTrimConfig = Field(default_factory=SoftTrimConfig)
+    hardClear: HardClearConfig = Field(default_factory=HardClearConfig)
+    tools: ContextPruningToolsConfig = Field(default_factory=ContextPruningToolsConfig)
+    minPrunableToolChars: int = Field(default=50000, ge=0)
+
+
+class CompactionConfig(BaseModel):
+    """Compaction configuration - mirrors TypeScript AgentCompactionConfig"""
+    enabled: bool = Field(default=True)
+    mode: str = Field(default="safeguard")  # "default" | "safeguard"
+    reserveTokens: int = Field(default=16384, ge=0)
+    keepRecentTokens: int = Field(default=20000, ge=0)
+    maxHistoryShare: float = Field(default=0.5, ge=0.1, le=0.9)
+    reserveTokensFloor: int | None = Field(default=None, ge=0)
+
+
 class AgentDefaults(BaseModel):
     """Default agent settings"""
 
@@ -95,6 +140,12 @@ class AgentDefaults(BaseModel):
     agentDir: str | None = Field(default=None)
     model: str | ModelConfig = Field(default="google/gemini-3-pro-preview")
     tools: ToolsConfig | None = Field(default=None)
+    compaction: CompactionConfig | None = Field(default=None)
+    contextPruning: ContextPruningConfig | None = Field(default=None)
+    maxHistoryTurns: int = Field(default=50, ge=1)
+    maxHistoryShare: float = Field(default=0.5, ge=0.1, le=0.9)
+    maxConcurrent: int | None = Field(default=None)
+    subagents: "SubagentsConfig | None" = Field(default=None)
 
 
 class IdentityConfig(BaseModel):
@@ -113,10 +164,25 @@ class SandboxConfig(BaseModel):
 
 
 class SubagentsConfig(BaseModel):
-    """Subagents configuration"""
-    enabled: bool = Field(default=True)
-    maxDepth: int = Field(default=5, ge=0, le=10)
-    maxActive: int = Field(default=10, ge=1)
+    """Subagents configuration (aligned with TS subagents schema)"""
+    maxConcurrent: int | None = Field(default=None)
+    maxSpawnDepth: int = Field(default=1, ge=1, le=5)
+    maxChildrenPerAgent: int = Field(default=5, ge=1, le=20)
+    archiveAfterMinutes: int = Field(default=60, ge=1)
+    model: str | ModelConfig | None = Field(default=None)
+    thinking: str | None = Field(default=None)
+    
+    # Legacy fields for backward compatibility
+    enabled: bool = Field(default=True, exclude=True)
+    maxDepth: int | None = Field(default=None, exclude=True)
+    maxActive: int | None = Field(default=None, exclude=True)
+    
+    def model_post_init(self, __context: object) -> None:
+        """Migrate legacy fields"""
+        if self.maxDepth is not None:
+            self.maxSpawnDepth = self.maxDepth
+        if self.maxActive is not None:
+            self.maxChildrenPerAgent = self.maxActive
 
 
 class GroupChatConfig(BaseModel):

@@ -10,6 +10,7 @@ from collections.abc import Callable, Coroutine
 from typing import Any, TypeVar
 
 from .lane import Lane
+from .lanes import CommandLane, LANE_DEFAULTS
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,14 @@ class QueueManager:
 
         self._session_lanes: dict[str, Lane] = {}
         self._global_lane = Lane("global", max_concurrent_global)
+        
+        # Fixed lanes with predefined concurrency (aligned with TS)
+        self._fixed_lanes: dict[CommandLane, Lane] = {
+            CommandLane.MAIN: Lane(CommandLane.MAIN.value, LANE_DEFAULTS[CommandLane.MAIN]),
+            CommandLane.CRON: Lane(CommandLane.CRON.value, LANE_DEFAULTS[CommandLane.CRON]),
+            CommandLane.SUBAGENT: Lane(CommandLane.SUBAGENT.value, LANE_DEFAULTS[CommandLane.SUBAGENT]),
+            CommandLane.NESTED: Lane(CommandLane.NESTED.value, LANE_DEFAULTS[CommandLane.NESTED]),
+        }
 
     def get_session_lane(self, session_id: str) -> Lane:
         """
@@ -61,6 +70,50 @@ class QueueManager:
     def get_global_lane(self) -> Lane:
         """Get global lane"""
         return self._global_lane
+    
+    def get_lane(self, lane: CommandLane) -> Lane:
+        """
+        Get fixed command lane
+        
+        Args:
+            lane: CommandLane enum value
+            
+        Returns:
+            Lane instance for this command lane
+        """
+        return self._fixed_lanes[lane]
+    
+    async def enqueue_in_lane(
+        self,
+        lane: CommandLane,
+        task: Callable[[], Coroutine[Any, Any, T]],
+        timeout: float | None = None,
+    ) -> T:
+        """
+        Enqueue task in a specific command lane
+        
+        Args:
+            lane: CommandLane enum value
+            task: Async function to execute
+            timeout: Optional timeout
+            
+        Returns:
+            Task result
+        """
+        lane_instance = self.get_lane(lane)
+        return await lane_instance.enqueue(task, timeout)
+    
+    def set_lane_concurrency(self, lane: CommandLane, max_concurrent: int) -> None:
+        """
+        Set concurrency limit for a command lane
+        
+        Args:
+            lane: CommandLane enum value
+            max_concurrent: New concurrency limit (>= 1)
+        """
+        lane_instance = self.get_lane(lane)
+        lane_instance.max_concurrent = max(1, max_concurrent)
+        logger.info(f"Updated lane {lane.value} maxConcurrent to {lane_instance.max_concurrent}")
 
     async def enqueue_session(
         self,

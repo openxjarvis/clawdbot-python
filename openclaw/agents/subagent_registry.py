@@ -63,12 +63,34 @@ class SubagentRegistry:
     - Persistence across Gateway restarts
     """
     
-    def __init__(self):
+    def __init__(self, config: dict[str, Any] | None = None):
         self._runs: dict[str, SubagentRunRecord] = {}
         self._resumed_runs: set[str] = set()
         self._restore_attempted = False
         self._event_listeners: dict[str, list[asyncio.Event]] = {}
         self._lock = asyncio.Lock()
+        self._config = config or {}
+    
+    def _resolve_archive_after_ms(self) -> int | None:
+        """
+        Resolve archiveAfterMinutes config to milliseconds
+        
+        Aligned with TS: subagent-registry.ts resolveArchiveAfterMs()
+        
+        Returns:
+            Archive delay in milliseconds, or None if disabled
+        """
+        minutes = (
+            self._config.get("agents", {})
+            .get("defaults", {})
+            .get("subagents", {})
+            .get("archiveAfterMinutes", 60)
+        )
+        
+        if not isinstance(minutes, (int, float)) or minutes <= 0:
+            return None
+        
+        return max(1, int(minutes)) * 60_000
     
     def register_subagent_run(
         self,
@@ -101,6 +123,10 @@ class SubagentRegistry:
         run_id = str(uuid.uuid4())
         now_ms = int(time.time() * 1000)
         
+        # Calculate archive time (aligned with TS)
+        archive_after_ms = self._resolve_archive_after_ms()
+        archive_at_ms = (now_ms + archive_after_ms) if archive_after_ms else None
+        
         record = SubagentRunRecord(
             run_id=run_id,
             child_session_key=child_session_key,
@@ -114,6 +140,8 @@ class SubagentRegistry:
             run_timeout_seconds=run_timeout_seconds,
             expects_completion_message=expects_completion_message,
             created_at=now_ms,
+            started_at=now_ms,
+            archive_at_ms=archive_at_ms,
         )
         
         self._runs[run_id] = record
@@ -232,6 +260,91 @@ class SubagentRegistry:
             entry.cleanup_handled = True
             self._persist()
     
+    async def _trigger_announce_and_cleanup(self, entry: SubagentRunRecord):
+        """
+        Trigger announce flow and cleanup for completed run
+        
+        Used for restoring runs that ended during gateway restart.
+        
+        Args:
+            entry: SubagentRunRecord that has ended
+        """
+        try:
+            logger.info(f"Triggering announce and cleanup for run {entry.run_id}")
+            
+            # Import here to avoid circular dependency
+            from .subagent_announce import run_subagent_announce_flow
+            
+            # Trigger announce flow
+            await run_subagent_announce_flow(entry)
+            
+            # Cleanup session if requested
+            if entry.cleanup == "delete":
+                await self._cleanup_session(entry.child_session_key)
+            
+            # Mark cleanup completed
+            self.mark_cleanup_completed(entry.run_id)
+            
+        except Exception as e:
+            logger.error(f"Failed to trigger announce/cleanup for run {entry.run_id}: {e}")
+    
+    async def _resume_wait_for_completion(self, entry: SubagentRunRecord):
+        """
+        Resume waiting for subagent completion after gateway restart
+        
+        Args:
+            entry: SubagentRunRecord that hasn't ended yet
+        """
+        try:
+            logger.info(f"Resuming wait for run {entry.run_id}")
+            
+            # Calculate remaining timeout
+            timeout_ms = None
+            if entry.run_timeout_seconds:
+                elapsed_ms = int(time.time() * 1000) - entry.created_at
+                remaining_ms = (entry.run_timeout_seconds * 1000) - elapsed_ms
+                if remaining_ms > 0:
+                    timeout_ms = remaining_ms
+                else:
+                    logger.warning(f"Run {entry.run_id} already timed out")
+                    self.mark_subagent_ended(
+                        entry.run_id,
+                        outcome={"status": "error", "error": "timeout"}
+                    )
+                    return
+            
+            # Wait for completion
+            result = await self.wait_for_subagent_completion(
+                entry.run_id,
+                timeout_ms=timeout_ms if timeout_ms else 300000  # 5min default
+            )
+            
+            if not result.get("success"):
+                logger.warning(f"Wait failed for run {entry.run_id}: {result.get('error')}")
+            
+        except Exception as e:
+            logger.error(f"Failed to resume wait for run {entry.run_id}: {e}")
+    
+    async def _cleanup_session(self, session_key: str):
+        """
+        Cleanup (delete) a subagent session
+        
+        Args:
+            session_key: Session key to delete
+        """
+        try:
+            # Import here to avoid circular dependency
+            from ..gateway.rpc_client import get_gateway_rpc_client
+            
+            rpc = get_gateway_rpc_client()
+            if rpc:
+                await rpc.call("sessions.delete", {"sessionKey": session_key})
+                logger.info(f"Deleted session {session_key}")
+            else:
+                logger.warning(f"No RPC client to delete session {session_key}")
+        except Exception as e:
+            logger.error(f"Failed to cleanup session {session_key}: {e}")
+    
     def _persist(self):
         """Persist registry to disk"""
         try:
@@ -272,14 +385,16 @@ class SubagentRegistry:
             # If ended but not cleaned up, schedule cleanup
             if entry.ended_at:
                 logger.info(f"Resuming cleanup for run {run_id}")
-                # TODO: Trigger announce and cleanup
                 self._resumed_runs.add(run_id)
+                # Schedule announce and cleanup in background
+                asyncio.create_task(self._trigger_announce_and_cleanup(entry))
                 continue
             
             # If not ended, wait for completion again
             logger.info(f"Resuming wait for run {run_id}")
-            # TODO: Wait for completion again
             self._resumed_runs.add(run_id)
+            # Resume waiting in background
+            asyncio.create_task(self._resume_wait_for_completion(entry))
     
     def list_runs(self, active_only: bool = False) -> list[SubagentRunRecord]:
         """

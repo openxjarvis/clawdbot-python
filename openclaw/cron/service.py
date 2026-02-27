@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Awaitable, Dict, Literal, Optional
 
+from .locked import locked
 from .types import (
     CronJob,
     CronJobState,
@@ -362,6 +363,7 @@ class CronService:
         session_store_path: Optional[str] = None,
         cron_config: Optional[Dict[str, Any]] = None,
         default_agent_id: Optional[str] = None,
+        lane_manager: Optional[Any] = None,  # QueueManager for lane-based execution
         # Legacy callback names (backward compat)
         on_system_event: Optional[Callable[..., Any]] = None,
         on_isolated_agent: Optional[Callable[..., Awaitable[Dict[str, Any]]]] = None,
@@ -387,9 +389,10 @@ class CronService:
         self.session_store_path = session_store_path
         self.cron_config = cron_config or {}
         self.default_agent_id = default_agent_id or "default"
+        self.lane_manager = lane_manager
 
-        # Concurrency lock (matches TS locked())
-        self._lock = asyncio.Lock()
+        # Store path for per-store-path locking (aligned with TS)
+        self._store_path = str(store_path) if store_path else ""
 
         # Timer
         self._timer: Optional[CronTimer] = None
@@ -403,12 +406,14 @@ class CronService:
         logger.info("CronService initialized")
 
     # ------------------------------------------------------------------
-    # Lock helper
+    # Lock helper (aligned with TS locked.ts)
     # ------------------------------------------------------------------
 
     async def _locked(self, fn: Callable[..., Awaitable[Any]], *args: Any) -> Any:
-        async with self._lock:
+        """Execute function under per-store-path lock"""
+        async def wrapper():
             return await fn(*args)
+        return await locked(self._store_path, wrapper)
 
     # ------------------------------------------------------------------
     # Store helpers
@@ -695,13 +700,31 @@ class CronService:
                 timeout_ms = self._resolve_job_timeout_ms(job)
 
                 try:
-                    if timeout_ms is not None:
-                        core_result = await asyncio.wait_for(
-                            self._execute_job_core(job),
-                            timeout=timeout_ms / 1000,
-                        )
+                    # Execute in CommandLane.CRON if lane_manager available (aligned with TS)
+                    if self.lane_manager:
+                        from openclaw.agents.queuing.lanes import CommandLane
+                        
+                        async def job_task():
+                            return await self._execute_job_core(job)
+                        
+                        if timeout_ms is not None:
+                            core_result = await asyncio.wait_for(
+                                self.lane_manager.enqueue_in_lane(CommandLane.CRON, job_task),
+                                timeout=timeout_ms / 1000,
+                            )
+                        else:
+                            core_result = await self.lane_manager.enqueue_in_lane(
+                                CommandLane.CRON, job_task
+                            )
                     else:
-                        core_result = await self._execute_job_core(job)
+                        # Fallback to direct execution (backward compat)
+                        if timeout_ms is not None:
+                            core_result = await asyncio.wait_for(
+                                self._execute_job_core(job),
+                                timeout=timeout_ms / 1000,
+                            )
+                        else:
+                            core_result = await self._execute_job_core(job)
                     results.append({
                         "id": job_id,
                         "job": job,

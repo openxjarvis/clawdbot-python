@@ -129,6 +129,7 @@ class SessionEntry(BaseModel):
     # Memory management
     memoryFlushAt: Optional[int] = Field(None, description="Timestamp when memory was flushed")
     memoryFlushCompactionCount: Optional[int] = Field(None, description="Compaction count at memory flush")
+    lastCacheTouchAt: Optional[int] = Field(None, description="Last cache touch timestamp for TTL mode")
     
     # Skills and system prompt
     skillsSnapshot: Optional[SessionSkillSnapshot] = Field(None, description="Skills snapshot")

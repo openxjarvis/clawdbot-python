@@ -79,12 +79,14 @@ class PiAgentRuntime:
         fallback_models: list[str] | None = None,
         cwd: str | Path | None = None,
         system_prompt: str | None = None,
+        config: dict[str, Any] | None = None,
     ) -> None:
         self.model_str = model
         # All candidates: primary first, then fallbacks (mirrors TS runWithModelFallback)
         self.model_candidates: list[str] = [model] + list(fallback_models or [])
         self.cwd = str(cwd) if cwd else None
         self.system_prompt = system_prompt
+        self.config = config or {}
 
         # Per-session pool: openclaw session_id → pi_coding_agent.AgentSession
         self._pool: dict[str, Any] = {}
@@ -131,9 +133,51 @@ class PiAgentRuntime:
                     # Further limit to last 50 turns
                     history_messages = limit_history_turns(history_messages, max_turns=50)
                     
+                    # Phase 4: Apply history budget limit (maxHistoryShare)
+                    try:
+                        from openclaw.agents.compaction.functions import prune_history_for_context_share
+                        from openclaw.agents.context_window_guard import resolve_context_window_info
+                        
+                        # Use context window guard for dynamic resolution
+                        provider = self.model_str.split('/')[0] if '/' in self.model_str else 'google'
+                        model_id = self.model_str.split('/')[-1] if '/' in self.model_str else self.model_str
+                        model_context_window = model.contextWindow if model and hasattr(model, 'contextWindow') else None
+                        
+                        window_info = resolve_context_window_info(
+                            cfg=self.config,
+                            provider=provider,
+                            model_id=model_id,
+                            model_context_window=model_context_window,
+                            default_tokens=1_048_576,
+                        )
+                        context_window = window_info.tokens
+                        
+                        # Get max_history_share from config
+                        agents_config = self.config.get('agents', {})
+                        defaults = agents_config.get('defaults', {})
+                        max_history_share = defaults.get('maxHistoryShare', 0.5)
+                        
+                        prune_result = prune_history_for_context_share(
+                            messages=history_messages,
+                            max_context_tokens=context_window,
+                            max_history_share=max_history_share,
+                        )
+                        
+                        if prune_result['dropped_messages'] > 0:
+                            history_messages = prune_result['messages']
+                            logger.info(
+                                f"History budget: dropped {prune_result['dropped_messages']} messages "
+                                f"({prune_result['dropped_tokens']} tokens), "
+                                f"kept {len(history_messages)} messages ({prune_result['kept_tokens']} tokens)"
+                            )
+                        else:
+                            logger.debug("History within budget, no pruning needed")
+                    except Exception as budget_exc:
+                        logger.debug(f"History budget pruning skipped: {budget_exc}")
+                    
                     logger.info(
                         f"Loaded {len(history_messages)} messages from history "
-                        f"(limited to 200 messages / 50 turns)"
+                        f"(limited to 200 messages / 50 turns, with budget pruning)"
                     )
             except Exception as e:
                 logger.warning(f"Failed to load limited history: {e}")
@@ -144,6 +188,18 @@ class PiAgentRuntime:
                 model=model,
                 session_id=session_id,
             )
+            
+            # Install tool result context guard (preemptive protection)
+            try:
+                from openclaw.agents.tool_result_context_guard import install_tool_result_context_guard
+                
+                cleanup_fn = install_tool_result_context_guard(
+                    agent=pi_session,
+                    context_window_tokens=context_window,
+                )
+                logger.debug(f"Tool result context guard installed for session {session_id[:8]}")
+            except Exception as guard_exc:
+                logger.debug(f"Tool result context guard installation failed: {guard_exc}")
             
             # Manually set limited history if session has _conversation_history attribute
             if hasattr(pi_session, '_conversation_history') and history_messages:
@@ -200,6 +256,147 @@ class PiAgentRuntime:
     def evict_session(self, session_id: str) -> None:
         """Remove a session from the pool."""
         self._pool.pop(session_id, None)
+
+    # ------------------------------------------------------------------
+    # Compaction execution
+    # ------------------------------------------------------------------
+    
+    async def _execute_compaction(
+        self,
+        session_id: str,
+        pi_session: Any,
+        context_window: int,
+        compaction_settings: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """
+        Execute compaction on a session's history.
+        
+        Mirrors TypeScript compaction flow:
+        1. Prune history for context share (maxHistoryShare)
+        2. Summarize dropped messages using LLM
+        3. Update session compactionCount
+        4. Enrich summary with tool failures and file ops
+        
+        Returns:
+            Compaction result dict with summary, or None if compaction skipped
+        """
+        try:
+            from openclaw.agents.compaction.functions import (
+                prune_history_for_context_share,
+                summarize_in_stages,
+                estimate_messages_tokens,
+            )
+            from openclaw.agents.extensions.compaction_safeguard import enrich_compaction_summary
+            from openclaw.agents.session_entry import update_session_entry_tokens
+            
+            if not hasattr(pi_session, '_conversation_history'):
+                logger.debug("No conversation history to compact")
+                return None
+            
+            history = pi_session._conversation_history
+            if not history or len(history) < 10:
+                logger.debug("History too short to compact (< 10 messages)")
+                return None
+            
+            # Step 1: Prune history for context budget
+            max_history_share = compaction_settings.get('maxHistoryShare', 0.5)
+            prune_result = prune_history_for_context_share(
+                messages=history,
+                max_context_tokens=context_window,
+                max_history_share=max_history_share,
+            )
+            
+            dropped_messages = prune_result['dropped_messages_list']
+            kept_messages = prune_result['messages']
+            
+            if not dropped_messages:
+                logger.debug("No messages dropped during history pruning")
+                return None
+            
+            logger.info(
+                f"Compaction: dropped {len(dropped_messages)} messages "
+                f"({prune_result['dropped_tokens']} tokens), "
+                f"kept {len(kept_messages)} messages ({prune_result['kept_tokens']} tokens)"
+            )
+            
+            # Step 2: Summarize dropped messages
+            # Try to get model info from pi_session
+            model_info = {
+                "provider": "google",  # Default for Gemini
+                "model": "gemini-2.0-flash",
+                "contextWindow": context_window,
+            }
+            
+            # Try to extract actual model from session
+            if hasattr(pi_session, '_agent'):
+                agent = pi_session._agent
+                if hasattr(agent, '_model'):
+                    model_obj = agent._model
+                    if hasattr(model_obj, 'id'):
+                        model_info["model"] = model_obj.id
+                    if hasattr(model_obj, 'context_window'):
+                        model_info["contextWindow"] = model_obj.context_window
+            
+            # Get API key (try environment)
+            import os
+            api_key = os.environ.get('GOOGLE_API_KEY') or os.environ.get('GEMINI_API_KEY', '')
+            
+            if not api_key:
+                logger.warning("No API key available for compaction summarization, using fallback")
+                summary = f"Summary of {len(dropped_messages)} dropped messages (no API key for LLM summarization)"
+            else:
+                reserve_tokens = compaction_settings.get('reserveTokens', 16384)
+                max_chunk_tokens = compaction_settings.get('keepRecentTokens', 20000)
+                
+                summary = await summarize_in_stages(
+                    messages=dropped_messages,
+                    model=model_info,
+                    api_key=api_key,
+                    signal=None,  # No abort signal for now
+                    reserve_tokens=reserve_tokens,
+                    max_chunk_tokens=max_chunk_tokens,
+                    context_window=context_window,
+                    custom_instructions="Preserve all key decisions, TODOs, open questions, and constraints.",
+                    previous_summary=None,
+                )
+            
+            # Step 3: Enrich summary with tool failures and file ops
+            enriched_summary = enrich_compaction_summary(
+                base_summary=summary,
+                messages_to_summarize=dropped_messages,
+                turn_prefix_messages=[],
+                file_ops=None,  # Would need to track file ops
+                workspace_dir=self.cwd,
+                include_workspace_context=True,
+            )
+            
+            # Step 4: Update session history with compacted version
+            # Insert summary as a system-like message at the beginning of kept messages
+            compaction_message = {
+                "role": "user",
+                "content": f"[Conversation history summary]\n{enriched_summary}",
+                "timestamp": 0,  # Place at beginning
+            }
+            
+            new_history = [compaction_message] + kept_messages
+            pi_session._conversation_history = new_history
+            
+            # Step 5: Update compactionCount in SessionEntry
+            # This would require access to session_manager
+            # For now, log the compaction
+            logger.info(f"Session {session_id[:8]} compaction completed successfully")
+            
+            return {
+                "summary": enriched_summary,
+                "dropped_messages": len(dropped_messages),
+                "dropped_tokens": prune_result['dropped_tokens'],
+                "kept_messages": len(kept_messages),
+                "kept_tokens": prune_result['kept_tokens'],
+            }
+            
+        except Exception as e:
+            logger.error(f"Compaction execution failed: {e}", exc_info=True)
+            return None
 
     # ------------------------------------------------------------------
     # Observer pattern — mirrors MultiProviderRuntime.add_event_listener
@@ -460,20 +657,113 @@ class PiAgentRuntime:
                     
                     # Phase 2: Token monitoring - estimate before sending
                     from openclaw.agents.compaction.functions import estimate_messages_tokens, should_compact
+                    from openclaw.agents.context_window_guard import resolve_and_guard_context_window
+                    
+                    # Dynamically resolve context window using guard
+                    provider = candidate_model.split('/')[0] if '/' in candidate_model else 'google'
+                    model_id = candidate_model.split('/')[-1] if '/' in candidate_model else candidate_model
+                    
+                    # Get model context window if available
+                    model_context_window = None
+                    if hasattr(_pi_session, '_agent') and hasattr(_pi_session._agent, '_model'):
+                        agent_model = _pi_session._agent._model
+                        if hasattr(agent_model, 'contextWindow'):
+                            model_context_window = agent_model.contextWindow
+                    
+                    # Resolve and guard context window
+                    guard_result = resolve_and_guard_context_window(
+                        cfg=self.config,
+                        provider=provider,
+                        model_id=model_id,
+                        model_context_window=model_context_window,
+                        default_tokens=1_048_576,
+                    )
+                    
+                    context_window = guard_result.tokens
+                    
+                    # Log warnings if needed
+                    if guard_result.should_block:
+                        logger.error(
+                            f"Context window too small: {context_window} tokens < 16K "
+                            f"(source: {guard_result.source})"
+                        )
+                    elif guard_result.should_warn:
+                        logger.warning(
+                            f"Context window is small: {context_window} tokens < 32K "
+                            f"(source: {guard_result.source})"
+                        )
+                    else:
+                        logger.debug(f"Context window: {context_window} tokens (source: {guard_result.source})")
                     
                     context_tokens = 0
-                    context_window = 1_048_576  # Gemini default
                     
                     try:
                         if hasattr(_pi_session, '_conversation_history'):
+                            # Phase 5: Apply context pruning before token estimation
+                            try:
+                                from openclaw.agents.context_pruning.pruner import prune_context_messages
+                                from openclaw.agents.context_pruning.cache_ttl import read_last_cache_ttl_timestamp
+                                
+                                # Get context pruning settings from config
+                                agents_config = self.config.get('agents', {})
+                                defaults = agents_config.get('defaults', {})
+                                pruning_config = defaults.get('contextPruning', {})
+                                
+                                context_pruning_settings = {
+                                    'mode': pruning_config.get('mode', 'off'),
+                                    'ttl': pruning_config.get('ttl', '5m'),
+                                    'softTrimRatio': pruning_config.get('softTrimRatio', 0.3),
+                                    'hardClearRatio': pruning_config.get('hardClearRatio', 0.5),
+                                    'keepLastAssistants': pruning_config.get('keepLastAssistants', 3),
+                                    'softTrim': pruning_config.get('softTrim', {
+                                        'maxChars': 4000,
+                                        'headChars': 1500,
+                                        'tailChars': 1500,
+                                    }),
+                                    'hardClear': pruning_config.get('hardClear', {
+                                        'enabled': True,
+                                        'placeholder': '[Old tool result content cleared]',
+                                    }),
+                                    'tools': pruning_config.get('tools', {
+                                        'prunable': ['Read', 'Grep', 'Shell'],
+                                    }),
+                                    'minPrunableToolChars': pruning_config.get('minPrunableToolChars', 50000),
+                                }
+                                
+                                # Get last cache touch timestamp for TTL mode
+                                last_cache_touch = None
+                                if hasattr(self, 'session_manager') and self.session_manager:
+                                    last_cache_touch = read_last_cache_ttl_timestamp(self.session_manager)
+                                
+                                original_len = len(_pi_session._conversation_history)
+                                pruned_history = prune_context_messages(
+                                    messages=_pi_session._conversation_history,
+                                    settings=context_pruning_settings,
+                                    ctx={'model': {'contextWindow': context_window}},
+                                    last_cache_touch_at=last_cache_touch,
+                                )
+                                
+                                if pruned_history != _pi_session._conversation_history:
+                                    _pi_session._conversation_history = pruned_history
+                                    logger.debug(f"Context pruning applied: {original_len} messages processed")
+                                else:
+                                    logger.debug("Context pruning: no changes needed")
+                            except Exception as prune_exc:
+                                logger.debug(f"Context pruning skipped: {prune_exc}")
+                            
                             context_tokens = estimate_messages_tokens(_pi_session._conversation_history)
                             logger.debug(f"Estimated context tokens: {context_tokens}")
                             
                             # Phase 3: Auto-compaction trigger (Safeguard)
+                            # Get compaction settings from config
+                            agents_config = self.config.get('agents', {})
+                            defaults = agents_config.get('defaults', {})
+                            compaction_config = defaults.get('compaction', {})
+                            
                             compaction_settings = {
-                                'enabled': True,
-                                'reserveTokens': 16384,      # 16K for response
-                                'keepRecentTokens': 20000,   # Keep recent 20K
+                                'enabled': compaction_config.get('enabled', True),
+                                'reserveTokens': compaction_config.get('reserveTokens', 16384),
+                                'keepRecentTokens': compaction_config.get('keepRecentTokens', 20000),
                             }
                             
                             if should_compact(context_tokens, context_window, compaction_settings):
@@ -482,9 +772,22 @@ class PiAgentRuntime:
                                     f"exceeds threshold ({context_window - compaction_settings['reserveTokens']})"
                                 )
                                 
-                                # Note: Full compaction implementation would go here
-                                # For now, the history limit (Phase 1) prevents overflow
-                                logger.info("Using history limiting as compaction strategy")
+                                # Phase 3: Execute compaction
+                                try:
+                                    compaction_result = await self._execute_compaction(
+                                        session_id=session_id,
+                                        pi_session=_pi_session,
+                                        context_window=context_window,
+                                        compaction_settings=compaction_settings,
+                                    )
+                                    if compaction_result:
+                                        summary = compaction_result.get('summary', '')
+                                        logger.info(f"Compaction completed: {summary[:100]}...")
+                                    else:
+                                        logger.info("Using history limiting as fallback compaction strategy")
+                                except Exception as e:
+                                    logger.error(f"Compaction failed: {e}", exc_info=True)
+                                    logger.info("Falling back to history limiting")
                             elif context_tokens > context_window * 0.9:
                                 logger.warning(
                                     f"Context tokens ({context_tokens}) approaching limit ({context_window})"

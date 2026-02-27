@@ -1,15 +1,10 @@
-"""
-Agent Extensions
-
-Extensions for enhancing agent behavior with additional features.
-"""
-
-from .context_pruning import (
-    ContextPruningSettings,
-    prune_context_messages,
+"""Agent extensions module - mirrors TypeScript pi-extensions."""
+from .session_manager_runtime_registry import (
+    SessionManagerRuntimeRegistry,
+    create_session_manager_runtime_registry,
 )
 
 __all__ = [
-    "ContextPruningSettings",
-    "prune_context_messages",
+    "SessionManagerRuntimeRegistry",
+    "create_session_manager_runtime_registry",
 ]
