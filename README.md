@@ -537,13 +537,12 @@ This Python implementation tracks [OpenClaw TypeScript](https://github.com/openc
 | **Cloudflare AI Gateway** | 📋 Planned | Gateway proxy support |
 | **vLLM** | 📋 Planned | Self-hosted LLM serving |
 
-**Performance Leaders (Feb 2026):**
-- 🏆 **Best Overall:** GPT-5.2 Pro (93.2% GPQA Diamond)
-- 💻 **Best Coding:** Claude Opus 4.6 (72.5% SWE-Bench) / GLM-4.7 (73.8% SWE-Bench, 66.7% multilingual)
-- 💰 **Best Value:** Gemini 3.1 Pro ($2/$12 per MT), DeepSeek V3.2 (~1/30th cost of GPT-5)
-- 🧠 **Best Reasoning:** Grok 4 Heavy (50% HLE) / GLM-5 (745B MoE with advanced reasoning)
-- 📚 **Longest Context:** Llama 4 Scout (10M tokens) / GLM-5 (200K + efficient DSA)
-- 🇨🇳 **Leading Chinese AI:** GLM-5 by Zhipu AI (745B MoE flagship, Feb 2026)
+**Recommended Models (Feb 2026):**
+- 🏆 GPT-5.2 Pro — Best overall performance
+- 💻 Claude Opus 4.6 / GLM-4.7 — Top coding assistants
+- 💰 Gemini 3.1 Pro / DeepSeek V3.2 — Best value
+- 🧠 Grok 4 / GLM-5 — Advanced reasoning
+- 🇨🇳 GLM-5 by Zhipu AI — Leading Chinese AI
 
 ### API Formats Supported
 
