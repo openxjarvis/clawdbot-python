@@ -44,6 +44,7 @@
 ## Preview
 
 <img src="assets/telegram-preview.jpg" alt="Jarvis on Telegram" width="360" />
+<img src="assets/IMG_1511.jpg" alt="Jarvis on Telegram" width="360" />
 
 *Jarvis responding on Telegram — powered by OpenXJarvis*
 
