@@ -1108,9 +1108,16 @@ class ChannelManager:
                 inbound_images: list[str] | None = None
                 inbound_attachments = getattr(message, "attachments", None) or []
                 for att in inbound_attachments:
-                    mime = att.get("mimeType", "")
-                    content = att.get("content", "")
-                    if content and (att.get("type") == "image" or mime.startswith("image/")):
+                    # att is a ChatAttachment Pydantic model — access via attributes, not .get()
+                    if isinstance(att, dict):
+                        mime = att.get("mime_type") or att.get("mimeType") or ""
+                        content = att.get("content") or ""
+                        att_type = att.get("type") or ""
+                    else:
+                        mime = att.mime_type or ""
+                        content = att.content or ""
+                        att_type = att.type or ""
+                    if content and (att_type == "image" or mime.startswith("image/")):
                         if inbound_images is None:
                             inbound_images = []
                         inbound_images.append(f"data:{mime or 'image/jpeg'};base64,{content}")
