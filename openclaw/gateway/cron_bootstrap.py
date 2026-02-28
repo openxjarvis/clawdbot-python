@@ -141,6 +141,18 @@ async def build_gateway_cron_service(
     async def run_isolated_agent(job: "CronJob", message: str) -> dict[str, Any]:
         """Run isolated agent for cron job."""
 
+        # Resolve job-level identifiers once so _agent_run can use them
+        job_agent_id = getattr(job, "agent_id", None) or "default"
+        base_session_key = (
+            getattr(job, "session_key", None) or f"cron:{job.id}"
+        ).strip()
+        job_session_key = (
+            f"{job_agent_id}:{base_session_key}"
+            if job_agent_id and job_agent_id != "default"
+            and not base_session_key.startswith(f"{job_agent_id}:")
+            else base_session_key
+        )
+
         async def _agent_run(job: "CronJob", message: str) -> dict[str, Any]:
             try:
                 cm = deps.get_channel_manager()
@@ -153,27 +165,70 @@ async def build_gateway_cron_service(
                         "delivered": False,
                     }
 
-                agent_id = getattr(job, "agent_id", None) or "default"
-                base_key = f"cron:{job.id}"
-                session_key = (
-                    f"{agent_id}:{base_key}"
-                    if agent_id and agent_id != "default"
-                    else base_key
-                )
-
-                session = deps.session_manager.get_or_create_session_by_key(session_key)
+                session = deps.session_manager.get_or_create_session_by_key(job_session_key)
                 tools = (cm.tools if cm else None) or []
                 system_prompt = cm.system_prompt if cm else None
 
+                # ----------------------------------------------------------
+                # Model selection chain: mirrors TS runCronIsolatedAgentTurn
+                # Priority: hooks.gmail.model > job.payload.model > session override > default
+                # ----------------------------------------------------------
+                model_override: str | None = None
+
+                # 1. hooks.gmail.model override for Gmail hook sessions
+                if base_session_key.startswith("hook:gmail:"):
+                    try:
+                        from openclaw.agents.model_selection import resolve_hooks_gmail_model
+                        gmail_model = resolve_hooks_gmail_model(config_dict)
+                        if gmail_model:
+                            model_override = gmail_model
+                    except Exception:
+                        pass
+
+                # 2. Job payload model override (agentTurn.model)
+                if model_override is None:
+                    payload_model = getattr(getattr(job, "payload", None), "model", None)
+                    if payload_model and isinstance(payload_model, str) and payload_model.strip():
+                        model_override = payload_model.strip()
+
+                # 3. Session model override (user-set via /model command)
+                if model_override is None:
+                    try:
+                        session_entry = getattr(session, "entry", None) or {}
+                        if isinstance(session_entry, dict):
+                            model_override = session_entry.get("modelOverride") or None
+                        elif hasattr(session_entry, "modelOverride"):
+                            model_override = session_entry.modelOverride or None
+                    except Exception:
+                        pass
+
                 response_text = ""
-                async for event in runtime.run_turn(
-                    session, message, tools=tools, system_prompt=system_prompt
-                ):
+                run_kwargs: dict[str, Any] = {
+                    "tools": tools,
+                    "system_prompt": system_prompt,
+                }
+                if model_override:
+                    run_kwargs["model_override"] = model_override
+
+                async for event in runtime.run_turn(session, message, **run_kwargs):
                     evt_type = getattr(event, "type", "")
                     if evt_type in ("text", "text_delta"):
                         data = getattr(event, "data", {}) or {}
                         chunk = data.get("text") or data.get("delta") or ""
                         response_text += str(chunk) if chunk else ""
+
+                # Collect basic telemetry if runtime exposes it
+                used_model: str | None = None
+                used_provider: str | None = None
+                usage: dict[str, Any] | None = None
+                try:
+                    last_meta = getattr(runtime, "last_run_meta", None)
+                    if isinstance(last_meta, dict):
+                        used_model = last_meta.get("model") or model_override
+                        used_provider = last_meta.get("provider")
+                        usage = last_meta.get("usage")
+                except Exception:
+                    pass
 
                 return {
                     "status": "ok",
@@ -181,7 +236,10 @@ async def build_gateway_cron_service(
                     "output_text": response_text,
                     "delivered": False,
                     "session_id": str(session.id) if hasattr(session, "id") else None,
-                    "session_key": session_key,
+                    "session_key": job_session_key,
+                    "model": used_model or model_override,
+                    "provider": used_provider,
+                    "usage": usage,
                     "error": None,
                 }
             except Exception as e:
@@ -192,6 +250,9 @@ async def build_gateway_cron_service(
             job=job,
             run_agent_fn=_agent_run,
             message=message,
+            session_key=job_session_key,
+            config=config,
+            agent_id=job_agent_id,
         )
 
     # ------------------------------------------------------------------
@@ -478,17 +539,27 @@ async def _deliver_via_channels(
                     # Send media files extracted from MEDIA: tokens
                     for media_url in all_media:
                         try:
-                            # Resolve relative paths against cron session workspace
+                            # Resolve relative paths against known workspace locations
                             resolved_url = media_url
                             if not media_url.startswith(("http://", "https://", "file://", "/")):
-                                candidate = Path(_cron_workspace) / media_url if _cron_workspace else None
-                                if candidate and candidate.exists():
-                                    resolved_url = str(candidate)
-                                    logger.info(f"cron: resolved relative path to: {resolved_url}")
+                                # Search order: cron workspace, CWD, home
+                                search_dirs = []
+                                if _cron_workspace:
+                                    search_dirs.append(Path(_cron_workspace))
+                                search_dirs.append(Path.cwd())
+                                search_dirs.append(Path.home())
+                                for search_dir in search_dirs:
+                                    candidate = search_dir / media_url
+                                    if candidate.exists():
+                                        resolved_url = str(candidate)
+                                        logger.info(f"cron: resolved relative path '{media_url}' -> {resolved_url}")
+                                        break
                                 else:
-                                    home_candidate = Path(media_url).expanduser()
-                                    if home_candidate.exists():
-                                        resolved_url = str(home_candidate)
+                                    # Not found anywhere — skip gracefully
+                                    logger.warning(
+                                        f"cron: media file '{media_url}' not found in any workspace, skipping"
+                                    )
+                                    continue
 
                             mime = detect_mime(resolved_url)
                             kind = media_kind_from_mime(mime)

@@ -243,13 +243,19 @@ class SessionManager:
     - Session key to session ID mapping
     """
 
-    def __init__(self, workspace_dir: Path | None = None, agent_id: str = "main"):
+    def __init__(
+        self,
+        workspace_dir: Path | None = None,
+        agent_id: str = "main",
+        base_dir: Path | None = None,
+    ):
         """
         Initialize session manager
 
         Args:
             workspace_dir: Base directory for session storage (legacy, still used for fallback)
             agent_id: Agent identifier (default: "main")
+            base_dir: Override the openclaw home directory (useful for testing isolation)
         """
         self.workspace_dir = Path(workspace_dir) if workspace_dir is not None else Path.home() / ".openclaw" / "workspace"
         self.agent_id = normalize_agent_id(agent_id)
@@ -259,7 +265,8 @@ class SessionManager:
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
 
         # Canonical path: ~/.openclaw/agents/{agentId}/sessions/ (matches TS)
-        openclaw_home = Path.home() / ".openclaw"
+        # base_dir allows tests to use a tmp directory instead of the real ~/.openclaw
+        openclaw_home = Path(base_dir) if base_dir is not None else Path.home() / ".openclaw"
         self._sessions_dir = openclaw_home / "agents" / self.agent_id / "sessions"
         self._sessions_dir.mkdir(parents=True, exist_ok=True)
         

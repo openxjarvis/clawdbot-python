@@ -1,227 +1,442 @@
-"""Delivery system for isolated agent results"""
+"""Delivery target resolution for cron isolated agent results.
+
+Mirrors TypeScript: openclaw/src/cron/isolated-agent/delivery-target.ts
+
+Key improvements over previous version:
+- DeliveryTarget now carries account_id, thread_id, mode and error (aligned with TS)
+- resolve_delivery_target now accepts cfg + agent_id for session-store lookup
+- Channel account binding resolution (multi-account setups)
+- resolve_outbound_target() validation / docking
+"""
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ...channels.base import BaseChannel
-    from ..types import CronDelivery, CronJob
+    from ..types import CronJob
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_CHAT_CHANNEL = "telegram"
 
+
+# ---------------------------------------------------------------------------
+# DeliveryTarget – mirrors TS resolve return type (delivery-target.ts)
+# ---------------------------------------------------------------------------
+
+@dataclass
 class DeliveryTarget:
-    """Resolved delivery target"""
-    
-    def __init__(self, channel: str, target_id: str):
-        """
-        Initialize delivery target
-        
-        Args:
-            channel: Channel ID (telegram, discord, slack, etc.)
-            target_id: Target user/chat ID
-        """
-        self.channel = channel
-        self.target_id = target_id
-    
-    def __repr__(self) -> str:
-        return f"DeliveryTarget(channel={self.channel}, target={self.target_id})"
+    """Resolved delivery target.
 
+    Mirrors TS:
+        { channel, to?, accountId?, threadId?, mode: "explicit"|"implicit", error? }
+    """
+    channel: str
+    to: str | None = None
+    account_id: str | None = None       # TS: accountId
+    thread_id: str | int | None = None  # TS: threadId
+    mode: str = "implicit"              # TS: "explicit" | "implicit"
+    error: Exception | None = None
+
+    # Legacy alias kept for backward compat with callers using .target_id
+    @property
+    def target_id(self) -> str | None:
+        return self.to
+
+    def __repr__(self) -> str:
+        parts = [f"channel={self.channel!r}", f"to={self.to!r}", f"mode={self.mode!r}"]
+        if self.account_id:
+            parts.append(f"account_id={self.account_id!r}")
+        if self.thread_id is not None:
+            parts.append(f"thread_id={self.thread_id!r}")
+        if self.error:
+            parts.append(f"error={self.error!r}")
+        return f"DeliveryTarget({', '.join(parts)})"
+
+
+# ---------------------------------------------------------------------------
+# resolve_delivery_target
+# Mirrors TS resolveDeliveryTarget (delivery-target.ts)
+# ---------------------------------------------------------------------------
 
 async def resolve_delivery_target(
-    job: CronJob,
+    job: "CronJob",
     session_history: list[dict[str, Any]] | None = None,
-) -> DeliveryTarget | None:
-    """
-    Resolve delivery target for job
-    
+    *,
+    cfg: Any = None,
+    agent_id: str | None = None,
+) -> DeliveryTarget:
+    """Resolve delivery target for a cron job.
+
+    Resolution order (mirrors TS resolveDeliveryTarget):
+    1. Explicit delivery.to with a non-"last" channel → explicit mode.
+    2. Session store lookup for the job's session_key or agent main session.
+    3. Fallback via message channel selection (config-driven).
+    4. DEFAULT_CHAT_CHANNEL final fallback.
+
     Args:
-        job: Cron job
-        session_history: Session message history
-        
+        job: Cron job whose delivery configuration to resolve.
+        session_history: Optional legacy session history for "last" channel lookup.
+        cfg: OpenClaw config (enables session-store and account-binding lookups).
+        agent_id: Agent identifier (used for session key and account bindings).
+
     Returns:
-        Resolved delivery target or None
+        DeliveryTarget with channel, to, account_id, thread_id, mode, error.
     """
     if not job.delivery:
         logger.debug("No delivery configuration")
-        return None
-    
+        return DeliveryTarget(channel=DEFAULT_CHAT_CHANNEL, mode="implicit")
+
     delivery = job.delivery
-    
-    # If explicit target provided, use it
-    if delivery.to and delivery.channel != "last":
-        logger.info(f"Using explicit delivery target: {delivery.channel}:{delivery.to}")
-        return DeliveryTarget(
-            channel=delivery.channel,
-            target_id=delivery.to
+    requested_channel: str = (delivery.channel or "last").strip().lower()
+    explicit_to: str | None = (
+        delivery.to.strip() if isinstance(delivery.to, str) and delivery.to.strip()
+        else None
+    )
+
+    # ------------------------------------------------------------------
+    # 1. Explicit channel + explicit to → skip session store
+    # ------------------------------------------------------------------
+    if requested_channel != "last" and explicit_to:
+        target = DeliveryTarget(
+            channel=requested_channel,
+            to=explicit_to,
+            mode="explicit",
         )
-    
-    # If channel is "last", resolve from session history
-    if delivery.channel == "last":
-        if not session_history:
-            logger.warning("Cannot resolve 'last' channel: no session history")
-            return None
-        
-        # Find last message with channel info
+        _try_resolve_account_id(target, cfg=cfg, agent_id=agent_id)
+        logger.info("cron delivery: explicit target %s", target)
+        return target
+
+    # ------------------------------------------------------------------
+    # 2. Session store lookup (mirrors TS loadSessionStore + store[sessionKey])
+    # ------------------------------------------------------------------
+    thread_session_key = (getattr(job, "session_key", None) or "").strip() or None
+    store_entry: dict[str, Any] | None = None
+
+    if cfg is not None:
+        try:
+            store_entry = _load_session_entry(cfg, agent_id, thread_session_key)
+        except Exception as exc:
+            logger.debug("cron delivery: session store lookup failed: %s", exc)
+
+    if store_entry:
+        resolved = _resolve_from_session_entry(
+            entry=store_entry,
+            requested_channel=requested_channel,
+            explicit_to=explicit_to,
+            allow_mismatched_last_to=(requested_channel == "last"),
+        )
+        if resolved.channel and (resolved.to or requested_channel == "last"):
+            _try_resolve_account_id(resolved, cfg=cfg, agent_id=agent_id)
+            _try_validate_outbound(resolved, cfg=cfg)
+            logger.info("cron delivery: session-store target %s", resolved)
+            return resolved
+
+    # ------------------------------------------------------------------
+    # 3. Fallback via session_history (legacy "last" channel support)
+    # ------------------------------------------------------------------
+    if requested_channel == "last" and session_history:
         for msg in reversed(session_history):
-            if isinstance(msg, dict):
-                metadata = msg.get("metadata", {})
-                channel = metadata.get("channel")
-                target_id = metadata.get("chat_id") or metadata.get("user_id")
-                
-                if channel and target_id:
-                    logger.info(f"Resolved 'last' channel to: {channel}:{target_id}")
-                    return DeliveryTarget(
-                        channel=channel,
-                        target_id=str(target_id)
-                    )
-        
-        logger.warning("Cannot resolve 'last' channel: no channel info in history")
-        return None
-    
-    # Channel specified but no target - cannot deliver
-    logger.warning(f"Channel '{delivery.channel}' specified but no target")
+            if not isinstance(msg, dict):
+                continue
+            metadata = msg.get("metadata", {}) or {}
+            ch = metadata.get("channel")
+            tid = metadata.get("chat_id") or metadata.get("user_id")
+            if ch and tid:
+                target = DeliveryTarget(
+                    channel=ch,
+                    to=str(tid),
+                    mode="implicit",
+                )
+                _try_resolve_account_id(target, cfg=cfg, agent_id=agent_id)
+                logger.info("cron delivery: history-resolved target %s", target)
+                return target
+        logger.warning("cron delivery: cannot resolve 'last' channel from session history")
+
+    # ------------------------------------------------------------------
+    # 4. Config-driven channel selection fallback
+    # ------------------------------------------------------------------
+    fallback_channel: str = DEFAULT_CHAT_CHANNEL
+    if cfg is not None:
+        try:
+            from openclaw.infra.outbound.channel_selection import resolve_message_channel_selection
+            sel = await resolve_message_channel_selection(cfg=cfg)
+            if sel and sel.get("channel"):
+                fallback_channel = sel["channel"]
+        except Exception:
+            pass
+
+    if requested_channel == "last" and not explicit_to:
+        # No explicit target resolved — return channel-only target (missing to)
+        target = DeliveryTarget(channel=fallback_channel, mode="implicit")
+        _try_resolve_account_id(target, cfg=cfg, agent_id=agent_id)
+        logger.warning("cron delivery: could not determine target recipient for channel %r", fallback_channel)
+        return target
+
+    # Channel specified but no target could be resolved
+    target = DeliveryTarget(
+        channel=requested_channel or fallback_channel,
+        to=explicit_to,
+        mode="explicit" if explicit_to else "implicit",
+    )
+    _try_resolve_account_id(target, cfg=cfg, agent_id=agent_id)
+    if not explicit_to:
+        logger.warning("cron delivery: channel %r specified but no target", requested_channel)
+    return target
+
+
+# ---------------------------------------------------------------------------
+# Session entry helpers
+# ---------------------------------------------------------------------------
+
+def _load_session_entry(
+    cfg: Any,
+    agent_id: str | None,
+    thread_session_key: str | None,
+) -> dict[str, Any] | None:
+    """Load a session entry from the store, preferring thread-specific over main."""
+    try:
+        from openclaw.config.sessions import load_session_store, resolve_store_path, resolve_agent_main_session_key
+        aid = (agent_id or "").strip() or "default"
+        store_path = resolve_store_path(
+            getattr(cfg, "session", {}).get("store") if isinstance(cfg, dict) else None,
+            agent_id=aid,
+        )
+        store = load_session_store(store_path)
+        if not store:
+            return None
+
+        # Prefer thread-specific session key, fallback to agent main
+        main_key = resolve_agent_main_session_key(cfg=cfg, agent_id=aid)
+        if thread_session_key and thread_session_key in store:
+            return store[thread_session_key]
+        if main_key in store:
+            return store[main_key]
+    except Exception:
+        pass
     return None
 
 
+def _resolve_from_session_entry(
+    entry: dict[str, Any],
+    requested_channel: str,
+    explicit_to: str | None,
+    allow_mismatched_last_to: bool,
+) -> DeliveryTarget:
+    """Extract channel/to/threadId from a session store entry."""
+    last_channel = (entry.get("lastChannel") or "").strip().lower() or None
+    last_to = (entry.get("lastTo") or "").strip() or None
+    thread_id_raw = entry.get("lastThreadId")
+
+    if requested_channel == "last":
+        channel = last_channel or DEFAULT_CHAT_CHANNEL
+        to = explicit_to or last_to
+        mode = "explicit" if explicit_to else "implicit"
+    else:
+        channel = requested_channel
+        to = explicit_to or (last_to if allow_mismatched_last_to else None)
+        mode = "explicit" if explicit_to else "implicit"
+
+    thread_id: str | int | None = None
+    if thread_id_raw is not None:
+        try:
+            thread_id = int(thread_id_raw) if str(thread_id_raw).lstrip("-").isdigit() else str(thread_id_raw)
+        except Exception:
+            thread_id = str(thread_id_raw)
+
+    # Only carry thread_id when explicitly set or delivering to same recipient
+    carry_thread = thread_id is not None and (
+        entry.get("lastThreadIdExplicit")
+        or (to is not None and to == last_to)
+    )
+
+    return DeliveryTarget(
+        channel=channel or DEFAULT_CHAT_CHANNEL,
+        to=to,
+        thread_id=thread_id if carry_thread else None,
+        mode=mode,
+    )
+
+
+def _try_resolve_account_id(
+    target: DeliveryTarget,
+    cfg: Any,
+    agent_id: str | None,
+) -> None:
+    """Resolve account_id from agent channel bindings if not already set.
+
+    Mirrors TS buildChannelAccountBindings fallback in delivery-target.ts.
+    """
+    if target.account_id or not cfg or not agent_id or not target.channel:
+        return
+    try:
+        from openclaw.routing.bindings import build_channel_account_bindings
+        from openclaw.routing.session_key import normalize_agent_id
+        bindings = build_channel_account_bindings(cfg)
+        by_agent = bindings.get(target.channel)
+        if by_agent:
+            bound = by_agent.get(normalize_agent_id(agent_id))
+            if bound and len(bound) > 0:
+                target.account_id = bound[0]
+    except Exception:
+        pass
+
+
+def _try_validate_outbound(target: DeliveryTarget, cfg: Any) -> None:
+    """Validate/dock the outbound target via resolveOutboundTarget.
+
+    Mirrors TS resolveOutboundTarget call in delivery-target.ts (lines 115-128).
+    Sets target.error if docking fails.
+    """
+    if not target.to or not cfg:
+        return
+    try:
+        from openclaw.infra.outbound.targets import resolve_outbound_target
+        result = resolve_outbound_target(
+            channel=target.channel,
+            to=target.to,
+            cfg=cfg,
+            account_id=target.account_id,
+            mode=target.mode,
+        )
+        if not result.get("ok"):
+            err_msg = result.get("error") or "outbound target validation failed"
+            target.error = ValueError(err_msg)
+            target.to = None
+        else:
+            target.to = result.get("to") or target.to
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# deliver_result – higher-level delivery function (unchanged interface)
+# ---------------------------------------------------------------------------
+
 async def deliver_result(
-    job: CronJob,
+    job: "CronJob",
     result: dict[str, Any],
     get_channel_manager: Any = None,
-    channel_registry: dict[str, BaseChannel] | None = None,
+    channel_registry: dict[str, "BaseChannel"] | None = None,
     session_history: list[dict[str, Any]] | None = None,
+    *,
+    cfg: Any = None,
+    agent_id: str | None = None,
 ) -> bool:
-    """
-    Deliver isolated agent result to channel
-    
+    """Deliver isolated agent result to channel.
+
     Args:
-        job: Cron job
-        result: Execution result
-        get_channel_manager: Function to get channel manager (preferred)
-        channel_registry: Registry of available channels (legacy)
-        session_history: Session history for resolving "last" channel
-        
+        job: Cron job.
+        result: Execution result dict.
+        get_channel_manager: Optional callable returning channel manager.
+        channel_registry: Optional registry of active channels (legacy).
+        session_history: Optional session history for "last" channel resolution.
+        cfg: OpenClaw config (for session-store lookup).
+        agent_id: Agent identifier.
+
     Returns:
-        True if delivery succeeded
+        True if delivery succeeded or was not needed.
     """
     # Resolve channel registry from channel manager if provided
     if get_channel_manager is not None and channel_registry is None:
         try:
-            channel_manager = get_channel_manager()
-            if channel_manager and hasattr(channel_manager, '_channels'):
-                channel_registry = channel_manager._channels
+            cm = get_channel_manager()
+            if cm and hasattr(cm, "_channels"):
+                channel_registry = cm._channels
         except Exception as e:
-            logger.warning(f"Failed to get channel registry from manager: {e}")
+            logger.warning("cron delivery: failed to get channel registry: %s", e)
+
     if not job.delivery:
-        logger.debug("No delivery configuration")
-        return True  # No delivery needed = success
-    
+        logger.debug("cron delivery: no delivery configuration")
+        return True
+
     # Check if agent already sent via messaging tool
     if result.get("self_sent", False):
-        logger.info("Agent already sent message via messaging tool")
+        logger.info("cron delivery: agent already sent via messaging tool")
         return True
-    
+
     # Resolve target
-    target = await resolve_delivery_target(job, session_history)
-    
-    if not target:
-        if job.delivery.best_effort:
-            logger.warning("Could not resolve delivery target (best effort mode)")
-            return True
+    target = await resolve_delivery_target(
+        job, session_history, cfg=cfg, agent_id=agent_id
+    )
+
+    if not target.to:
+        if target.error:
+            msg = str(target.error)
         else:
-            logger.error("Could not resolve delivery target")
-            return False
-    
-    # Get channel
-    if not channel_registry:
-        logger.error("No channel registry available")
+            msg = "could not resolve delivery target"
+        delivery_obj = job.delivery
+        if getattr(delivery_obj, "best_effort", False):
+            logger.warning("cron delivery: %s (best effort)", msg)
+            return True
+        logger.error("cron delivery: %s", msg)
         return False
-    
+
+    if not channel_registry:
+        logger.error("cron delivery: no channel registry available")
+        return False
+
     channel = channel_registry.get(target.channel)
-    
+
     if not channel:
-        error_msg = f"Channel '{target.channel}' not found"
-        if job.delivery.best_effort:
-            logger.warning(f"{error_msg} (best effort mode)")
+        error_msg = f"channel '{target.channel}' not found"
+        if getattr(job.delivery, "best_effort", False):
+            logger.warning("cron delivery: %s (best effort)", error_msg)
             return True
-        else:
-            logger.error(error_msg)
-            return False
-    
-    # Check if channel is running
+        logger.error("cron delivery: %s", error_msg)
+        return False
+
     if not channel.is_running():
-        error_msg = f"Channel '{target.channel}' is not running"
-        if job.delivery.best_effort:
-            logger.warning(f"{error_msg} (best effort mode)")
+        error_msg = f"channel '{target.channel}' is not running"
+        if getattr(job.delivery, "best_effort", False):
+            logger.warning("cron delivery: %s (best effort)", error_msg)
             return True
-        else:
-            logger.error(error_msg)
-            return False
-    
+        logger.error("cron delivery: %s", error_msg)
+        return False
+
     # Prepare message
-    if not result.get("success"):
-        # Delivery failed result
+    if not result.get("success") and result.get("error"):
         error = result.get("error", "Unknown error")
-        message = f"⚠️ Cron job '{job.name}' failed:\n\n{error}"
+        message = f"\u26a0\ufe0f Cron job '{job.name}' failed:\n\n{error}"
     else:
-        # Delivery successful result
-        summary = result.get("summary", "")
+        summary = result.get("summary", "") or result.get("full_response", "")
         if not summary:
-            summary = result.get("full_response", "")
-        
-        if not summary:
-            logger.warning("No content to deliver")
+            logger.warning("cron delivery: no content to deliver")
             return True
-        
-        message = f"🤖 **{job.name}**\n\n{summary}"
-    
-    # Deliver
+        message = f"\U0001f916 **{job.name}**\n\n{summary}"
+
     try:
-        logger.info(f"Delivering to {target.channel}:{target.target_id}")
-        
-        await channel.send_text(target.target_id, message)
-        
-        logger.info("Delivery succeeded")
+        logger.info("cron delivery: sending to %s:%s", target.channel, target.to)
+        await channel.send_text(target.to, message)
+        logger.info("cron delivery: succeeded")
         return True
-        
     except Exception as e:
-        error_msg = f"Delivery failed: {e}"
-        
-        if job.delivery.best_effort:
-            logger.warning(f"{error_msg} (best effort mode)", exc_info=True)
+        error_msg = f"delivery failed: {e}"
+        if getattr(job.delivery, "best_effort", False):
+            logger.warning("cron delivery: %s (best effort)", error_msg, exc_info=True)
             return True
-        else:
-            logger.error(error_msg, exc_info=True)
-            return False
+        logger.error("cron delivery: %s", error_msg, exc_info=True)
+        return False
 
 
-def format_delivery_message(job: CronJob, result: dict[str, Any]) -> str:
-    """
-    Format delivery message
-    
-    Args:
-        job: Cron job
-        result: Execution result
-        
-    Returns:
-        Formatted message
-    """
-    if not result.get("success"):
+def format_delivery_message(job: "CronJob", result: dict[str, Any]) -> str:
+    """Format a delivery message string for a cron job result."""
+    if not result.get("success") and result.get("error"):
         error = result.get("error", "Unknown error")
-        return f"⚠️ Cron job '{job.name}' failed:\n\n{error}"
-    
-    summary = result.get("summary", "")
-    if not summary:
-        summary = result.get("full_response", "No response")
-    
-    # Add emoji based on job type
-    emoji = "🤖"
-    if "reminder" in job.name.lower():
-        emoji = "⏰"
-    elif "alert" in job.name.lower():
-        emoji = "🔔"
-    elif "report" in job.name.lower():
-        emoji = "📊"
-    
+        return f"\u26a0\ufe0f Cron job '{job.name}' failed:\n\n{error}"
+
+    summary = result.get("summary") or result.get("full_response") or "No response"
+
+    emoji = "\U0001f916"
+    name_lower = (job.name or "").lower()
+    if "reminder" in name_lower:
+        emoji = "\u23f0\ufe0f"
+    elif "alert" in name_lower:
+        emoji = "\U0001f514"
+    elif "report" in name_lower:
+        emoji = "\U0001f4ca"
+
     return f"{emoji} **{job.name}**\n\n{summary}"

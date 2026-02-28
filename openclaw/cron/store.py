@@ -351,7 +351,14 @@ class CronRunLog:
             logger.error(f"cron: run log prune error: {e}", exc_info=True)
 
     def read(self, limit: int | None = None, job_id: str | None = None) -> list[dict[str, Any]]:
-        """Read entries reverse-chronological (newest first). Matches TS readCronRunLogEntries."""
+        """Read entries reverse-chronological (newest first). Matches TS readCronRunLogEntries.
+
+        Validates and normalizes fields to match TS schema exactly:
+        - Required: action=="finished", jobId (non-empty string), ts (finite number)
+        - Telemetry: model, provider (non-empty strings only)
+        - Usage: input_tokens, output_tokens, total_tokens, cache_read_tokens,
+          cache_write_tokens (numbers only, others dropped)
+        """
         if not self.log_path.exists():
             return []
         try:
@@ -388,11 +395,61 @@ class CronRunLog:
             if not isinstance(job_id_val, str) or not job_id_val.strip():
                 continue
             ts_val = obj.get("ts")
-            if not isinstance(ts_val, (int, float)) or not (ts_val == ts_val):  # nan check
+            # Reject non-finite values (mirrors TS Number.isFinite check)
+            if not isinstance(ts_val, (int, float)) or ts_val != ts_val:  # nan check
+                continue
+            import math as _math
+            if not _math.isfinite(float(ts_val)):
                 continue
             if filter_job_id and job_id_val != filter_job_id:
                 continue
-            parsed.append(obj)
+
+            # Normalize telemetry fields (mirrors TS readCronRunLogEntries normalization)
+            entry: dict[str, Any] = {
+                "ts": ts_val,
+                "jobId": job_id_val,
+                "action": "finished",
+                "status": obj.get("status"),
+                "error": obj.get("error"),
+                "summary": obj.get("summary"),
+                "runAtMs": obj.get("runAtMs"),
+                "durationMs": obj.get("durationMs"),
+                "nextRunAtMs": obj.get("nextRunAtMs"),
+            }
+
+            # model / provider: only include non-empty strings
+            model_val = obj.get("model")
+            if isinstance(model_val, str) and model_val.strip():
+                entry["model"] = model_val
+
+            provider_val = obj.get("provider")
+            if isinstance(provider_val, str) and provider_val.strip():
+                entry["provider"] = provider_val
+
+            # sessionId / sessionKey
+            session_id_val = obj.get("sessionId")
+            if isinstance(session_id_val, str) and session_id_val.strip():
+                entry["sessionId"] = session_id_val
+
+            session_key_val = obj.get("sessionKey")
+            if isinstance(session_key_val, str) and session_key_val.strip():
+                entry["sessionKey"] = session_key_val
+
+            # usage: normalize sub-fields (mirrors TS usage normalization block)
+            raw_usage = obj.get("usage")
+            if raw_usage and isinstance(raw_usage, dict):
+                normalized_usage: dict[str, Any] = {}
+                for token_key in (
+                    "input_tokens", "output_tokens", "total_tokens",
+                    "cache_read_tokens", "cache_write_tokens",
+                ):
+                    v = raw_usage.get(token_key)
+                    if isinstance(v, (int, float)) and v == v:  # not nan
+                        normalized_usage[token_key] = v
+                if normalized_usage:
+                    entry["usage"] = normalized_usage
+
+            parsed.append(entry)
 
         # parsed is newest-first; return as-is (reverse-chronological)
         return parsed

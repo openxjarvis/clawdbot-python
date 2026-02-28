@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# pre-commit hook — lint and format staged Python files with ruff.
+# Mirrors: openclaw/git-hooks/pre-commit (oxlint + oxfmt → ruff check + ruff format)
+#
+# Install:
+#   cp git-hooks/pre-commit .git/hooks/pre-commit
+#   chmod +x .git/hooks/pre-commit
+# Or use with pre-commit framework:
+#   pip install pre-commit && pre-commit install
+
+set -euo pipefail
+
+# Collect staged Python/config files (NUL-delimited for safety)
+files=()
+while IFS= read -r -d '' file; do
+  files+=("$file")
+done < <(git diff --cached --name-only --diff-filter=ACMR -z)
+
+if [ "${#files[@]}" -eq 0 ]; then
+  exit 0
+fi
+
+# Filter to only .py files
+py_files=()
+for f in "${files[@]}"; do
+  case "$f" in
+    *.py) py_files+=("$f") ;;
+  esac
+done
+
+if [ "${#py_files[@]}" -eq 0 ]; then
+  exit 0
+fi
+
+# Ensure ruff is available
+if ! command -v ruff &>/dev/null; then
+  if command -v uv &>/dev/null; then
+    # Try via uv run
+    RUFF_CMD="uv run ruff"
+  else
+    echo "pre-commit: ruff not found. Install with: pip install ruff" >&2
+    exit 1
+  fi
+else
+  RUFF_CMD="ruff"
+fi
+
+# 1. Lint with auto-fix (mirrors oxlint --fix)
+$RUFF_CMD check --fix -- "${py_files[@]}" || {
+  echo "pre-commit: ruff check failed. Fix the above errors and try again." >&2
+  exit 1
+}
+
+# 2. Format (mirrors oxfmt --write)
+$RUFF_CMD format -- "${py_files[@]}"
+
+# Re-stage any files that ruff modified
+git add -- "${py_files[@]}"

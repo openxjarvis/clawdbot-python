@@ -9,14 +9,14 @@ import pytest
 
 
 @pytest.mark.performance
-async def test_concurrent_sessions():
+async def test_concurrent_sessions(tmp_path):
     """Test handling 100 concurrent sessions"""
     from openclaw.agents.session import SessionManager
-    
-    session_manager = SessionManager(agent_id="main")
-    
+
+    session_manager = SessionManager(agent_id="main", base_dir=tmp_path)
+
     start_time = time.time()
-    
+
     # Create 100 concurrent sessions
     sessions = []
     for i in range(100):
@@ -27,13 +27,13 @@ async def test_concurrent_sessions():
             peer_id=f"user_{i}"
         )
         sessions.append(session)
-    
+
     duration = time.time() - start_time
-    
+
     # Should create 100 sessions quickly
     assert len(sessions) == 100
     assert duration < 1.0  # Less than 1 second
-    
+
     print(f"\n✓ Created 100 sessions in {duration:.3f}s ({100/duration:.1f} sessions/sec)")
 
 

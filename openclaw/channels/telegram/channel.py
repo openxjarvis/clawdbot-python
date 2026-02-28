@@ -1,31 +1,47 @@
 """Telegram channel implementation"""
 from __future__ import annotations
 
-
 import asyncio
 import logging
 from datetime import UTC, datetime, timezone
 from typing import Any, Optional
 
-from telegram import Update, BotCommand, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, ContextTypes, MessageHandler, CommandHandler, CallbackQueryHandler, MessageReactionHandler, filters
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    MessageReactionHandler,
+    filters,
+)
 
-from ..chat_commands import ChatCommandExecutor, ChatCommandParser
 from ..base import ChannelCapabilities, ChannelPlugin, InboundMessage
+from ..chat_commands import ChatCommandExecutor, ChatCommandParser
+from .commands_extended import (
+    register_extended_commands,  # noqa: F401 – kept for backward compat, not used directly
+)
 from .i18n_support import register_lang_handlers
-from .commands_extended import register_extended_commands  # noqa: F401 – kept for backward compat, not used directly
+from .sent_message_cache import record_sent_message, was_sent_by_bot
+from .sticker_cache import (
+    CachedSticker,
+    cache_sticker,
+    describe_sticker_image,
+    get_cached_sticker,
+)
+from .update_dedupe import TelegramUpdateDedupe, callback_key, message_key, update_key
 from .update_offset_store import (
     read_telegram_update_offset,
     write_telegram_update_offset,
 )
-from .update_dedupe import TelegramUpdateDedupe, update_key, message_key, callback_key
-from .sticker_cache import (
-    cache_sticker,
-    get_cached_sticker,
-    describe_sticker_image,
-    CachedSticker,
-)
-from .sent_message_cache import record_sent_message, was_sent_by_bot
 
 logger = logging.getLogger(__name__)
 
@@ -57,25 +73,26 @@ class TelegramChannel(ChannelPlugin):
         )
         self._app: Application | None = None
         self._bot_token: str | None = None
-        self._command_parser: Optional[ChatCommandParser] = None
-        self._command_executor: Optional[ChatCommandExecutor] = None
-        self._owner_id: Optional[str] = None
-        self._config: Optional[dict] = None
+        self._command_parser: ChatCommandParser | None = None
+        self._command_executor: ChatCommandExecutor | None = None
+        self._owner_id: str | None = None
+        self._config: dict | None = None
         self._cfg: dict[str, Any] = {}
-        self._account_id: Optional[str] = None
+        self._account_id: str | None = None
         self._agent_runtime: Any = None
         self._session_manager: Any = None
         self._dedupe = TelegramUpdateDedupe()
         self._conflict_backoff = _CONFLICT_BACKOFF_INITIAL
-        self._conflict_retry_task: Optional[asyncio.Task] = None
-        
+        self._conflict_retry_task: asyncio.Task | None = None
+        self._conflict_recovery_in_progress: bool = False
+
         # Media group buffering (albums)
         self._media_group_buffer: dict[str, dict] = {}
-        self._media_group_processing: Optional[asyncio.Task] = None
-        
+        self._media_group_processing: asyncio.Task | None = None
+
         # Text fragment buffering (long messages split by Telegram)
         self._text_fragment_buffer: dict[str, dict] = {}
-        self._text_fragment_processing: Optional[asyncio.Task] = None
+        self._text_fragment_processing: asyncio.Task | None = None
 
         if bot_token is not None:
             if not bot_token:
@@ -218,7 +235,7 @@ class TelegramChannel(ChannelPlugin):
         self._app.add_handler(
             MessageHandler(filters.Document.ALL, self._handle_telegram_media)
         )
-        
+
         # Handle message reactions
         self._app.add_handler(
             MessageReactionHandler(self._handle_reaction_update)
@@ -227,7 +244,7 @@ class TelegramChannel(ChannelPlugin):
         # Start bot
         await self._app.initialize()
         await self._app.start()
-        
+
         # Get bot info after initialization
         bot_info = await self._app.bot.get_me()
         # Resolve account_id: use configured accountId if present, else "default" (matches TS resolveAccountId())
@@ -238,7 +255,7 @@ class TelegramChannel(ChannelPlugin):
         )
         account_id = str(cfg_account_id).strip() if cfg_account_id else ""
         logger.info(f"Bot initialized: @{bot_info.username} (account_id: {account_id})")
-        
+
         # Create a minimal config dict for command handler
         cmd_config = {
             "channels": {
@@ -256,7 +273,7 @@ class TelegramChannel(ChannelPlugin):
                 }
             }
         }
-        
+
         self._account_id = account_id
 
         # Register conflict/error handler for update-processing errors
@@ -271,7 +288,7 @@ class TelegramChannel(ChannelPlugin):
         # Register dynamic command handlers (all native commands from registry)
         # Must be after bot initialization so we have account_id and cfg
         await self._register_dynamic_command_handlers()
-        
+
         # Register bot commands with Telegram
         await self._register_bot_commands()
 
@@ -283,33 +300,9 @@ class TelegramChannel(ChannelPlugin):
         if saved_offset is not None:
             logger.info("Resuming from persisted update offset %d", saved_offset)
 
-        def _polling_error_cb(exc: Exception) -> None:
-            """Sync callback for Updater network_retry_loop errors — mirrors TS monitor.ts.
-
-            Called by PTB's internal polling loop on every TelegramError.
-            For Conflict (409) errors we schedule an async restart with backoff.
-            """
-            import telegram.error as tg_err
-            if isinstance(exc, tg_err.Conflict):
-                logger.warning(
-                    "Telegram Conflict (another bot instance is polling) — "
-                    "scheduling restart in %.1fs",
-                    self._conflict_backoff,
-                )
-                asyncio.get_event_loop().create_task(
-                    self._restart_polling_after_conflict()
-                )
-            elif isinstance(exc, tg_err.NetworkError):
-                logger.warning("Telegram network error (will auto-retry): %s", exc)
-            elif isinstance(exc, tg_err.TimedOut):
-                logger.debug("Telegram getUpdates timed out (will retry): %s", exc)
-            else:
-                logger.error("Telegram polling error: %s", exc)
-
         await self._app.updater.start_polling(
             allowed_updates=Update.ALL_TYPES,
             drop_pending_updates=False,  # We already dropped via delete_webhook
-            error_callback=_polling_error_cb,
         )
 
         self._running = True
@@ -318,6 +311,7 @@ class TelegramChannel(ChannelPlugin):
 
     async def stop(self) -> None:
         """Stop Telegram bot"""
+        self._conflict_recovery_in_progress = False
         if self._conflict_retry_task and not self._conflict_retry_task.done():
             self._conflict_retry_task.cancel()
         if self._app:
@@ -347,13 +341,18 @@ class TelegramChannel(ChannelPlugin):
             return
 
         if isinstance(exc, tg_err.Conflict):
+            if self._conflict_recovery_in_progress:
+                logger.debug("Telegram Conflict — recovery already in progress, skipping duplicate")
+                return
             logger.warning(
                 "Telegram Conflict (another bot instance is polling): %s — "
                 "retrying in %.1fs (backoff)",
                 exc,
                 self._conflict_backoff,
             )
-            # Schedule the restart; don't await here to avoid blocking PTB internals
+            # Cancel any previous retry task before scheduling a new one
+            if self._conflict_retry_task and not self._conflict_retry_task.done():
+                self._conflict_retry_task.cancel()
             self._conflict_retry_task = asyncio.create_task(
                 self._restart_polling_after_conflict()
             )
@@ -366,37 +365,44 @@ class TelegramChannel(ChannelPlugin):
 
     async def _restart_polling_after_conflict(self) -> None:
         """Stop polling, wait with exponential backoff, then resume."""
-        wait = self._conflict_backoff
-        # Increase backoff for the next conflict (capped)
-        self._conflict_backoff = min(
-            self._conflict_backoff * _CONFLICT_BACKOFF_FACTOR,
-            _CONFLICT_BACKOFF_MAX,
-        )
-        logger.info("Pausing polling for %.1fs before restart", wait)
-        await asyncio.sleep(wait)
-
-        if not self._running or self._app is None:
+        if self._conflict_recovery_in_progress:
             return
-
+        self._conflict_recovery_in_progress = True
         try:
-            await self._app.updater.stop()
-        except Exception as exc:
-            logger.debug("Updater stop during conflict recovery: %s", exc)
+            wait = self._conflict_backoff
+            # Increase backoff for the next conflict (capped)
+            self._conflict_backoff = min(
+                self._conflict_backoff * _CONFLICT_BACKOFF_FACTOR,
+                _CONFLICT_BACKOFF_MAX,
+            )
+            logger.info("Pausing polling for %.1fs before restart", wait)
+            await asyncio.sleep(wait)
 
-        try:
-            await self._app.updater.start_polling(
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=False,
-            )
-            # Reset backoff on successful restart
-            self._conflict_backoff = _CONFLICT_BACKOFF_INITIAL
-            logger.info("Polling restarted after conflict backoff")
-        except Exception as exc:
-            logger.error("Failed to restart polling: %s", exc)
-            # Schedule another retry
-            self._conflict_retry_task = asyncio.create_task(
-                self._restart_polling_after_conflict()
-            )
+            if not self._running or self._app is None:
+                return
+
+            try:
+                await self._app.updater.stop()
+            except Exception as exc:
+                logger.debug("Updater stop during conflict recovery: %s", exc)
+
+            try:
+                await self._app.updater.start_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=False,
+                )
+                # Reset backoff on successful restart
+                self._conflict_backoff = _CONFLICT_BACKOFF_INITIAL
+                logger.info("Polling restarted after conflict backoff")
+            except Exception as exc:
+                logger.error("Failed to restart polling: %s", exc)
+                self._conflict_recovery_in_progress = False
+                # Schedule another retry
+                self._conflict_retry_task = asyncio.create_task(
+                    self._restart_polling_after_conflict()
+                )
+        finally:
+            self._conflict_recovery_in_progress = False
 
     async def send_typing(self, target: str) -> None:
         """Send a 'typing…' chat action to show the bot is processing."""
@@ -419,13 +425,16 @@ class TelegramChannel(ChannelPlugin):
     ) -> None:
         """Fire internal hook for message:sent (fire-and-forget)."""
         import asyncio
-        
+
         if not session_key:
             return
-        
+
         try:
-            from openclaw.hooks.internal_hooks import create_internal_hook_event, trigger_internal_hook
-            
+            from openclaw.hooks.internal_hooks import (
+                create_internal_hook_event,
+                trigger_internal_hook,
+            )
+
             context = {
                 "to": to,
                 "content": content,
@@ -437,24 +446,24 @@ class TelegramChannel(ChannelPlugin):
                 "conversationId": to,
                 "conversation_id": to,
             }
-            
+
             if message_id:
                 context["messageId"] = message_id
                 context["message_id"] = message_id
-            
+
             if error:
                 context["error"] = error
-            
+
             hook_event = create_internal_hook_event(
                 "message",
                 "sent",
                 session_key,
                 context
             )
-            
+
             async def _trigger():
                 await trigger_internal_hook(hook_event)
-            
+
             try:
                 loop = asyncio.get_event_loop()
                 if loop.is_running():
@@ -474,7 +483,7 @@ class TelegramChannel(ChannelPlugin):
         success = False
         error_msg = None
         message_id = None
-        
+
         try:
             # Parse target (chat_id)
             chat_id = int(target) if target.lstrip("-").isdigit() else target
@@ -483,8 +492,8 @@ class TelegramChannel(ChannelPlugin):
             # Try Markdown first, fallback to plain text if parsing fails
             try:
                 message = await self._app.bot.send_message(
-                    chat_id=chat_id, 
-                    text=text, 
+                    chat_id=chat_id,
+                    text=text,
                     reply_to_message_id=int(reply_to) if reply_to else None,
                     parse_mode="Markdown"
                 )
@@ -492,17 +501,17 @@ class TelegramChannel(ChannelPlugin):
                 logger.debug(f"Markdown parsing failed, sending as plain text: {markdown_error}")
                 # Fallback to plain text
                 message = await self._app.bot.send_message(
-                    chat_id=chat_id, 
-                    text=text, 
+                    chat_id=chat_id,
+                    text=text,
                     reply_to_message_id=int(reply_to) if reply_to else None
                 )
-            
+
             # Record sent message for reaction tracking
             record_sent_message(chat_id, message.message_id)
-            
+
             message_id = str(message.message_id)
             success = True
-            
+
             # Trigger message:sent hook
             self._fire_message_sent_hook(
                 to=target,
@@ -517,7 +526,7 @@ class TelegramChannel(ChannelPlugin):
         except Exception as e:
             error_msg = str(e)
             logger.error(f"Failed to send Telegram message: {e}", exc_info=True)
-            
+
             # Trigger message:sent hook for failure
             self._fire_message_sent_hook(
                 to=target,
@@ -526,7 +535,7 @@ class TelegramChannel(ChannelPlugin):
                 error=error_msg,
                 session_key=session_key,
             )
-            
+
             raise
 
     async def send_photo(
@@ -566,10 +575,10 @@ class TelegramChannel(ChannelPlugin):
                 reply_to_message_id=int(reply_to) if reply_to else None,
                 reply_markup=keyboard,
             )
-            
+
             # Record sent message for reaction tracking
             record_sent_message(resolved_chat_id, message.message_id)
-            
+
             return str(message.message_id)
         except Exception as e:
             logger.error(f"Failed to send photo: {e}")
@@ -582,9 +591,9 @@ class TelegramChannel(ChannelPlugin):
         """Send video message"""
         if not self._app:
             raise RuntimeError("Telegram channel not started")
-        
+
         chat_id = int(target) if target.lstrip("-").isdigit() else target
-        
+
         try:
             message = await self._app.bot.send_video(
                 chat_id=chat_id,
@@ -594,10 +603,10 @@ class TelegramChannel(ChannelPlugin):
                 reply_to_message_id=int(reply_to) if reply_to else None,
                 reply_markup=keyboard
             )
-            
+
             # Record sent message for reaction tracking
             record_sent_message(chat_id, message.message_id)
-            
+
             return str(message.message_id)
         except Exception as e:
             logger.error(f"Failed to send video: {e}")
@@ -610,9 +619,9 @@ class TelegramChannel(ChannelPlugin):
         """Send document/file message"""
         if not self._app:
             raise RuntimeError("Telegram channel not started")
-        
+
         chat_id = int(target) if target.lstrip("-").isdigit() else target
-        
+
         try:
             message = await self._app.bot.send_document(
                 chat_id=chat_id,
@@ -622,10 +631,10 @@ class TelegramChannel(ChannelPlugin):
                 reply_to_message_id=int(reply_to) if reply_to else None,
                 reply_markup=keyboard
             )
-            
+
             # Record sent message for reaction tracking
             record_sent_message(chat_id, message.message_id)
-            
+
             return str(message.message_id)
         except Exception as e:
             logger.error(f"Failed to send document: {e}")
@@ -638,9 +647,9 @@ class TelegramChannel(ChannelPlugin):
         """Send audio message"""
         if not self._app:
             raise RuntimeError("Telegram channel not started")
-        
+
         chat_id = int(target) if target.lstrip("-").isdigit() else target
-        
+
         try:
             message = await self._app.bot.send_audio(
                 chat_id=chat_id,
@@ -649,10 +658,10 @@ class TelegramChannel(ChannelPlugin):
                 parse_mode="Markdown" if caption else None,
                 reply_to_message_id=int(reply_to) if reply_to else None
             )
-            
+
             # Record sent message for reaction tracking
             record_sent_message(chat_id, message.message_id)
-            
+
             return str(message.message_id)
         except Exception as e:
             logger.error(f"Failed to send audio: {e}")
@@ -665,9 +674,9 @@ class TelegramChannel(ChannelPlugin):
         """Send location message"""
         if not self._app:
             raise RuntimeError("Telegram channel not started")
-        
+
         chat_id = int(target) if target.lstrip("-").isdigit() else target
-        
+
         try:
             message = await self._app.bot.send_location(
                 chat_id=chat_id,
@@ -675,10 +684,10 @@ class TelegramChannel(ChannelPlugin):
                 longitude=longitude,
                 reply_to_message_id=int(reply_to) if reply_to else None
             )
-            
+
             # Record sent message for reaction tracking
             record_sent_message(chat_id, message.message_id)
-            
+
             return str(message.message_id)
         except Exception as e:
             logger.error(f"Failed to send location: {e}")
@@ -691,9 +700,9 @@ class TelegramChannel(ChannelPlugin):
         """Send poll message"""
         if not self._app:
             raise RuntimeError("Telegram channel not started")
-        
+
         chat_id = int(target) if target.lstrip("-").isdigit() else target
-        
+
         try:
             message = await self._app.bot.send_poll(
                 chat_id=chat_id,
@@ -702,10 +711,10 @@ class TelegramChannel(ChannelPlugin):
                 is_anonymous=is_anonymous,
                 reply_to_message_id=int(reply_to) if reply_to else None
             )
-            
+
             # Record sent message for reaction tracking
             record_sent_message(chat_id, message.message_id)
-            
+
             return str(message.message_id)
         except Exception as e:
             logger.error(f"Failed to send poll: {e}")
@@ -718,19 +727,19 @@ class TelegramChannel(ChannelPlugin):
         """Send dice/animation message (🎲🎯🏀⚽🎳🎰)"""
         if not self._app:
             raise RuntimeError("Telegram channel not started")
-        
+
         chat_id = int(target) if target.lstrip("-").isdigit() else target
-        
+
         try:
             message = await self._app.bot.send_dice(
                 chat_id=chat_id,
                 emoji=emoji,
                 reply_to_message_id=int(reply_to) if reply_to else None
             )
-            
+
             # Record sent message for reaction tracking
             record_sent_message(chat_id, message.message_id)
-            
+
             return str(message.message_id)
         except Exception as e:
             logger.error(f"Failed to send dice: {e}")
@@ -849,7 +858,7 @@ class TelegramChannel(ChannelPlugin):
 
             # Record sent message for reaction tracking
             record_sent_message(chat_id, msg.message_id)
-            
+
             # Send overflow caption as a follow-up text message
             if overflow_text:
                 overflow_msg = await self._app.bot.send_message(
@@ -888,7 +897,7 @@ class TelegramChannel(ChannelPlugin):
         if self._dedupe.should_skip(dedup_key):
             logger.debug("Skipping duplicate media message %s", message.message_id)
             return
-        
+
         # Media group handling (albums) - buffer multi-image messages
         media_group_id = getattr(message, "media_group_id", None)
         if media_group_id:
@@ -937,7 +946,7 @@ class TelegramChannel(ChannelPlugin):
                 file_id = message.sticker.file_id
                 file_name = f"sticker_{message.message_id}.webp"
                 mime_type = "image/webp"
-                
+
                 # Store sticker metadata for potential caching
                 sticker_metadata = {
                     "file_id": message.sticker.file_id,
@@ -964,9 +973,15 @@ class TelegramChannel(ChannelPlugin):
             import base64
             b64_content = base64.b64encode(bytes(file_bytes)).decode()
 
-            # Determine attachment type bucket (image vs file)
+            # Determine attachment type bucket
             is_image = (mime_type or "").startswith("image/")
-            attach_type = "image" if is_image else "file"
+            is_audio = media_type in ("voice", "audio") or (mime_type or "").startswith("audio/")
+            if is_image:
+                attach_type = "image"
+            elif is_audio:
+                attach_type = media_type or "audio"  # "voice" or "audio"
+            else:
+                attach_type = "file"
 
             attachment: dict = {
                 "type": attach_type,
@@ -980,7 +995,7 @@ class TelegramChannel(ChannelPlugin):
                 "Received %s: %s (%d bytes) from user %s",
                 media_type, file_name, file_size, sender.id,
             )
-            
+
             # Cache sticker if this is a static sticker
             if message.sticker and "sticker_metadata" in locals():
                 await self._cache_sticker_if_needed(
@@ -1049,7 +1064,7 @@ class TelegramChannel(ChannelPlugin):
         if self._dedupe.should_skip(dedup_key):
             logger.debug("Skipping duplicate text message %s", message.message_id)
             return
-        
+
         # Text fragment handling - buffer long messages split by Telegram
         text_fragment_id = self._detect_text_fragment(message)
         if text_fragment_id:
@@ -1066,16 +1081,16 @@ class TelegramChannel(ChannelPlugin):
         # Determine chat type first
         is_group = chat.type in ["group", "supergroup"]
         is_dm = not is_group
-        
+
         # DM Access Control - Check dm_policy for direct messages
         if is_dm and self._config:
             dm_policy = self._config.get("dmPolicy") or self._config.get("dm_policy") or "pairing"
-            
+
             # Handle disabled DM
             if dm_policy == "disabled":
                 logger.info(f"DM from {sender.id} blocked by dm_policy=disabled")
                 return
-            
+
             # Handle pairing and allowlist modes
             if dm_policy in ["pairing", "allowlist"]:
                 # Check if sender is allowed
@@ -1084,7 +1099,7 @@ class TelegramChannel(ChannelPlugin):
                     username=sender.username,
                     dm_policy=dm_policy
                 )
-                
+
                 if not is_allowed:
                     # For pairing mode, create pairing request
                     if dm_policy == "pairing":
@@ -1096,15 +1111,20 @@ class TelegramChannel(ChannelPlugin):
 
         # Process as normal message
         await self._process_normal_text_message(message, update, context)
-    
+
     async def _register_dynamic_command_handlers(self) -> None:
         """Register all native command handlers dynamically (mirrors TS bot-native-commands.ts:438-647)."""
         try:
-            from openclaw.auto_reply.commands_registry_data import list_native_command_specs_for_config
+            from openclaw.auto_reply.commands_registry_data import (
+                list_native_command_specs_for_config,
+            )
             from openclaw.auto_reply.skill_commands import list_skill_commands_for_agents
-            from openclaw.channels.telegram.commands import normalize_telegram_command_name, TELEGRAM_COMMAND_NAME_PATTERN
             from openclaw.channels.telegram.command_pipeline import handle_native_command
-            
+            from openclaw.channels.telegram.commands import (
+                TELEGRAM_COMMAND_NAME_PATTERN,
+                normalize_telegram_command_name,
+            )
+
             # Get skill commands if enabled
             skill_commands = []
             try:
@@ -1112,28 +1132,28 @@ class TelegramChannel(ChannelPlugin):
                 logger.info(f"Loaded {len(skill_commands)} skill commands for registration")
             except Exception as exc:
                 logger.warning(f"Failed to load skill commands: {exc}")
-            
+
             # Get all native commands from registry
             native_specs = list_native_command_specs_for_config(
                 self._cfg,
                 skill_commands,
                 provider="telegram"
             )
-            
+
             logger.info(f"Registering {len(native_specs)} native command handlers dynamically")
-            
+
             # Register handler for each command
             registered_count = 0
             for spec in native_specs:
                 name = spec.name or spec.native_name
                 if not name:
                     continue
-                
+
                 normalized = normalize_telegram_command_name(name)
                 if not TELEGRAM_COMMAND_NAME_PATTERN.match(normalized):
                     logger.warning(f"Skipping invalid command name: {normalized}")
                     continue
-                
+
                 # Create handler closure that captures the spec
                 async def create_command_handler(command_spec):
                     async def command_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1148,14 +1168,14 @@ class TelegramChannel(ChannelPlugin):
                             channel_id=self.id,
                         )
                     return command_handler
-                
+
                 handler = await create_command_handler(spec)
                 self._app.add_handler(CommandHandler(normalized, handler))
                 registered_count += 1
                 logger.debug(f"Registered command handler: /{normalized}")
-            
+
             logger.info(f"Successfully registered {registered_count} command handlers")
-        
+
         except Exception as exc:
             logger.error(f"Failed to register dynamic command handlers: {exc}")
             # Fallback to minimal hardcoded handlers
@@ -1195,17 +1215,17 @@ class TelegramChannel(ChannelPlugin):
             )
         except Exception as e:
             logger.error(f"Failed to register commands with Telegram API: {e}")
-            
+
             # Fallback to minimal hardcoded commands
             try:
                 from telegram import BotCommand
-                
+
                 minimal_commands = [
                     BotCommand("start", "Start using the bot"),
                     BotCommand("help", "View help information"),
                     BotCommand("status", "View status"),
                 ]
-                
+
                 await self._app.bot.set_my_commands(minimal_commands)
                 logger.info("Registered minimal fallback commands")
             except Exception as fallback_err:
@@ -1226,7 +1246,7 @@ class TelegramChannel(ChannelPlugin):
             [KeyboardButton("❓ Help"), KeyboardButton("🤖 Switch Model")],
         ]
         return ReplyKeyboardMarkup(
-            keyboard, 
+            keyboard,
             resize_keyboard=True,
             one_time_keyboard=False
         )
@@ -1242,7 +1262,7 @@ class TelegramChannel(ChannelPlugin):
             "• 🛠️ Execute various tasks\n\n"
             "Send any message to start a conversation, or use /help to see more commands."
         )
-        
+
         # Send welcome message with quick reply keyboard
         await update.message.reply_text(
             welcome_message,
@@ -1265,7 +1285,7 @@ class TelegramChannel(ChannelPlugin):
             "• Multi-turn conversation supported\n\n"
             "_Need help? Visit documentation or contact support team._"
         )
-        
+
         await update.message.reply_text(
             help_message,
             parse_mode="Markdown"
@@ -1274,7 +1294,7 @@ class TelegramChannel(ChannelPlugin):
     async def _handle_new_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /new command - start new conversation"""
         user_id = update.effective_user.id
-        
+
         # Create inline keyboard for confirmation
         keyboard = [
             [
@@ -1283,7 +1303,7 @@ class TelegramChannel(ChannelPlugin):
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        
+
         await update.message.reply_text(
             "🆕 *Start New Conversation*\n\n"
             "This will clear the current conversation history.\n"
@@ -1291,27 +1311,27 @@ class TelegramChannel(ChannelPlugin):
             parse_mode="Markdown",
             reply_markup=reply_markup
         )
-    
+
     async def _handle_reset_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /reset command - reset session (clear transcript)"""
         try:
             # Build session key from chat info
             chat_id = update.effective_chat.id
             chat_type = update.effective_chat.type
-            
+
             # Construct session key matching gateway format
             # Format: {channel}:{account_id}:{scope}:{id}
             if chat_type == "private":
                 session_key = f"telegram:{self.id}:dm:main:{chat_id}"
             else:
                 session_key = f"telegram:{self.id}:group:{chat_id}"
-            
+
             logger.info(f"[{self.id}] Reset requested for session: {session_key}")
-            
+
             # Call gateway sessions.reset method
             try:
                 from openclaw.gateway.api.sessions_methods import SessionsResetMethod
-                
+
                 reset_method = SessionsResetMethod()
                 result = await reset_method.execute(
                     connection=None,
@@ -1320,7 +1340,7 @@ class TelegramChannel(ChannelPlugin):
                         "archiveTranscript": True  # Archive old transcript
                     }
                 )
-                
+
                 if result.get("ok"):
                     new_session_id = result.get("sessionId", "unknown")
                     message = (
@@ -1333,7 +1353,7 @@ class TelegramChannel(ChannelPlugin):
                 else:
                     message = "⚠️ **Reset Partial**\n\nSession was reset, but something went wrong."
                     logger.warning(f"[{self.id}] Session reset returned non-ok result")
-                    
+
             except Exception as reset_err:
                 logger.error(f"[{self.id}] Failed to reset session via API: {reset_err}")
                 message = (
@@ -1341,9 +1361,9 @@ class TelegramChannel(ChannelPlugin):
                     "Unable to reset session. Please try again or contact support.\n"
                     f"Error: `{str(reset_err)[:100]}`"
                 )
-            
+
             await update.message.reply_text(message, parse_mode="Markdown")
-            
+
         except Exception as e:
             logger.error(f"[{self.id}] Error handling reset command: {e}")
             await update.message.reply_text(
@@ -1355,7 +1375,7 @@ class TelegramChannel(ChannelPlugin):
         """Handle /status command"""
         # Get current model from config
         current_model = self._config.get("model", "google/gemini-3-pro-preview") if self._config else "unknown"
-        
+
         status_message = (
             "📊 *Bot Status*\n\n"
             f"🤖 Current Model: `{current_model}`\n"
@@ -1364,7 +1384,7 @@ class TelegramChannel(ChannelPlugin):
             f"📡 Connection: Normal\n\n"
             "_System running normally_"
         )
-        
+
         await update.message.reply_text(
             status_message,
             parse_mode="Markdown"
@@ -1373,7 +1393,7 @@ class TelegramChannel(ChannelPlugin):
     async def _handle_model_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /model command - show model selection"""
         current_model = self._config.get("model", "google/gemini-3-pro-preview") if self._config else "unknown"
-        
+
         keyboard = [
             [InlineKeyboardButton("🌟 Gemini Pro (Current)", callback_data="model_gemini")],
             [InlineKeyboardButton("🧠 Claude Sonnet", callback_data="model_claude")],
@@ -1381,7 +1401,7 @@ class TelegramChannel(ChannelPlugin):
             [InlineKeyboardButton("🔥 GPT-4 Turbo", callback_data="model_gpt4turbo")],
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        
+
         await update.message.reply_text(
             f"🤖 *Select AI Model*\n\n"
             f"Current Model: `{current_model}`\n\n"
@@ -1393,13 +1413,13 @@ class TelegramChannel(ChannelPlugin):
     async def _handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle callback queries from inline keyboards"""
         from telegram.error import BadRequest
-        
+
         query = update.callback_query
         await query.answer()
-        
+
         data = query.data
         logger.info(f"Callback query: {data}")
-        
+
         if data == "new_confirm":
             # Clear conversation history (implement this in session manager)
             try:
@@ -1414,7 +1434,7 @@ class TelegramChannel(ChannelPlugin):
                     logger.debug(f"Message already shows correct state for {data}")
                 else:
                     raise
-        
+
         elif data == "new_cancel":
             try:
                 await query.edit_message_text(
@@ -1426,7 +1446,7 @@ class TelegramChannel(ChannelPlugin):
                     logger.debug(f"Message already shows correct state for {data}")
                 else:
                     raise
-        
+
         elif data.startswith("model_"):
             model_name = data.replace("model_", "")
             model_map = {
@@ -1435,13 +1455,13 @@ class TelegramChannel(ChannelPlugin):
                 "gpt4": ("gpt-4", "GPT-4"),
                 "gpt4turbo": ("gpt-4-turbo", "GPT-4 Turbo"),
             }
-            
+
             if model_name in model_map:
                 model_id, display_name = model_map[model_name]
                 # Update config (this would need to be persisted)
                 if self._config:
                     self._config["model"] = model_id
-                
+
                 try:
                     await query.edit_message_text(
                         f"✅ *Model Switched*\n\n"
@@ -1455,7 +1475,7 @@ class TelegramChannel(ChannelPlugin):
                         logger.debug(f"Message already shows correct state for model {model_name}")
                     else:
                         raise
-    
+
     async def _check_sender_allowed(
         self,
         sender_id: str,
@@ -1477,10 +1497,10 @@ class TelegramChannel(ChannelPlugin):
             allow_from = self._config.get("allowFrom") or self._config.get("allow_from") or []
             if "*" in allow_from:
                 return True
-        
+
         # Get allowFrom from config
         allow_from_config = self._config.get("allowFrom") or self._config.get("allow_from") or []
-        
+
         # Get allowFrom from pairing store
         try:
             from ...pairing.pairing_store import read_channel_allow_from_store
@@ -1489,34 +1509,34 @@ class TelegramChannel(ChannelPlugin):
         except Exception as e:
             logger.warning(f"Failed to read pairing store: {e}")
             allow_from_store = []
-        
+
         # Merge both lists
         effective_allow_from = list(set(allow_from_config + allow_from_store))
-        
+
         # Check wildcard
         if "*" in effective_allow_from:
             return True
-        
+
         # Check if empty and not in pairing mode
         if not effective_allow_from and dm_policy == "allowlist":
             return False
-        
+
         # Check sender ID match
         if sender_id in effective_allow_from:
             return True
-        
+
         # Check username match (case-insensitive)
         if username:
             username_lower = username.lower()
             username_with_at = f"@{username_lower}"
-            
+
             for allowed in effective_allow_from:
                 allowed_lower = allowed.lower()
                 if allowed_lower == username_lower or allowed_lower == username_with_at:
                     return True
-        
+
         return False
-    
+
     async def _handle_pairing_request(
         self,
         sender: Any,
@@ -1531,9 +1551,9 @@ class TelegramChannel(ChannelPlugin):
             context: Telegram context
         """
         try:
-            from ...pairing.pairing_store import upsert_channel_pairing_request
             from ...pairing.messages import format_pairing_request_message
-            
+            from ...pairing.pairing_store import upsert_channel_pairing_request
+
             # Create or update pairing request (with account_id for multi-account support)
             result = upsert_channel_pairing_request(
                 channel="telegram",
@@ -1546,33 +1566,33 @@ class TelegramChannel(ChannelPlugin):
                     "full_name": sender.full_name or "",
                 }
             )
-            
+
             pairing_code = result["code"]
             is_new_request = result["created"]
-            
+
             # Only send message for new requests
             if is_new_request:
                 logger.info(f"Created pairing request for telegram:{sender.id}, code={pairing_code}")
-                
+
                 # Format pairing message
                 message_text = format_pairing_request_message(
                     code=pairing_code,
                     channel="telegram",
                     id_label=f"Telegram ID ({sender.id})"
                 )
-                
+
                 # Add user info
-                user_info = f"\n📱 **Your Info**\n"
+                user_info = "\n📱 **Your Info**\n"
                 user_info += f"- Telegram ID: `{sender.id}`\n"
                 if sender.username:
                     user_info += f"- Username: @{sender.username}\n"
                 user_info += f"- Name: {sender.full_name}\n"
-                
+
                 message_text = message_text.replace(
                     "This code expires in 1 hour.",
                     user_info + "\nThis code expires in 1 hour."
                 )
-                
+
                 # Send to user
                 await context.bot.send_message(
                     chat_id=chat.id,
@@ -1581,14 +1601,14 @@ class TelegramChannel(ChannelPlugin):
                 )
             else:
                 logger.debug(f"Pairing request already exists for telegram:{sender.id}")
-                
+
         except Exception as e:
             logger.error(f"Failed to handle pairing request: {e}", exc_info=True)
             await context.bot.send_message(
                 chat_id=chat.id,
                 text="⚠️ Access not configured. Please contact the bot owner.",
             )
-    
+
     async def _cache_sticker_if_needed(
         self,
         sticker_metadata: dict[str, Any],
@@ -1606,38 +1626,38 @@ class TelegramChannel(ChannelPlugin):
         file_unique_id = sticker_metadata.get("file_unique_id")
         if not file_unique_id:
             return
-        
+
         # Check if already cached
         existing = get_cached_sticker(file_unique_id)
         if existing:
             logger.debug("Sticker %s already cached", file_unique_id)
             return
-        
+
         try:
             import tempfile
-            
+
             # Save to temp file for vision analysis
             with tempfile.NamedTemporaryFile(suffix=".webp", delete=False) as tmp:
                 tmp.write(file_bytes)
                 temp_path = tmp.name
-            
+
             # Describe sticker using vision API
             description = await describe_sticker_image(
                 image_path=temp_path,
                 config=self._config,
                 agent_id=None,
             )
-            
+
             # Clean up temp file
             import os
             try:
                 os.unlink(temp_path)
             except Exception:
                 pass
-            
+
             if not description:
                 description = "Sticker"
-            
+
             # Cache the sticker
             cached = CachedSticker(
                 file_id=sticker_metadata.get("file_id", ""),
@@ -1648,66 +1668,66 @@ class TelegramChannel(ChannelPlugin):
                 cached_at=datetime.now(UTC).isoformat(),
                 received_from=sender_username,
             )
-            
+
             cache_sticker(cached)
             logger.info("Cached sticker %s: %s", file_unique_id, description)
-        
+
         except Exception as exc:
             logger.warning("Failed to cache sticker: %s", exc)
-    
+
     async def _handle_reaction_update(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
         """Handle incoming message reaction updates"""
         if not update.message_reaction:
             return
-        
+
         reaction = update.message_reaction
         chat = reaction.chat
         message_id = reaction.message_id
         user = reaction.user
-        
+
         # Resolve reaction notification mode (default: "own")
         reaction_mode = (
             self._config.get("reactionNotifications")
             or self._config.get("reaction_notifications")
             or "own"
         )
-        
+
         if reaction_mode == "off":
             return
-        
+
         if user and user.is_bot:
             return
-        
+
         # Filter based on mode
         if reaction_mode == "own" and not was_sent_by_bot(chat.id, message_id):
             return
-        
+
         # Detect added reactions (compare old vs new)
         old_emojis = set()
         if reaction.old_reaction:
             for r in reaction.old_reaction:
                 if hasattr(r, "type") and r.type == "emoji" and hasattr(r, "emoji"):
                     old_emojis.add(r.emoji)
-        
+
         added_reactions = []
         if reaction.new_reaction:
             for r in reaction.new_reaction:
                 if hasattr(r, "type") and r.type == "emoji" and hasattr(r, "emoji"):
                     if r.emoji not in old_emojis:
                         added_reactions.append(r.emoji)
-        
+
         if not added_reactions:
             return
-        
+
         # Build sender label
         sender_label = "unknown"
         if user:
             name_parts = [user.first_name or "", user.last_name or ""]
             sender_name = " ".join(p for p in name_parts if p).strip()
             sender_username = f"@{user.username}" if user.username else None
-            
+
             if sender_name and sender_username:
                 sender_label = f"{sender_name} ({sender_username})"
             elif sender_name:
@@ -1716,11 +1736,11 @@ class TelegramChannel(ChannelPlugin):
                 sender_label = sender_username
             elif user.id:
                 sender_label = f"id:{user.id}"
-        
+
         # Determine session routing
         is_group = chat.type in ["group", "supergroup"]
         is_forum = getattr(chat, "is_forum", False)
-        
+
         # Build session key for reaction (chat-level, no thread ID available)
         if is_group:
             # For groups, route to chat-level session
@@ -1728,11 +1748,11 @@ class TelegramChannel(ChannelPlugin):
         else:
             # For DMs
             session_key = f"agent:main:telegram:{chat.id}"
-        
+
         # Enqueue system event for each added reaction
         for emoji in added_reactions:
             text = f"Telegram reaction added: {emoji} by {sender_label} on msg {message_id}"
-            
+
             # Create system event
             try:
                 if self._message_handler:
@@ -1753,13 +1773,13 @@ class TelegramChannel(ChannelPlugin):
                             "session_key": session_key,
                         },
                     )
-                    
+
                     await self._message_handler(inbound)
                     logger.debug("Reaction event enqueued: %s", text)
-            
+
             except Exception as exc:
                 logger.error("Failed to handle reaction event: %s", exc, exc_info=True)
-    
+
     async def _buffer_media_group(
         self,
         message: Any,
@@ -1780,15 +1800,15 @@ class TelegramChannel(ChannelPlugin):
             context: Telegram context
         """
         MEDIA_GROUP_TIMEOUT_MS = 500
-        
+
         # Get or create buffer entry
         if media_group_id in self._media_group_buffer:
             entry = self._media_group_buffer[media_group_id]
-            
+
             # Cancel existing timer
             if "timer" in entry:
                 entry["timer"].cancel()
-            
+
             # Add message to buffer
             entry["messages"].append({
                 "message": message,
@@ -1804,16 +1824,16 @@ class TelegramChannel(ChannelPlugin):
                 }],
             }
             self._media_group_buffer[media_group_id] = entry
-        
+
         # Schedule flush
         async def flush_group():
             await asyncio.sleep(MEDIA_GROUP_TIMEOUT_MS / 1000)
             if media_group_id in self._media_group_buffer:
                 buffered = self._media_group_buffer.pop(media_group_id)
                 await self._process_media_group(buffered)
-        
+
         entry["timer"] = asyncio.create_task(flush_group())
-    
+
     async def _process_media_group(self, entry: dict) -> None:
         """
         Process a buffered media group.
@@ -1828,33 +1848,33 @@ class TelegramChannel(ChannelPlugin):
             messages = entry["messages"]
             if not messages:
                 return
-            
+
             # Sort by message_id
             messages.sort(key=lambda m: m["message"].message_id)
-            
+
             # Find message with caption (prefer first one with caption)
             caption_msg = next(
                 (m for m in messages if m["message"].caption or m["message"].text),
                 messages[0]
             )
-            
+
             primary_message = caption_msg["message"]
             primary_context = caption_msg["context"]
-            
+
             chat = primary_message.chat
             sender = primary_message.from_user
-            
+
             # Download all media
             attachments = []
             for msg_entry in messages:
                 msg = msg_entry["message"]
                 ctx = msg_entry["context"]
-                
+
                 # Determine media type and file info
                 file_id = None
                 file_name = None
                 mime_type = None
-                
+
                 if msg.photo:
                     file_id = msg.photo[-1].file_id
                     file_name = f"photo_{msg.message_id}.jpg"
@@ -1867,23 +1887,23 @@ class TelegramChannel(ChannelPlugin):
                     file_id = msg.document.file_id
                     file_name = msg.document.file_name or f"document_{msg.message_id}"
                     mime_type = msg.document.mime_type or "application/octet-stream"
-                
+
                 if not file_id:
                     continue
-                
+
                 try:
                     # Download file
                     tg_file = await ctx.bot.get_file(file_id)
                     file_bytes = await tg_file.download_as_bytearray()
                     file_size = len(file_bytes)
-                    
+
                     import base64
                     b64_content = base64.b64encode(bytes(file_bytes)).decode()
-                    
+
                     # Determine attachment type
                     is_image = (mime_type or "").startswith("image/")
                     attach_type = "image" if is_image else "file"
-                    
+
                     attachment = {
                         "type": attach_type,
                         "mimeType": mime_type or "application/octet-stream",
@@ -1891,16 +1911,16 @@ class TelegramChannel(ChannelPlugin):
                         "filename": file_name,
                         "size": file_size,
                     }
-                    
+
                     attachments.append(attachment)
-                
+
                 except Exception as exc:
                     logger.warning("Failed to download media from group: %s", exc)
-            
+
             if not attachments:
                 logger.warning("No attachments in media group")
                 return
-            
+
             # Combine captions from all messages
             captions = [
                 m["message"].caption or m["message"].text
@@ -1908,17 +1928,17 @@ class TelegramChannel(ChannelPlugin):
                 if m["message"].caption or m["message"].text
             ]
             combined_caption = "\n".join(c for c in captions if c)
-            
+
             # Determine chat type
             chat_type = "direct"
             if chat.type in ("group", "supergroup"):
                 chat_type = "group"
             elif chat.type == "channel":
                 chat_type = "channel"
-            
+
             # Human-readable text description
             text = combined_caption if combined_caption else f"[User sent {len(attachments)} media items]"
-            
+
             # Build InboundMessage
             inbound = InboundMessage(
                 channel_id=self.id,
@@ -1940,12 +1960,12 @@ class TelegramChannel(ChannelPlugin):
                 },
                 attachments=attachments,
             )
-            
+
             await self._handle_message(inbound)
-        
+
         except Exception as exc:
             logger.error("Error processing media group: %s", exc, exc_info=True)
-    
+
     def _detect_text_fragment(self, message: Any) -> str | None:
         """
         Detect if message is part of a split text fragment.
@@ -1959,21 +1979,21 @@ class TelegramChannel(ChannelPlugin):
             Fragment ID (sender_chat composite) or None
         """
         TEXT_FRAGMENT_MIN_LENGTH = 3900
-        
+
         if not message.text:
             return None
-        
+
         # Only buffer messages close to the limit
         if len(message.text) < TEXT_FRAGMENT_MIN_LENGTH:
             return None
-        
+
         # Generate fragment key (sender + chat)
         sender_id = message.from_user.id if message.from_user else None
         if not sender_id:
             return None
-        
+
         return f"{message.chat_id}:{sender_id}"
-    
+
     async def _buffer_text_fragment(
         self,
         message: Any,
@@ -1993,15 +2013,15 @@ class TelegramChannel(ChannelPlugin):
             context: Telegram context
         """
         TEXT_FRAGMENT_TIMEOUT_MS = 2000
-        
+
         # Get or create buffer entry
         if fragment_id in self._text_fragment_buffer:
             entry = self._text_fragment_buffer[fragment_id]
-            
+
             # Cancel existing timer
             if "timer" in entry:
                 entry["timer"].cancel()
-            
+
             # Add message to buffer
             entry["messages"].append({
                 "message": message,
@@ -2017,16 +2037,16 @@ class TelegramChannel(ChannelPlugin):
                 }],
             }
             self._text_fragment_buffer[fragment_id] = entry
-        
+
         # Schedule flush
         async def flush_fragments():
             await asyncio.sleep(TEXT_FRAGMENT_TIMEOUT_MS / 1000)
             if fragment_id in self._text_fragment_buffer:
                 buffered = self._text_fragment_buffer.pop(fragment_id)
                 await self._process_text_fragments(buffered)
-        
+
         entry["timer"] = asyncio.create_task(flush_fragments())
-    
+
     async def _process_text_fragments(self, entry: dict) -> None:
         """
         Process buffered text fragments.
@@ -2040,23 +2060,23 @@ class TelegramChannel(ChannelPlugin):
             messages = entry["messages"]
             if not messages:
                 return
-            
+
             # Sort by message_id
             messages.sort(key=lambda m: m["message"].message_id)
-            
+
             # Combine all text
             combined_text = "".join(m["message"].text or "" for m in messages)
-            
+
             # Use first message as primary
             primary_message = messages[0]["message"]
             primary_update = messages[0]["update"]
             primary_context = messages[0]["context"]
-            
+
             # Create new Update with combined text for normal processing
             # We'll modify the message text temporarily
             original_text = primary_message.text
             primary_message.text = combined_text
-            
+
             try:
                 # Now process as normal text message (skip fragment detection)
                 await self._process_normal_text_message(
@@ -2066,10 +2086,10 @@ class TelegramChannel(ChannelPlugin):
                 )
             finally:
                 primary_message.text = original_text
-        
+
         except Exception as exc:
             logger.error("Error processing text fragments: %s", exc, exc_info=True)
-    
+
     async def _process_normal_text_message(
         self,
         message: Any,
@@ -2091,16 +2111,16 @@ class TelegramChannel(ChannelPlugin):
         # Determine chat type first
         is_group = chat.type in ["group", "supergroup"]
         is_dm = not is_group
-        
+
         # DM Access Control - Check dm_policy for direct messages
         if is_dm and self._config:
             dm_policy = self._config.get("dmPolicy") or self._config.get("dm_policy") or "pairing"
-            
+
             # Handle disabled DM
             if dm_policy == "disabled":
                 logger.info(f"DM from {sender.id} blocked by dm_policy=disabled")
                 return
-            
+
             # Handle pairing and allowlist modes
             if dm_policy in ["pairing", "allowlist"]:
                 # Check if sender is allowed
@@ -2109,7 +2129,7 @@ class TelegramChannel(ChannelPlugin):
                     username=sender.username,
                     dm_policy=dm_policy
                 )
-                
+
                 if not is_allowed:
                     # For pairing mode, create pairing request
                     if dm_policy == "pairing":

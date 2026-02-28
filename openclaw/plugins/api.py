@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
+from .runtime import PluginRuntime, create_plugin_runtime
 from .types import (
     PLUGIN_HOOK_NAMES,
     OpenClawPluginCommandDefinition,
@@ -22,16 +24,14 @@ from .types import (
     PluginCliRegistration,
     PluginCommandRegistration,
     PluginDiagnostic,
-    PluginGatewayMethodRegistration,
     PluginHookRegistration,
     PluginHttpRegistration,
     PluginHttpRouteRegistration,
     PluginLogger,
-    PluginRecord,
+    PluginProviderRegistration,
     PluginRegistry,
     PluginServiceRegistration,
     PluginToolRegistration,
-    PluginProviderRegistration,
     ProviderPlugin,
     TypedPluginHookRegistration,
 )
@@ -106,6 +106,7 @@ class PluginApi:
         description: str | None = None,
         plugin_config: dict[str, Any] | None = None,
         workspace_dir: str | None = None,
+        runtime: PluginRuntime | None = None,
     ) -> None:
         self.id = plugin_id
         self.name = plugin_name
@@ -117,6 +118,7 @@ class PluginApi:
         self._registry = registry
         self._workspace_dir = workspace_dir
         self.logger: PluginLogger = _PluginApiLogger(plugin_id)  # type: ignore[assignment]
+        self.runtime: PluginRuntime = runtime if runtime is not None else create_plugin_runtime()
 
     # =========================================================================
     # Tool Registration
@@ -422,7 +424,6 @@ class PluginApi:
 
     def _push_diagnostic(self, level: str, message: str) -> None:
         """Push a diagnostic message into the registry. Mirrors TS pushDiagnostic()."""
-        from .types import PluginDiagnostic
         self._registry.diagnostics.append(PluginDiagnostic(
             level=level,
             message=message,
@@ -441,6 +442,7 @@ def create_plugin_api(
     description: str | None = None,
     plugin_config: dict[str, Any] | None = None,
     workspace_dir: str | None = None,
+    runtime: PluginRuntime | None = None,
 ) -> PluginApi:
     """Factory function to create a PluginApi instance."""
     return PluginApi(
@@ -453,6 +455,7 @@ def create_plugin_api(
         description=description,
         plugin_config=plugin_config,
         workspace_dir=workspace_dir,
+        runtime=runtime,
     )
 
 

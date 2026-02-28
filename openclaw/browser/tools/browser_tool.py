@@ -331,7 +331,7 @@ class UnifiedBrowserTool(AgentTool):
         """Resolve browser node target. Matches TS resolveBrowserNodeTarget() lines 81-140"""
         from openclaw.config.loader import load_config
 
-        cfg = load_config(as_dict=True)
+        cfg = load_config(as_dict=True) or {}
         policy = cfg.get("gateway", {}).get("nodes", {}).get("browser", {})
         mode = policy.get("mode", "auto")
 
@@ -432,7 +432,7 @@ class UnifiedBrowserTool(AgentTool):
         """Resolve browser base URL. Matches TS resolveBrowserBaseUrl() lines 191-219"""
         from openclaw.config.loader import load_config
 
-        cfg = load_config(as_dict=True)
+        cfg = load_config(as_dict=True) or {}
         browser_config = cfg.get("browser", {})
         enabled = browser_config.get("enabled", False)
 
@@ -831,7 +831,7 @@ class UnifiedBrowserTool(AgentTool):
         from openclaw.browser import client
         from openclaw.config.loader import load_config
 
-        cfg = load_config(as_dict=True)
+        cfg = load_config(as_dict=True) or {}
         snapshot_defaults = cfg.get("browser", {}).get("snapshotDefaults", {})
 
         snapshot_format = params.get("snapshotFormat", "ai")

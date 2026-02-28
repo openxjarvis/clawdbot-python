@@ -16,7 +16,6 @@ Architecture:
 """
 from __future__ import annotations
 
-
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
@@ -26,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from ..agents.runtime import AgentRuntime
-from ..channels.base import ChannelPlugin, ChannelAccountSnapshot, InboundMessage, MessageHandler
+from ..channels.base import ChannelPlugin, InboundMessage, MessageHandler
 from ..events import Event, EventType
 
 # =============================================================================
@@ -63,6 +62,142 @@ class ChannelEventType:
     ERROR = "error"
 
 logger = logging.getLogger(__name__)
+
+
+async def _transcribe_audio_attachment(
+    content: str,
+    mime: str,
+    filename: str,
+    config: dict,
+) -> str | None:
+    """Decode a base64 audio attachment and transcribe it using the configured STT provider.
+
+    Mirrors TS media-understanding/audio-preflight.ts transcribeFirstAudio().
+    Returns the transcript text or None if unavailable/disabled.
+
+    Provider priority:
+    1. config.tools.media.audio (explicit configuration)
+    2. OpenAI Whisper (if OPENAI_API_KEY or config.providers.openai.apiKey present)
+    3. Groq Whisper (if GROQ_API_KEY present)
+    """
+    import base64
+    import os
+    import tempfile
+
+    # Check explicit audio config
+    audio_cfg = ((config.get("tools") or {}).get("media") or {}).get("audio") or {}
+    if audio_cfg.get("enabled") is False:
+        return None
+
+    explicit_provider = (audio_cfg.get("provider") or "").lower()
+    explicit_api_key = audio_cfg.get("apiKey") or ""
+
+    # Resolve provider + api key
+    api_key: str | None = None
+    provider_name: str | None = None
+
+    if explicit_provider and explicit_api_key:
+        provider_name = explicit_provider
+        api_key = explicit_api_key
+    else:
+        # Auto-detect from env / global provider config
+        openai_key = (
+            explicit_api_key
+            or ((config.get("providers") or {}).get("openai") or {}).get("apiKey")
+            or os.environ.get("OPENAI_API_KEY")
+        )
+        if openai_key:
+            provider_name = "openai"
+            api_key = openai_key
+        else:
+            groq_key = (
+                ((config.get("providers") or {}).get("groq") or {}).get("apiKey")
+                or os.environ.get("GROQ_API_KEY")
+            )
+            if groq_key:
+                provider_name = "groq"
+                api_key = groq_key
+
+    if not provider_name or not api_key:
+        # Last resort: check env vars and model provider config
+        openai_key = os.environ.get("OPENAI_API_KEY", "")
+        if not openai_key:
+            # Try to get from model providers config (e.g. models.openai.apiKey)
+            for section in ("models", "providers"):
+                openai_key = (
+                    (config.get(section) or {}).get("openai", {}).get("apiKey")
+                    or (config.get(section) or {}).get("openai", {}).get("api_key")
+                    or ""
+                )
+                if openai_key:
+                    break
+        if openai_key:
+            provider_name = "openai"
+            api_key = openai_key
+        else:
+            logger.debug(
+                "_transcribe_audio_attachment: no STT provider configured "
+                "(set OPENAI_API_KEY or add tools.media.audio to openclaw.json)"
+            )
+            return None
+
+    # Decode base64 content
+    try:
+        audio_bytes = base64.b64decode(content)
+    except Exception as exc:
+        logger.warning(f"_transcribe_audio_attachment: base64 decode failed: {exc}")
+        return None
+
+    # Determine file extension from MIME or filename
+    if filename and "." in filename:
+        ext = "." + filename.rsplit(".", 1)[-1]
+    else:
+        _mime_to_ext: dict[str, str] = {
+            "audio/ogg": ".ogg",
+            "audio/mpeg": ".mp3",
+            "audio/mp4": ".m4a",
+            "audio/wav": ".wav",
+            "audio/webm": ".webm",
+            "audio/flac": ".flac",
+        }
+        ext = _mime_to_ext.get((mime or "").split(";")[0].strip(), ".ogg")
+
+    # Write to temp file and transcribe
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = tmp.name
+
+        if provider_name == "openai":
+            from openclaw.media_understanding.providers.openai_provider import OpenAIAudioProvider
+            stt = OpenAIAudioProvider(api_key=api_key)
+        elif provider_name == "groq":
+            from openclaw.media_understanding.providers.groq_provider import (
+                GroqAudioProvider,  # type: ignore[import]
+            )
+            stt = GroqAudioProvider(api_key=api_key)
+        elif provider_name == "deepgram":
+            from openclaw.media_understanding.providers.deepgram_provider import (
+                DeepgramProvider,  # type: ignore[import]
+            )
+            stt = DeepgramProvider(api_key=api_key)
+        else:
+            return None
+
+        result = await stt.transcribe(tmp_path)
+        transcript = (result.get("text") or "").strip()
+        return transcript or None
+
+    except Exception as exc:
+        logger.warning(f"_transcribe_audio_attachment: transcription error: {exc}")
+        return None
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 class ChannelState(str, Enum):
@@ -186,7 +321,7 @@ class ChannelManager:
         else:
             self.tools = list(tools)
         self.workspace_dir = workspace_dir or Path.home() / ".openclaw" / "workspace"
-        
+
         # Load bootstrap files and build complete system prompt
         self.system_prompt = self._build_system_prompt_with_bootstrap(system_prompt)
 
@@ -232,35 +367,35 @@ class ChannelManager:
             Complete system prompt with bootstrap files
         """
         try:
-            from ..agents.system_prompt_bootstrap import (
-                load_bootstrap_files, 
-                format_bootstrap_context, 
-                format_bootstrap_context_string
-            )
             from ..agents.system_prompt import build_agent_system_prompt
+            from ..agents.system_prompt_bootstrap import (
+                format_bootstrap_context,
+                format_bootstrap_context_string,
+                load_bootstrap_files,
+            )
             from ..agents.system_prompt_params import build_system_prompt_params
-            
+
             # Load bootstrap files from workspace
             bootstrap_files = load_bootstrap_files(self.workspace_dir)
             logger.info(f"Loaded {len(bootstrap_files)} bootstrap files from {self.workspace_dir}")
-            
+
             # Format as string for injection
             bootstrap_context = format_bootstrap_context_string(bootstrap_files)
-            
+
             # If there's a base prompt, append bootstrap context
             if base_prompt:
                 if bootstrap_context:
                     return f"{base_prompt}\n\n{bootstrap_context}"
                 return base_prompt
-            
+
             # Otherwise, build complete system prompt with bootstrap files
             tool_names = [tool.name for tool in self.tools] if self.tools else []
-            
+
             # Get model name from default_runtime if available
             model_name = "unknown"
             if self.default_runtime and hasattr(self.default_runtime, 'model_str'):
                 model_name = self.default_runtime.model_str
-            
+
             # Get complete runtime parameters (includes timezone, runtime_info, etc.)
             # Load config so the configured timezone (agents.defaults.timezone) is used.
             try:
@@ -278,7 +413,7 @@ class ChannelManager:
                     "default_model": model_name,
                 }
             )
-            
+
             # Build complete system prompt with resolved parameters
             system_prompt = build_agent_system_prompt(
                 workspace_dir=self.workspace_dir,
@@ -291,16 +426,16 @@ class ChannelManager:
                     if "(File" not in bf.content
                 ]) if bootstrap_files else None,
             )
-            
+
             logger.info(f"Built system prompt with bootstrap files ({len(system_prompt)} chars)")
             logger.info(f"Using timezone: {prompt_params['user_timezone']}")
             return system_prompt
-            
+
         except Exception as e:
             logger.error(f"Failed to build system prompt with bootstrap: {e}", exc_info=True)
             # Fallback to base prompt or default
             return base_prompt or "You are a personal assistant running inside OpenClaw."
-    
+
     # =========================================================================
     # Registration
     # =========================================================================
@@ -428,7 +563,7 @@ class ChannelManager:
 
         logger.debug(f"Configured channel {channel_id}: {config}")
 
-    def set_default_runtime(self, runtime: "AgentRuntime") -> None:
+    def set_default_runtime(self, runtime: AgentRuntime) -> None:
         """
         Replace the default AgentRuntime used for all channels without an explicit
         per-channel runtime.  Mirrors TS ChannelManager.setDefaultRuntime().
@@ -439,7 +574,7 @@ class ChannelManager:
         self.default_runtime = runtime
         logger.info("Default channel runtime updated")
 
-    def set_runtime(self, channel_id: str, runtime: "AgentRuntime") -> None:
+    def set_runtime(self, channel_id: str, runtime: AgentRuntime) -> None:
         """
         Set custom AgentRuntime for a channel
 
@@ -818,13 +953,13 @@ class ChannelManager:
         for channel_id in self.list_channels():
             channel = self._channels.get(channel_id)
             env = self._runtime_envs.get(channel_id)
-            
+
             channel_info = {
                 "id": channel_id,
                 "enabled": env.enabled if env else False,
                 "state": env.state.value if env else "unknown",
             }
-            
+
             if channel:
                 channel_info.update({
                     "label": channel.label,
@@ -842,9 +977,9 @@ class ChannelManager:
                     "healthy": False,
                     "capabilities": {},
                 })
-            
+
             channels.append(channel_info)
-        
+
         return channels
 
     def get_status(self, channel_id: str) -> dict[str, Any] | None:
@@ -997,15 +1132,14 @@ class ChannelManager:
                 from openclaw.auto_reply.inbound_context import (
                     MsgContext,
                     finalize_inbound_context,
-                    build_session_key_from_context,
                 )
-                
+
                 # Build proper session key (align with TypeScript format)
                 from openclaw.routing.session_key import build_agent_peer_session_key
-                
+
                 # Determine peer_kind based on chat_type
                 peer_kind = "dm" if message.chat_type == "dm" else message.chat_type or "dm"
-                
+
                 # Build session key: agent:main:telegram:dm:8366053063
                 session_key = build_agent_peer_session_key(
                     agent_id=self.session_manager.agent_id if self.session_manager else "main",
@@ -1014,9 +1148,9 @@ class ChannelManager:
                     peer_id=str(message.chat_id),
                     dm_scope="per-channel-peer"  # Each channel+peer gets own session
                 )
-                
+
                 logger.info(f"[{channel_id}] Built session key: {session_key}")
-                
+
                 # Propagate command metadata from InboundMessage (set by command_dispatcher.py)
                 _meta = message.metadata or {}
                 _command_authorized = bool(_meta.get("command_authorized", False))
@@ -1053,10 +1187,10 @@ class ChannelManager:
                     if media_url:
                         ctx.MediaUrls = [media_url]
                         ctx.MediaUrl = media_url
-                
+
                 # Finalize context (applies normalization, sender metadata, etc.)
                 ctx = finalize_inbound_context(ctx)
-                
+
                 logger.debug(f"[{channel_id}] Context finalized: BodyForAgent length={len(ctx.BodyForAgent or '')}, ChatType={ctx.ChatType}")
 
                 # Get or create session using session key (will query store for UUID)
@@ -1066,7 +1200,7 @@ class ChannelManager:
                 if self.session_manager:
                     session = self.session_manager.get_or_create_session_by_key(session_key)
                     logger.info(f"[{channel_id}] Session created/retrieved: key={session_key}, uuid={session.session_id}")
-                    
+
                     # Resolve session workspace for file generation
                     from openclaw.agents.session_workspace import resolve_session_workspace_dir
                     _workspace_root = session.workspace_dir if session else Path.home() / ".openclaw" / "workspace"
@@ -1086,8 +1220,8 @@ class ChannelManager:
 
                 logger.info(f"[{channel_id}] Starting run_turn with {len(self.tools)} tools")
 
-                from openclaw.events import EventType
                 from openclaw.auto_reply.reply.typing import create_typing_controller
+                from openclaw.events import EventType
 
                 # Wire up typing indicator (mirrors TS bot-message-dispatch.ts)
                 # send_typing() is defined on TelegramChannel; ignore for other channel types.
@@ -1103,8 +1237,8 @@ class ChannelManager:
                 await typing_ctrl.on_reply_start()
                 await typing_ctrl.start_typing_loop()
 
-                # Build image data URLs from inbound attachments (mirrors TS chat.ts)
-                # Non-image attachments are described in message_text by the channel layer.
+                # Build image data URLs from inbound attachments, and transcribe audio.
+                # Mirrors TS bot-message-context.ts allMedia / audio-preflight flow.
                 inbound_images: list[str] | None = None
                 inbound_attachments = getattr(message, "attachments", None) or []
                 for att in inbound_attachments:
@@ -1113,14 +1247,45 @@ class ChannelManager:
                         mime = att.get("mime_type") or att.get("mimeType") or ""
                         content = att.get("content") or ""
                         att_type = att.get("type") or ""
+                        filename = att.get("filename") or att.get("file_name") or ""
                     else:
                         mime = att.mime_type or ""
                         content = att.content or ""
                         att_type = att.type or ""
+                        filename = getattr(att, "filename", "") or getattr(att, "file_name", "") or ""
                     if content and (att_type == "image" or mime.startswith("image/")):
                         if inbound_images is None:
                             inbound_images = []
                         inbound_images.append(f"data:{mime or 'image/jpeg'};base64,{content}")
+                    elif content and (att_type in ("voice", "audio") or mime.startswith("audio/")):
+                        # Audio/voice attachment — transcribe and replace placeholder text.
+                        # Mirrors TS audio-preflight.ts transcribeFirstAudio().
+                        try:
+                            _audio_cfg: dict = {}
+                            try:
+                                from openclaw.config.loader import load_config as _lc
+                                _raw_cfg = _lc()
+                                if hasattr(_raw_cfg, "model_dump"):
+                                    _audio_cfg = _raw_cfg.model_dump()
+                                elif isinstance(_raw_cfg, dict):
+                                    _audio_cfg = _raw_cfg
+                            except Exception:
+                                pass
+                            audio_transcript = await _transcribe_audio_attachment(
+                                content=content,
+                                mime=mime,
+                                filename=filename or "voice.ogg",
+                                config=_audio_cfg,
+                            )
+                            if audio_transcript:
+                                message_text = audio_transcript
+                                logger.info(
+                                    f"[{channel_id}] Audio transcription: {len(audio_transcript)} chars"
+                                )
+                        except Exception as _audio_err:
+                            logger.warning(
+                                f"[{channel_id}] Audio transcription failed: {_audio_err}"
+                            )
 
                 # Stream events via run_turn() async generator.
                 # This is the only correct pattern: pi_coding_agent emits events
@@ -1191,7 +1356,7 @@ class ChannelManager:
 
                 # Parse MEDIA: tokens from response text (mirrors TS splitMediaFromOutput)
                 from openclaw.auto_reply.media_parse import split_media_from_output
-                from openclaw.media.mime import detect_mime, media_kind_from_mime, MediaKind
+                from openclaw.media.mime import MediaKind, detect_mime, media_kind_from_mime
 
                 media_result = split_media_from_output(response_text)
                 # Use cleaned text (MEDIA: lines removed) as the text to send
