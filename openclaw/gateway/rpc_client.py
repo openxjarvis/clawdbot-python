@@ -78,27 +78,59 @@ class GatewayRPCClient:
             async with websockets.connect(self.url, **connect_kwargs) as ws:
                 # Step 1: Send connect handshake (unless calling connect itself)
                 if method != "connect" and method != "health":
+                    # The server immediately sends a "connect.challenge" event after
+                    # the WebSocket opens (before the client says anything).
+                    # Drain all server-initiated events before sending our request.
+                    connect_id = self._next_id()
                     connect_request = {
                         "jsonrpc": "2.0",
                         "method": "connect",
                         "params": {
-                            "minProtocol": 1,
-                            "maxProtocol": 1,
+                            "minProtocol": 3,
+                            "maxProtocol": 3,
                             "client": {
-                                "name": "openclaw-python-cli",
+                                "id": "openclaw-python-rpc",
                                 "version": "1.0.0",
-                                "platform": "python"
-                            }
+                                "platform": "python",
+                                "mode": "rpc",
+                            },
                         },
-                        "id": self._next_id(),
+                        "id": connect_id,
                     }
+
+                    # Drain any server-push events (e.g. connect.challenge) first
+                    try:
+                        while True:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=0.5)
+                            msg = json.loads(raw)
+                            # Stop draining once we see a response with our id
+                            # (shouldn't happen before we send, but be safe)
+                            if msg.get("id") is not None:
+                                break
+                            # Pure event — keep draining
+                    except asyncio.TimeoutError:
+                        pass  # No more server events waiting
+
                     await ws.send(json.dumps(connect_request))
-                    
-                    # Wait for connect response
-                    connect_response_data = await ws.recv()
-                    connect_response = json.loads(connect_response_data)
-                    
-                    if "error" in connect_response:
+
+                    # Wait for the connect response, skipping any interleaved events
+                    while True:
+                        connect_response_data = await asyncio.wait_for(ws.recv(), timeout=10)
+                        connect_response = json.loads(connect_response_data)
+                        # Skip server-pushed events (no "id" field or event key)
+                        if "event" in connect_response and "id" not in connect_response:
+                            continue
+                        if connect_response.get("id") != connect_id:
+                            continue
+                        break
+
+                    # Check for connect error
+                    if connect_response.get("type") == "res" and not connect_response.get("ok", True):
+                        err = connect_response.get("error") or {}
+                        code = err.get("code", "CONNECT_FAILED") if isinstance(err, dict) else "CONNECT_FAILED"
+                        msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                        raise GatewayRPCError(f"Connect failed: {code}: {msg}")
+                    elif "error" in connect_response and connect_response.get("error"):
                         error = connect_response["error"]
                         raise GatewayRPCError(
                             f"Connect failed: {error.get('code')}: {error.get('message')}"

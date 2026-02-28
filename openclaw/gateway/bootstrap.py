@@ -544,6 +544,45 @@ class GatewayBootstrap:
                     except Exception as e:
                         logger.warning(f"❌ Failed to start channel '{channel_id}': {e}")
 
+            # Auto-start built-in channels (telegram, etc.) from openclaw.json config.
+            # In TS, built-in channels are pre-registered in the plugin registry via
+            # extensions/ — here we replicate that by registering them directly when
+            # the corresponding config section is present and enabled.
+            _BUILTIN_CHANNELS: dict[str, str] = {
+                "telegram": "openclaw.channels.telegram.enhanced_telegram.EnhancedTelegramChannel",
+            }
+            for builtin_id, class_path in _BUILTIN_CHANNELS.items():
+                ch_config_raw = channels_config_dict.get(builtin_id)
+                if not ch_config_raw:
+                    continue
+                if isinstance(ch_config_raw, dict):
+                    raw = ch_config_raw
+                elif hasattr(ch_config_raw, "model_dump"):
+                    raw = ch_config_raw.model_dump(by_alias=True, exclude_none=True)
+                else:
+                    raw = {}
+                if not raw.get("enabled", False):
+                    logger.debug(f"Built-in channel '{builtin_id}' not enabled, skipping")
+                    continue
+                if builtin_id in (self.channel_manager._channel_classes or {}):
+                    logger.debug(f"Built-in channel '{builtin_id}' already registered, skipping")
+                    continue
+                try:
+                    module_path, cls_name = class_path.rsplit(".", 1)
+                    import importlib
+                    mod = importlib.import_module(module_path)
+                    cls = getattr(mod, cls_name)
+                    self.channel_manager.register(builtin_id, cls)
+                    self.channel_manager.configure(builtin_id, raw)
+                    success = await self.channel_manager.start_channel(builtin_id)
+                    if success:
+                        started_count += 1
+                        logger.info(f"✅ Built-in channel '{builtin_id}' started")
+                    else:
+                        logger.warning(f"⚠️  Built-in channel '{builtin_id}' start returned False")
+                except Exception as e:
+                    logger.warning(f"❌ Failed to start built-in channel '{builtin_id}': {e}", exc_info=True)
+
             logger.info(f"Started {started_count} channels from plugin registry")
         except Exception as e:
             logger.error(f"Channel manager creation failed: {e}")
@@ -659,9 +698,11 @@ class GatewayBootstrap:
             from .server import GatewayServer
             port = self.config.gateway.port if self.config and self.config.gateway else 18789
             
-            # Get tools list from registry
-            tools = self.tool_registry.list_tools() if self.tool_registry else []
-            
+            # Pass the ToolRegistry object directly so GatewayServer can detect it
+            # with isinstance() and skip creating a second registry (which would
+            # trigger auto_register=True and raise "Tool already registered").
+            tools = self.tool_registry if self.tool_registry else []
+
             self.server = GatewayServer(
                 config=self.config,
                 agent_runtime=self.runtime,

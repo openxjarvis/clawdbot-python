@@ -7,6 +7,67 @@ from rich.table import Table
 console = Console()
 pairing_app = typer.Typer(help="Channel pairing management")
 
+# Mirrors TS PAIRING_APPROVED_MESSAGE from src/channels/plugins/pairing-message.ts
+PAIRING_APPROVED_MESSAGE = "✅ OpenClaw access approved. Send a message to start chatting."
+
+
+def _notify_pairing_approved(channel: str, sender_id: str, account_id: str | None = None) -> None:
+    """Send an approval notification to the user via the channel's bot API.
+
+    Mirrors TS notifyPairingApproved() → adapter.notifyApproval().
+    Currently supports: telegram.
+    """
+    if channel == "telegram":
+        _telegram_notify_approved(sender_id, account_id)
+    else:
+        raise NotImplementedError(f"Notification not yet implemented for channel: {channel}")
+
+
+def _telegram_notify_approved(chat_id: str, account_id: str | None = None) -> None:
+    """Send PAIRING_APPROVED_MESSAGE to a Telegram user via the Bot API."""
+    import urllib.request
+    import urllib.parse
+    import json as _json
+
+    # Resolve bot token from openclaw config
+    bot_token: str | None = None
+    try:
+        from ..config.loader import load_config
+        cfg = load_config()
+        tg_cfg = None
+        if cfg:
+            channels = getattr(cfg, "channels", None)
+            if channels:
+                tg_cfg = getattr(channels, "telegram", None)
+        if tg_cfg:
+            bot_token = getattr(tg_cfg, "botToken", None) or getattr(tg_cfg, "bot_token", None)
+    except Exception:
+        pass
+
+    # Fallback: read directly from openclaw.json
+    if not bot_token:
+        import json as _j
+        from pathlib import Path
+        cfg_path = Path.home() / ".openclaw" / "openclaw.json"
+        if cfg_path.exists():
+            raw = _j.loads(cfg_path.read_text())
+            tg_raw = raw.get("channels", {}).get("telegram", {})
+            bot_token = tg_raw.get("botToken") or tg_raw.get("bot_token")
+
+    if not bot_token:
+        raise RuntimeError("Telegram bot token not found in config")
+
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = _json.dumps({
+        "chat_id": chat_id,
+        "text": PAIRING_APPROVED_MESSAGE,
+    }).encode()
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        result = _json.loads(resp.read())
+    if not result.get("ok"):
+        raise RuntimeError(f"Telegram API error: {result}")
+
 
 @pairing_app.command("list")
 def list_pairing_requests(
@@ -111,12 +172,10 @@ def approve_pairing_request(
             if notify:
                 try:
                     console.print(f"\n[cyan]Notifying requester...[/cyan]")
-                    console.print(f"[yellow]Note: Notification not yet implemented in Python version[/yellow]")
+                    _notify_pairing_approved(channel, sender_id, account or None)
+                    console.print(f"[green]✓[/green] Notification sent")
                 except Exception as notify_err:
                     console.print(f"[yellow]Failed to notify requester: {notify_err}[/yellow]")
-            elif channel == "telegram":
-                console.print(f"\n💡 [dim]You may want to notify them on Telegram that they've been approved.[/dim]")
-                console.print(f"[dim]Use --notify flag to send automatic notification.[/dim]")
         else:
             console.print(f"[red]✗[/red] Pairing code not found or expired")
             list_cmd = f"uv run openclaw pairing list {channel}"

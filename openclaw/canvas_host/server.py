@@ -118,14 +118,19 @@ def _default_index_html() -> str:
 
 class CanvasFileWatcher(FileSystemEventHandler):
     """Watch canvas files for changes"""
-    
-    def __init__(self, server: 'CanvasHostServer'):
+
+    def __init__(self, server: "CanvasHostServer", loop: asyncio.AbstractEventLoop):
         self.server = server
-    
+        self._loop = loop
+
     def on_modified(self, event):
-        """Handle file modification"""
+        """Handle file modification — called from watchdog thread, not the event loop."""
         if not event.is_directory:
-            asyncio.create_task(self.server._broadcast_reload())
+            # asyncio.create_task() requires the running loop; use
+            # call_soon_threadsafe() to schedule safely from a foreign thread.
+            self._loop.call_soon_threadsafe(
+                lambda: asyncio.ensure_future(self.server._broadcast_reload(), loop=self._loop)
+            )
 
 
 class CanvasHostServer:
@@ -156,6 +161,7 @@ class CanvasHostServer:
         self._clients: Set[WebSocketServerProtocol] = set()
         self._observer: Observer | None = None
         self._running = False
+        self._loop: asyncio.AbstractEventLoop | None = None
     
     def _prepare_canvas_root(self) -> None:
         """Prepare canvas root with default index.html if missing (TS alignment)"""
@@ -181,7 +187,8 @@ class CanvasHostServer:
             self.port = port
         
         self._running = True
-        
+        self._loop = asyncio.get_running_loop()
+
         # Start WebSocket server for live reload
         self._server = await websockets.serve(
             self._handle_ws_connection,
@@ -221,7 +228,7 @@ class CanvasHostServer:
     
     def _start_file_watcher(self):
         """Start watching canvas files"""
-        handler = CanvasFileWatcher(self)
+        handler = CanvasFileWatcher(self, self._loop)
         self._observer = Observer()
         self._observer.schedule(handler, str(self.canvas_root), recursive=True)
         self._observer.start()

@@ -1166,11 +1166,26 @@ class TelegramChannel(ChannelPlugin):
         """Register bot commands with Telegram API using dynamic registration."""
         try:
             from openclaw.channels.telegram.command_handler import register_telegram_native_commands
-            
+
+            # Load the FULL openclaw config so skill commands (from agents.list)
+            # and custom commands are included. self._config is only the telegram
+            # channel sub-config (botToken, dmPolicy…), not the root config.
+            try:
+                from openclaw.config.loader import load_config
+                full_cfg_obj = load_config()
+                if full_cfg_obj and hasattr(full_cfg_obj, "model_dump"):
+                    full_cfg: dict = full_cfg_obj.model_dump(by_alias=True, exclude_none=True)
+                elif isinstance(full_cfg_obj, dict):
+                    full_cfg = full_cfg_obj
+                else:
+                    full_cfg = self._config or {}
+            except Exception:
+                full_cfg = self._config or {}
+
             # Use dynamic registration from command registry
             await register_telegram_native_commands(
                 bot=self._app.bot,
-                cfg=self._config or {},
+                cfg=full_cfg,
                 account_id=self._account_id or "",
                 native_enabled=True,
                 native_skills_enabled=True,

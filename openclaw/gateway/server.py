@@ -455,7 +455,13 @@ class GatewayServer:
         self.started_at: float | None = None
         self.agent_runtime = agent_runtime
         self.session_manager = session_manager
-        self.tools = tools or []
+        # Normalise: accept ToolRegistry or plain list (mirrors TS plain array)
+        if tools is None:
+            self.tools = []
+        elif hasattr(tools, "list_tools"):
+            self.tools = tools.list_tools()
+        else:
+            self.tools = list(tools)
         self.system_prompt = system_prompt
         self.http_server = None
         self.http_server_task = None

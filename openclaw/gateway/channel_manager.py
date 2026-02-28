@@ -177,7 +177,14 @@ class ChannelManager:
         """
         self.default_runtime = default_runtime
         self.session_manager = session_manager
-        self.tools = tools or []
+        # Normalise: accept either a ToolRegistry object or a plain list of tools
+        # (TS ChannelManager receives a plain array — we mirror that internally)
+        if tools is None:
+            self.tools = []
+        elif hasattr(tools, "list_tools"):
+            self.tools = tools.list_tools()
+        else:
+            self.tools = list(tools)
         self.workspace_dir = workspace_dir or Path.home() / ".openclaw" / "workspace"
         
         # Load bootstrap files and build complete system prompt
@@ -1043,16 +1050,19 @@ class ChannelManager:
                 # Get or create session using session key (will query store for UUID)
                 session = None
                 session_workspace: str | None = None
+                workspace_root: str | None = str(Path.home() / ".openclaw" / "workspace")
                 if self.session_manager:
                     session = self.session_manager.get_or_create_session_by_key(session_key)
                     logger.info(f"[{channel_id}] Session created/retrieved: key={session_key}, uuid={session.session_id}")
                     
                     # Resolve session workspace for file generation
                     from openclaw.agents.session_workspace import resolve_session_workspace_dir
+                    _workspace_root = session.workspace_dir if session else Path.home() / ".openclaw" / "workspace"
                     session_workspace = str(resolve_session_workspace_dir(
-                        workspace_root=session.workspace_dir if session else Path.home() / ".openclaw" / "workspace",
+                        workspace_root=_workspace_root,
                         session_key=session_key
                     ))
+                    workspace_root = str(_workspace_root)
                     logger.info(f"[{channel_id}] Session workspace: {session_workspace}")
 
                 # Process through Agent Runtime
@@ -1185,18 +1195,27 @@ class ChannelManager:
                     all_media.extend(media_result.media_urls)
                 for media_url in all_media:
                     try:
-                        # Resolve relative paths against session workspace
-                        # The agent often outputs relative paths like
-                        # "presentations/file.pptx" which live under the
-                        # session workspace directory.
+                        # Resolve relative paths — try candidates in priority order:
+                        #  1. session workspace  (agent-specific subdirectory)
+                        #  2. workspace root     (main ~/.openclaw/workspace, where
+                        #                         document_gen saves presentations/)
+                        #  3. home-dir expansion (~/ prefix)
                         resolved_url = media_url
                         if not media_url.startswith(("http://", "https://", "file://", "/")):
-                            candidate = Path(session_workspace) / media_url if session_workspace else None
-                            if candidate and candidate.exists():
-                                resolved_url = str(candidate)
-                                logger.info(f"[{channel_id}] Resolved relative path to: {resolved_url}")
-                            else:
-                                # Also try home-dir expansion
+                            _search_dirs = []
+                            if session_workspace:
+                                _search_dirs.append(Path(session_workspace))
+                            if workspace_root:
+                                _search_dirs.append(Path(workspace_root))
+                            found = False
+                            for _base in _search_dirs:
+                                _candidate = _base / media_url
+                                if _candidate.exists():
+                                    resolved_url = str(_candidate)
+                                    logger.info(f"[{channel_id}] Resolved relative path to: {resolved_url}")
+                                    found = True
+                                    break
+                            if not found:
                                 home_candidate = Path(media_url).expanduser()
                                 if home_candidate.exists():
                                     resolved_url = str(home_candidate)

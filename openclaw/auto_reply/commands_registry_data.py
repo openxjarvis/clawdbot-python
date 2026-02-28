@@ -477,6 +477,22 @@ def _build_chat_commands() -> list[ChatCommandDefinition]:
                 CommandArg("command", "Shell command", capture_remaining=True),
             ],
         ),
+        _define_chat_command(
+            key="canvas",
+            native_name="canvas",
+            description="Present, snapshot, or control the Canvas.",
+            text_alias="/canvas",
+            category="tools",
+            args=[
+                CommandArg(
+                    "action",
+                    "present | snapshot | hide | navigate | eval | status",
+                    choices=["present", "snapshot", "hide", "navigate", "eval", "status"],
+                ),
+                CommandArg("value", "URL or expression (for navigate/eval)", capture_remaining=True),
+            ],
+            args_parsing="none",
+        ),
     ]
     
     # Register additional aliases (mirrors TS registerAlias calls)
