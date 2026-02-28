@@ -1,0 +1,13 @@
+{
+  "id": "zalouser",
+  "name": "Zalo User",
+  "description": "Zalo personal user channel integration.",
+  "channels": [
+    "zalouser"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

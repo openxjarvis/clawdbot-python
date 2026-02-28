@@ -1,0 +1,11 @@
+{
+  "id": "memory-core",
+  "name": "Memory (Core)",
+  "description": "File-backed memory search and get tools with CLI management.",
+  "kind": "memory",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

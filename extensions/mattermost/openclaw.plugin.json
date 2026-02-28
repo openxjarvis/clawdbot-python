@@ -1,0 +1,13 @@
+{
+  "id": "mattermost",
+  "name": "Mattermost",
+  "description": "Mattermost channel integration.",
+  "channels": [
+    "mattermost"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

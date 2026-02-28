@@ -1046,3 +1046,7 @@ def is_first_run(workspace_dir: Path) -> bool:
     """
     from openclaw.agents.ensure_workspace import is_workspace_onboarding_completed
     return not is_workspace_onboarding_completed(workspace_dir)
+
+
+# Alias matching TS runInteractiveOnboarding — used by bootstrap and tests
+run_interactive_onboarding = run_onboarding_wizard

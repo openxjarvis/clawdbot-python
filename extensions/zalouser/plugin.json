@@ -1,0 +1,8 @@
+{
+  "id": "zalouser",
+  "name": "zalouser",
+  "version": "0.1.0",
+  "description": "Zalo user management",
+  "author": "OpenClaw",
+  "main": "plugin.py"
+}

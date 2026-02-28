@@ -1,0 +1,8 @@
+{
+  "id": "llm-task",
+  "name": "llm-task",
+  "version": "0.1.0",
+  "description": "LLM task management and orchestration",
+  "author": "OpenClaw",
+  "main": "plugin.py"
+}

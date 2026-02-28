@@ -101,10 +101,10 @@ description: "Bundled version"
 # Bundled
 """)
         
-        # Create workspace skill (should override)
+        # Create workspace skill (should override) — TS uses {workspace}/skills/
         workspace_dir = tmppath / "workspace"
         workspace_dir.mkdir()
-        workspace_skills = workspace_dir / ".openclaw" / "skills"
+        workspace_skills = workspace_dir / "skills"
         workspace_skills.mkdir(parents=True)
         (workspace_skills / "test").mkdir()
         (workspace_skills / "test" / "SKILL.md").write_text("""---

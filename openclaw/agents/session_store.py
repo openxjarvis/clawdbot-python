@@ -119,14 +119,14 @@ class SessionStore:
         # Cache infrastructure - aligned with openclaw-ts
         self._cache: dict[str, SessionStoreCacheEntry] = {}
         self._lock = asyncio.Lock()
-    
+
+        # In-memory session map — loaded lazily from disk on first access
+        self._sessions: dict[str, SessionEntry] = {}
+
     @property
     def sessions_dir(self) -> Path:
         """Public accessor for sessions directory"""
         return self._sessions_dir
-
-        # Load session metadata
-        self._sessions: dict[str, SessionEntry] = self._load_sessions()
 
     def _load_sessions(self) -> dict[str, SessionEntry]:
         """

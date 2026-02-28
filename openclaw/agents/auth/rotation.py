@@ -15,7 +15,7 @@ if sys.version_info >= (3, 11):
 else:
     UTC = timezone.utc
 
-from .profile import AuthProfile, ProfileStore
+from .profile import AuthProfile, ProfileStore, calculate_auth_profile_cooldown_ms
 
 logger = logging.getLogger(__name__)
 
@@ -113,38 +113,108 @@ class RotationManager:
             logger.debug(f"Profile {profile_id} used successfully")
 
     def mark_failure(
-        self, profile_id: str, reason: str = "unknown", is_rate_limit: bool = False
+        self,
+        profile_id: str,
+        reason: str = "unknown",
+        is_rate_limit: bool = False,
+        is_billing_error: bool = False,
+        billing_backoff_ms: int = 5 * 60 * 60 * 1000,   # 5 hours default
+        billing_max_ms: int = 24 * 60 * 60 * 1000,       # 24 hours cap
     ) -> None:
-        """
-        Mark profile as failed and apply cooldown if needed
+        """Mark profile as failed and apply exponential cooldown.
+
+        Mirrors TS markAuthProfileFailure() in auth-profiles/usage.ts:
+        - Increments errorCount
+        - Uses calculateAuthProfileCooldownMs(errorCount) → 1min/5min/25min/1h
+        - Billing errors use disabledUntil with 5h/24h backoff schedule
 
         Args:
             profile_id: Profile ID
             reason: Failure reason
             is_rate_limit: Whether failure was due to rate limit
+            is_billing_error: Whether failure was a billing/payment error
+            billing_backoff_ms: Billing backoff duration (default 5h)
+            billing_max_ms: Max billing disable duration (default 24h)
         """
         profile = self.store.get_profile(profile_id)
         if not profile:
             return
 
-        profile.failure_count += 1
+        profile.error_count = (profile.error_count or 0) + 1
+        profile.failure_count = profile.error_count
 
-        # Apply cooldown if too many failures or rate limit
-        if profile.failure_count >= self.max_failures or is_rate_limit:
-            cooldown_minutes = self.cooldown_minutes
+        now = datetime.now(UTC)
 
-            # Longer cooldown for rate limits
-            if is_rate_limit:
-                cooldown_minutes *= 2
-
-            profile.cooldown_until = datetime.now(UTC) + timedelta(minutes=cooldown_minutes)
-
+        if is_billing_error:
+            # Billing disable: longer window, capped at billing_max_ms
+            current_disabled = profile.disabled_until
+            if current_disabled and current_disabled > now:
+                # Extend proportionally
+                remaining_ms = (current_disabled - now).total_seconds() * 1000
+                next_ms = min(remaining_ms + billing_backoff_ms, billing_max_ms)
+            else:
+                next_ms = billing_backoff_ms
+            profile.disabled_until = now + timedelta(milliseconds=next_ms)
+            profile.disabled_reason = reason
             logger.warning(
-                f"Profile {profile_id} in cooldown until {profile.cooldown_until} "
-                f"(reason: {reason}, failures: {profile.failure_count})"
+                "Profile %s billing-disabled until %s (reason: %s)",
+                profile_id, profile.disabled_until, reason,
+            )
+        else:
+            # Exponential cooldown: 1m → 5m → 25m → 1h
+            cooldown_ms = calculate_auth_profile_cooldown_ms(profile.error_count)
+            profile.cooldown_until = now + timedelta(milliseconds=cooldown_ms)
+            logger.warning(
+                "Profile %s in cooldown until %s (reason: %s, errorCount: %d, cooldown: %ds)",
+                profile_id, profile.cooldown_until, reason, profile.error_count, cooldown_ms // 1000,
             )
 
         self.store.add_profile(profile)
+
+    def clear_expired_cooldowns(self) -> int:
+        """Remove expired cooldowns from all profiles.
+
+        Mirrors TS clearExpiredCooldowns().
+
+        Returns:
+            Number of profiles cleared.
+        """
+        now = datetime.now(UTC)
+        cleared = 0
+        for profile in self.store.list_profiles():
+            changed = False
+            if profile.cooldown_until and now >= profile.cooldown_until:
+                profile.cooldown_until = None
+                profile.error_count = 0
+                profile.failure_count = 0
+                changed = True
+            if profile.disabled_until and now >= profile.disabled_until:
+                profile.disabled_until = None
+                profile.disabled_reason = None
+                changed = True
+            if changed:
+                self.store.add_profile(profile)
+                cleared += 1
+        return cleared
+
+    def mark_billing_disable(
+        self,
+        profile_id: str,
+        reason: str = "billing_error",
+        backoff_ms: int = 5 * 60 * 60 * 1000,
+        max_ms: int = 24 * 60 * 60 * 1000,
+    ) -> None:
+        """Apply a billing-level disable window to a profile.
+
+        Mirrors TS markAuthProfileBillingDisable().
+        """
+        self.mark_failure(
+            profile_id,
+            reason=reason,
+            is_billing_error=True,
+            billing_backoff_ms=backoff_ms,
+            billing_max_ms=max_ms,
+        )
 
     def reset_profile(self, profile_id: str) -> None:
         """

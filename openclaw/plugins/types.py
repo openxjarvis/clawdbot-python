@@ -1,253 +1,30 @@
-"""Plugin type definitions — mirrors src/plugins/types.ts"""
+"""Plugin type definitions.
+
+Python equivalents of TypeScript src/plugins/types.ts and src/plugins/registry.ts.
+
+Defines all plugin hook names, registration types, PluginRecord, PluginRegistry,
+and the OpenClawPluginApi protocol.
+"""
+
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Literal, Protocol
-
-
-# ---------------------------------------------------------------------------
-# Logger
-# ---------------------------------------------------------------------------
-
-class PluginLogger(Protocol):
-    def info(self, message: str) -> None: ...
-    def warn(self, message: str) -> None: ...
-    def error(self, message: str) -> None: ...
-    def debug(self, message: str) -> None: ...
-
-
-# ---------------------------------------------------------------------------
-# Basic types
-# ---------------------------------------------------------------------------
-
-PluginKind = Literal["memory"]
-PluginOrigin = Literal["bundled", "global", "workspace", "config"]
-
-
-@dataclass
-class PluginConfigUiHint:
-    label: str | None = None
-    help: str | None = None
-    advanced: bool = False
-    sensitive: bool = False
-    placeholder: str | None = None
-
-
-@dataclass
-class PluginDiagnostic:
-    level: Literal["warn", "error"]
-    message: str
-    plugin_id: str | None = None
-    source: str | None = None
-
-
-# ---------------------------------------------------------------------------
-# Config schema
-# ---------------------------------------------------------------------------
-
-class PluginConfigValidationOk:
-    ok: bool = True
-    value: Any = None
-
-
-class PluginConfigValidationFail:
-    ok: bool = False
-    errors: list[str] = field(default_factory=list)
-
-
-PluginConfigValidation = PluginConfigValidationOk | PluginConfigValidationFail
-
-
-# ---------------------------------------------------------------------------
-# Tool
-# ---------------------------------------------------------------------------
-
-@dataclass
-class OpenClawPluginToolContext:
-    config: Any = None
-    workspace_dir: str | None = None
-    agent_dir: str | None = None
-    agent_id: str | None = None
-    session_key: str | None = None
-    message_channel: str | None = None
-    agent_account_id: str | None = None
-    sandboxed: bool = False
-
-
-OpenClawPluginToolFactory = Callable[[OpenClawPluginToolContext], Any]
-
-
-@dataclass
-class OpenClawPluginToolOptions:
-    name: str | None = None
-    names: list[str] | None = None
-    optional: bool = False
-
-
-# ---------------------------------------------------------------------------
-# Hook options
-# ---------------------------------------------------------------------------
-
-@dataclass
-class OpenClawPluginHookOptions:
-    entry: Any = None
-    name: str | None = None
-    description: str | None = None
-    register: bool = True
-
-
-# ---------------------------------------------------------------------------
-# Provider
-# ---------------------------------------------------------------------------
-
-ProviderAuthKind = Literal["oauth", "api_key", "token", "device_code", "custom"]
-
-
-@dataclass
-class ProviderAuthResult:
-    profiles: list[dict] = field(default_factory=list)
-    config_patch: dict | None = None
-    default_model: str | None = None
-    notes: list[str] | None = None
-
-
-@dataclass
-class ProviderAuthMethod:
-    id: str
-    label: str
-    kind: ProviderAuthKind
-    run: Callable[..., Awaitable[ProviderAuthResult]] = field(default=None)  # type: ignore[assignment]
-    hint: str | None = None
-
-
-@dataclass
-class ProviderPlugin:
-    id: str
-    label: str
-    auth: list[ProviderAuthMethod] = field(default_factory=list)
-    docs_path: str | None = None
-    aliases: list[str] | None = None
-    env_vars: list[str] | None = None
-    models: dict | None = None
-
-
-# ---------------------------------------------------------------------------
-# Gateway method
-# ---------------------------------------------------------------------------
-
-@dataclass
-class OpenClawPluginGatewayMethod:
-    method: str
-    handler: Callable[..., Any]
-
-
-# ---------------------------------------------------------------------------
-# Commands
-# ---------------------------------------------------------------------------
-
-@dataclass
-class PluginCommandContext:
-    channel: str
-    is_authorized_sender: bool
-    command_body: str
-    config: Any = None
-    sender_id: str | None = None
-    channel_id: str | None = None
-    args: str | None = None
-    from_: str | None = None
-    to: str | None = None
-    account_id: str | None = None
-    message_thread_id: int | None = None
-
-
-PluginCommandHandler = Callable[[PluginCommandContext], Any]
-
-
-@dataclass
-class OpenClawPluginCommandDefinition:
-    name: str
-    description: str
-    handler: PluginCommandHandler
-    accepts_args: bool = False
-    require_auth: bool = True
-
-
-# ---------------------------------------------------------------------------
-# HTTP / CLI / Service
-# ---------------------------------------------------------------------------
-
-OpenClawPluginHttpHandler = Callable[..., Any]
-OpenClawPluginHttpRouteHandler = Callable[..., Any]
-OpenClawPluginCliRegistrar = Callable[..., Any]
-
-
-@dataclass
-class OpenClawPluginServiceContext:
-    config: Any
-    state_dir: str
-    workspace_dir: str | None = None
-    logger: PluginLogger | None = None  # type: ignore[assignment]
-
-
-@dataclass
-class OpenClawPluginService:
-    id: str
-    start: Callable[[OpenClawPluginServiceContext], Any]
-    stop: Callable[[OpenClawPluginServiceContext], Any] | None = None
-
-
-@dataclass
-class OpenClawPluginChannelRegistration:
-    plugin: Any  # ChannelPlugin
-    dock: Any | None = None  # ChannelDock
-
-
-# ---------------------------------------------------------------------------
-# Plugin definition and API
-# ---------------------------------------------------------------------------
-
-@dataclass
-class OpenClawPluginDefinition:
-    id: str | None = None
-    name: str | None = None
-    description: str | None = None
-    version: str | None = None
-    kind: PluginKind | None = None
-    config_schema: Any = None
-    register: Callable[..., Any] | None = None
-    activate: Callable[..., Any] | None = None
-
-
-class OpenClawPluginApi(Protocol):
-    """API object passed to plugin activate() — mirrors TS OpenClawPluginApi."""
-
-    id: str
-    name: str
-    version: str | None
-    description: str | None
-    source: str
-    config: Any
-    plugin_config: dict | None
-    runtime: Any  # PluginRuntime
-    logger: PluginLogger
-
-    def register_tool(self, tool: Any, opts: OpenClawPluginToolOptions | None = None) -> None: ...
-    def register_hook(self, events: str | list[str], handler: Any, opts: OpenClawPluginHookOptions | None = None) -> None: ...
-    def register_http_handler(self, handler: OpenClawPluginHttpHandler) -> None: ...
-    def register_http_route(self, path: str, handler: OpenClawPluginHttpRouteHandler) -> None: ...
-    def register_channel(self, registration: OpenClawPluginChannelRegistration | Any) -> None: ...
-    def register_gateway_method(self, method: str, handler: Any) -> None: ...
-    def register_cli(self, registrar: OpenClawPluginCliRegistrar, opts: dict | None = None) -> None: ...
-    def register_service(self, service: OpenClawPluginService) -> None: ...
-    def register_provider(self, provider: ProviderPlugin) -> None: ...
-    def register_command(self, command: OpenClawPluginCommandDefinition) -> None: ...
-    def resolve_path(self, input: str) -> str: ...
-    def on(self, hook_name: "PluginHookName", handler: Any, opts: dict | None = None) -> None: ...
-
-
-# ---------------------------------------------------------------------------
-# Hook names and event types  (mirrors PluginHookName union)
-# ---------------------------------------------------------------------------
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Literal,
+    Protocol,
+    TypedDict,
+    runtime_checkable,
+)
+
+logger = logging.getLogger(__name__)
+
+# =============================================================================
+# Plugin Hook Names (mirrors TS PluginHookName union)
+# =============================================================================
 
 PluginHookName = Literal[
     "before_model_resolve",
@@ -272,7 +49,7 @@ PluginHookName = Literal[
     "gateway_stop",
 ]
 
-PLUGIN_HOOK_NAMES: tuple[str, ...] = (
+PLUGIN_HOOK_NAMES: frozenset[str] = frozenset([
     "before_model_resolve",
     "before_prompt_build",
     "before_agent_start",
@@ -293,12 +70,298 @@ PLUGIN_HOOK_NAMES: tuple[str, ...] = (
     "session_end",
     "gateway_start",
     "gateway_stop",
-)
+])
 
-# --- Agent context ---
+# Handler callable types
+VoidHookHandler = Callable[[dict[str, Any], dict[str, Any]], Awaitable[None] | None]
+ModifyingHookHandler = Callable[[dict[str, Any], dict[str, Any]], Awaitable[dict[str, Any] | None] | dict[str, Any] | None]
+SyncHookHandler = Callable[[dict[str, Any], dict[str, Any]], dict[str, Any] | None]
+
+# =============================================================================
+# Typed Hook Registration (mirrors TS TypedPluginHookRegistration)
+# =============================================================================
+
+@dataclass
+class TypedPluginHookRegistration:
+    """Typed plugin lifecycle hook registration."""
+    plugin_id: str
+    hook_name: str           # One of PluginHookName
+    handler: Callable        # The handler function
+    priority: int = 0        # Higher = runs first
+    source: str = ""
+
+
+# =============================================================================
+# Plugin Registration Types
+# =============================================================================
+
+@dataclass
+class PluginToolRegistration:
+    """Tool registered by a plugin."""
+    plugin_id: str
+    factory: Callable        # Tool factory or tool object
+    names: list[str] = field(default_factory=list)
+    optional: bool = False
+    source: str = ""
+
+
+@dataclass
+class PluginHookRegistration:
+    """Internal hook registered by a plugin."""
+    plugin_id: str
+    events: list[str] = field(default_factory=list)   # Event keys like "command:new"
+    handler: Callable = field(default=lambda e: None)
+    entry: dict[str, Any] | None = None               # HookEntry metadata
+    source: str = ""
+
+
+@dataclass
+class PluginChannelRegistration:
+    """Channel plugin registered by a plugin."""
+    plugin_id: str
+    plugin: Any              # ChannelPlugin instance
+    dock: Any | None = None  # ChannelDock
+    source: str = ""
+
+
+@dataclass
+class PluginProviderRegistration:
+    """Model provider registered by a plugin."""
+    plugin_id: str
+    provider: "ProviderPlugin"
+    source: str = ""
+
+
+@dataclass
+class PluginHttpRegistration:
+    """HTTP handler registered by a plugin."""
+    plugin_id: str
+    handler: Callable
+    source: str = ""
+
+
+@dataclass
+class PluginHttpRouteRegistration:
+    """HTTP route registered by a plugin."""
+    plugin_id: str | None
+    path: str
+    handler: Callable
+    source: str = ""
+
+
+@dataclass
+class PluginCliRegistration:
+    """CLI registrar registered by a plugin."""
+    plugin_id: str
+    register: Callable
+    commands: list[str] = field(default_factory=list)
+    source: str = ""
+
+
+@dataclass
+class PluginServiceRegistration:
+    """Background service registered by a plugin."""
+    plugin_id: str
+    service: "OpenClawPluginService"
+    source: str = ""
+
+
+@dataclass
+class PluginCommandRegistration:
+    """Custom command registered by a plugin."""
+    plugin_id: str
+    command: "OpenClawPluginCommandDefinition"
+    source: str = ""
+
+
+@dataclass
+class PluginGatewayMethodRegistration:
+    """Gateway RPC method registered by a plugin."""
+    plugin_id: str
+    method: str
+    handler: Callable
+    source: str = ""
+
+
+# =============================================================================
+# Plugin Record (mirrors TS PluginRecord)
+# =============================================================================
+
+@dataclass
+class PluginRecord:
+    """Metadata record for a loaded plugin."""
+    id: str
+    name: str
+    version: str | None = None
+    description: str | None = None
+    kind: str | None = None             # e.g. "memory"
+    source: str = ""
+    origin: str = "global"              # "bundled" | "global" | "workspace" | "config"
+    workspace_dir: str | None = None
+    enabled: bool = True
+    status: str = "loaded"             # "loaded" | "disabled" | "error"
+    error: str | None = None
+    tool_names: list[str] = field(default_factory=list)
+    hook_names: list[str] = field(default_factory=list)
+    channel_ids: list[str] = field(default_factory=list)
+    provider_ids: list[str] = field(default_factory=list)
+    gateway_methods: list[str] = field(default_factory=list)
+    cli_commands: list[str] = field(default_factory=list)
+    services: list[str] = field(default_factory=list)
+    commands: list[str] = field(default_factory=list)
+    http_handlers: int = 0
+    hook_count: int = 0
+    config_schema: bool = False
+    config_ui_hints: dict[str, Any] | None = None
+    config_json_schema: dict[str, Any] | None = None
+
+
+# =============================================================================
+# Plugin Diagnostic
+# =============================================================================
+
+@dataclass
+class PluginDiagnostic:
+    """Plugin diagnostic message."""
+    level: str           # "warn" | "error"
+    message: str
+    plugin_id: str | None = None
+    source: str | None = None
+
+
+# =============================================================================
+# Plugin Registry (mirrors TS PluginRegistry)
+# =============================================================================
+
+@dataclass
+class PluginRegistry:
+    """Registry of all loaded plugins and their contributions."""
+    plugins: list[PluginRecord] = field(default_factory=list)
+    tools: list[PluginToolRegistration] = field(default_factory=list)
+    hooks: list[PluginHookRegistration] = field(default_factory=list)
+    typed_hooks: list[TypedPluginHookRegistration] = field(default_factory=list)
+    channels: list[PluginChannelRegistration] = field(default_factory=list)
+    providers: list[PluginProviderRegistration] = field(default_factory=list)
+    gateway_handlers: dict[str, Callable] = field(default_factory=dict)
+    http_handlers: list[PluginHttpRegistration] = field(default_factory=list)
+    http_routes: list[PluginHttpRouteRegistration] = field(default_factory=list)
+    cli_registrars: list[PluginCliRegistration] = field(default_factory=list)
+    services: list[PluginServiceRegistration] = field(default_factory=list)
+    commands: list[PluginCommandRegistration] = field(default_factory=list)
+    diagnostics: list[PluginDiagnostic] = field(default_factory=list)
+
+
+def create_empty_plugin_registry() -> PluginRegistry:
+    """Create an empty plugin registry."""
+    return PluginRegistry()
+
+
+# =============================================================================
+# Provider Plugin (mirrors TS ProviderPlugin)
+# =============================================================================
+
+@dataclass
+class ProviderAuthMethod:
+    """Auth method for a provider plugin."""
+    id: str
+    label: str
+    kind: str           # "oauth" | "api_key" | "token" | "device_code" | "custom"
+    hint: str | None = None
+    run: Callable | None = None
+
+
+@dataclass
+class ProviderPlugin:
+    """Model provider registered by a plugin."""
+    id: str
+    label: str
+    auth: list[ProviderAuthMethod] = field(default_factory=list)
+    docs_path: str | None = None
+    aliases: list[str] = field(default_factory=list)
+    env_vars: list[str] = field(default_factory=list)
+    models: dict[str, Any] | None = None
+    format_api_key: Callable | None = None
+    refresh_oauth: Callable | None = None
+
+
+# =============================================================================
+# Plugin Service (mirrors TS OpenClawPluginService)
+# =============================================================================
+
+@dataclass
+class OpenClawPluginService:
+    """Background service registered by a plugin."""
+    id: str
+    start: Callable      # async (ctx) -> None
+    stop: Callable | None = None   # async (ctx) -> None
+
+
+# =============================================================================
+# Plugin Command (mirrors TS OpenClawPluginCommandDefinition)
+# =============================================================================
+
+@dataclass
+class OpenClawPluginCommandDefinition:
+    """Custom command registered by a plugin."""
+    name: str            # Command name without leading slash
+    description: str
+    handler: Callable
+    accepts_args: bool = False
+    require_auth: bool = True
+
+
+# =============================================================================
+# Plugin Logger
+# =============================================================================
+
+class PluginLogger(Protocol):
+    """Logger interface for plugins."""
+
+    def info(self, message: str) -> None: ...
+    def warn(self, message: str) -> None: ...
+    def error(self, message: str) -> None: ...
+    def debug(self, message: str) -> None: ...
+
+
+# =============================================================================
+# OpenClawPluginApi Protocol (mirrors TS OpenClawPluginApi)
+# =============================================================================
+
+@runtime_checkable
+class OpenClawPluginApiProtocol(Protocol):
+    """Protocol for the plugin API object passed to plugin register() functions."""
+
+    id: str
+    name: str
+    version: str | None
+    description: str | None
+    source: str
+    config: dict[str, Any]
+    plugin_config: dict[str, Any] | None
+    logger: PluginLogger
+
+    def register_tool(self, tool: Any, opts: dict[str, Any] | None = None) -> None: ...
+    def register_hook(self, events: str | list[str], handler: Callable, opts: dict[str, Any] | None = None) -> None: ...
+    def register_http_handler(self, handler: Callable) -> None: ...
+    def register_http_route(self, path: str, handler: Callable) -> None: ...
+    def register_channel(self, registration: Any) -> None: ...
+    def register_gateway_method(self, method: str, handler: Callable) -> None: ...
+    def register_cli(self, registrar: Callable, opts: dict[str, Any] | None = None) -> None: ...
+    def register_service(self, service: OpenClawPluginService) -> None: ...
+    def register_provider(self, provider: ProviderPlugin) -> None: ...
+    def register_command(self, command: OpenClawPluginCommandDefinition) -> None: ...
+    def on(self, hook_name: str, handler: Callable, opts: dict[str, Any] | None = None) -> None: ...
+    def resolve_path(self, input: str) -> str: ...
+
+
+# =============================================================================
+# Typed Hook Event / Context / Result classes (used by hooks.py)
+# Each class mirrors a TypeScript interface in src/plugins/hooks.ts
+# =============================================================================
 
 @dataclass
 class PluginHookAgentContext:
+    """Agent context shared across agent hooks. Mirrors TS PluginHookAgentContext."""
     agent_id: str | None = None
     session_key: str | None = None
     session_id: str | None = None
@@ -306,342 +369,406 @@ class PluginHookAgentContext:
     message_provider: str | None = None
 
 
-# --- before_model_resolve ---
+@dataclass
+class PluginHookSessionContext:
+    """Context passed to session lifecycle hooks. Mirrors TS PluginHookSessionContext."""
+    agent_id: str | None = None
+    session_id: str = ""
+
+
+@dataclass
+class PluginHookGatewayContext:
+    """Context passed to gateway lifecycle hooks. Mirrors TS PluginHookGatewayContext."""
+    port: int | None = None
+
+
+@dataclass
+class PluginHookMessageContext:
+    """Context passed to message-related hooks. Mirrors TS PluginHookMessageContext."""
+    channel_id: str = ""
+    account_id: str | None = None
+    conversation_id: str | None = None
+
+
+@dataclass
+class PluginHookToolContext:
+    """Context passed to tool-related hooks. Mirrors TS PluginHookToolContext."""
+    agent_id: str | None = None
+    session_key: str | None = None
+    tool_name: str = ""
+
+
+@dataclass
+class PluginHookToolResultPersistContext:
+    """Context passed to tool_result_persist hook. Mirrors TS PluginHookToolResultPersistContext."""
+    agent_id: str | None = None
+    session_key: str | None = None
+    tool_name: str | None = None
+    tool_call_id: str | None = None
+
+
+# =============================================================================
+# Hook event / result dataclasses — mirrors TS src/plugins/types.ts exactly
+# =============================================================================
 
 @dataclass
 class PluginHookBeforeModelResolveEvent:
-    prompt: str
+    """Mirrors TS PluginHookBeforeModelResolveEvent.
+    User prompt for this run. No session messages available yet.
+    """
+    prompt: str = ""
 
 
 @dataclass
 class PluginHookBeforeModelResolveResult:
+    """Mirrors TS PluginHookBeforeModelResolveResult."""
     model_override: str | None = None
     provider_override: str | None = None
 
 
-# --- before_prompt_build ---
-
 @dataclass
 class PluginHookBeforePromptBuildEvent:
-    prompt: str
+    """Mirrors TS PluginHookBeforePromptBuildEvent."""
+    prompt: str = ""
     messages: list[Any] = field(default_factory=list)
 
 
 @dataclass
 class PluginHookBeforePromptBuildResult:
+    """Mirrors TS PluginHookBeforePromptBuildResult."""
     system_prompt: str | None = None
     prepend_context: str | None = None
 
 
-# --- before_agent_start ---
-
 @dataclass
 class PluginHookBeforeAgentStartEvent:
-    prompt: str
+    """Mirrors TS PluginHookBeforeAgentStartEvent (combines both phases for legacy compat)."""
+    prompt: str = ""
     messages: list[Any] | None = None
 
 
 @dataclass
 class PluginHookBeforeAgentStartResult:
+    """Mirrors TS PluginHookBeforeAgentStartResult."""
     system_prompt: str | None = None
     prepend_context: str | None = None
     model_override: str | None = None
     provider_override: str | None = None
 
 
-# --- llm_input ---
-
 @dataclass
 class PluginHookLlmInputEvent:
-    run_id: str
-    session_id: str
-    provider: str
-    model: str
-    prompt: str
+    """Mirrors TS PluginHookLlmInputEvent."""
+    run_id: str = ""
+    session_id: str = ""
+    provider: str = ""
+    model: str = ""
+    system_prompt: str | None = None
+    prompt: str = ""
     history_messages: list[Any] = field(default_factory=list)
     images_count: int = 0
-    system_prompt: str | None = None
 
-
-# --- llm_output ---
 
 @dataclass
 class PluginHookLlmOutputEvent:
-    run_id: str
-    session_id: str
-    provider: str
-    model: str
+    """Mirrors TS PluginHookLlmOutputEvent."""
+    run_id: str = ""
+    session_id: str = ""
+    provider: str = ""
+    model: str = ""
     assistant_texts: list[str] = field(default_factory=list)
     last_assistant: Any = None
-    usage: dict | None = None
+    usage: dict[str, Any] | None = None
 
-
-# --- agent_end ---
 
 @dataclass
 class PluginHookAgentEndEvent:
+    """Mirrors TS PluginHookAgentEndEvent."""
     messages: list[Any] = field(default_factory=list)
     success: bool = True
     error: str | None = None
     duration_ms: int | None = None
 
 
-# --- before_compaction ---
-
 @dataclass
 class PluginHookBeforeCompactionEvent:
-    message_count: int
+    """Mirrors TS PluginHookBeforeCompactionEvent."""
+    message_count: int = 0
     compacting_count: int | None = None
     token_count: int | None = None
     messages: list[Any] | None = None
     session_file: str | None = None
 
 
-# --- after_compaction ---
-
 @dataclass
 class PluginHookAfterCompactionEvent:
-    message_count: int
-    compacted_count: int
+    """Mirrors TS PluginHookAfterCompactionEvent."""
+    message_count: int = 0
     token_count: int | None = None
+    compacted_count: int = 0
     session_file: str | None = None
 
 
-# --- before_reset ---
-
 @dataclass
 class PluginHookBeforeResetEvent:
+    """Mirrors TS PluginHookBeforeResetEvent."""
     session_file: str | None = None
     messages: list[Any] | None = None
     reason: str | None = None
 
 
-# --- Message context ---
-
-@dataclass
-class PluginHookMessageContext:
-    channel_id: str
-    account_id: str | None = None
-    conversation_id: str | None = None
-
-
-# --- message_received ---
-
 @dataclass
 class PluginHookMessageReceivedEvent:
-    from_: str
-    content: str
+    """Mirrors TS PluginHookMessageReceivedEvent."""
+    from_: str = ""
+    content: str = ""
     timestamp: int | None = None
-    metadata: dict | None = None
+    metadata: dict[str, Any] | None = None
 
-
-# --- message_sending ---
 
 @dataclass
 class PluginHookMessageSendingEvent:
-    to: str
-    content: str
-    metadata: dict | None = None
+    """Mirrors TS PluginHookMessageSendingEvent."""
+    to: str = ""
+    content: str = ""
+    metadata: dict[str, Any] | None = None
 
 
 @dataclass
 class PluginHookMessageSendingResult:
+    """Mirrors TS PluginHookMessageSendingResult."""
     content: str | None = None
-    cancel: bool | None = None
+    cancel: bool = False
 
-
-# --- message_sent ---
 
 @dataclass
 class PluginHookMessageSentEvent:
-    to: str
-    content: str
-    success: bool
+    """Mirrors TS PluginHookMessageSentEvent."""
+    to: str = ""
+    content: str = ""
+    success: bool = True
     error: str | None = None
 
 
-# --- Tool context ---
-
-@dataclass
-class PluginHookToolContext:
-    tool_name: str
-    agent_id: str | None = None
-    session_key: str | None = None
-
-
-# --- before_tool_call ---
-
 @dataclass
 class PluginHookBeforeToolCallEvent:
-    tool_name: str
-    params: dict = field(default_factory=dict)
+    """Mirrors TS PluginHookBeforeToolCallEvent."""
+    tool_name: str = ""
+    params: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class PluginHookBeforeToolCallResult:
-    params: dict | None = None
-    block: bool | None = None
+    """Mirrors TS PluginHookBeforeToolCallResult."""
+    params: dict[str, Any] | None = None
+    block: bool = False
     block_reason: str | None = None
 
 
-# --- after_tool_call ---
-
 @dataclass
 class PluginHookAfterToolCallEvent:
-    tool_name: str
-    params: dict = field(default_factory=dict)
+    """Mirrors TS PluginHookAfterToolCallEvent."""
+    tool_name: str = ""
+    params: dict[str, Any] = field(default_factory=dict)
     result: Any = None
     error: str | None = None
     duration_ms: int | None = None
 
 
-# --- tool_result_persist ---
-
-@dataclass
-class PluginHookToolResultPersistContext:
-    agent_id: str | None = None
-    session_key: str | None = None
-    tool_name: str | None = None
-    tool_call_id: str | None = None
-
-
 @dataclass
 class PluginHookToolResultPersistEvent:
-    message: Any  # AgentMessage
+    """Mirrors TS PluginHookToolResultPersistEvent."""
     tool_name: str | None = None
     tool_call_id: str | None = None
+    message: Any = None
     is_synthetic: bool = False
 
 
 @dataclass
 class PluginHookToolResultPersistResult:
-    message: Any | None = None  # AgentMessage
+    """Mirrors TS PluginHookToolResultPersistResult."""
+    message: Any = None
 
-
-# --- before_message_write ---
 
 @dataclass
 class PluginHookBeforeMessageWriteEvent:
-    message: Any  # AgentMessage
+    """Mirrors TS PluginHookBeforeMessageWriteEvent."""
+    message: Any = None
     session_key: str | None = None
     agent_id: str | None = None
 
 
 @dataclass
 class PluginHookBeforeMessageWriteResult:
-    block: bool | None = None
-    message: Any | None = None  # AgentMessage
-
-
-# --- Session context ---
-
-@dataclass
-class PluginHookSessionContext:
-    session_id: str
-    agent_id: str | None = None
+    """Mirrors TS PluginHookBeforeMessageWriteResult."""
+    block: bool = False
+    message: Any = None
 
 
 @dataclass
 class PluginHookSessionStartEvent:
-    session_id: str
+    """Mirrors TS PluginHookSessionStartEvent."""
+    session_id: str = ""
     resumed_from: str | None = None
 
 
 @dataclass
 class PluginHookSessionEndEvent:
-    session_id: str
-    message_count: int
+    """Mirrors TS PluginHookSessionEndEvent."""
+    session_id: str = ""
+    message_count: int = 0
     duration_ms: int | None = None
-
-
-# --- Gateway context ---
-
-@dataclass
-class PluginHookGatewayContext:
-    port: int | None = None
 
 
 @dataclass
 class PluginHookGatewayStartEvent:
-    port: int
+    """Mirrors TS PluginHookGatewayStartEvent."""
+    port: int = 0
 
 
 @dataclass
 class PluginHookGatewayStopEvent:
+    """Mirrors TS PluginHookGatewayStopEvent."""
     reason: str | None = None
 
 
-# ---------------------------------------------------------------------------
-# Hook registration
-# ---------------------------------------------------------------------------
+# =============================================================================
+# Additional types expected by __init__.py and other existing modules
+# =============================================================================
 
 @dataclass
-class PluginHookRegistration:
-    plugin_id: str
-    hook_name: str  # PluginHookName
-    handler: Callable[..., Any]
-    source: str
+class OpenClawPluginServiceContext:
+    """Context passed to plugin service start/stop. Mirrors TS OpenClawPluginServiceContext."""
+    config: dict[str, Any] = field(default_factory=dict)
+    workspace_dir: str | None = None
+    state_dir: str = ""
+    logger: Any = None
+
+
+@dataclass
+class OpenClawPluginDefinition:
+    """Plugin definition object. Mirrors TS OpenClawPluginDefinition."""
+    id: str
+    name: str
+    version: str | None = None
+    description: str | None = None
+    kind: str | None = None
+    register: Callable | None = None
+
+
+@dataclass
+class OpenClawPluginHookOptions:
+    """Options for registering a plugin hook."""
     priority: int = 0
+    entry: dict[str, Any] | None = None
 
 
-# ---------------------------------------------------------------------------
-# Manifest types (kept for backward compat from original types.py)
-# ---------------------------------------------------------------------------
-
-class PluginManifest:
-    def __init__(
-        self,
-        id: str,
-        name: str,
-        version: str,
-        description: str | None = None,
-        author: str | None = None,
-        main: str = "plugin.py",
-        skills: list[str] | None = None,
-        requires: list[str] | None = None,
-    ):
-        self.id = id
-        self.name = name
-        self.version = version
-        self.description = description
-        self.author = author
-        self.main = main
-        self.skills = skills or []
-        self.requires = requires or []
+@dataclass
+class OpenClawPluginToolOptions:
+    """Options for registering a plugin tool."""
+    name: str | None = None
+    names: list[str] | None = None
+    optional: bool = False
 
 
-class PluginAPI:
-    """Concrete API object given to plugins that don't use the full OpenClawPluginApi."""
+PluginKind = Literal["memory", "search", "calendar", "contact", "custom"]
+PluginOrigin = Literal["bundled", "global", "workspace", "config"]
 
-    def __init__(self, plugin_id: str):
-        self.plugin_id = plugin_id
-        self._tools: list[Any] = []
-        self._channels: list[Any] = []
-        self._hooks: list[tuple[str, Callable, int]] = []
-
-    def register_tool(self, tool: Any) -> None:
-        self._tools.append(tool)
-
-    def register_channel(self, channel: Any) -> None:
-        self._channels.append(channel)
-
-    def register_hook(self, event: str, handler: Callable, priority: int = 0) -> None:
-        self._hooks.append((event, handler, priority))
-
-    def get_config(self) -> dict[str, Any]:
-        return {}
+# Aliases for backward-compat with existing modules
+Plugin = OpenClawPluginDefinition
+PluginAPI = "OpenClawPluginApiProtocol"  # string to avoid self-ref
 
 
-class Plugin:
-    """Base plugin class."""
+@dataclass
+class PluginConfigUiHint:
+    """UI hint for a config field. Mirrors TS PluginConfigUiHint."""
+    label: str | None = None
+    help: str | None = None
+    advanced: bool = False
+    sensitive: bool = False
+    placeholder: str | None = None
 
-    def __init__(self, manifest: PluginManifest, path: str):
-        self.manifest = manifest
-        self.path = path
-        self.api: PluginAPI | None = None
 
-    async def activate(self, api: PluginAPI) -> None:
-        self.api = api
+# PluginManifest type alias (for loader.py and manifest.py compatibility)
+# The full PluginManifest is defined in manifest.py; this is a forward reference
+PluginManifest = Any  # type: ignore[misc]
 
-    async def deactivate(self) -> None:
-        pass
+
+@dataclass
+class OpenClawPluginApi:
+    """Legacy alias — use PluginApi from api.py for new code."""
+    id: str = ""
+    name: str = ""
+
+
+__all__ = [
+    "PluginHookName",
+    "PLUGIN_HOOK_NAMES",
+    "TypedPluginHookRegistration",
+    "PluginToolRegistration",
+    "PluginHookRegistration",
+    "PluginChannelRegistration",
+    "PluginProviderRegistration",
+    "PluginHttpRegistration",
+    "PluginHttpRouteRegistration",
+    "PluginCliRegistration",
+    "PluginServiceRegistration",
+    "PluginCommandRegistration",
+    "PluginGatewayMethodRegistration",
+    "PluginRecord",
+    "PluginDiagnostic",
+    "PluginRegistry",
+    "create_empty_plugin_registry",
+    "ProviderAuthMethod",
+    "ProviderPlugin",
+    "OpenClawPluginService",
+    "OpenClawPluginServiceContext",
+    "OpenClawPluginCommandDefinition",
+    "PluginLogger",
+    "OpenClawPluginApiProtocol",
+    "PluginConfigUiHint",
+    # Hook contexts
+    "PluginHookAgentContext",
+    "PluginHookSessionContext",
+    "PluginHookGatewayContext",
+    "PluginHookMessageContext",
+    "PluginHookToolContext",
+    "PluginHookToolResultPersistContext",
+    # Hook events and results
+    "PluginHookBeforeModelResolveEvent",
+    "PluginHookBeforeModelResolveResult",
+    "PluginHookBeforePromptBuildEvent",
+    "PluginHookBeforePromptBuildResult",
+    "PluginHookBeforeAgentStartEvent",
+    "PluginHookBeforeAgentStartResult",
+    "PluginHookLlmInputEvent",
+    "PluginHookLlmOutputEvent",
+    "PluginHookAgentEndEvent",
+    "PluginHookBeforeCompactionEvent",
+    "PluginHookAfterCompactionEvent",
+    "PluginHookBeforeResetEvent",
+    "PluginHookMessageReceivedEvent",
+    "PluginHookMessageSendingEvent",
+    "PluginHookMessageSendingResult",
+    "PluginHookMessageSentEvent",
+    "PluginHookBeforeToolCallEvent",
+    "PluginHookBeforeToolCallResult",
+    "PluginHookAfterToolCallEvent",
+    "PluginHookToolResultPersistEvent",
+    "PluginHookToolResultPersistResult",
+    "PluginHookBeforeMessageWriteEvent",
+    "PluginHookBeforeMessageWriteResult",
+    "PluginHookSessionStartEvent",
+    "PluginHookSessionEndEvent",
+    "PluginHookGatewayStartEvent",
+    "PluginHookGatewayStopEvent",
+    # Backward-compat types
+    "OpenClawPluginDefinition",
+    "OpenClawPluginHookOptions",
+    "OpenClawPluginToolOptions",
+    "OpenClawPluginApi",
+    "Plugin",
+    "PluginKind",
+    "PluginOrigin",
+    "PluginManifest",
+]

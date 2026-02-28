@@ -84,16 +84,20 @@ async def handle_model_command(
     session_key: str,
     runtime: Any,
 ) -> ReplyPayload | None:
-    if name in ("model", "m"):
+    if name in ("model", "m", "models"):
+        if name == "models" and not args.strip():
+            return await _handle_list_models(ctx, cfg)
         return await _handle_set_model(args, ctx, cfg, session_key)
-    if name == "models":
-        return await _handle_list_models(ctx, cfg)
-    if name == "think":
+    if name in ("think", "thinking", "t"):
         return await _handle_think(args, ctx, cfg, session_key)
-    if name == "verbose":
+    if name in ("verbose", "v"):
         return await _handle_verbose(args, ctx, cfg, session_key)
-    if name == "reasoning":
+    if name in ("reasoning", "reason"):
         return await _handle_reasoning(args, ctx, cfg, session_key)
+    if name in ("elevated", "elev"):
+        return await _handle_elevated(args, ctx, cfg, session_key)
+    if name == "exec":
+        return await _handle_exec_directive(args, ctx, cfg, session_key)
     return None
 
 
@@ -480,3 +484,114 @@ def resolve_model_selection_from_directive(
         profile_override = raw_model_profile or None
 
     return {"model_selection": model_selection, "profile_override": profile_override}
+
+
+# ---------------------------------------------------------------------------
+# /elevated on|off|ask|full — exec elevation mode
+# Mirrors TS handleElevatedDirective()
+# ---------------------------------------------------------------------------
+
+async def _handle_elevated(
+    args: str,
+    ctx: Any,
+    cfg: dict[str, Any],
+    session_key: str,
+) -> ReplyPayload:
+    """Set or show the elevated exec mode for this session.
+
+    Modes:
+      on   — same as 'ask' (prompt before each exec)
+      off  — no elevation
+      ask  — prompt before each exec
+      full — skip exec approval prompts (most permissive)
+    """
+    mode = args.strip().lower()
+
+    if not mode:
+        try:
+            entry = _load_session_entry_for_model(session_key, cfg)
+            current = (entry or {}).get("elevatedLevel") or "off"
+            return ReplyPayload(text=f"Elevated exec mode: {current}")
+        except Exception:
+            return ReplyPayload(text="Elevated exec mode: off")
+
+    valid = ("on", "off", "ask", "full")
+    if mode not in valid:
+        return ReplyPayload(text="Usage: /elevated on|off|ask|full")
+
+    normalized = "ask" if mode == "on" else mode
+    try:
+        from openclaw.agents.sessions import patch_session_entry
+        patch_session_entry(session_key, {"elevatedLevel": normalized}, cfg)
+        return ReplyPayload(text=f"Elevated exec mode: {normalized}")
+    except Exception as exc:
+        logger.warning(f"/elevated error: {exc}")
+        return ReplyPayload(text=f"Elevated: {normalized} (may not persist — {exc})")
+
+
+# ---------------------------------------------------------------------------
+# /exec host=<sandbox|gateway|node> security=<deny|allowlist|full> ask=<...>
+# Mirrors TS handleExecDirective()
+# ---------------------------------------------------------------------------
+
+async def _handle_exec_directive(
+    args: str,
+    ctx: Any,
+    cfg: dict[str, Any],
+    session_key: str,
+) -> ReplyPayload:
+    """Show or override exec settings for this session."""
+    if not args.strip():
+        # Show current
+        try:
+            entry = _load_session_entry_for_model(session_key, cfg)
+            e = entry or {}
+            host = e.get("execHost") or "gateway"
+            security = e.get("execSecurity") or "allowlist"
+            ask = e.get("execAsk") or "on-miss"
+            node = e.get("execNode") or ""
+            lines = [
+                f"Exec settings:",
+                f"  host={host}",
+                f"  security={security}",
+                f"  ask={ask}",
+            ]
+            if node:
+                lines.append(f"  node={node}")
+            return ReplyPayload(text="\n".join(lines))
+        except Exception:
+            return ReplyPayload(text="Exec settings: (default)")
+
+    # Parse key=value pairs
+    updates: dict[str, str] = {}
+    for token in args.split():
+        if "=" in token:
+            k, v = token.split("=", 1)
+            key_map = {"host": "execHost", "security": "execSecurity", "ask": "execAsk", "node": "execNode"}
+            if k in key_map:
+                updates[key_map[k]] = v
+
+    if not updates:
+        return ReplyPayload(text="Usage: /exec host=<sandbox|gateway|node> security=<deny|allowlist|full> ask=<off|on-miss|always>")
+
+    try:
+        from openclaw.agents.sessions import patch_session_entry
+        patch_session_entry(session_key, updates, cfg)
+        parts = [f"{k.replace('exec', '').lower()}={v}" for k, v in updates.items()]
+        return ReplyPayload(text=f"Exec updated: {', '.join(parts)}")
+    except Exception as exc:
+        logger.warning(f"/exec error: {exc}")
+        return ReplyPayload(text=f"Exec update failed: {exc}")
+
+
+def _load_session_entry_for_model(session_key: str, cfg: dict[str, Any]) -> dict | None:
+    """Load session entry (shared helper for model commands)."""
+    if not session_key:
+        return None
+    try:
+        from openclaw.config.sessions import load_session_store, resolve_store_path
+        store_path = resolve_store_path(cfg.get("session", {}).get("store"), {})
+        store = load_session_store(store_path)
+        return store.get(session_key.lower()) or store.get(session_key)
+    except Exception:
+        return None

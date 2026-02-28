@@ -1,0 +1,8 @@
+{
+  "id": "diagnostics-otel",
+  "name": "diagnostics-otel",
+  "version": "0.1.0",
+  "description": "OpenTelemetry diagnostics and tracing",
+  "author": "OpenClaw",
+  "main": "plugin.py"
+}

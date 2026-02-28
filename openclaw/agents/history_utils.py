@@ -1,16 +1,171 @@
 """
-History Utils - session history cleaning and limiting
+History Utils - session history cleaning and limiting.
 
-Aligned with openclaw/src/agents/pi-embedded-runner/run/attempt.ts
+Includes TranscriptPolicy + resolve_transcript_policy() mirroring
+TS openclaw/src/agents/transcript-policy.ts.
 """
 from __future__ import annotations
 
 import json
 import logging
+import re
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# TranscriptPolicy — mirrors TS TranscriptPolicy type + resolveTranscriptPolicy()
+# ---------------------------------------------------------------------------
+
+TranscriptSanitizeMode = Literal["full", "images-only"]
+ToolCallIdMode = Literal["strict", "strict9"]
+
+_MISTRAL_MODEL_HINTS: tuple[str, ...] = (
+    "mistral", "mixtral", "codestral", "pixtral", "devstral", "ministral", "mistralai",
+)
+
+_OPENAI_MODEL_APIS: frozenset[str] = frozenset(
+    ["openai", "openai-completions", "openai-responses", "openai-codex-responses"]
+)
+
+_OPENAI_PROVIDERS: frozenset[str] = frozenset(["openai", "openai-codex"])
+
+_GOOGLE_MODEL_APIS: frozenset[str] = frozenset(
+    ["google-ai-studio", "google-vertex", "google-genai", "gemini", "gemini-vertex"]
+)
+
+
+@dataclass
+class SanitizeThoughtSignaturesConfig:
+    """Config for thought-signature sanitization (OpenRouter Gemini)."""
+    allow_base64_only: bool = False
+    include_camel_case: bool = False
+
+
+@dataclass
+class TranscriptPolicy:
+    """Provider-aware transcript sanitization policy.
+
+    Mirrors TS TranscriptPolicy in openclaw/src/agents/transcript-policy.ts.
+    """
+    sanitize_mode: TranscriptSanitizeMode = "images-only"
+    sanitize_tool_call_ids: bool = False
+    tool_call_id_mode: ToolCallIdMode | None = None
+    repair_tool_use_result_pairing: bool = False
+    preserve_signatures: bool = False
+    sanitize_thought_signatures: SanitizeThoughtSignaturesConfig | None = None
+    normalize_antigravity_thinking_blocks: bool = False
+    apply_google_turn_ordering: bool = False
+    validate_gemini_turns: bool = False
+    validate_anthropic_turns: bool = False
+    allow_synthetic_tool_results: bool = False
+
+
+def _normalize_provider_id(provider: str) -> str:
+    """Local normalizer — calls model_selection.normalize_provider_id if available."""
+    try:
+        from openclaw.agents.model_selection import normalize_provider_id
+        return normalize_provider_id(provider)
+    except Exception:
+        return provider.strip().lower()
+
+
+def _is_openai_api(model_api: str | None) -> bool:
+    return bool(model_api) and model_api in _OPENAI_MODEL_APIS
+
+
+def _is_openai_provider(provider: str | None) -> bool:
+    return bool(provider) and _normalize_provider_id(provider) in _OPENAI_PROVIDERS
+
+
+def _is_anthropic_api(model_api: str | None, provider: str | None) -> bool:
+    if model_api == "anthropic-messages":
+        return True
+    # MiniMax uses openai-completions, not anthropic-messages
+    return _normalize_provider_id(provider or "") == "anthropic"
+
+
+def _is_google_model_api(model_api: str | None) -> bool:
+    return bool(model_api) and model_api in _GOOGLE_MODEL_APIS
+
+
+def _is_mistral_model(provider: str | None, model_id: str | None) -> bool:
+    p = _normalize_provider_id(provider or "")
+    if p == "mistral":
+        return True
+    mid = (model_id or "").lower()
+    return any(hint in mid for hint in _MISTRAL_MODEL_HINTS)
+
+
+def _is_antigravity_claude(model_api: str | None, provider: str | None, model_id: str | None) -> bool:
+    """Detect Antigravity Claude (Google-hosted Anthropic models)."""
+    p = _normalize_provider_id(provider or "")
+    api = model_api or ""
+    if p == "antigravity":
+        return True
+    if api in ("antigravity", "antigravity-messages"):
+        return True
+    if p == "google-vertex" and (model_id or "").lower().startswith("claude"):
+        return True
+    return False
+
+
+def resolve_transcript_policy(
+    model_api: str | None = None,
+    provider: str | None = None,
+    model_id: str | None = None,
+) -> TranscriptPolicy:
+    """Resolve provider-aware transcript sanitization policy.
+
+    Mirrors TS resolveTranscriptPolicy() in openclaw/src/agents/transcript-policy.ts.
+
+    Args:
+        model_api: API type string (e.g. 'anthropic-messages', 'google-ai-studio').
+        provider: Provider name (e.g. 'anthropic', 'openai', 'mistral').
+        model_id: Model identifier (e.g. 'claude-3-5-sonnet', 'gemini-2.0-flash').
+
+    Returns:
+        TranscriptPolicy with all sanitization flags resolved.
+    """
+    p = _normalize_provider_id(provider or "")
+    mid = model_id or ""
+
+    is_google = _is_google_model_api(model_api)
+    is_anthropic = _is_anthropic_api(model_api, p)
+    is_openai = _is_openai_provider(p) or (not p and _is_openai_api(model_api))
+    is_mistral = _is_mistral_model(p, mid)
+    is_openrouter_gemini = (p in ("openrouter", "opencode")) and "gemini" in mid.lower()
+    is_antigravity_claude = _is_antigravity_claude(model_api, p, mid)
+
+    needs_non_image_sanitize = is_google or is_anthropic or is_mistral or is_openrouter_gemini
+
+    sanitize_tool_call_ids = is_google or is_mistral or is_anthropic
+    tool_call_id_mode: ToolCallIdMode | None = (
+        "strict9" if is_mistral
+        else "strict" if sanitize_tool_call_ids
+        else None
+    )
+    repair_tool_use_result_pairing = is_google or is_anthropic
+    sanitize_thought_signatures = (
+        SanitizeThoughtSignaturesConfig(allow_base64_only=True, include_camel_case=True)
+        if is_openrouter_gemini else None
+    )
+
+    return TranscriptPolicy(
+        sanitize_mode="images-only" if is_openai else ("full" if needs_non_image_sanitize else "images-only"),
+        sanitize_tool_call_ids=not is_openai and sanitize_tool_call_ids,
+        tool_call_id_mode=tool_call_id_mode,
+        repair_tool_use_result_pairing=not is_openai and repair_tool_use_result_pairing,
+        preserve_signatures=is_antigravity_claude,
+        sanitize_thought_signatures=None if is_openai else sanitize_thought_signatures,
+        normalize_antigravity_thinking_blocks=is_antigravity_claude,
+        apply_google_turn_ordering=not is_openai and is_google,
+        validate_gemini_turns=not is_openai and is_google,
+        validate_anthropic_turns=not is_openai and is_anthropic,
+        allow_synthetic_tool_results=not is_openai and (is_google or is_anthropic),
+    )
 
 
 def sanitize_session_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -38,10 +193,18 @@ def sanitize_session_history(messages: list[dict[str, Any]]) -> list[dict[str, A
             continue
         
         # Create clean copy without metadata
+        role = msg["role"]
+        # compactionSummary / branchSummary have a "summary" field, not "content"
+        content_val = msg.get("content")
+        if role in ("compactionSummary", "branchSummary") and content_val is None:
+            content_val = msg.get("summary")
         clean_msg = {
-            "role": msg["role"],
-            "content": msg.get("content"),
+            "role": role,
+            "content": content_val,
         }
+        # Preserve "summary" so convert_to_llm can access it
+        if role in ("compactionSummary", "branchSummary") and "summary" in msg:
+            clean_msg["summary"] = msg["summary"]
         
         # Preserve essential fields only
         if "id" in msg:
@@ -368,3 +531,13 @@ def read_session_transcript(
         messages = messages[-limit:]
     
     return messages
+
+
+__all__ = [
+    "TranscriptPolicy",
+    "TranscriptSanitizeMode",
+    "ToolCallIdMode",
+    "SanitizeThoughtSignaturesConfig",
+    "resolve_transcript_policy",
+    "sanitize_session_history",
+]

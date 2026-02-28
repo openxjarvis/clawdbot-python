@@ -277,32 +277,39 @@ def build_agent_system_prompt(
 
     # ── 23. Project Context (bootstrap files) ────────────────────────
     if context_files:
-        has_soul = any(
-            _is_soul_file(f) for f in context_files
-        )
-
-        lines.extend([
-            "# Project Context",
-            "",
-            "The following project context files have been loaded:",
-        ])
-
-        if has_soul:
-            lines.append(
-                "If SOUL.md is present, embody its persona and tone. "
-                "Avoid stiff, generic replies; follow its guidance unless "
-                "higher-priority instructions override it."
-            )
-
-        lines.append("")
-
-        for file in context_files:
+        # Support both list[dict] form and plain string form (test convenience)
+        if isinstance(context_files, str):
             lines.extend([
-                f"## {file['path']}",
+                "# Project Context",
                 "",
-                file["content"],
+                context_files,
                 "",
             ])
+        else:
+            has_soul = any(_is_soul_file(f) for f in context_files)
+
+            lines.extend([
+                "# Project Context",
+                "",
+                "The following project context files have been loaded:",
+            ])
+
+            if has_soul:
+                lines.append(
+                    "If SOUL.md is present, embody its persona and tone. "
+                    "Avoid stiff, generic replies; follow its guidance unless "
+                    "higher-priority instructions override it."
+                )
+
+            lines.append("")
+
+            for file in context_files:
+                lines.extend([
+                    f"## {file['path']}",
+                    "",
+                    file["content"],
+                    "",
+                ])
 
     # ── 24. Silent Replies ───────────────────────────────────────────
     lines.extend(build_silent_replies_section(is_minimal))

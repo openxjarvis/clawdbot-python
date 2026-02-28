@@ -124,6 +124,58 @@ def log_run_attempt(session_key: str, model: str) -> None:
     _emit("run.attempt", {"session_key": session_key, "model": model})
 
 
+def log_model_usage(
+    session_key: str,
+    provider: str,
+    model: str,
+    usage: dict[str, Any],
+    cost_usd: float | None = None,
+    duration_ms: float | None = None,
+    channel: str | None = None,
+    session_id: str | None = None,
+    context: dict[str, Any] | None = None,
+    last_call_usage: dict[str, Any] | None = None,
+) -> None:
+    """Emit a ``model.usage`` diagnostic event.
+
+    Mirrors TypeScript ``emitDiagnosticEvent({ type: "model.usage", ... })``
+    called from ``src/auto-reply/reply/agent-runner.ts`` after each LLM call.
+
+    Args:
+        session_key: Active session key.
+        provider: LLM provider name (e.g. ``"anthropic"``, ``"openai"``).
+        model: Model identifier (e.g. ``"claude-opus-4"``).
+        usage: Token usage dict with keys ``input``, ``output``, ``cacheRead``,
+            ``cacheWrite``, ``promptTokens``, ``total``.
+        cost_usd: Estimated cost in USD (optional).
+        duration_ms: Run duration in milliseconds (optional).
+        channel: Channel hint (e.g. ``"telegram"``) for routing context.
+        session_id: Session UUID if available.
+        context: Context window info — ``{"limit": int, "used": int}``.
+        last_call_usage: Raw usage from the last provider call (optional).
+    """
+    payload: dict[str, Any] = {
+        "session_key": session_key,
+        "provider": provider,
+        "model": model,
+        "usage": usage,
+    }
+    if cost_usd is not None:
+        payload["cost_usd"] = cost_usd
+    if duration_ms is not None:
+        payload["duration_ms"] = duration_ms
+    if channel is not None:
+        payload["channel"] = channel
+    if session_id is not None:
+        payload["session_id"] = session_id
+    if context is not None:
+        payload["context"] = context
+    if last_call_usage is not None:
+        payload["last_call_usage"] = last_call_usage
+
+    _emit("model.usage", payload)
+
+
 def log_active_runs(count: int) -> None:
     """Log active run count"""
     _stats.active_runs = count
@@ -141,9 +193,10 @@ def get_diagnostic_flag(flag: str) -> bool:
 
 
 def get_diagnostic_stats() -> DiagnosticStats:
-    """Get current diagnostic statistics"""
+    """Get current diagnostic statistics (returns a snapshot copy)."""
     _stats.uptime_seconds = (datetime.now() - _start_time).total_seconds()
-    return _stats
+    import copy
+    return copy.copy(_stats)
 
 
 def on_diagnostic_event(listener: Callable[[str, Any], Any]) -> Callable:

@@ -303,31 +303,70 @@ class DockerSandbox:
         
         self._started = False
     
-    async def exec_command(self, cmd: str, **kwargs) -> dict[str, Any]:
-        """
-        Execute command in sandbox container
-        
+    async def exec_command(
+        self,
+        cmd: str,
+        workdir: str | None = None,
+        env_override: dict[str, str] | None = None,
+        interactive: bool = True,
+        stdin: bytes | None = None,
+        allow_failure: bool = True,
+    ) -> dict[str, Any]:
+        """Execute command in sandbox container.
+
+        Builds ``docker exec`` arguments in the same style as the TypeScript
+        ``buildDockerExecArgs()`` helper.
+
         Args:
-            cmd: Shell command to execute
-            **kwargs: Additional options (timeout_ms, etc.)
-            
+            cmd: Shell command string to execute via ``sh -c``.
+            workdir: Working directory inside the container (``-w`` flag).
+            env_override: Extra environment variables to pass (``-e KEY=val``).
+            interactive: Pass ``-i`` flag (required for stdin/stdout pipes).
+            stdin: Optional bytes to pipe to the process's stdin.
+            allow_failure: If ``False``, raise on non-zero exit code.
+
         Returns:
-            Dict with stdout, stderr, exit_code
+            Dict with ``stdout``, ``stderr``, ``exit_code``, ``success``.
         """
         if not self.container_name or not self._started:
             raise RuntimeError("Sandbox not started")
-        
-        # Build exec command
-        args = ["exec", self.container_name, "sh", "-c", cmd]
-        
-        # Execute
-        result = await exec_docker(args, allow_failure=True)
-        
+
+        # Build exec args — mirrors TS buildDockerExecArgs()
+        args: list[str] = ["exec"]
+
+        if interactive:
+            args.append("-i")
+
+        if workdir:
+            args.extend(["-w", workdir])
+
+        for key, value in (env_override or {}).items():
+            args.extend(["-e", f"{key}={value}"])
+
+        args.extend([self.container_name, "sh", "-lc", cmd])
+
+        proc = await asyncio.create_subprocess_exec(
+            "docker",
+            *args,
+            stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        stdout_bytes, stderr_bytes = await proc.communicate(input=stdin)
+        code = proc.returncode or 0
+        stdout_text = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
+        stderr_text = stderr_bytes.decode("utf-8", errors="replace") if stderr_bytes else ""
+
+        if code != 0 and not allow_failure:
+            msg = stderr_text.strip() or f"sandbox exec failed with code {code}"
+            raise RuntimeError(msg)
+
         return {
-            "stdout": result["stdout"],
-            "stderr": result["stderr"],
-            "exit_code": result["code"],
-            "success": result["code"] == 0,
+            "stdout": stdout_text,
+            "stderr": stderr_text,
+            "exit_code": code,
+            "success": code == 0,
         }
     
     async def __aenter__(self):

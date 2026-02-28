@@ -1,0 +1,8 @@
+{
+  "id": "phone-control",
+  "name": "phone-control",
+  "version": "0.1.0",
+  "description": "Phone control and automation",
+  "author": "OpenClaw",
+  "main": "plugin.py"
+}

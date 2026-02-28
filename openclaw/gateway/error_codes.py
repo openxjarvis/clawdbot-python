@@ -100,6 +100,27 @@ class AuthRequiredError(GatewayError):
         super().__init__(message, ErrorCode.AUTH_REQUIRED, details)
 
 
+class GatewayLockError(Exception):
+    """Raised when gateway cannot bind its port because another instance is running.
+
+    Mirrors TS GatewayLockError in openclaw/src/gateway/lock.ts.
+    The OS releases the TCP listener automatically on process exit (including
+    crashes / SIGKILL), so no separate lock-file cleanup is needed.
+    """
+
+    def __init__(self, host: str, port: int, cause: Exception | None = None) -> None:
+        self.host = host
+        self.port = port
+        self.cause = cause
+        msg = (
+            f"another gateway instance is already listening on "
+            f"ws://{host}:{port}"
+        )
+        if cause and "address already in use" not in str(cause).lower():
+            msg = f"failed to bind gateway socket on ws://{host}:{port}: {cause}"
+        super().__init__(msg)
+
+
 class AuthFailedError(GatewayError):
     """Authentication failed."""
     def __init__(self, message: str = "Authentication failed", details: dict | None = None):

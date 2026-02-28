@@ -291,13 +291,17 @@ async def load_internal_hooks(
     """
     opts = opts or {}
     
-    # Ensure cfg is not None
-    if cfg is None:
+    # Ensure cfg is not None and is a dict
+    if not isinstance(cfg, dict):
         cfg = {}
     
-    # Check if hooks are enabled
-    hooks_config = cfg.get("hooks", {})
-    internal_config = hooks_config.get("internal", {})
+    # Check if hooks are enabled (defensive chain to avoid NoneType errors)
+    hooks_config = cfg.get("hooks")
+    if not isinstance(hooks_config, dict):
+        hooks_config = {}
+    internal_config = hooks_config.get("internal")
+    if not isinstance(internal_config, dict):
+        internal_config = {}
     if not internal_config.get("enabled"):
         return 0
     

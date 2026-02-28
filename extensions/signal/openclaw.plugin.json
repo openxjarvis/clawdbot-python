@@ -1,0 +1,13 @@
+{
+  "id": "signal",
+  "name": "Signal",
+  "description": "Signal messaging channel integration.",
+  "channels": [
+    "signal"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "id": "msteams",
+  "name": "Microsoft Teams Channel",
+  "version": "1.0.0",
+  "description": "Microsoft Teams messaging integration",
+  "author": "OpenClaw",
+  "main": "plugin.py"
+}

@@ -1,13 +1,19 @@
 """
-Queue manager for session and global lanes
+Queue manager for session and global lanes.
+
+Mirrors TS openclaw/src/process/command-queue.ts including:
+- warn_after_ms / on_wait callback
+- drop policies: 'old', 'new', 'summarize'
+- reset_all_lanes() for in-process restarts (SIGUSR1)
 """
 from __future__ import annotations
 
-
+import asyncio
 import hashlib
 import logging
+import time
 from collections.abc import Callable, Coroutine
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 from .lane import Lane
 from .lanes import CommandLane, LANE_DEFAULTS
@@ -15,6 +21,10 @@ from .lanes import CommandLane, LANE_DEFAULTS
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+DropPolicy = Literal["old", "new", "summarize"]
+
+DEFAULT_WARN_AFTER_MS: int = 2_000
 
 
 class QueueManager:
@@ -88,20 +98,56 @@ class QueueManager:
         lane: CommandLane,
         task: Callable[[], Coroutine[Any, Any, T]],
         timeout: float | None = None,
+        warn_after_ms: int = DEFAULT_WARN_AFTER_MS,
+        on_wait: Callable[[int, int], None] | None = None,
+        drop_policy: DropPolicy | None = None,
     ) -> T:
         """
-        Enqueue task in a specific command lane
-        
+        Enqueue task in a specific command lane.
+
         Args:
-            lane: CommandLane enum value
-            task: Async function to execute
-            timeout: Optional timeout
-            
+            lane: CommandLane enum value.
+            task: Async function to execute.
+            timeout: Optional timeout in seconds.
+            warn_after_ms: Log a warning if the task waits longer than this (default 2s).
+            on_wait: Optional callback ``(wait_ms, queued_ahead)`` fired when warn threshold exceeded.
+            drop_policy: How to handle overload: 'old' drops oldest, 'new' rejects this task,
+                         'summarize' merges into a backlog message.
+
         Returns:
-            Task result
+            Task result.
         """
         lane_instance = self.get_lane(lane)
-        return await lane_instance.enqueue(task, timeout)
+        enqueued_at = time.monotonic()
+
+        if drop_policy is not None:
+            queue_size = lane_instance.queue.qsize()
+            if queue_size > 0:
+                if drop_policy == "new":
+                    raise RuntimeError(f"Lane {lane.value} busy; dropping new task (policy=new)")
+                elif drop_policy == "old":
+                    try:
+                        lane_instance.queue.get_nowait()
+                        logger.warning("Dropped oldest queued task in lane %s (policy=old)", lane.value)
+                    except asyncio.QueueEmpty:
+                        pass
+                elif drop_policy == "summarize":
+                    logger.warning(
+                        "Lane %s busy; merging task into backlog (policy=summarize)", lane.value
+                    )
+
+        async def timed_task() -> T:
+            wait_ms = int((time.monotonic() - enqueued_at) * 1000)
+            if wait_ms >= warn_after_ms:
+                if on_wait is not None:
+                    on_wait(wait_ms, lane_instance.queue.qsize())
+                logger.warning(
+                    "Lane wait exceeded: lane=%s waited_ms=%d queued_ahead=%d",
+                    lane.value, wait_ms, lane_instance.queue.qsize(),
+                )
+            return await task()
+
+        return await lane_instance.enqueue(timed_task, timeout)
     
     def set_lane_concurrency(self, lane: CommandLane, max_concurrent: int) -> None:
         """
@@ -120,20 +166,55 @@ class QueueManager:
         session_id: str,
         task: Callable[[], Coroutine[Any, Any, T]],
         timeout: float | None = None,
+        warn_after_ms: int = DEFAULT_WARN_AFTER_MS,
+        on_wait: Callable[[int, int], None] | None = None,
+        drop_policy: DropPolicy | None = None,
     ) -> T:
         """
-        Enqueue task in session lane
+        Enqueue task in session lane.
 
         Args:
-            session_id: Session identifier
-            task: Async function to execute
-            timeout: Optional timeout
+            session_id: Session identifier.
+            task: Async function to execute.
+            timeout: Optional timeout in seconds.
+            warn_after_ms: Warn threshold in ms (default 2 s).
+            on_wait: Callback ``(wait_ms, queued_ahead)`` fired on warn.
+            drop_policy: 'old', 'new', or 'summarize' overload policy.
 
         Returns:
-            Task result
+            Task result.
         """
         lane = self.get_session_lane(session_id)
-        return await lane.enqueue(task, timeout)
+        enqueued_at = time.monotonic()
+
+        if drop_policy is not None:
+            queue_size = lane.queue.qsize()
+            if queue_size > 0:
+                if drop_policy == "new":
+                    raise RuntimeError(f"Session lane {session_id} busy; dropping new task (policy=new)")
+                elif drop_policy == "old":
+                    try:
+                        lane.queue.get_nowait()
+                        logger.warning("Dropped oldest queued task in session lane %s (policy=old)", session_id)
+                    except asyncio.QueueEmpty:
+                        pass
+                elif drop_policy == "summarize":
+                    logger.warning(
+                        "Session lane %s busy; merging task into backlog (policy=summarize)", session_id
+                    )
+
+        async def timed_task() -> T:
+            wait_ms = int((time.monotonic() - enqueued_at) * 1000)
+            if wait_ms >= warn_after_ms:
+                if on_wait is not None:
+                    on_wait(wait_ms, lane.queue.qsize())
+                logger.warning(
+                    "Session lane wait exceeded: session=%s waited_ms=%d queued_ahead=%d",
+                    session_id, wait_ms, lane.queue.qsize(),
+                )
+            return await task()
+
+        return await lane.enqueue(timed_task, timeout)
 
     async def enqueue_global(
         self, task: Callable[[], Coroutine[Any, Any, T]], timeout: float | None = None
@@ -191,6 +272,33 @@ class QueueManager:
             await lane.stop()
             del self._session_lanes[session_id]
             logger.debug(f"Cleaned up lane for session: {session_id}")
+
+    def reset_all_lanes(self) -> None:
+        """Reset all lane runtime state to idle.
+
+        Mirrors TS ``resetAllLanes()`` — used after SIGUSR1 in-process restarts.
+
+        Bumps each lane's generation so stale in-flight completions are ignored.
+        Clears active-task counters.  Queued entries are preserved because they
+        represent pending user work that should still execute after restart.
+
+        After resetting, starts each lane's worker so preserved work drains
+        immediately rather than waiting for a future ``enqueue`` call.
+        """
+        all_lanes: list[Lane] = (
+            list(self._fixed_lanes.values())
+            + list(self._session_lanes.values())
+            + [self._global_lane]
+        )
+        for lane in all_lanes:
+            lane.generation += 1
+            lane._active_tasks.clear()
+            lane.active = 0
+            lane._running = False
+            if not lane.queue.empty():
+                lane._start_worker()
+
+        logger.info("reset_all_lanes: reset %d lanes", len(all_lanes))
 
     def get_stats(self) -> dict:
         """Get queue manager statistics"""

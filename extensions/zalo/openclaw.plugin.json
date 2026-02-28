@@ -1,0 +1,13 @@
+{
+  "id": "zalo",
+  "name": "Zalo",
+  "description": "Zalo channel integration.",
+  "channels": [
+    "zalo"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

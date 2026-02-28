@@ -80,6 +80,7 @@ class PiAgentRuntime:
         cwd: str | Path | None = None,
         system_prompt: str | None = None,
         config: dict[str, Any] | None = None,
+        hook_runner: Any | None = None,
     ) -> None:
         self.model_str = model
         # All candidates: primary first, then fallbacks (mirrors TS runWithModelFallback)
@@ -87,6 +88,10 @@ class PiAgentRuntime:
         self.cwd = str(cwd) if cwd else None
         self.system_prompt = system_prompt
         self.config = config or {}
+
+        # Plugin hook runner — fires typed lifecycle hooks registered by plugins.
+        # Mirrors TS: hookRunner created from PluginRegistry in server.impl.ts.
+        self._hook_runner: Any | None = hook_runner
 
         # Per-session pool: openclaw session_id → pi_coding_agent.AgentSession
         self._pool: dict[str, Any] = {}
@@ -257,6 +262,33 @@ class PiAgentRuntime:
         """Remove a session from the pool."""
         self._pool.pop(session_id, None)
 
+    async def reset_session(self, session_id: str) -> None:
+        """Reset a session — fires before_reset hook then evicts the session.
+
+        Called on /new or /reset commands. Mirrors TS resetSession() behavior.
+        """
+        # --- Plugin Hook: before_reset ---
+        if self._hook_runner and self._hook_runner.has_hooks("before_reset"):
+            try:
+                await self._hook_runner.run_before_reset(
+                    {"session_key": session_id},
+                    self._build_agent_ctx(session_id),
+                )
+            except Exception as exc:
+                logger.debug(f"before_reset hook failed: {exc}")
+
+        self.evict_session(session_id)
+
+        # --- Plugin Hook: session_end ---
+        if self._hook_runner and self._hook_runner.has_hooks("session_end"):
+            try:
+                await self._hook_runner.run_session_end(
+                    {"session_key": session_id},
+                    self._build_session_ctx(session_id),
+                )
+            except Exception as exc:
+                logger.debug(f"session_end hook failed: {exc}")
+
     # ------------------------------------------------------------------
     # Compaction execution
     # ------------------------------------------------------------------
@@ -281,6 +313,16 @@ class PiAgentRuntime:
             Compaction result dict with summary, or None if compaction skipped
         """
         try:
+            # --- Plugin Hook: before_compaction ---
+            if self._hook_runner and self._hook_runner.has_hooks("before_compaction"):
+                try:
+                    await self._hook_runner.run_before_compaction(
+                        {"session_id": session_id, "context_window": context_window},
+                        self._build_agent_ctx(session_id),
+                    )
+                except Exception as exc:
+                    logger.debug(f"before_compaction hook failed: {exc}")
+
             from openclaw.agents.compaction.functions import (
                 prune_history_for_context_share,
                 summarize_in_stages,
@@ -385,14 +427,26 @@ class PiAgentRuntime:
             # This would require access to session_manager
             # For now, log the compaction
             logger.info(f"Session {session_id[:8]} compaction completed successfully")
-            
-            return {
+
+            compaction_result = {
                 "summary": enriched_summary,
                 "dropped_messages": len(dropped_messages),
                 "dropped_tokens": prune_result['dropped_tokens'],
                 "kept_messages": len(kept_messages),
                 "kept_tokens": prune_result['kept_tokens'],
             }
+
+            # --- Plugin Hook: after_compaction ---
+            if self._hook_runner and self._hook_runner.has_hooks("after_compaction"):
+                try:
+                    await self._hook_runner.run_after_compaction(
+                        {"session_id": session_id, "result": compaction_result},
+                        self._build_agent_ctx(session_id),
+                    )
+                except Exception as exc:
+                    logger.debug(f"after_compaction hook failed: {exc}")
+
+            return compaction_result
             
         except Exception as e:
             logger.error(f"Compaction execution failed: {e}", exc_info=True)
@@ -401,6 +455,34 @@ class PiAgentRuntime:
     # ------------------------------------------------------------------
     # Observer pattern — mirrors MultiProviderRuntime.add_event_listener
     # ------------------------------------------------------------------
+
+    def set_hook_runner(self, hook_runner: Any) -> None:
+        """Set the plugin hook runner. Called from bootstrap after plugin loading."""
+        self._hook_runner = hook_runner
+
+    def _build_agent_ctx(self, session_id: str) -> dict[str, Any]:
+        """Build PluginHookAgentContext for hook calls."""
+        return {
+            "agent_id": "main",
+            "session_key": session_id,
+            "session_id": session_id,
+            "model": self.model_str,
+            "workspace_dir": self.cwd,
+        }
+
+    def _build_session_ctx(self, session_id: str) -> dict[str, Any]:
+        """Build PluginHookSessionContext for hook calls."""
+        return {
+            "session_key": session_id,
+            "session_id": session_id,
+        }
+
+    def _build_gateway_ctx(self) -> dict[str, Any]:
+        """Build PluginHookGatewayContext for hook calls."""
+        return {
+            "config": self.config,
+            "workspace_dir": self.cwd,
+        }
 
     def add_event_listener(self, listener: Callable) -> None:
         """Register a listener that is called for every Event produced during run_turn.
@@ -466,6 +548,70 @@ class PiAgentRuntime:
         """
         session_id = getattr(session, "session_id", "") or ""
         extra_tools = list(tools) if tools else None
+
+        # --- Plugin Hook: session_start ---
+        if self._hook_runner and not getattr(session, "_hook_session_started", False):
+            try:
+                await self._hook_runner.run_session_start(
+                    {"session_key": session_id},
+                    self._build_session_ctx(session_id),
+                )
+                object.__setattr__(session, "_hook_session_started", True)
+            except Exception:
+                pass  # hooks must not break core flow
+
+        # --- Plugin Hook: before_model_resolve ---
+        # Allows plugins to override provider/model before resolution
+        effective_model = model
+        if self._hook_runner:
+            try:
+                resolve_result = await self._hook_runner.run_before_model_resolve(
+                    {"model": model or self.model_str, "config": self.config},
+                    self._build_agent_ctx(session_id),
+                )
+                if resolve_result:
+                    if resolve_result.get("model_override"):
+                        effective_model = resolve_result["model_override"]
+                        logger.debug(f"[hooks] before_model_resolve: model overridden to {effective_model}")
+            except Exception as exc:
+                logger.warning(f"before_model_resolve hook failed: {exc}")
+
+        # --- Plugin Hook: before_prompt_build ---
+        # Allows plugins to inject system_prompt and prepend_context
+        effective_system_prompt = system_prompt
+        if self._hook_runner:
+            try:
+                prompt_result = await self._hook_runner.run_before_prompt_build(
+                    {"system_prompt": system_prompt, "config": self.config},
+                    self._build_agent_ctx(session_id),
+                )
+                if prompt_result:
+                    if prompt_result.get("system_prompt"):
+                        effective_system_prompt = prompt_result["system_prompt"]
+                    if prompt_result.get("prepend_context") and effective_system_prompt:
+                        effective_system_prompt = (
+                            prompt_result["prepend_context"] + "\n\n" + effective_system_prompt
+                        )
+                    elif prompt_result.get("prepend_context"):
+                        effective_system_prompt = prompt_result["prepend_context"]
+            except Exception as exc:
+                logger.warning(f"before_prompt_build hook failed: {exc}")
+
+        # Use effective values going forward
+        if effective_model and effective_model != model:
+            model = effective_model
+        if effective_system_prompt and effective_system_prompt != system_prompt:
+            system_prompt = effective_system_prompt
+
+        # --- Plugin Hook: message_received ---
+        if self._hook_runner:
+            try:
+                await self._hook_runner.run_message_received(
+                    {"message": message, "session_key": session_id},
+                    self._build_agent_ctx(session_id),
+                )
+            except Exception as exc:
+                logger.warning(f"message_received hook failed: {exc}")
 
         # Build the candidate list for this turn.
         # A per-call override bypasses the configured fallback chain (mirrors TS).
@@ -800,9 +946,29 @@ class PiAgentRuntime:
                     except Exception as e:
                         logger.debug(f"Token estimation failed: {e}")
                     
+                    # --- Plugin Hook: llm_input (observe prompt before LLM) ---
+                    if self._hook_runner and self._hook_runner.has_hooks("llm_input"):
+                        try:
+                            await self._hook_runner.run_llm_input(
+                                {"message": message, "model": candidate_model},
+                                self._build_agent_ctx(session_id),
+                            )
+                        except Exception as exc:
+                            logger.debug(f"llm_input hook failed: {exc}")
+
                     logger.debug(f"[{session_id[:8]}] Calling pi_session.prompt")
                     await _pi_session.prompt(message, pi_images)
                     logger.debug(f"[{session_id[:8]}] pi_session.prompt completed")
+
+                    # --- Plugin Hook: llm_output (observe LLM output) ---
+                    if self._hook_runner and self._hook_runner.has_hooks("llm_output"):
+                        try:
+                            await self._hook_runner.run_llm_output(
+                                {"model": candidate_model},
+                                self._build_agent_ctx(session_id),
+                            )
+                        except Exception as exc:
+                            logger.debug(f"llm_output hook failed: {exc}")
                 except Exception as exc:
                     logger.error(f"[{session_id[:8]}] _run_prompt error: {exc}", exc_info=True)
                     if _is_quota_error(exc):
@@ -900,6 +1066,16 @@ class PiAgentRuntime:
                     )
             except Exception as e:
                 logger.warning(f"Failed to update session token statistics: {e}")
+
+            # --- Plugin Hook: agent_end (fire-and-forget, parallel) ---
+            if self._hook_runner and self._hook_runner.has_hooks("agent_end") and not _quota_error:
+                try:
+                    asyncio.create_task(self._hook_runner.run_agent_end(
+                        {"session_key": session_id, "model": candidate_model},
+                        self._build_agent_ctx(session_id),
+                    ))
+                except Exception as exc:
+                    logger.debug(f"agent_end hook failed: {exc}")
 
             # If quota error and NO more fallbacks, emit a helpful error
             if _quota_error:

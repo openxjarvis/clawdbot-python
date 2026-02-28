@@ -18,6 +18,7 @@ Migration Guide:
 
 import asyncio
 import logging
+import os
 import warnings
 from collections.abc import AsyncIterator
 
@@ -269,41 +270,108 @@ class MultiProviderRuntime:
                 logger.error(f"Observer notification failed: {e}", exc_info=True)
 
     def _create_provider(self) -> LLMProvider:
-        """Create appropriate provider based on provider name"""
-        provider_name = self.provider_name.lower()
+        """Create appropriate provider based on provider name.
+
+        Routes aligned with TS register-builtins.ts and openai-completions.ts.
+        OpenAI-compatible providers (xAI, DeepSeek, Zhipu/ZAI, Groq, Mistral,
+        Moonshot, Together, OpenRouter, HuggingFace, Cerebras) all use
+        OpenAIProvider with provider-specific base_url and api_key env vars.
+        """
+        from .model_selection import normalize_provider_id
+        provider_name = normalize_provider_id(self.provider_name)
 
         # Common parameters
-        kwargs = {
+        kwargs: dict = {
             "model": self.model_name,
             "api_key": self.api_key,
             "base_url": self.base_url,
             **self.extra_params,
         }
 
-        # Create provider
+        # ── Core providers ─────────────────────────────────────────────────
         if provider_name == "anthropic":
             return AnthropicProvider(**kwargs)
 
-        elif provider_name == "openai":
+        if provider_name == "openai":
             return OpenAIProvider(**kwargs)
 
-        elif provider_name in ("gemini", "google", "google-gemini"):
+        if provider_name in ("gemini", "google", "google-gemini"):
             return GeminiProvider(**kwargs)
 
-        elif provider_name in ("bedrock", "aws-bedrock"):
+        if provider_name in ("bedrock", "aws-bedrock", "amazon-bedrock"):
             return BedrockProvider(**kwargs)
 
-        elif provider_name == "ollama":
+        if provider_name == "ollama":
             return OllamaProvider(**kwargs)
 
-        elif provider_name in ("lmstudio", "openai-compatible", "custom"):
-            # OpenAI-compatible with custom base URL
+        # ── OpenAI-compatible providers (mirrors TS register-builtins.ts) ──
+
+        if provider_name == "xai":
+            kwargs["base_url"] = kwargs.get("base_url") or "https://api.x.ai/v1"
+            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("XAI_API_KEY")
+            return OpenAIProvider(provider_name_override="xai", **kwargs)
+
+        if provider_name in ("zai", "zhipu"):
+            kwargs["base_url"] = kwargs.get("base_url") or "https://open.bigmodel.cn/api/paas/v4"
+            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("ZAI_API_KEY") or os.getenv("ZHIPU_API_KEY")
+            return OpenAIProvider(provider_name_override="zai", **kwargs)
+
+        if provider_name == "deepseek":
+            kwargs["base_url"] = kwargs.get("base_url") or "https://api.deepseek.com"
+            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("DEEPSEEK_API_KEY")
+            return OpenAIProvider(provider_name_override="deepseek", **kwargs)
+
+        if provider_name == "groq":
+            kwargs["base_url"] = kwargs.get("base_url") or "https://api.groq.com/openai/v1"
+            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("GROQ_API_KEY")
+            return OpenAIProvider(provider_name_override="groq", **kwargs)
+
+        if provider_name == "mistral":
+            kwargs["base_url"] = kwargs.get("base_url") or "https://api.mistral.ai/v1"
+            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("MISTRAL_API_KEY")
+            return OpenAIProvider(provider_name_override="mistral", **kwargs)
+
+        if provider_name in ("moonshot", "kimi-coding", "kimi"):
+            kwargs["base_url"] = kwargs.get("base_url") or "https://api.moonshot.cn/v1"
+            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("MOONSHOT_API_KEY")
+            return OpenAIProvider(provider_name_override="moonshot", **kwargs)
+
+        if provider_name == "together":
+            kwargs["base_url"] = kwargs.get("base_url") or "https://api.together.xyz/v1"
+            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("TOGETHER_API_KEY")
+            return OpenAIProvider(provider_name_override="together", **kwargs)
+
+        if provider_name == "openrouter":
+            kwargs["base_url"] = kwargs.get("base_url") or "https://openrouter.ai/api/v1"
+            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("OPENROUTER_API_KEY")
+            return OpenAIProvider(provider_name_override="openrouter", **kwargs)
+
+        if provider_name == "huggingface":
+            kwargs["base_url"] = kwargs.get("base_url") or "https://api-inference.huggingface.co/v1"
+            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("HUGGINGFACE_API_KEY") or os.getenv("HF_API_KEY")
+            return OpenAIProvider(provider_name_override="huggingface", **kwargs)
+
+        if provider_name == "cerebras":
+            kwargs["base_url"] = kwargs.get("base_url") or "https://api.cerebras.ai/v1"
+            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("CEREBRAS_API_KEY")
+            return OpenAIProvider(provider_name_override="cerebras", **kwargs)
+
+        if provider_name in ("opencode", "opencode-zen"):
+            kwargs["base_url"] = kwargs.get("base_url") or os.getenv("OPENCODE_BASE_URL", "https://api.opencode.ai/v1")
+            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("OPENCODE_API_KEY")
+            return OpenAIProvider(provider_name_override="opencode", **kwargs)
+
+        if provider_name in ("qwen-portal", "qwen"):
+            kwargs["base_url"] = kwargs.get("base_url") or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("DASHSCOPE_API_KEY") or os.getenv("QWEN_API_KEY")
+            return OpenAIProvider(provider_name_override="qwen", **kwargs)
+
+        if provider_name in ("lmstudio", "openai-compatible", "custom"):
             return OpenAIProvider(**kwargs)
 
-        else:
-            # Unknown provider, try OpenAI-compatible
-            logger.warning(f"Unknown provider '{provider_name}', trying OpenAI-compatible mode")
-            return OpenAIProvider(**kwargs)
+        # Unknown provider — try OpenAI-compatible
+        logger.warning(f"Unknown provider '{provider_name}', trying OpenAI-compatible mode")
+        return OpenAIProvider(**kwargs)
 
     async def _stream_single_turn(
         self,
@@ -690,6 +758,8 @@ class MultiProviderRuntime:
         yield event
 
         # Execute with retry logic and failover
+        import time as _time
+        _run_started_at = _time.monotonic()
         retry_count = 0
         thinking_state = {}  # State for streaming thinking extraction
         initial_text = ""  # Store initial assistant text (before tool calls)
@@ -885,7 +955,11 @@ class MultiProviderRuntime:
                         {
                             "name": tool.name,
                             "description": tool.description,
-                            "parameters": tool.get_schema(),
+                            "parameters": (
+                                tool.get_schema()
+                                if callable(getattr(tool, "get_schema", None))
+                                else getattr(tool, "parameters", {})
+                            ),
                             "execute": tool.execute if hasattr(tool, 'execute') else None,
                         }
                         for tool in tools
@@ -1049,7 +1123,7 @@ class MultiProviderRuntime:
                                         sig = signature(tool.execute)
                                         param_count = len([p for p in sig.parameters.values() if p.default == p.empty])
                                         
-                                        if param_count >= 3:  # new interface: tool_call_id, params, signal, on_update
+                                        if param_count >= 2:  # new interface: tool_call_id, params (signal, on_update optional)
                                             result = await tool.execute(
                                                 tool_call_id=tc["id"],
                                                 params=tc["arguments"],
@@ -1409,6 +1483,26 @@ class MultiProviderRuntime:
                     # Record success
                     if self.fallback_manager:
                         self.fallback_manager.record_success(current_model)
+
+                # Emit model.usage diagnostic event (mirrors TS agent-runner.ts)
+                try:
+                    from openclaw.infra.diagnostic_events import log_model_usage
+                    _duration_ms = (_time.monotonic() - _run_started_at) * 1000
+                    _session_key = getattr(session, "session_id", "") or ""
+                    log_model_usage(
+                        session_key=_session_key,
+                        provider=self.provider_name or "",
+                        model=current_model,
+                        usage={
+                            "input": 0,
+                            "output": 0,
+                            "total": 0,
+                        },
+                        duration_ms=_duration_ms,
+                        session_id=_session_key,
+                    )
+                except Exception as _diag_err:
+                    logger.debug(f"model.usage diagnostic emit failed: {_diag_err}")
 
                 # Success, exit retry loop
                 event = Event(

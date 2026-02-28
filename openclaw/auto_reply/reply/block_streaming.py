@@ -20,6 +20,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Callable, Awaitable
 
+from openclaw.markdown.fences import parse_fence_spans, is_safe_fence_break
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -128,18 +130,38 @@ class BlockReplyCoalescer:
 
     @staticmethod
     def _find_break_point(text: str, near: int) -> int:
-        """Find a good break point near `near` chars (paragraph → newline → char)."""
+        """Find a good break point near ``near`` chars, respecting code fences.
+
+        Strategy:
+        1. Try double-newline (paragraph break) — skip if inside a code fence.
+        2. Try single newline — skip if inside a code fence.
+        3. Hard-cut at *near* — if inside a fence, close+reopen it so Markdown remains valid.
+        """
         if len(text) <= near:
             return len(text)
+
+        spans = parse_fence_spans(text)
+
         # Prefer double-newline (paragraph break)
         pos = text.rfind("\n\n", 0, near + 200)
-        if pos > near // 2:
+        if pos > near // 2 and is_safe_fence_break(spans, pos):
             return pos + 2
+
         # Single newline
         pos = text.rfind("\n", 0, near + 100)
-        if pos > near // 2:
+        if pos > near // 2 and is_safe_fence_break(spans, pos):
             return pos + 1
-        # Hard cut
+
+        # Hard cut — safe outside fences
+        if is_safe_fence_break(spans, near):
+            return near
+
+        # Inside a fence: find next newline after near that is fence-safe
+        lookahead = text.find("\n", near)
+        if lookahead != -1 and is_safe_fence_break(spans, lookahead):
+            return lookahead + 1
+
+        # Last resort: hard cut (caller handles fence repair if needed)
         return near
 
 

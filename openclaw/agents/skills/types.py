@@ -17,13 +17,15 @@ class Skill:
     Attributes:
         name: Skill name
         description: Skill description
-        location: Path to SKILL.md file
+        location: Path to SKILL.md file (TS: filePath)
         source: Source identifier (bundled, managed, workspace)
+        metadata: OpenClaw-specific metadata extracted from frontmatter
     """
     name: str
     description: str
     location: str
     source: str = "unknown"
+    metadata: "OpenClawSkillMetadata | None" = None
 
 
 @dataclass
@@ -106,7 +108,7 @@ class OpenClawSkillMetadata:
     emoji: str | None = None
     homepage: str | None = None
     os: list[str] = field(default_factory=list)
-    requires: dict[str, list[str]] = field(default_factory=dict)
+    requires: "SkillRequires | None" = None  # TS: requires (bins/anyBins/env/config)
     install: list[SkillInstallSpec] = field(default_factory=list)
 
 
@@ -165,22 +167,51 @@ class SkillEntry:
         frontmatter: Parsed YAML frontmatter
         metadata: OpenClaw-specific metadata
         invocation: Invocation policy
+        source: Source identifier (bundled, managed, workspace, plugin)
+        source_dir: Directory this skill was loaded from
+        skill_key: Unique key for this skill (used for config lookups)
     """
     skill: Skill
-    frontmatter: dict[str, Any]
+    frontmatter: dict[str, Any] = None  # type: ignore[assignment]
     metadata: OpenClawSkillMetadata | None = None
     invocation: SkillInvocationPolicy | None = None
+    source: str = "unknown"
+    source_dir: str = ""
+
+    def __post_init__(self) -> None:
+        if self.frontmatter is None:
+            self.frontmatter = {}
+
+    @property
+    def skill_key(self) -> str:
+        """Unique key for config lookups (name-based)."""
+        return self.skill.name
 
 
 @dataclass
 class SkillEligibilityContext:
     """
-    Context for skill eligibility checking (matches TS SkillEligibilityContext).
-    
+    Context for skill eligibility checking.
+
+    Extends the minimal TS SkillEligibilityContext (which only has ``remote``)
+    with local runtime information needed by the Python eligibility engine.
+
     Attributes:
-        remote: Remote environment info (platforms, binary checks)
+        remote: Remote environment info (platforms, binary checks) — TS field
+        platform: Local OS platform string (darwin | linux | win32)
+        available_bins: Set of binaries found on PATH
+        env_vars: Dictionary of environment variables
     """
     remote: dict[str, Any] | None = None
+    platform: str = ""
+    available_bins: "set[str]" = None  # type: ignore[assignment]
+    env_vars: dict[str, str] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.available_bins is None:
+            self.available_bins = set()
+        if self.env_vars is None:
+            self.env_vars = {}
 
 
 @dataclass

@@ -225,11 +225,65 @@ def extract_description_from_body(body: str, max_length: int = 200) -> str:
     return first_para
 
 
+def _parse_openclaw_metadata(raw: dict) -> "Any | None":
+    """
+    Parse ``metadata.openclaw`` section from frontmatter into OpenClawSkillMetadata.
+
+    Mirrors TS OpenClawSkillMetadata extraction in skills loader.
+    """
+    from .types import OpenClawSkillMetadata, SkillRequires, SkillInstallSpec
+
+    if not isinstance(raw, dict):
+        return None
+
+    requires_raw = raw.get("requires")
+    requires = None
+    if isinstance(requires_raw, dict):
+        requires = SkillRequires(
+            bins=requires_raw.get("bins") or [],
+            any_bins=requires_raw.get("anyBins") or requires_raw.get("any_bins") or [],
+            env=requires_raw.get("env") or [],
+            config=requires_raw.get("config") or [],
+        )
+
+    install_raw = raw.get("install") or []
+    install = []
+    for spec in install_raw:
+        if isinstance(spec, dict) and "kind" in spec:
+            install.append(SkillInstallSpec(
+                kind=spec["kind"],
+                id=spec.get("id"),
+                label=spec.get("label"),
+                bins=spec.get("bins") or [],
+                os=spec.get("os") or [],
+                formula=spec.get("formula"),
+                package=spec.get("package"),
+                module=spec.get("module"),
+                url=spec.get("url"),
+                archive=spec.get("archive"),
+                extract=bool(spec.get("extract", False)),
+                strip_components=int(spec.get("stripComponents") or 0),
+                target_dir=spec.get("targetDir"),
+            ))
+
+    return OpenClawSkillMetadata(
+        always=bool(raw.get("always", False)),
+        skill_key=raw.get("skillKey") or raw.get("skill_key"),
+        primary_env=raw.get("primaryEnv") or raw.get("primary_env"),
+        emoji=raw.get("emoji"),
+        homepage=raw.get("homepage"),
+        os=raw.get("os") or [],
+        requires=requires,
+        install=install,
+    )
+
+
 def parse_skill_frontmatter(content: str, path: str) -> "Any | None":
     """
     Parse a SKILL.md file into a Skill object.
 
     Convenience wrapper that combines parse_frontmatter + Skill construction.
+    Also extracts ``metadata.openclaw`` section into OpenClawSkillMetadata.
 
     Args:
         content: Full SKILL.md file content.
@@ -249,7 +303,12 @@ def parse_skill_frontmatter(content: str, path: str) -> "Any | None":
     if not name:
         return None
 
-    skill = Skill(name=name, description=description, location=path)
+    # Extract OpenClaw metadata from frontmatter (mirrors TS skills loader)
+    metadata_section = frontmatter.get("metadata") or {}
+    openclaw_raw = metadata_section.get("openclaw") if isinstance(metadata_section, dict) else None
+    metadata = _parse_openclaw_metadata(openclaw_raw) if openclaw_raw else None
+
+    skill = Skill(name=name, description=description, location=path, metadata=metadata)
     # Attach the full body so tests can inspect it
     skill.content = body  # type: ignore[attr-defined]
     return skill

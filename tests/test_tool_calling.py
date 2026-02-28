@@ -25,7 +25,7 @@ async def test_message_order():
     
     # Run agent turn (should call bash tool)
     events = []
-    async for event in runtime.run_turn(session=session, user_input="What is the current date?"):
+    async for event in runtime.run_turn(session=session, message="What is the current date?"):
         events.append(event)
     
     # Check message order in session
@@ -64,7 +64,7 @@ async def test_ppt_generation():
     
     async for event in runtime.run_turn(
         session=session, 
-        user_input="Create a PPT about Python programming with 3 slides"
+        message="Create a PPT about Python programming with 3 slides"
     ):
         if event.type == "agent.file_generated":
             file_generated_event = event
@@ -101,19 +101,27 @@ async def test_file_detection_from_metadata():
 async def test_bash_tool():
     """Test bash tool execution"""
     bash_tool = BashTool()
-    result = await bash_tool.execute({"command": "echo 'Hello World'"})
-    
-    assert result.success, "Bash tool should succeed"
-    assert "Hello World" in result.content, "Output should contain 'Hello World'"
+    # BashTool uses AgentToolBase interface: execute(tool_call_id, params)
+    result = await bash_tool.execute("test-call-id", {"command": "echo 'Hello World'"})
+
+    # AgentToolResult: check content list
+    text_parts = [c.text for c in result.content if hasattr(c, "text")]
+    combined = " ".join(text_parts)
+    assert "Hello World" in combined, f"Output should contain 'Hello World', got: {combined!r}"
     print("✅ Bash tool test passed")
 
 
 @pytest.mark.asyncio
 async def test_web_search_tool():
     """Test web search tool"""
+    try:
+        import ddgs  # noqa: F401
+    except ImportError:
+        pytest.skip("ddgs not installed")
+
     web_tool = WebSearchTool()
-    result = await web_tool.execute({"query": "Python programming"})
-    
+    result = await web_tool._execute_impl({"query": "Python programming"})
+
     assert result.success, "Web search should succeed"
     assert result.content, "Web search should return content"
     print("✅ Web search tool test passed")

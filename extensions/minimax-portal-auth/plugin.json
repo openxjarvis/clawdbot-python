@@ -1,0 +1,8 @@
+{
+  "id": "minimax-portal-auth",
+  "name": "minimax-portal-auth",
+  "version": "0.1.0",
+  "description": "MiniMax portal authentication provider",
+  "author": "OpenClaw",
+  "main": "plugin.py"
+}

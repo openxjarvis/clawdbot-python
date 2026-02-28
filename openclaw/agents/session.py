@@ -76,7 +76,7 @@ class Session(BaseModel):
     def __init__(
         self,
         session_id: str,
-        workspace_dir: Path,
+        workspace_dir: Path | None = None,
         session_key: str | None = None,
         *,
         sessions_dir_override: Path | None = None,
@@ -90,6 +90,8 @@ class Session(BaseModel):
             workspace_dir: Workspace directory
             session_key: Optional session key for reference (e.g., "agent:main:telegram:dm:123")
         """
+        if workspace_dir is None:
+            workspace_dir = Path.home() / ".openclaw" / "workspace"
         super().__init__(session_id=session_id, workspace_dir=workspace_dir, session_key=session_key, **kwargs)
 
         # Set sessions directory override for workspace-scoped sessions
@@ -142,9 +144,12 @@ class Session(BaseModel):
         self._save()
         return msg
 
-    def add_user_message(self, content: str) -> Message:
-        """Add a user message"""
-        return self.add_message("user", content)
+    def add_user_message(self, content: str, images: list | None = None) -> Message:
+        """Add a user message with optional images (mirrors TS addUserMessage)."""
+        msg = self.add_message("user", content)
+        if images:
+            msg.images = images
+        return msg
 
     def add_assistant_message(
         self, content: str, tool_calls: list[dict[str, Any]] | None = None
@@ -238,7 +243,7 @@ class SessionManager:
     - Session key to session ID mapping
     """
 
-    def __init__(self, workspace_dir: Path, agent_id: str = "main"):
+    def __init__(self, workspace_dir: Path | None = None, agent_id: str = "main"):
         """
         Initialize session manager
 
@@ -246,7 +251,7 @@ class SessionManager:
             workspace_dir: Base directory for session storage (legacy, still used for fallback)
             agent_id: Agent identifier (default: "main")
         """
-        self.workspace_dir = Path(workspace_dir)
+        self.workspace_dir = Path(workspace_dir) if workspace_dir is not None else Path.home() / ".openclaw" / "workspace"
         self.agent_id = normalize_agent_id(agent_id)
         self._sessions: dict[str, Session] = {}
 
@@ -605,11 +610,12 @@ class SessionManager:
         if sid in self._sessions:
             return self._sessions[sid]
 
+        # Simple (non-agent-key) sessions live in workspace_dir/.sessions/
+        # so they are portable and workspace-scoped (mirrors TS local session storage).
         session = Session(
             session_id=sid,
             workspace_dir=self.workspace_dir,
             session_key=sid,
-            sessions_dir_override=self._sessions_dir,
         )
         self._sessions[sid] = session
         # Persist immediately so list_sessions() can discover it.

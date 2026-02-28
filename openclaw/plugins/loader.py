@@ -3,12 +3,17 @@ from __future__ import annotations
 
 
 import importlib.util
-import json
 import logging
 import sys
 from pathlib import Path
 
-from .types import Plugin, PluginAPI, PluginManifest
+from .manifest import (
+    PluginManifest,
+    load_plugin_manifest,
+    PluginManifestLoadFail,
+    PluginManifestLoadOk,
+)
+from .types import Plugin, PluginAPI
 
 logger = logging.getLogger(__name__)
 
@@ -19,49 +24,61 @@ class PluginLoader:
     def __init__(self):
         self.plugins: dict[str, Plugin] = {}
         self._plugin_apis: dict[str, PluginAPI] = {}
+        # Tracks manifest / load errors by plugin dir path; mirrors TS plugin diagnostics
+        self._errors: dict[str, str] = {}
 
     def discover_plugins(self) -> list[Path]:
         """Discover plugins from standard locations"""
         plugin_dirs = []
 
+        def _has_manifest(item: Path) -> bool:
+            return (item / "openclaw.plugin.json").exists() or (item / "plugin.json").exists()
+
         # Extensions directory (bundled plugins)
         bundled_dir = Path(__file__).parent.parent.parent / "extensions"
         if bundled_dir.exists():
             for item in bundled_dir.iterdir():
-                if item.is_dir() and (item / "plugin.json").exists():
+                if item.is_dir() and _has_manifest(item):
                     plugin_dirs.append(item)
 
         # User plugins
         user_dir = Path.home() / ".openclaw" / "extensions"
         if user_dir.exists():
             for item in user_dir.iterdir():
-                if item.is_dir() and (item / "plugin.json").exists():
+                if item.is_dir() and _has_manifest(item):
                     plugin_dirs.append(item)
 
         logger.info(f"Discovered {len(plugin_dirs)} plugins")
         return plugin_dirs
 
     def load_plugin(self, plugin_dir: Path) -> Plugin | None:
-        """Load a single plugin"""
+        """Load a single plugin.
+
+        Uses load_plugin_manifest() from manifest.py which enforces the 'id'
+        and 'configSchema' required fields.  Broken manifests are logged as
+        errors and tracked in self._errors (mirrors TS plugin validation).
+        """
         try:
-            # Load manifest
-            manifest_file = plugin_dir / "plugin.json"
-            if not manifest_file.exists():
-                logger.warning(f"No plugin.json in {plugin_dir}")
+            result = load_plugin_manifest(str(plugin_dir))
+            if isinstance(result, PluginManifestLoadFail):
+                logger.error(
+                    f"Plugin manifest error in {plugin_dir}: {result.error}"
+                )
+                self._errors[str(plugin_dir)] = result.error
                 return None
 
-            with open(manifest_file) as f:
-                manifest_data = json.load(f)
-
-            manifest = PluginManifest(**manifest_data)
+            manifest = result.manifest
 
             # Create plugin instance
             plugin = Plugin(manifest, str(plugin_dir))
 
-            # Load plugin module
-            main_file = plugin_dir / manifest.main
-            if main_file.exists():
-                self._load_plugin_module(plugin, main_file)
+            # Load plugin module — convention: plugin.py in plugin root
+            # (PluginManifest has no 'main' field; Python plugins use plugin.py)
+            for candidate_name in ("plugin.py", "__init__.py"):
+                main_file = plugin_dir / candidate_name
+                if main_file.exists():
+                    self._load_plugin_module(plugin, main_file)
+                    break
 
             self.plugins[manifest.id] = plugin
             logger.info(f"Loaded plugin: {manifest.id} v{manifest.version}")

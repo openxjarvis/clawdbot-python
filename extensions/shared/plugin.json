@@ -1,0 +1,8 @@
+{
+  "id": "shared",
+  "name": "shared",
+  "version": "0.1.0",
+  "description": "Shared extension utilities",
+  "author": "OpenClaw",
+  "main": "plugin.py"
+}

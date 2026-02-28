@@ -377,7 +377,7 @@ async def handle_agent(connection: Any, params: dict[str, Any]) -> dict[str, Any
     timeout_secs = params.get("timeout")
     lane = params.get("lane")
 
-    if not _agent_runtime or not _session_manager or not _tool_registry:
+    if _agent_runtime is None or _session_manager is None:
         raise RuntimeError("Agent runtime not initialized")
 
     gateway = getattr(connection, "gateway", None)

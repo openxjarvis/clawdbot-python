@@ -1,11 +1,21 @@
-"""Telegram channel plugin"""
+"""Telegram channel plugin.
 
-from openclaw.channels.registry import get_channel_registry
-from openclaw.channels.telegram import TelegramChannel
+Mirrors TypeScript: openclaw/extensions/telegram/index.ts
+"""
+from __future__ import annotations
 
 
-def register(api):
-    """Register Telegram channel"""
-    channel = TelegramChannel()
-    registry = get_channel_registry()
-    registry.register(channel)
+def register(api) -> None:
+    try:
+        from openclaw.channels.telegram import TelegramChannel
+        api.register_channel(TelegramChannel())
+    except ImportError:
+        import logging
+        logging.getLogger(__name__).warning("Telegram channel unavailable")
+
+plugin = {
+    "id": "telegram",
+    "name": "Telegram",
+    "description": "Telegram bot channel integration.",
+    "register": register,
+}

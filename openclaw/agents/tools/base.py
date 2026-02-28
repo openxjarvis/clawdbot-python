@@ -389,8 +389,11 @@ class LegacyAgentTool:
             DeprecationWarning,
             stacklevel=2
         )
-        self.name = ""
-        self.description = ""
+        # Only set defaults if the subclass hasn't declared them as class attributes
+        if not type(self).__dict__.get("name"):
+            self.name = ""
+        if not type(self).__dict__.get("description"):
+            self.description = ""
     
     @property
     def label(self) -> str:
@@ -399,10 +402,17 @@ class LegacyAgentTool:
     
     @property
     def parameters(self) -> dict[str, Any]:
-        """Get parameters from get_schema()"""
+        """Get parameters — returns explicit override, then get_schema(), then empty schema."""
+        if hasattr(self, "_parameters_override") and self._parameters_override is not None:
+            return self._parameters_override
         if hasattr(self, "get_schema"):
             return self.get_schema()
         return {"type": "object", "properties": {}, "required": []}
+
+    @parameters.setter
+    def parameters(self, value: dict[str, Any]) -> None:
+        """Allow subclasses to set parameters directly (e.g., in __init__)."""
+        self._parameters_override = value
     
     async def execute(
         self,

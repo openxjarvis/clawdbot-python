@@ -1,0 +1,13 @@
+{
+  "id": "googlechat",
+  "name": "Google Chat",
+  "description": "Google Chat channel integration.",
+  "channels": [
+    "googlechat"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

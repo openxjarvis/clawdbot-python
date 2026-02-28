@@ -1,0 +1,8 @@
+{
+  "id": "irc",
+  "name": "IRC",
+  "version": "0.1.0",
+  "description": "IRC channel plugin",
+  "author": "OpenClaw",
+  "main": "plugin.py"
+}

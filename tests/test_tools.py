@@ -31,7 +31,7 @@ async def test_read_file_tool():
 
     try:
         tool = ReadFileTool()
-        result = await tool.execute({"path": temp_path})
+        result = await tool._execute_impl({"path": temp_path})
 
         assert result.success
         assert result.content == "Test content"
@@ -46,7 +46,7 @@ async def test_write_file_tool():
         file_path = Path(tmpdir) / "test.txt"
 
         tool = WriteFileTool()
-        result = await tool.execute({"path": str(file_path), "content": "New content"})
+        result = await tool._execute_impl({"path": str(file_path), "content": "New content"})
 
         assert result.success
         assert file_path.exists()

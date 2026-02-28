@@ -170,15 +170,15 @@ class TestMultiSessionFlow:
             assert len(ws.sent_messages) > 0
     
     @pytest.mark.asyncio
-    async def test_session_isolation(self):
+    async def test_session_isolation(self, tmp_path):
         """Test that sessions are properly isolated"""
         # Create runtime
         runtime = MultiProviderRuntime(model="mock/test")
         runtime.provider = AsyncMock()
-        
-        # Create two sessions
-        session1 = Session(session_id="session-1")
-        session2 = Session(session_id="session-2")
+
+        # Create two sessions with isolated workspace dirs
+        session1 = Session(session_id="session-1", workspace_dir=tmp_path / "ws1")
+        session2 = Session(session_id="session-2", workspace_dir=tmp_path / "ws2")
         
         # Add messages to session 1
         session1.add_user_message("Message 1 for session 1")
@@ -277,7 +277,7 @@ class TestToolEnabledFlow:
             parameters = {"type": "object", "properties": {}}
             call_count = 0
             
-            async def execute(self, **kwargs) -> ToolResult:
+            async def _execute_impl(self, params: dict) -> ToolResult:
                 Tool1.call_count += 1
                 return ToolResult(success=True, output="Tool 1 result")
         
@@ -287,7 +287,7 @@ class TestToolEnabledFlow:
             parameters = {"type": "object", "properties": {}}
             call_count = 0
             
-            async def execute(self, **kwargs) -> ToolResult:
+            async def _execute_impl(self, params: dict) -> ToolResult:
                 Tool2.call_count += 1
                 return ToolResult(success=True, output="Tool 2 result")
         
@@ -296,13 +296,20 @@ class TestToolEnabledFlow:
         
         mock_provider = AsyncMock()
         
+        from openclaw.agents.providers.base import LLMResponse
+
         async def mock_stream(*args, **kwargs):
-            yield {"type": "tool_use", "name": "tool1", "arguments": {}}
-            yield {"type": "tool_use", "name": "tool2", "arguments": {}}
-            yield {"type": "text", "text": "Both tools executed"}
-            yield {"type": "stop"}
-        
-        mock_provider.stream = AsyncMock(return_value=mock_stream())
+            yield LLMResponse(
+                type="tool_call",
+                content=None,
+                tool_calls=[
+                    {"name": "tool1", "id": "call-1", "arguments": {}},
+                    {"name": "tool2", "id": "call-2", "arguments": {}},
+                ],
+            )
+            yield LLMResponse(type="message_stop", content=None)
+
+        mock_provider.stream = mock_stream
         
         runtime = MultiProviderRuntime(model="mock/test")
         runtime.provider = mock_provider

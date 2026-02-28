@@ -39,10 +39,52 @@ class SessionSkillSnapshot(BaseModel):
     apiKeys: dict[str, str] = Field(default_factory=dict)
 
 
+class SessionSystemPromptReportWorkspaceFile(BaseModel):
+    """Injected workspace file entry in the system prompt report"""
+    name: str
+    path: str
+    missing: bool = False
+    rawChars: int = 0
+    injectedChars: int = 0
+    truncated: bool = False
+
+
+class SessionSystemPromptReportSkillEntry(BaseModel):
+    """Skill entry in the system prompt report"""
+    name: str
+    blockChars: int = 0
+
+
+class SessionSystemPromptReportToolEntry(BaseModel):
+    """Tool entry in the system prompt report"""
+    name: str
+    summaryChars: int = 0
+    schemaChars: int = 0
+    propertiesCount: Optional[int] = None
+
+
 class SessionSystemPromptReport(BaseModel):
-    """System prompt build report"""
-    builtAt: Optional[int] = None
-    sections: Optional[list[dict[str, Any]]] = None
+    """System prompt build report — aligned with TS SessionSystemPromptReport"""
+    source: Literal["run", "estimate"] = "estimate"
+    generatedAt: int = Field(default_factory=lambda: int(__import__("time").time() * 1000))
+    sessionId: Optional[str] = None
+    sessionKey: Optional[str] = None
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    workspaceDir: Optional[str] = None
+    bootstrapMaxChars: Optional[int] = None
+    bootstrapTotalMaxChars: Optional[int] = None
+    sandbox: Optional[dict[str, Any]] = None
+    systemPrompt: dict[str, int] = Field(
+        default_factory=lambda: {"chars": 0, "projectContextChars": 0, "nonProjectContextChars": 0}
+    )
+    injectedWorkspaceFiles: list[SessionSystemPromptReportWorkspaceFile] = Field(default_factory=list)
+    skills: dict[str, Any] = Field(
+        default_factory=lambda: {"promptChars": 0, "entries": []}
+    )
+    tools: dict[str, Any] = Field(
+        default_factory=lambda: {"listChars": 0, "schemaChars": 0, "entries": []}
+    )
 
 
 class SessionEntry(BaseModel):

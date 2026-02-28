@@ -80,18 +80,39 @@ async def load_web_media(
     parsed = urlparse(url_or_path)
     scheme = parsed.scheme.lower()
 
+    # Handle data URIs: data:<content-type>;base64,<data>
+    if scheme == "data":
+        rest = url_or_path[5:]  # strip "data:"
+        if "," not in rest:
+            raise ValueError(f"Invalid data URL: missing comma separator in '{url_or_path}'")
+        meta, _, encoded = rest.partition(",")
+        parts = meta.split(";")
+        content_type = parts[0] if parts[0] else "application/octet-stream"
+        if "base64" in parts:
+            import base64 as _base64
+            try:
+                buffer = _base64.b64decode(encoded)
+            except Exception as exc:
+                raise ValueError(f"Invalid data URL: base64 decode failed: {exc}") from exc
+        else:
+            from urllib.parse import unquote_plus
+            buffer = unquote_plus(encoded).encode("utf-8")
+        file_name = None
+        kind = media_kind_from_mime(content_type)
+        return LoadedMedia(buffer=buffer, content_type=content_type, file_name=file_name, kind=kind)
+
     # Check if it's a local file path
     if scheme in ("", "file") or url_or_path.startswith("/"):
         path_str = unquote(url_or_path.replace("file://", ""))
         path = Path(path_str)
 
         if not path.exists():
-            raise ValueError(f"File not found: {path}")
+            raise FileNotFoundError(f"File not found: {path}")
 
         file_size = path.stat().st_size
         if file_size > max_size:
             raise ValueError(
-                f"File size {file_size} exceeds max_bytes {max_size}"
+                f"File size {file_size} exceeds size limit of {max_size} bytes"
             )
 
         buffer = path.read_bytes()
@@ -167,12 +188,51 @@ load_media = load_web_media
 
 
 class MediaLoader:
-    """Media loader class for backward compatibility."""
-    
-    @staticmethod
-    async def load(url_or_path: str, max_bytes: Optional[int] = None) -> LoadedMedia:
-        """Load media from URL or file path."""
-        return await load_web_media(url_or_path, max_bytes)
+    """
+    Media loader with optional workspace sandbox and size limit.
+
+    Mirrors the TypeScript WebMediaOptions constructor pattern.
+    """
+
+    def __init__(
+        self,
+        max_bytes: Optional[int] = None,
+        workspace_root: Optional[Path] = None,
+        allow_remote: bool = True,
+    ) -> None:
+        self.max_bytes = max_bytes
+        self.workspace_root = workspace_root
+        self.allow_remote = allow_remote
+
+    async def load(self, url_or_path: str) -> LoadedMedia:
+        """Load media from URL or file path, applying sandbox and size constraints."""
+        if self.workspace_root is not None:
+            # Validate path is inside workspace (unless it's a URL/data URI)
+            parsed = urlparse(url_or_path)
+            scheme = parsed.scheme.lower()
+            if scheme not in ("http", "https", "data"):
+                resolved = Path(url_or_path).resolve()
+                ws_resolved = Path(self.workspace_root).resolve()
+                # Check if the resolved path is inside workspace or media/inbound fallback
+                try:
+                    resolved.relative_to(ws_resolved)
+                except ValueError:
+                    # Try media/inbound fallback (bare filename → {workspace}/media/inbound/{name})
+                    if "/" not in url_or_path and "\\" not in url_or_path:
+                        fallback = ws_resolved / "media" / "inbound" / url_or_path
+                        if fallback.exists():
+                            url_or_path = str(fallback)
+                        else:
+                            raise ValueError(f"Path outside workspace: {url_or_path}")
+                    else:
+                        raise ValueError(f"Path outside workspace: {url_or_path}")
+
+        return await load_web_media(
+            url_or_path,
+            max_bytes=self.max_bytes,
+            workspace_root=self.workspace_root,
+            allow_remote=self.allow_remote,
+        )
 
 
 __all__ = ["LoadedMedia", "load_web_media", "load_media", "MediaLoader"]

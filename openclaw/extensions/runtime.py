@@ -24,6 +24,9 @@ class ExtensionRuntime:
         self._tools: list[dict[str, Any]] = []
         self._handlers: dict[str, list[Callable[..., Any]]] = {}
         self._commands: dict[str, dict[str, Any]] = {}
+        self._channels: list[Any] = []
+        self._providers: list[Any] = []
+        self._services: list[Any] = []
         self._context: ExtensionContext | None = None
 
     def set_context(self, context: ExtensionContext) -> None:
@@ -42,6 +45,30 @@ class ExtensionRuntime:
     def register_commands(self, commands: dict[str, dict[str, Any]]) -> None:
         """Register commands from loaded extensions."""
         self._commands.update(commands)
+
+    def register_channels(self, channels: list[Any]) -> None:
+        """Register channel instances from loaded user extensions."""
+        self._channels.extend(channels)
+
+    def register_providers(self, providers: list[Any]) -> None:
+        """Register provider descriptors from loaded user extensions."""
+        self._providers.extend(providers)
+
+    def register_services(self, services: list[Any]) -> None:
+        """Register background services from loaded user extensions."""
+        self._services.extend(services)
+
+    def get_channels(self) -> list[Any]:
+        """Return all registered channel instances."""
+        return self._channels.copy()
+
+    def get_providers(self) -> list[Any]:
+        """Return all registered provider descriptors."""
+        return self._providers.copy()
+
+    def get_services(self) -> list[Any]:
+        """Return all registered background services."""
+        return self._services.copy()
 
     def get_tools(self) -> list[dict[str, Any]]:
         """Return all registered tools (for agent to use)."""

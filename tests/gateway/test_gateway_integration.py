@@ -177,27 +177,27 @@ def test_cron_service():
     
     service = CronService()
     
-    # Create job
+    from openclaw.cron.types import EverySchedule, SystemEventPayload
+
+    # Create job with TS-aligned fields (everyMs, payload)
     job = CronJob(
         id="test-job",
-        schedule="*/5 * * * *",  # Every 5 minutes
-        action="agent",
-        params={"message": "Test"}
+        name="Test Job",
+        schedule=EverySchedule(every_ms=5 * 60 * 1000, type="every"),
+        payload=SystemEventPayload(kind="systemEvent", text="Test"),
     )
-    
+
     # Add job
-    success = service.add_job(job)
-    assert success
-    
+    import asyncio
+    asyncio.get_event_loop().run_until_complete(service.add_job(job))
+
     # List jobs
-    jobs = service.list_jobs()
-    assert len(jobs) == 1
-    assert jobs[0]["id"] == "test-job"
-    
+    assert "test-job" in service.jobs
+    assert service.jobs["test-job"].id == "test-job"
+
     # Remove job
-    service.remove_job("test-job")
-    jobs = service.list_jobs()
-    assert len(jobs) == 0
+    asyncio.get_event_loop().run_until_complete(service.remove_job("test-job"))
+    assert "test-job" not in service.jobs
 
 
 def test_node_manager():

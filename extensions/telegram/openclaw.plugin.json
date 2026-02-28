@@ -1,0 +1,13 @@
+{
+  "id": "telegram",
+  "name": "Telegram",
+  "description": "Telegram bot channel integration.",
+  "channels": [
+    "telegram"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

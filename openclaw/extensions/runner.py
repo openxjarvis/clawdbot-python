@@ -87,21 +87,33 @@ class ExtensionRunner:
 
     def load(self) -> ExtensionRuntime:
         """
-        Load all extensions and populate runtime. Returns the runtime so caller
-        can set_context() and use get_tools() / emit().
+        Load all user extensions and populate runtime.
+
+        Collects tools, handlers, commands, channels, providers, and services
+        from all discovered extensions (those in ~/.openclaw/extensions).
+        Returns the runtime so the caller can bind context and emit events.
         """
         apis = self._loader.load_all()
         all_tools: list[dict[str, Any]] = []
         all_handlers: dict[str, list] = {}
         all_commands: dict[str, dict[str, Any]] = {}
+        all_channels: list[Any] = []
+        all_providers: list[Any] = []
+        all_services: list[Any] = []
         for api in apis:
             all_tools.extend(api.get_tools())
             for evt, handlers in api.get_handlers().items():
                 all_handlers.setdefault(evt, []).extend(handlers)
             all_commands.update(api.get_commands())
+            all_channels.extend(api.get_channels())
+            all_providers.extend(api.get_providers())
+            all_services.extend(api.get_services())
         self._runtime.register_tools(all_tools)
         self._runtime.register_handlers(all_handlers)
         self._runtime.register_commands(all_commands)
+        self._runtime.register_channels(all_channels)
+        self._runtime.register_providers(all_providers)
+        self._runtime.register_services(all_services)
         return self._runtime
 
     def get_agent_tools(self, context: ExtensionContext | None = None) -> list[AgentTool]:

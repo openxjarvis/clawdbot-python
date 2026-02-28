@@ -1,0 +1,13 @@
+{
+  "id": "discord",
+  "name": "Discord",
+  "description": "Discord bot channel.",
+  "channels": [
+    "discord"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

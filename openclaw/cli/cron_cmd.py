@@ -236,3 +236,202 @@ def disable(
     except Exception as e:
         console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(1)
+
+
+# ---------------------------------------------------------------------------
+# cron add
+# ---------------------------------------------------------------------------
+
+@cron_app.command("add")
+def add(
+    message: str = typer.Argument(..., help="Message / task payload for the cron job"),
+    at: str = typer.Option(..., "--at", help="Schedule expression (cron or ISO 8601 datetime)"),
+    keep_after_run: bool = typer.Option(False, "--keep-after-run", help="Keep the job after it runs once"),
+    agent_id: Optional[str] = typer.Option(None, "--agent", "-a", help="Target agent ID"),
+    label: Optional[str] = typer.Option(None, "--label", "-l", help="Human-readable label"),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Schedule a new cron job"""
+    import uuid
+    job_id = str(uuid.uuid4())
+    job = {
+        "id": job_id,
+        "label": label or message[:40],
+        "schedule": at,
+        "message": message,
+        "agentId": agent_id,
+        "deleteAfterRun": not keep_after_run,
+        "enabled": True,
+    }
+    from pathlib import Path
+    store = Path.home() / ".openclaw" / "cron" / "jobs.json"
+    store.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        existing = []
+        if store.exists():
+            data = json.loads(store.read_text())
+            existing = data.get("jobs", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        existing.append(job)
+        store.write_text(json.dumps({"jobs": existing}, indent=2))
+        if json_output:
+            print(json.dumps({"ok": True, "id": job_id, "job": job}))
+        else:
+            console.print(f"[green]✓[/green] Cron job added: [cyan]{job_id[:8]}[/cyan]  schedule={at}")
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+
+# ---------------------------------------------------------------------------
+# cron edit
+# ---------------------------------------------------------------------------
+
+@cron_app.command("edit")
+def edit(
+    job_id: str = typer.Argument(..., help="Job ID to edit"),
+    at: Optional[str] = typer.Option(None, "--at", help="New schedule"),
+    message: Optional[str] = typer.Option(None, "--message", "-m", help="New message/task"),
+    label: Optional[str] = typer.Option(None, "--label", "-l", help="New label"),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Edit an existing cron job"""
+    from pathlib import Path
+    store = Path.home() / ".openclaw" / "cron" / "jobs.json"
+    if not store.exists():
+        console.print(f"[red]No cron jobs found[/red]")
+        raise typer.Exit(1)
+    try:
+        data = json.loads(store.read_text())
+        jobs = data.get("jobs", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        found = False
+        for job in jobs:
+            if isinstance(job, dict) and (job.get("id", "").startswith(job_id) or job.get("id") == job_id):
+                if at:
+                    job["schedule"] = at
+                if message:
+                    job["message"] = message
+                if label:
+                    job["label"] = label
+                found = True
+                break
+        if not found:
+            console.print(f"[red]Job not found:[/red] {job_id}")
+            raise typer.Exit(1)
+        store.write_text(json.dumps({"jobs": jobs}, indent=2))
+        if json_output:
+            print(json.dumps({"ok": True, "id": job_id}))
+        else:
+            console.print(f"[green]✓[/green] Cron job updated: {job_id[:8]}")
+    except typer.Exit:
+        raise
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+
+# ---------------------------------------------------------------------------
+# cron delete
+# ---------------------------------------------------------------------------
+
+@cron_app.command("delete")
+def delete(
+    job_id: str = typer.Argument(..., help="Job ID to delete"),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Delete a cron job"""
+    from pathlib import Path
+    store = Path.home() / ".openclaw" / "cron" / "jobs.json"
+    if not store.exists():
+        console.print(f"[yellow]No cron jobs found[/yellow]")
+        raise typer.Exit(1)
+    try:
+        data = json.loads(store.read_text())
+        jobs = data.get("jobs", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        before = len(jobs)
+        jobs = [j for j in jobs if not (isinstance(j, dict) and (j.get("id", "").startswith(job_id) or j.get("id") == job_id))]
+        removed = before - len(jobs)
+        store.write_text(json.dumps({"jobs": jobs}, indent=2))
+        if json_output:
+            print(json.dumps({"ok": True, "removed": removed}))
+        else:
+            if removed:
+                console.print(f"[green]✓[/green] Removed {removed} job(s)")
+            else:
+                console.print(f"[yellow]Job not found:[/yellow] {job_id}")
+    except typer.Exit:
+        raise
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)
+
+
+# ---------------------------------------------------------------------------
+# cron run
+# ---------------------------------------------------------------------------
+
+@cron_app.command("run")
+def run(
+    job_id: str = typer.Argument(..., help="Job ID to trigger immediately"),
+    url: Optional[str] = typer.Option(None, "--url", help="Gateway WebSocket URL"),
+    token: Optional[str] = typer.Option(None, "--token", help="Gateway auth token"),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Trigger a cron job immediately"""
+    try:
+        from .gateway_rpc_cli import GatewayRpcOpts, call_gateway_from_cli
+        opts = GatewayRpcOpts(url=url, token=token, timeout=10_000, json_output=json_output)
+        result = call_gateway_from_cli("cron.run", opts, {"id": job_id}, show_progress=False)
+        if json_output:
+            print(json.dumps(result, indent=2))
+        else:
+            console.print(f"[green]✓[/green] Cron job triggered: {job_id}")
+    except Exception as e:
+        console.print(f"[yellow]⚠[/yellow]  Could not trigger via gateway: {e}")
+        console.print("  (Start the gateway with: openclaw gateway run)")
+        raise typer.Exit(1)
+
+
+# ---------------------------------------------------------------------------
+# cron status
+# ---------------------------------------------------------------------------
+
+@cron_app.command("status")
+def status(
+    job_id: Optional[str] = typer.Argument(None, help="Job ID (omit for all)"),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Show execution history/status of cron jobs"""
+    from pathlib import Path
+    log_file = Path.home() / ".openclaw" / "cron" / "history.json"
+    if not log_file.exists():
+        if json_output:
+            print(json.dumps([]))
+        else:
+            console.print("[yellow]No cron execution history found[/yellow]")
+        return
+    try:
+        entries = json.loads(log_file.read_text())
+        if isinstance(entries, dict):
+            entries = entries.get("history", [])
+        if job_id:
+            entries = [e for e in entries if isinstance(e, dict) and (e.get("jobId", "").startswith(job_id) or e.get("id", "").startswith(job_id))]
+        if json_output:
+            print(json.dumps(entries, indent=2))
+        else:
+            if not entries:
+                console.print("[yellow]No history found[/yellow]")
+                return
+            t = Table(title="Cron History")
+            t.add_column("Job ID", style="dim")
+            t.add_column("Status")
+            t.add_column("Ran At")
+            for e in entries[-20:]:
+                if not isinstance(e, dict):
+                    continue
+                st = e.get("status", "?")
+                color = "green" if st == "ok" else "red" if st == "error" else "yellow"
+                t.add_row(str(e.get("jobId", e.get("id", "")))[:8], f"[{color}]{st}[/{color}]", str(e.get("ranAt", e.get("ts", ""))))
+            console.print(t)
+    except Exception as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(1)

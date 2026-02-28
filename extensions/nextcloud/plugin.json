@@ -1,8 +1,0 @@
-{
-  "id": "nextcloud",
-  "name": "unextcloud Channel",
-  "version": "1.0.0",
-  "description": "unextcloud messaging integration",
-  "author": "ClawdBot",
-  "main": "plugin.py"
-}

@@ -68,7 +68,7 @@ class TestAgentTool:
     async def test_tool_execute_success(self):
         """Test successful tool execution"""
         tool = MockTool()
-        result = await tool.execute({"param": "test"})
+        result = await tool._execute_impl({"param": "test"})
 
         assert result.error is None
         assert "test" in result.content
@@ -77,7 +77,7 @@ class TestAgentTool:
     async def test_tool_execute_error(self):
         """Test tool execution with error"""
         tool = MockTool()
-        result = await tool.execute({"param": "error"})
+        result = await tool._execute_impl({"param": "error"})
 
         assert result.error == "Mock error"
         assert result.content == ""

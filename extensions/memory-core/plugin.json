@@ -1,0 +1,9 @@
+{
+  "id": "memory-core",
+  "name": "Memory (Core)",
+  "version": "0.1.0",
+  "description": "File-backed memory search and get tools with CLI management",
+  "author": "OpenClaw",
+  "main": "plugin.py",
+  "kind": "memory"
+}

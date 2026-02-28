@@ -1,0 +1,13 @@
+{
+  "id": "google-gemini-cli-auth",
+  "name": "Google Gemini CLI Auth",
+  "description": "Google Gemini CLI OAuth provider plugin.",
+  "providers": [
+    "google-gemini-cli"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

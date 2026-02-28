@@ -1,0 +1,10 @@
+{
+  "id": "shared",
+  "name": "Shared Utilities",
+  "description": "Shared extension utilities (internal).",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

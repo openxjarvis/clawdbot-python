@@ -24,12 +24,27 @@ logger = logging.getLogger(__name__)
 # Command dispatch table
 # ---------------------------------------------------------------------------
 
-_SESSION_CMDS = {"new", "reset", "compact", "session", "clear"}
+_SESSION_CMDS = {
+    "new", "reset", "compact", "session", "clear",
+    # Added to match TS slash-commands spec
+    "stop", "restart",
+    "activation",   # /activation mention|always (groups)
+    "send",         # /send on|off|inherit (owner-only)
+    "queue",        # /queue <mode>
+    "kill",         # /kill <id|#|all>
+    "steer", "tell",  # /steer / /tell <id> <message>
+    "dock-telegram", "dock_telegram",
+    "dock-discord", "dock_discord",
+    "dock-slack", "dock_slack",
+}
 _INFO_CMDS = {
     "help", "commands", "status", "context", "context-report",
-    "whoami", "export-session", "export", "debug",
+    "whoami", "id",  # /id is alias for /whoami
+    "export-session", "export", "debug",
+    "usage",   # /usage off|tokens|full|cost
+    "skill",   # /skill <name> [input]
 }
-_MODEL_CMDS = {"model", "models", "think", "verbose", "reasoning"}
+_MODEL_CMDS = {"model", "models", "think", "thinking", "t", "verbose", "v", "reasoning", "reason", "elevated", "elev", "exec"}
 _CONFIG_CMDS = {"config", "set", "unset", "system-prompt"}
 _TOOLS_CMDS = {"bash", "shell", "subagents", "allowlist", "approve", "ptt", "tts", "plugin"}
 

@@ -1,0 +1,13 @@
+{
+  "id": "qwen-portal-auth",
+  "name": "Qwen Portal Auth",
+  "description": "Qwen portal OAuth provider plugin.",
+  "providers": [
+    "qwen-portal"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

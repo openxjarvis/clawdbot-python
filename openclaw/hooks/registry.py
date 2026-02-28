@@ -101,6 +101,28 @@ class HookRegistry:
         """
         return list(self._event_handlers.keys())
 
+    def register_plugin_hooks(
+        self,
+        plugin_id: str,
+        hooks: list[tuple[str, HookHandler, Any]],
+    ) -> None:
+        """
+        Register multiple hooks from a plugin in one call.
+
+        Mirrors TS HookRegistry.registerPluginHooks().
+
+        Args:
+            plugin_id: Unique identifier for the plugin.
+            hooks:     List of (event_name, handler, priority_or_options) tuples.
+        """
+        for event_name, handler, options in hooks:
+            opts: dict | None = None
+            if isinstance(options, dict):
+                opts = options
+            elif options is not None:
+                opts = {"priority": options}
+            self.register_hook([event_name], handler, opts)
+
 
 # Global registry instance
 _global_registry: Optional[HookRegistry] = None

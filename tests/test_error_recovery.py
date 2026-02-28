@@ -69,7 +69,9 @@ class TestLLMAPIFailures:
             await connection1.handle_message(json.dumps(request1))
         except Exception:
             pass  # Timeout expected
-        
+        # Give the background task time to run
+        await asyncio.sleep(0.3)
+
         # Retry request (success)
         ws2 = MockWebSocket()
         connection2 = GatewayConnection(ws2, config, gateway=server)
@@ -83,7 +85,9 @@ class TestLLMAPIFailures:
         }
         
         await connection2.handle_message(json.dumps(request2))
-        
+        # Give the background task time to run
+        await asyncio.sleep(0.1)
+
         # Verify retry succeeded
         assert attempt_count == 2
     
@@ -169,7 +173,9 @@ class TestLLMAPIFailures:
             }))
         except Exception:
             pass
-        
+        # Give the background task time to run
+        await asyncio.sleep(0.2)
+
         # Retry with valid response
         ws2 = MockWebSocket()
         connection2 = GatewayConnection(ws2, config, gateway=server)
@@ -181,7 +187,9 @@ class TestLLMAPIFailures:
             "method": "agent",
             "params": {"message": "Test retry", "sessionId": "test"}
         }))
-        
+        # Give the background task time to run
+        await asyncio.sleep(0.1)
+
         assert call_count == 2
 
 
@@ -243,11 +251,19 @@ class TestToolExecutionFailures:
         runtime = MultiProviderRuntime(model="mock/test")
         runtime.provider = AsyncMock()
         
+        from openclaw.agents.providers.base import LLMResponse
+
         async def mock_stream(*args, **kwargs):
-            yield {"type": "tool_use", "name": "slow_tool", "arguments": {}}
-            yield {"type": "stop"}
-        
-        runtime.provider.stream = AsyncMock(return_value=mock_stream())
+            yield LLMResponse(
+                type="tool_call",
+                content=None,
+                tool_calls=[{"name": "slow_tool", "id": "call-1", "arguments": {}}],
+            )
+            # Simulate provider blocking during tool execution
+            await asyncio.sleep(10)
+            yield LLMResponse(type="message_stop", content=None)
+
+        runtime.provider.stream = mock_stream
         
         session = Session(session_id="test-session")
         
@@ -257,7 +273,7 @@ class TestToolExecutionFailures:
         )
         
         # Cancel after short time
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.05)
         task.cancel()
         
         # Should handle cancellation

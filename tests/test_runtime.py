@@ -16,7 +16,7 @@ class TestAgentRuntime:
     def test_init_default(self):
         """Test runtime initialization with defaults"""
         runtime = AgentRuntime()
-        assert runtime.model_str == "google/gemini-1.5-flash"
+        assert runtime.model_str == "google/gemini-3-pro-preview"
         assert runtime.api_key is None
 
     def test_init_custom(self):
@@ -25,16 +25,12 @@ class TestAgentRuntime:
         assert runtime.model_str == "openai/gpt-4o"
         assert runtime.api_key == "test-key"
 
-    def test_get_client_anthropic(self, mock_api_key):
+    def test_get_client_anthropic(self):
         """Test getting Anthropic client"""
-        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": mock_api_key}):
-            AgentRuntime(model="anthropic/claude-opus-4")
-            # Skip - runtime refactored to use provider pattern
-            pytest.skip("Runtime refactored to use provider pattern")
+        pytest.skip("Runtime refactored to use provider pattern")
 
-    def test_get_client_openai(self, mock_api_key):
+    def test_get_client_openai(self):
         """Test getting OpenAI client"""
-        # Skip - runtime refactored to use provider pattern
         pytest.skip("Runtime refactored to use provider pattern")
 
     def test_format_tools_for_api(self):
@@ -43,10 +39,10 @@ class TestAgentRuntime:
         pytest.skip("New runtime uses provider-based tool formatting")
 
     @pytest.mark.asyncio
-    async def test_run_turn_adds_user_message(self, temp_workspace):
+    async def test_run_turn_adds_user_message(self, tmp_path):
         """Test that run_turn adds user message to session"""
         runtime = AgentRuntime()
-        session = Session("test-session", temp_workspace)
+        session = Session("test-session", tmp_path)
 
         # Mock the provider's stream method to avoid actual API call
         with patch.object(runtime.provider, "stream", new_callable=AsyncMock) as mock_stream:

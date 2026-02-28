@@ -195,6 +195,113 @@ from openclaw.plugins.runtime.types import (
     PluginRuntimeMedia,
 )
 
+# ---------------------------------------------------------------------------
+# Plugin config schema helpers
+# Mirrors TS emptyPluginConfigSchema() from src/plugin-sdk/index.ts
+# ---------------------------------------------------------------------------
+
+def empty_plugin_config_schema() -> dict:
+    """Return an empty (but valid) plugin config JSON Schema.
+
+    Mirrors TypeScript ``emptyPluginConfigSchema()`` from ``openclaw/plugin-sdk``.
+    Plugins that accept no configuration can use this as their ``config_schema``.
+
+    Returns:
+        A minimal JSON Schema object that accepts an empty config object.
+
+    Example::
+
+        plugin = {
+            "id": "my-plugin",
+            "name": "My Plugin",
+            "config_schema": empty_plugin_config_schema(),
+            "register": register,
+        }
+    """
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Plugin hooks directory loader
+# Mirrors TS registerPluginHooksFromDir() from src/plugin-sdk/index.ts
+# ---------------------------------------------------------------------------
+
+def register_plugin_hooks_from_dir(api: "Any", hooks_dir: str) -> None:
+    """Register plugin hooks from a directory of hook files.
+
+    Mirrors TypeScript ``registerPluginHooksFromDir(api, dir)`` from
+    ``openclaw/plugin-sdk``.
+
+    Scans ``hooks_dir`` for Python files (non-underscore-prefixed). Each file
+    must define a ``register(api)`` function or a module-level ``hook`` dict.
+    Hook files are loaded in sorted order.
+
+    Args:
+        api: The PluginApi instance passed to the plugin's ``register()`` function.
+        hooks_dir: Path to the directory containing hook files (relative to the
+            plugin root, or absolute).
+
+    Example::
+
+        def register(api) -> None:
+            register_plugin_hooks_from_dir(api, "./hooks")
+    """
+    import importlib.util
+    import os
+    import sys
+    import logging
+
+    _logger = logging.getLogger(__name__)
+
+    # Resolve hooks_dir relative to the plugin source file
+    if not os.path.isabs(hooks_dir):
+        plugin_source = getattr(api, "source", None) or ""
+        if plugin_source and os.path.isfile(plugin_source):
+            base = os.path.dirname(plugin_source)
+        elif plugin_source and os.path.isdir(plugin_source):
+            base = plugin_source
+        else:
+            base = os.getcwd()
+        hooks_dir = os.path.join(base, hooks_dir)
+
+    hooks_path = os.path.abspath(hooks_dir)
+    if not os.path.isdir(hooks_path):
+        _logger.debug(f"register_plugin_hooks_from_dir: directory not found: {hooks_path}")
+        return
+
+    hook_files = sorted(
+        p for p in os.listdir(hooks_path)
+        if p.endswith(".py") and not p.startswith("_")
+    )
+
+    for filename in hook_files:
+        filepath = os.path.join(hooks_path, filename)
+        module_name = f"openclaw_plugin_{getattr(api, 'id', 'unknown')}_hook_{filename[:-3]}"
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, filepath)
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+
+            if hasattr(module, "register"):
+                module.register(api)
+            elif hasattr(module, "hook"):
+                hook = module.hook
+                if isinstance(hook, dict):
+                    events = hook.get("events") or hook.get("event")
+                    handler = hook.get("handler")
+                    if events and handler:
+                        api.register_hook(events if isinstance(events, list) else [events], handler)
+        except Exception as exc:
+            _logger.warning(f"Failed to load hook file '{filepath}': {exc}")
+
+
 __all__ = [
     # Channel
     "AllowlistMatch",
@@ -266,4 +373,7 @@ __all__ = [
     "PluginRuntimeChannel",
     "PluginRuntimeConfig",
     "PluginRuntimeMedia",
+    # Plugin helpers
+    "empty_plugin_config_schema",
+    "register_plugin_hooks_from_dir",
 ]

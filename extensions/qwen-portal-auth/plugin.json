@@ -1,0 +1,8 @@
+{
+  "id": "qwen-portal-auth",
+  "name": "qwen-portal-auth",
+  "version": "0.1.0",
+  "description": "Qwen portal authentication provider",
+  "author": "OpenClaw",
+  "main": "plugin.py"
+}

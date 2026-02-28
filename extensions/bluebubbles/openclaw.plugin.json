@@ -1,0 +1,13 @@
+{
+  "id": "bluebubbles",
+  "name": "BlueBubbles",
+  "description": "BlueBubbles iMessage bridge channel.",
+  "channels": [
+    "bluebubbles"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

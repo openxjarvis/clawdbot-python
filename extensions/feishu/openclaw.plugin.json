@@ -1,0 +1,16 @@
+{
+  "id": "feishu",
+  "name": "Feishu",
+  "description": "Feishu/Lark channel plugin with Doc, Wiki, Drive, Perm, and Bitable tools.",
+  "channels": [
+    "feishu"
+  ],
+  "skills": [
+    "./skills"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

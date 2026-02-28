@@ -1,0 +1,13 @@
+{
+  "id": "minimax-portal-auth",
+  "name": "MiniMax Portal Auth",
+  "description": "MiniMax portal authentication provider.",
+  "providers": [
+    "minimax-portal"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

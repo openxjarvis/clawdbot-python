@@ -1,0 +1,13 @@
+{
+  "id": "line",
+  "name": "LINE",
+  "description": "LINE messaging channel integration.",
+  "channels": [
+    "line"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

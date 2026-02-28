@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel
 
@@ -20,18 +20,127 @@ from .connection import (
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# Channel Meta (mirrors TS ChannelMeta)
+# =============================================================================
+
+class ChannelMeta(BaseModel):
+    """Channel metadata — mirrors TS ChannelMeta."""
+    id: str
+    label: str
+    description: str | None = None
+    docs_path: str | None = None
+    icon_url: str | None = None
+
+
+# =============================================================================
+# Channel Account Snapshot (mirrors TS ChannelAccountSnapshot)
+# =============================================================================
+
+class ChannelAccountSnapshot(BaseModel):
+    """Runtime status for a channel account. Mirrors TS ChannelAccountSnapshot."""
+    account_id: str
+    enabled: bool = True
+    configured: bool = True
+    running: bool = False
+    last_error: str | None = None
+    last_start_at: int | None = None
+    last_stop_at: int | None = None
+    reconnect_attempts: int = 0
+
+
+# =============================================================================
+# Channel Adapter Protocols (mirrors TS types.adapters.ts)
+# =============================================================================
+
+@runtime_checkable
+class ChannelConfigAdapter(Protocol):
+    """Adapter for channel account configuration. Mirrors TS ChannelConfigAdapter."""
+
+    def list_account_ids(self, cfg: dict[str, Any]) -> list[str]:
+        """Return list of configured account IDs for this channel."""
+        ...
+
+    def resolve_account(self, cfg: dict[str, Any], account_id: str) -> dict[str, Any] | None:
+        """Resolve full account config for a given account ID."""
+        ...
+
+    def is_enabled(self, account: dict[str, Any] | None, cfg: dict[str, Any]) -> bool:
+        """Return True if account is enabled."""
+        ...
+
+    def is_configured(self, account: dict[str, Any] | None, cfg: dict[str, Any]) -> bool:
+        """Return True if account is fully configured (has required fields)."""
+        ...
+
+    def disabled_reason(self, account: dict[str, Any] | None, cfg: dict[str, Any]) -> str | None:
+        """Return human-readable reason why account is disabled, or None."""
+        ...
+
+    def unconfigured_reason(self, account: dict[str, Any] | None, cfg: dict[str, Any]) -> str | None:
+        """Return human-readable reason why account is not configured, or None."""
+        ...
+
+
+@runtime_checkable
+class ChannelGatewayAdapter(Protocol):
+    """Per-account gateway lifecycle adapter. Mirrors TS ChannelGatewayAdapter."""
+
+    async def start_account(
+        self,
+        *,
+        cfg: dict[str, Any],
+        account_id: str,
+        account: dict[str, Any] | None,
+        abort_signal: Any,
+        get_status: Callable[[], ChannelAccountSnapshot],
+        set_status: Callable[[ChannelAccountSnapshot], None],
+        log: Any,
+    ) -> None:
+        """Start a single account. Runs until stopped or error. Mirrors TS startAccount()."""
+        ...
+
+    async def stop_account(
+        self,
+        *,
+        account_id: str,
+        account: dict[str, Any] | None,
+    ) -> None:
+        """Stop a specific account gracefully. Mirrors TS stopAccount()."""
+        ...
+
+
 class ChannelCapabilities(BaseModel):
-    """Channel capabilities"""
+    """Channel capabilities — mirrors TS ChannelCapabilities"""
 
     chat_types: list[str] = ["direct", "group"]  # Supported chat types
     supports_media: bool = False
     supports_reactions: bool = False
     supports_threads: bool = False
     supports_polls: bool = False
+    # TS-aligned fields
+    block_streaming: bool = False       # TS: blockStreaming — send full message, no streaming
+    native_commands: bool = False       # TS: nativeCommands — platform slash/native commands
+    supports_edit: bool = False         # TS: edit — can edit sent messages
+    supports_unsend: bool = False       # TS: unsend — can delete/unsend messages
+    supports_reply: bool = True         # TS: reply — supports threaded replies
+    group_management: bool = False      # TS: groupManagement — can manage groups
+    text_chunk_limit: int | None = None  # TS: textChunkLimit — max chars per message
+
+
+class ChatAttachment(BaseModel):
+    """File/media attachment — mirrors TS ChatAttachment exactly"""
+
+    type: str                       # "image" | "audio" | "video" | "file" | "sticker"
+    mime_type: str | None = None    # TS: mimeType
+    content: str | None = None      # base64-encoded content
+    url: str | None = None          # remote URL (alternative to content)
+    filename: str | None = None
+    size: int | None = None         # bytes
 
 
 class InboundMessage(BaseModel):
-    """Normalized inbound message"""
+    """Normalized inbound message — mirrors TS InboundMessage"""
 
     channel_id: str
     message_id: str
@@ -43,9 +152,7 @@ class InboundMessage(BaseModel):
     timestamp: str
     reply_to: str | None = None
     metadata: dict[str, Any] = {}
-    # File attachments — each entry mirrors TS ChatAttachment:
-    # {type, mimeType, content (base64), filename, size}
-    attachments: list[dict[str, Any]] = []
+    attachments: list[ChatAttachment] = []
 
 
 class OutboundMessage(BaseModel):

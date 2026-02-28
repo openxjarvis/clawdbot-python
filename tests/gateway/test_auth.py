@@ -126,12 +126,13 @@ class TestAuthorizeGatewayConnect:
         assert result.method == AuthMethod.PASSWORD
     
     def test_local_direct_bypass(self):
-        """Local connections bypass auth."""
+        """Local connections bypass auth when both client_ip and host are loopback."""
         result = authorize_gateway_connect(
             auth_mode=AuthMode.TOKEN,
             config_token="token123",
             request_token="wrong",  # Wrong token
-            client_ip="127.0.0.1"  # But local
+            client_ip="127.0.0.1",  # Loopback IP
+            host_header="127.0.0.1",  # Loopback host (TS also requires host to be local)
         )
         assert result.ok
         assert result.method == AuthMethod.LOCAL_DIRECT

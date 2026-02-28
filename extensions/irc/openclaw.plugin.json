@@ -1,0 +1,13 @@
+{
+  "id": "irc",
+  "name": "IRC",
+  "description": "IRC channel plugin.",
+  "channels": [
+    "irc"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

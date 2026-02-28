@@ -1,11 +1,21 @@
-"""Signal channel plugin"""
+"""Signal channel plugin.
 
-from openclaw.channels.registry import get_channel_registry
-from openclaw.channels.signal import SignalChannel
+Mirrors TypeScript: openclaw/extensions/signal/index.ts
+"""
+from __future__ import annotations
 
 
-def register(api):
-    """Register Signal channel"""
-    channel = SignalChannel()
-    registry = get_channel_registry()
-    registry.register(channel)
+def register(api) -> None:
+    try:
+        from openclaw.channels.signal import SignalChannel
+        api.register_channel(SignalChannel())
+    except ImportError:
+        import logging
+        logging.getLogger(__name__).warning("Signal channel unavailable")
+
+plugin = {
+    "id": "signal",
+    "name": "Signal",
+    "description": "Signal messaging channel integration.",
+    "register": register,
+}

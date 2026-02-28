@@ -1,0 +1,13 @@
+{
+  "id": "tlon",
+  "name": "Tlon (Urbit)",
+  "description": "Tlon/Urbit channel integration.",
+  "channels": [
+    "tlon"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

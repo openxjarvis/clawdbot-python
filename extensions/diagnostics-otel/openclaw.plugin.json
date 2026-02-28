@@ -1,0 +1,10 @@
+{
+  "id": "diagnostics-otel",
+  "name": "Diagnostics (OpenTelemetry)",
+  "description": "OpenTelemetry diagnostics and tracing.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

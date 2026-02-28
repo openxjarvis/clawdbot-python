@@ -173,12 +173,12 @@ class TestRotationManager:
 
         manager = RotationManager(store, cooldown_minutes=10, max_failures=2)
 
-        # First failure - no cooldown yet
+        # First failure - TS always sets cooldown immediately (calculateAuthProfileCooldownMs(1))
         manager.mark_failure("test")
         assert store.get_profile("test").failure_count == 1
-        assert store.get_profile("test").cooldown_until is None
+        assert store.get_profile("test").cooldown_until is not None  # TS: always set
 
-        # Second failure - triggers cooldown
+        # Second failure - cooldown updated to longer duration
         manager.mark_failure("test")
         updated = store.get_profile("test")
         assert updated.failure_count == 2

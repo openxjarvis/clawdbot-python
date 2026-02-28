@@ -1,11 +1,21 @@
-"""Slack channel plugin"""
+"""Slack channel plugin.
 
-from openclaw.channels.registry import get_channel_registry
-from openclaw.channels.slack import SlackChannel
+Mirrors TypeScript: openclaw/extensions/slack/index.ts
+"""
+from __future__ import annotations
 
 
-def register(api):
-    """Register Slack channel"""
-    channel = SlackChannel()
-    registry = get_channel_registry()
-    registry.register(channel)
+def register(api) -> None:
+    try:
+        from openclaw.channels.slack import SlackChannel
+        api.register_channel(SlackChannel())
+    except ImportError:
+        import logging
+        logging.getLogger(__name__).warning("Slack channel unavailable")
+
+plugin = {
+    "id": "slack",
+    "name": "Slack",
+    "description": "Slack bot channel integration.",
+    "register": register,
+}

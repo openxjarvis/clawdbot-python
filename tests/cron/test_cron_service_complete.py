@@ -74,7 +74,7 @@ class TestCronServiceBasics:
         job = CronJob(
             id="test-1",
             name="Test Job",
-            schedule=EverySchedule(interval_ms=60000, type="every"),
+            schedule=EverySchedule(every_ms=60000, type="every"),
             session_target="main",
             payload=SystemEventPayload(kind="systemEvent", text="Test"),
             enabled=True
@@ -106,7 +106,7 @@ class TestCronServiceBasics:
         job = CronJob(
             id="test-run",
             name="Run Test",
-            schedule=EverySchedule(interval_ms=3600000, type="every"),  # 1 hour
+            schedule=EverySchedule(every_ms=3600000, type="every"),  # 1 hour
             payload=SystemEventPayload(kind="systemEvent", text="Test"),
         )
         await service.add_job(job)
@@ -149,7 +149,7 @@ class TestCronServicePersistence:
         job = CronJob(
             id="persist-test",
             name="Persistence Test",
-            schedule=EverySchedule(interval_ms=60000, type="every"),
+            schedule=EverySchedule(every_ms=60000, type="every"),
             session_target="main",
             payload=SystemEventPayload(kind="systemEvent", text="Test"),
             enabled=True
@@ -215,9 +215,9 @@ class TestCronCallbacks:
         job = CronJob(
             id="test",
             name="Test",
-            schedule=AtSchedule(timestamp=datetime.now(timezone.utc).isoformat(), type="at"),
+            schedule=AtSchedule(at=datetime.now(timezone.utc).isoformat(), type="at"),
             session_target="isolated",
-            payload=AgentTurnPayload(kind="agentTurn", prompt="Test"),
+            payload=AgentTurnPayload(kind="agentTurn", message="Test"),
             enabled=True
         )
 
@@ -254,7 +254,7 @@ class TestCronCallbacks:
         job = CronJob(
             id="test-update",
             name="Original Name",
-            schedule=EverySchedule(interval_ms=60000, type="every"),
+            schedule=EverySchedule(every_ms=60000, type="every"),
             payload=SystemEventPayload(kind="systemEvent", text="Test"),
         )
         await service.add_job(job)
@@ -270,7 +270,7 @@ class TestCronCallbacks:
         job = CronJob(
             id="test-remove",
             name="To Remove",
-            schedule=EverySchedule(interval_ms=60000, type="every"),
+            schedule=EverySchedule(every_ms=60000, type="every"),
             payload=SystemEventPayload(kind="systemEvent", text="Test"),
         )
         await service.add_job(job)
@@ -323,18 +323,20 @@ class TestCronScheduling:
 
     def test_schedule_computation_every(self):
         """Test interval schedule computation"""
-        schedule = EverySchedule(interval_ms=60000, type="every")
+        schedule = EverySchedule(every_ms=60000, type="every")
 
         assert schedule.type == "every"
-        assert schedule.interval_ms == 60000
+        assert schedule.every_ms == 60000
+        assert schedule.interval_ms == 60000  # backward-compat property
 
     def test_schedule_computation_at(self):
         """Test at schedule computation"""
         future_time = datetime.now(timezone.utc)
-        schedule = AtSchedule(timestamp=future_time.isoformat(), type="at")
+        schedule = AtSchedule(at=future_time.isoformat(), type="at")
 
         assert schedule.type == "at"
-        assert schedule.timestamp is not None
+        assert schedule.at is not None
+        assert schedule.timestamp is not None  # backward-compat property
 
 
 @pytest.mark.skip(reason="Requires full gateway setup")

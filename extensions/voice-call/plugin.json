@@ -1,0 +1,8 @@
+{
+  "id": "voice-call",
+  "name": "Voice Call",
+  "version": "0.1.0",
+  "description": "Voice call functionality via Twilio — inbound/outbound call handling",
+  "author": "OpenClaw",
+  "main": "plugin.py"
+}

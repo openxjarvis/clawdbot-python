@@ -1,0 +1,8 @@
+{
+  "id": "copilot-proxy",
+  "name": "Copilot Proxy",
+  "version": "0.1.0",
+  "description": "Local Copilot Proxy (VS Code LM) provider plugin",
+  "author": "OpenClaw",
+  "main": "plugin.py"
+}

@@ -9,9 +9,48 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Bootstrap size constants — aligned with TS DEFAULT_BOOTSTRAP_MAX_CHARS
+# ---------------------------------------------------------------------------
+
+DEFAULT_BOOTSTRAP_MAX_CHARS: int = 20_000
+DEFAULT_BOOTSTRAP_TOTAL_MAX_CHARS: int = 150_000
+
+
+def resolve_bootstrap_max_chars(cfg: Any = None) -> int:
+    """Return bootstrapMaxChars from config, or the default 20000.
+
+    Mirrors TS resolveBootstrapMaxChars(cfg?: OpenClawConfig): number.
+    Config key: agents.defaults.bootstrapMaxChars
+    """
+    try:
+        if cfg and isinstance(cfg, dict):
+            raw = cfg.get("agents", {}).get("defaults", {}).get("bootstrapMaxChars")
+            if isinstance(raw, (int, float)) and raw > 0:
+                return int(raw)
+    except Exception:
+        pass
+    return DEFAULT_BOOTSTRAP_MAX_CHARS
+
+
+def resolve_bootstrap_total_max_chars(cfg: Any = None) -> int:
+    """Return bootstrapTotalMaxChars from config, or the default 150000.
+
+    Mirrors TS resolveBootstrapTotalMaxChars(cfg?: OpenClawConfig): number.
+    Config key: agents.defaults.bootstrapTotalMaxChars
+    """
+    try:
+        if cfg and isinstance(cfg, dict):
+            raw = cfg.get("agents", {}).get("defaults", {}).get("bootstrapTotalMaxChars")
+            if isinstance(raw, (int, float)) and raw > 0:
+                return int(raw)
+    except Exception:
+        pass
+    return DEFAULT_BOOTSTRAP_TOTAL_MAX_CHARS
 
 
 class BootstrapFile(NamedTuple):
@@ -77,11 +116,12 @@ def resolve_memory_bootstrap_entries(workspace_dir: Path) -> list[tuple[str, Pat
 
 def load_bootstrap_files(
     workspace_dir: Path,
-    max_chars_per_file: int = 20000
+    max_chars_per_file: int | None = None,
+    cfg: Any = None,
 ) -> list[BootstrapFile]:
     """
     Load workspace bootstrap files
-    
+
     Files loaded (in order):
     - AGENTS.md: Project guidelines and conventions
     - SOUL.md: Persona definition
@@ -90,14 +130,19 @@ def load_bootstrap_files(
     - USER.md: User information
     - HEARTBEAT.md: Heartbeat configuration
     - BOOTSTRAP.md: Bootstrap instructions (for new workspaces)
-    
+
     Args:
         workspace_dir: Workspace directory
-        max_chars_per_file: Maximum characters per file (truncate if exceeded)
+        max_chars_per_file: Maximum characters per file (truncate if exceeded).
+            Defaults to ``resolve_bootstrap_max_chars(cfg)``.
+        cfg: Optional config dict for resolving bootstrap max chars.
     
     Returns:
         List of BootstrapFile objects
     """
+    if max_chars_per_file is None:
+        max_chars_per_file = resolve_bootstrap_max_chars(cfg)
+
     bootstrap_files = [
         "AGENTS.md",
         "SOUL.md",

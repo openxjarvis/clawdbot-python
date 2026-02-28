@@ -193,12 +193,16 @@ def convert_to_llm(messages: list[AgentMessage]) -> list[dict[str, Any]]:
             llm_messages.append(msg_dict)
         
         elif role == "toolResult":
-            # Tool result message
+            # Tool result message — support both snake_case and camelCase attribute names
             content = _format_content(getattr(msg, "content", []))
-            
+            tool_call_id = (
+                getattr(msg, "tool_call_id", None)
+                or getattr(msg, "toolCallId", None)
+                or ""
+            )
             llm_messages.append({
                 "role": "tool",
-                "tool_call_id": getattr(msg, "tool_call_id", ""),
+                "tool_call_id": tool_call_id,
                 "content": content
             })
         
@@ -757,7 +761,10 @@ def sanitize_session_history(
     if not messages:
         return messages
     
-    valid_roles = {"user", "assistant", "system", "tool", "toolResult"}
+    valid_roles = {
+        "user", "assistant", "system", "tool", "toolResult",
+        "compactionSummary", "branchSummary",  # TS-aligned summary types
+    }
     result: list[AgentMessage] = []
     
     for msg in messages:

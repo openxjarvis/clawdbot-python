@@ -162,6 +162,11 @@ def doctor(
         "--json",
         help="Output results as JSON"
     ),
+    generate_gateway_token: bool = typer.Option(
+        False,
+        "--generate-gateway-token",
+        help="Generate and save a new gateway authentication token"
+    ),
 ):
     """Run diagnostics and check configuration"""
     console.print("[cyan]Running diagnostics...[/cyan]\n")
@@ -341,6 +346,93 @@ def doctor(
                             })
             except Exception:
                 pass
+
+    # Check: generate gateway token if requested
+    if generate_gateway_token:
+        import secrets
+        from ..config.loader import get_config_path, load_config, save_config
+        token = secrets.token_hex(32)
+        try:
+            cfg = load_config()
+            if not hasattr(cfg, "gateway") or cfg.gateway is None:
+                cfg.gateway = {}
+            if isinstance(cfg.gateway, dict):
+                cfg.gateway["token"] = token
+            else:
+                cfg.gateway.token = token
+            save_config(cfg)
+            console.print(f"[green]✓[/green] Gateway token generated and saved to config")
+            console.print(f"    Token: {token[:8]}...{token[-4:]}")
+        except Exception as e:
+            console.print(f"[yellow]⚠[/yellow]  Could not save gateway token: {e}")
+            console.print(f"    Token: {token}")
+        check_results.append({"check": "gateway_token", "status": "ok", "message": "generated"})
+
+    # Check: legacy config key migrations (channel.*.token → channels.*)
+    if config_path.exists():
+        try:
+            import json as _json
+            raw = config_path.read_text()
+            raw_cfg = _json.loads(raw)
+            legacy_keys = [k for k in raw_cfg if k.startswith("channel.")]
+            if legacy_keys:
+                warnings.append(f"Legacy config keys found: {legacy_keys}. Migrate to 'channels.*'")
+                console.print(f"[yellow]⚠[/yellow]  Legacy config keys: {legacy_keys}")
+                if repair:
+                    for k in legacy_keys:
+                        parts = k.split(".")
+                        if len(parts) >= 2:
+                            raw_cfg.setdefault("channels", {}).setdefault(parts[1], {})[parts[-1]] = raw_cfg.pop(k)
+                    config_path.write_text(_json.dumps(raw_cfg, indent=2))
+                    console.print("[green]✓[/green] Migrated legacy config keys")
+                check_results.append({"check": "legacy_config_keys", "status": "warning", "message": str(legacy_keys)})
+            else:
+                check_results.append({"check": "legacy_config_keys", "status": "ok"})
+        except Exception:
+            pass
+
+    # Check: state directory permissions
+    state_dir = Path.home() / ".openclaw"
+    if state_dir.exists():
+        import stat
+        mode = state_dir.stat().st_mode
+        if mode & stat.S_IWOTH:
+            warnings.append(f"State directory {state_dir} is world-writable (security risk)")
+            console.print(f"[yellow]⚠[/yellow]  State directory is world-writable")
+            if repair:
+                state_dir.chmod(mode & ~stat.S_IWOTH)
+                console.print(f"[green]✓[/green] Fixed state directory permissions")
+            check_results.append({"check": "state_dir_permissions", "status": "warning"})
+        else:
+            check_results.append({"check": "state_dir_permissions", "status": "ok"})
+
+    # Check: gateway port binding probe (deep)
+    if deep:
+        import socket
+        gateway_port = 4747
+        try:
+            from ..config.loader import load_config as _lc
+            _cfg = _lc()
+            gateway_port = getattr(getattr(_cfg, "gateway", None), "port", None) or 4747
+        except Exception:
+            pass
+        try:
+            with socket.create_connection(("127.0.0.1", gateway_port), timeout=1):
+                console.print(f"[green]✓[/green] Gateway reachable on port {gateway_port}")
+                check_results.append({"check": "gateway_port", "status": "ok", "port": gateway_port})
+        except (ConnectionRefusedError, OSError):
+            console.print(f"[yellow]⚠[/yellow]  Gateway not reachable on port {gateway_port}")
+            check_results.append({"check": "gateway_port", "status": "warning", "port": gateway_port})
+
+        # Check: skills directory
+        skills_dir = Path.home() / ".openclaw" / "skills"
+        if skills_dir.exists():
+            skill_files = list(skills_dir.glob("*.md")) + list(skills_dir.glob("*.yaml")) + list(skills_dir.glob("*.yml"))
+            console.print(f"[green]✓[/green] Skills: {len(skill_files)} file(s) in {skills_dir}")
+            check_results.append({"check": "skills", "status": "ok", "count": len(skill_files)})
+        else:
+            console.print(f"[yellow]⚠[/yellow]  Skills directory not found: {skills_dir}")
+            check_results.append({"check": "skills", "status": "info", "message": "no skills directory"})
 
     # Apply automatic fixes if requested
     if repair and fixes and not json_output:

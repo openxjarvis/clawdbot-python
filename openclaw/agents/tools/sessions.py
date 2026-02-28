@@ -271,49 +271,129 @@ class SessionsSendTool(AgentTool):
 
 
 class SessionsSpawnTool(AgentTool):
-    """Spawn a new session"""
+    """Spawn a subagent session to run a task.
 
-    def __init__(self, session_manager: SessionManager):
+    Mirrors TS createSessionsSpawnTool() in sessions-spawn-tool.ts.
+    Schema fields align with TS: task, label, agentId, model, thinking,
+    runTimeoutSeconds, cleanup.
+    """
+
+    def __init__(self, session_manager: SessionManager | None = None, gateway: Any = None):
         super().__init__()
         self.name = "sessions_spawn"
-        self.description = "Create a new session with optional initial context"
+        self.description = (
+            "Spawn a subagent session to work on a task asynchronously. "
+            "Returns a session key you can use to check status via sessions_status."
+        )
         self.session_manager = session_manager
+        self.gateway = gateway
 
     def get_schema(self) -> dict[str, Any]:
         return {
             "type": "object",
             "properties": {
-                "session_id": {
+                "task": {
                     "type": "string",
-                    "description": "New session ID (optional, will generate if not provided)",
+                    "description": "The task for the subagent to work on.",
                 },
-                "initial_message": {
+                "label": {
                     "type": "string",
-                    "description": "Initial message to seed the session",
+                    "description": "Human-readable label for the spawned session.",
+                },
+                "agentId": {
+                    "type": "string",
+                    "description": "Agent ID to use. Defaults to the current agent.",
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Model override for the spawned session (e.g. 'anthropic:claude-sonnet-4').",
+                },
+                "thinking": {
+                    "type": "string",
+                    "description": "Thinking/reasoning mode override ('auto', 'none', or a number of tokens).",
+                },
+                "runTimeoutSeconds": {
+                    "type": "number",
+                    "minimum": 0,
+                    "description": "Timeout in seconds for the spawned run (default: 600).",
+                },
+                "cleanup": {
+                    "type": "string",
+                    "enum": ["delete", "keep"],
+                    "description": "Whether to delete the session after the run completes. Default: 'keep'.",
                 },
             },
-            "required": [],
+            "required": ["task"],
         }
 
     async def execute(self, params: dict[str, Any]) -> ToolResult:
-        """Spawn new session"""
-        session_id = params.get("session_id") or f"spawned-{int(__import__('time').time())}"
-        initial_message = params.get("initial_message")
+        """Spawn subagent session."""
+        task = params.get("task")
+        if not isinstance(task, str) or not task.strip():
+            return ToolResult(success=False, content="", error="'task' is required")
+
+        label = params.get("label") or ""
+        agent_id = params.get("agentId")
+        model = params.get("model")
+        thinking = params.get("thinking")
+        cleanup = params.get("cleanup", "keep")
+        if cleanup not in ("delete", "keep"):
+            cleanup = "keep"
+        run_timeout_seconds = params.get("runTimeoutSeconds")
+        if run_timeout_seconds is not None:
+            try:
+                run_timeout_seconds = max(0, float(run_timeout_seconds))
+            except (TypeError, ValueError):
+                run_timeout_seconds = None
 
         try:
-            # Create session
-            session = self.session_manager.get_session(session_id)
+            import time
+            session_id = (
+                label.lower().replace(" ", "-")[:32]
+                if label
+                else f"spawned-{int(time.time())}"
+            )
 
-            # Add initial message if provided
-            if initial_message:
-                session.add_user_message(initial_message)
+            if self.gateway is not None:
+                spawn_fn = getattr(self.gateway, "spawn_subagent", None)
+                if callable(spawn_fn):
+                    result = await spawn_fn(
+                        task=task.strip(),
+                        label=label or None,
+                        agent_id=agent_id,
+                        model=model,
+                        thinking=thinking,
+                        run_timeout_seconds=run_timeout_seconds,
+                        cleanup=cleanup,
+                    )
+                    if isinstance(result, dict):
+                        session_key = result.get("sessionKey") or result.get("session_key") or session_id
+                        return ToolResult(
+                            success=True,
+                            content=f"Spawned subagent session '{session_key}'. Task: {task.strip()[:120]}",
+                            metadata=result,
+                        )
+
+            if self.session_manager is not None:
+                session = self.session_manager.get_session(session_id)
+                session.add_user_message(task.strip())
+                return ToolResult(
+                    success=True,
+                    content=f"Spawned session '{session_id}'",
+                    metadata={
+                        "sessionKey": session_id,
+                        "agentId": agent_id,
+                        "model": model,
+                        "cleanup": cleanup,
+                    },
+                )
 
             return ToolResult(
                 success=True,
-                content=f"Created new session '{session_id}'",
-                metadata={"session_id": session_id, "has_initial_message": bool(initial_message)},
+                content=f"Session spawn queued: {session_id}",
+                metadata={"sessionKey": session_id},
             )
 
-        except Exception as e:
-            logger.error(f"Sessions spawn error: {e}", exc_info=True)
-            return ToolResult(success=False, content="", error=str(e))
+        except Exception as exc:
+            logger.error("sessions_spawn error: %s", exc, exc_info=True)
+            return ToolResult(success=False, content="", error=str(exc))

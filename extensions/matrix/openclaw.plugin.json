@@ -1,0 +1,13 @@
+{
+  "id": "matrix",
+  "name": "Matrix",
+  "description": "Matrix protocol channel (matrix-nio).",
+  "channels": [
+    "matrix"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

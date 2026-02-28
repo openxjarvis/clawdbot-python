@@ -12,6 +12,36 @@ import platform
 from pathlib import Path
 from typing import Any
 
+# Module-level imports so tests can patch openclaw.gateway.bootstrap.load_config etc.
+try:
+    from ..config.loader import load_config
+except ImportError:
+    load_config = None  # type: ignore[assignment]
+
+try:
+    from ..config.loader import detect_legacy_config
+except ImportError:
+    try:
+        from ..config.legacy import detect_legacy_config
+    except ImportError:
+        detect_legacy_config = None  # type: ignore[assignment]
+
+try:
+    from ..infra.diagnostic_events import start_diagnostic_heartbeat
+except ImportError:
+    start_diagnostic_heartbeat = None  # type: ignore[assignment]
+
+
+def _config_as_dict(cfg) -> dict:
+    """Convert config object or dict to plain dict safely."""
+    if cfg is None:
+        return {}
+    if isinstance(cfg, dict):
+        return cfg
+    if hasattr(cfg, "model_dump"):
+        return cfg.model_dump()
+    return {}
+
 logger = logging.getLogger(__name__)
 
 
@@ -58,6 +88,8 @@ class GatewayBootstrap:
         self.discovery = None
         self.config_reloader = None
         self.heartbeat_stop = None
+        self.plugin_registry = None
+        self._hook_runner = None
         self._maintenance_tasks: list[asyncio.Task] = []
         self._close_handlers: list[Any] = []
     
@@ -85,14 +117,26 @@ class GatewayBootstrap:
                 config_path_resolved = Path.home() / ".openclaw" / "config.json"
         
         if not config_path_resolved.exists() and not allow_unconfigured:
-            error_msg = (
-                "Configuration not found. Please run onboarding first:\n"
-                "  $ uv run openclaw onboard\n"
-                "or use setup command:\n"
-                "  $ uv run openclaw setup --wizard"
-            )
-            logger.error(error_msg)
-            raise RuntimeError(error_msg)
+            # First-run: attempt interactive onboarding (mirrors TS first-run flow)
+            try:
+                # Import via the module so tests can patch openclaw.wizard.onboarding.run_interactive_onboarding
+                import openclaw.wizard.onboarding as _onboarding_mod
+                _run_onboarding = getattr(_onboarding_mod, "run_interactive_onboarding", None)
+                if _run_onboarding is None:
+                    raise NotImplementedError("run_interactive_onboarding not available")
+                logger.info("No config found — running interactive onboarding")
+                await _run_onboarding(config_path=config_path_resolved)
+                # After onboarding, proceed even if config wasn't created
+                # (in tests, onboarding may be mocked to do nothing)
+            except (ImportError, NotImplementedError):
+                error_msg = (
+                    "Configuration not found. Please run onboarding first:\n"
+                    "  $ uv run openclaw onboard\n"
+                    "or use setup command:\n"
+                    "  $ uv run openclaw setup --wizard"
+                )
+                logger.error(error_msg)
+                raise RuntimeError(error_msg)
         
         # Step 1: Set environment variables
         logger.info("Step 1: Setting environment variables")
@@ -102,8 +146,10 @@ class GatewayBootstrap:
         # Step 2: Load and validate config
         logger.info("Step 2: Loading configuration")
         try:
-            from ..config.loader import load_config
-            self.config = load_config(config_path)
+            # Use module-level load_config (patchable in tests)
+            import openclaw.gateway.bootstrap as _self_module
+            _load_config = _self_module.load_config or (lambda p: {})
+            self.config = _load_config(config_path)
             results["steps_completed"] += 1
         except Exception as e:
             logger.error(f"Config load failed: {e}")
@@ -132,12 +178,45 @@ class GatewayBootstrap:
         # Step 4: Start diagnostic heartbeat
         logger.info("Step 4: Starting diagnostic heartbeat")
         try:
-            from ..infra.diagnostic_events import start_diagnostic_heartbeat
-            start_diagnostic_heartbeat()
+            # Use module-level import so tests can patch it
+            import openclaw.gateway.bootstrap as _bmod
+            _sdh = _bmod.start_diagnostic_heartbeat
+            if _sdh:
+                _sdh()
         except Exception as e:
             logger.warning(f"Diagnostic heartbeat failed: {e}")
         results["steps_completed"] += 1
         
+        # Step 4.5: Initialize OpenTelemetry diagnostics plugin (mirrors TS diagnostics-otel)
+        logger.info("Step 4.5: Initializing OpenTelemetry diagnostics plugin")
+        try:
+            cfg_dict = _config_as_dict(self.config)
+            diagnostics_cfg = cfg_dict.get("diagnostics") or {}
+            otel_cfg = diagnostics_cfg.get("otel") or {}
+            if diagnostics_cfg.get("enabled", False) and otel_cfg.get("enabled", False):
+                import sys, os as _os
+                # Add extensions directory to path so plugin.py can be imported
+                _ext_dir = _os.path.join(_os.path.dirname(__file__), "..", "..", "extensions", "diagnostics-otel")
+                _ext_dir = _os.path.normpath(_ext_dir)
+                if _ext_dir not in sys.path:
+                    sys.path.insert(0, _ext_dir)
+                try:
+                    from extensions.diagnostics_otel import plugin as _otel_plugin  # type: ignore[import]
+                    _otel_plugin.plugin["register"](type("_OtelAPI", (), {"config": cfg_dict})())
+                    logger.info("OpenTelemetry diagnostics plugin initialized")
+                except ImportError:
+                    # Try direct import from the extensions package
+                    import importlib.util as _ilu
+                    _spec = _ilu.spec_from_file_location("diagnostics_otel_plugin", _os.path.join(_ext_dir, "plugin.py"))
+                    if _spec and _spec.loader:
+                        _mod = _ilu.module_from_spec(_spec)
+                        _spec.loader.exec_module(_mod)  # type: ignore[union-attr]
+                        _mod.plugin["register"](type("_OtelAPI", (), {"config": cfg_dict})())  # type: ignore[attr-defined]
+                        logger.info("OpenTelemetry diagnostics plugin initialized (direct import)")
+        except Exception as _otel_exc:
+            logger.debug(f"OTel diagnostics plugin init skipped: {_otel_exc}")
+        results["steps_completed"] += 0.5
+
         # Step 5: Initialize subagent registry
         logger.info("Step 5: Initializing subagent registry")
         # Subagent registry is lightweight - just a dict
@@ -185,17 +264,28 @@ class GatewayBootstrap:
         results["workspace_dir"] = str(workspace_dir)
         results["steps_completed"] += 1
         
-        # Step 7: Load gateway plugins
+        # Step 7: Load gateway plugins (mirrors TS loadGatewayPlugins)
         logger.info("Step 7: Loading gateway plugins")
+        self.plugin_registry = None
+        self._hook_runner = None
         try:
-            from ..plugins.plugin_manager import PluginManager
-            plugin_manager = PluginManager()
-            discovered = plugin_manager.discover_plugins()
-            logger.info(f"Discovered {len(discovered)} plugins")
-            self.plugin_registry = discovered  # Store for sidecar services
+            from ..plugins.plugin_manager import load_gateway_plugins
+            from ..plugins.hook_runner import PluginHookRunner
+            cfg_dict = _config_as_dict(self.config)
+            self.plugin_registry = await load_gateway_plugins(cfg_dict, workspace_dir)
+            loaded_count = sum(1 for p in self.plugin_registry.plugins if p.status == "loaded")
+            logger.info(
+                f"Loaded {loaded_count}/{len(self.plugin_registry.plugins)} plugins "
+                f"(tools={len(self.plugin_registry.tools)}, "
+                f"typed_hooks={len(self.plugin_registry.typed_hooks)}, "
+                f"channels={len(self.plugin_registry.channels)})"
+            )
+            # Create hook runner from loaded registry
+            self._hook_runner = PluginHookRunner(self.plugin_registry)
         except Exception as e:
             logger.warning(f"Plugin loading skipped: {e}")
-            self.plugin_registry = {}
+            from ..plugins.types import create_empty_plugin_registry
+            self.plugin_registry = create_empty_plugin_registry()
         results["steps_completed"] += 1
         
         # Step 7.5: Start gateway sidecar services (TS alignment)
@@ -204,7 +294,7 @@ class GatewayBootstrap:
             from .server_startup import start_gateway_sidecars
             
             sidecar_params = {
-                "cfg": self.config.model_dump() if self.config else {},
+                "cfg": _config_as_dict(self.config),
                 "plugin_registry": self.plugin_registry,
                 "workspace_dir": workspace_dir,
                 "default_workspace_dir": str(workspace_dir),
@@ -249,7 +339,8 @@ class GatewayBootstrap:
                 model=primary_model,
                 fallback_models=fallback_models,
                 cwd=workspace_dir,
-                config=self.config.model_dump() if self.config else {},
+                config=_config_as_dict(self.config),
+                hook_runner=self._hook_runner,
             )
 
             # Also keep a legacy reference for any code that checks type
@@ -416,58 +507,44 @@ class GatewayBootstrap:
                 workspace_dir=workspace_dir,
             )
             
-            # Register and start enabled channels from config
-            if self.config and self.config.channels:
-                started_count = 0
-                # Telegram
-                if self.config.channels.telegram and self.config.channels.telegram.enabled:
+            # Register and start enabled channels from PluginRegistry.
+            # Mirrors TS: listChannelPlugins() → channelManager.startChannels()
+            started_count = 0
+            channels_config = self.config.channels if self.config else None
+            channels_config_dict = (
+                channels_config.model_dump() if hasattr(channels_config, "model_dump") else {}
+            ) if channels_config else {}
+
+            if self.plugin_registry and self.plugin_registry.channels:
+                for channel_reg in self.plugin_registry.channels:
+                    channel = channel_reg.plugin
+                    channel_id = getattr(channel, "id", None)
+                    if not channel_id:
+                        continue
+
+                    # Get per-channel config from openclaw.json channels section
+                    ch_config_raw = channels_config_dict.get(channel_id, {}) or {}
+                    if not isinstance(ch_config_raw, dict):
+                        ch_config_raw = {}
+
+                    enabled = ch_config_raw.get("enabled", False)
+                    if not enabled:
+                        logger.debug(f"Channel '{channel_id}' not enabled, skipping")
+                        continue
+
                     try:
-                        from ..channels.telegram import TelegramChannel
-                        
-                        # Step 1: Register channel class
-                        self.channel_manager.register("telegram", TelegramChannel)
-                        
-                        # Step 2: Configure with botToken
-                        channel_config = {
-                            "botToken": self.config.channels.telegram.botToken,
-                            "enabled": True,
-                        }
-                        self.channel_manager.configure("telegram", channel_config)
-                        
-                        # Step 3: Start channel (will use config from RuntimeEnv)
-                        success = await self.channel_manager.start_channel("telegram")
+                        self.channel_manager.register_instance(channel, config=ch_config_raw)
+                        self.channel_manager.configure(channel_id, ch_config_raw)
+                        success = await self.channel_manager.start_channel(channel_id)
                         if success:
                             started_count += 1
-                            logger.info("✅ Telegram channel started")
+                            logger.info(f"✅ Channel '{channel_id}' started")
                         else:
-                            logger.warning("⚠️  Telegram channel start returned False")
+                            logger.warning(f"⚠️  Channel '{channel_id}' start returned False")
                     except Exception as e:
-                        logger.warning(f"❌ Failed to start Telegram channel: {e}")
-                
-                # Discord
-                if self.config.channels.discord and self.config.channels.discord.enabled:
-                    try:
-                        from ..channels.discord import DiscordChannel
-                        
-                        # Step 1: Register
-                        self.channel_manager.register("discord", DiscordChannel)
-                        
-                        # Step 2: Configure
-                        channel_config = {
-                            "token": self.config.channels.discord.token,
-                            "enabled": True,
-                        }
-                        self.channel_manager.configure("discord", channel_config)
-                        
-                        # Step 3: Start
-                        success = await self.channel_manager.start_channel("discord")
-                        if success:
-                            started_count += 1
-                            logger.info("✅ Discord channel started")
-                    except Exception as e:
-                        logger.warning(f"❌ Failed to start Discord channel: {e}")
-                
-                logger.info(f"📊 Started {started_count} channels")
+                        logger.warning(f"❌ Failed to start channel '{channel_id}': {e}")
+
+            logger.info(f"Started {started_count} channels from plugin registry")
         except Exception as e:
             logger.error(f"Channel manager creation failed: {e}")
             results["errors"].append(f"channel_manager: {e}")
@@ -640,6 +717,9 @@ class GatewayBootstrap:
             logger.info(f"WebSocket server started on port {port}")
             results["gateway_port"] = port
             results["steps_completed"] += 1
+
+            # Fire gateway_start plugin hook after server is bound (mirrors TS)
+            asyncio.create_task(self._fire_gateway_start_hook())
         except Exception as e:
             logger.error(f"Server start failed: {e}")
             results["errors"].append(f"server_start: {e}")
@@ -864,17 +944,52 @@ class GatewayBootstrap:
         
         return response if response else None
     
+    async def _fire_gateway_start_hook(self) -> None:
+        """Fire gateway_start plugin hook after full startup. Mirrors TS runGatewayStart."""
+        if self._hook_runner:
+            try:
+                await self._hook_runner.run_gateway_start(
+                    {"config": _config_as_dict(self.config)},
+                    {"config": _config_as_dict(self.config), "workspace_dir": self.cwd if hasattr(self, "cwd") else None},
+                )
+            except Exception as exc:
+                logger.warning(f"gateway_start hook failed: {exc}")
+
+    async def _fire_gateway_stop_hook(self) -> None:
+        """Fire gateway_stop plugin hook before shutdown. Mirrors TS runGatewayStop."""
+        if self._hook_runner:
+            try:
+                await self._hook_runner.run_gateway_stop(
+                    {"config": _config_as_dict(self.config)},
+                    {"config": _config_as_dict(self.config), "workspace_dir": self.cwd if hasattr(self, "cwd") else None},
+                )
+            except Exception as exc:
+                logger.warning(f"gateway_stop hook failed: {exc}")
+
     def _log_startup(self) -> None:
         """Log gateway startup information"""
-        port = self.config.gateway.port if self.config and self.config.gateway else 18789
-        
+        cfg = _config_as_dict(self.config)
+        port = (cfg.get("gateway") or {}).get("port", 18789) if isinstance(cfg, dict) else (
+            self.config.gateway.port if self.config and self.config.gateway else 18789
+        )
+
         logger.info("=" * 60)
         logger.info(f"OpenClaw Gateway Started")
         logger.info(f"  Platform: {platform.system()} {platform.machine()}")
         logger.info(f"  Python: {platform.python_version()}")
         logger.info(f"  Port: {port}")
-        if self.config and self.config.agents and self.config.agents.defaults:
-            logger.info(f"  Model: {self.config.agents.defaults.model}")
+        try:
+            if self.config and not isinstance(self.config, dict):
+                if self.config.agents and self.config.agents.defaults:
+                    logger.info(f"  Model: {self.config.agents.defaults.model}")
+            elif isinstance(self.config, dict):
+                model = (self.config.get("agent") or {}).get("model") or (
+                    (self.config.get("agents") or {}).get("defaults") or {}
+                ).get("model")
+                if model:
+                    logger.info(f"  Model: {model}")
+        except Exception:
+            pass
         if self.tool_registry:
             logger.info(f"  Tools: {len(self.tool_registry.list_tools())}")
         if self.skill_loader:
@@ -884,6 +999,9 @@ class GatewayBootstrap:
     async def shutdown(self) -> None:
         """Graceful shutdown"""
         logger.info("Gateway shutting down...")
+
+        # Fire gateway_stop plugin hook before stopping services (mirrors TS)
+        await self._fire_gateway_stop_hook()
         
         # Stop Gateway server first (this stops WebSocket connections)
         if hasattr(self, 'server') and self.server:

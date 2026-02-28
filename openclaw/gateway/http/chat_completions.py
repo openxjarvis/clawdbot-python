@@ -65,6 +65,8 @@ def parse_agent_id(model: str) -> str:
     """
     if model.startswith("openclaw:"):
         return model.split(":", 1)[1]
+    if model.startswith("agent:"):
+        return model.split(":", 1)[1]
     return "main"  # Default agent
 
 

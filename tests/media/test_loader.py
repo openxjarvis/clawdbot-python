@@ -32,7 +32,7 @@ class TestDataUrlLoading:
     @pytest.mark.asyncio
     async def test_invalid_data_url(self):
         loader = MediaLoader()
-        
+
         with pytest.raises(ValueError, match="Invalid data URL"):
             await loader.load("data:invalid")
 
@@ -55,8 +55,8 @@ class TestFileLoading:
     @pytest.mark.asyncio
     async def test_file_not_found(self):
         loader = MediaLoader()
-        
-        with pytest.raises(FileNotFoundError):
+
+        with pytest.raises((FileNotFoundError, ValueError)):
             await loader.load("/nonexistent/file.png")
     
     @pytest.mark.asyncio

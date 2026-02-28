@@ -1,0 +1,8 @@
+{
+  "id": "device-pair",
+  "name": "device-pair",
+  "version": "0.1.0",
+  "description": "Device pairing and management",
+  "author": "OpenClaw",
+  "main": "plugin.py"
+}

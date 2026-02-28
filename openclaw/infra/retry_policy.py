@@ -60,51 +60,57 @@ async def retry_async(
     """
     if config is None:
         config = TELEGRAM_RETRY_DEFAULTS
-    
+
+    # TS: Math.max(1, attempts) — clamp to at least 1 attempt
+    max_attempts = max(1, config.attempts)
     last_error = None
-    
-    for attempt in range(1, config.attempts + 1):
+
+    for attempt in range(1, max_attempts + 1):
         try:
             return await fn()
         except Exception as e:
             last_error = e
-            
+
             # Check if should retry
             if should_retry and not should_retry(e):
                 raise
-            
-            if attempt >= config.attempts:
+
+            if attempt >= max_attempts:
                 raise
-            
-            # Calculate delay
+
+            # Calculate base delay (exponential backoff)
             delay_ms = config.min_delay_ms * (2 ** (attempt - 1))
             delay_ms = min(delay_ms, config.max_delay_ms)
-            
+
+            # Override with retry_after_ms if provided, then clamp (mirrors TS)
+            if retry_after_ms:
+                custom_delay = retry_after_ms(e)
+                if custom_delay is not None:
+                    # TS: Math.max(retryAfterMs, minDelayMs) then Math.min(..., maxDelayMs)
+                    delay_ms = max(custom_delay, config.min_delay_ms)
+                    delay_ms = min(delay_ms, config.max_delay_ms)
+
             # Add jitter
             if config.jitter > 0:
                 jitter_amount = delay_ms * config.jitter
                 delay_ms += random.uniform(-jitter_amount, jitter_amount)
-            
-            # Check for retry_after from error
-            if retry_after_ms:
-                custom_delay = retry_after_ms(e)
-                if custom_delay is not None:
-                    delay_ms = custom_delay
-            
+
             delay_ms = max(0, delay_ms)
-            
-            # Call retry callback
+
+            # Call retry callback (mirrors TS onRetry info shape)
             if on_retry:
                 on_retry({
                     "attempt": attempt,
-                    "max_attempts": config.attempts,
+                    "max_attempts": max_attempts,
+                    "maxAttempts": max_attempts,
+                    "delayMs": delay_ms,
                     "delay_ms": delay_ms,
                     "label": label,
                     "error": str(e),
                 })
             
             logger.debug(
-                f"Retry {attempt}/{config.attempts} for {label or 'operation'} "
+                f"Retry {attempt}/{max_attempts} for {label or 'operation'} "
                 f"after {delay_ms}ms: {e}"
             )
             

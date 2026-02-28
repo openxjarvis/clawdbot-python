@@ -211,7 +211,9 @@ def load_skill_entry_from_file(
         skill=skill,
         frontmatter=frontmatter,
         metadata=metadata,
-        invocation=invocation
+        invocation=invocation,
+        source=source,
+        source_dir=str(file_path.parent.parent),
     )
 
 

@@ -1,0 +1,13 @@
+{
+  "id": "msteams",
+  "name": "Microsoft Teams",
+  "description": "Microsoft Teams channel integration.",
+  "channels": [
+    "msteams"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

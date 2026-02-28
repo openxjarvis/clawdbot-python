@@ -1,8 +1,10 @@
 """Plugin system for extensibility"""
 
 import importlib
+import importlib.util
 import json
 import logging
+import os
 from pathlib import Path
 import shutil
 from datetime import datetime, UTC
@@ -232,3 +234,311 @@ class PluginManager:
     def list_loaded(self) -> list[str]:
         """List loaded plugin names"""
         return list(self.plugins.keys())
+
+
+# =============================================================================
+# Gateway Plugin Loader (mirrors TS loadGatewayPlugins)
+# =============================================================================
+
+def _resolve_bundled_plugins_dir() -> Path | None:
+    """Walk up from __file__ up to 6 levels to find the project extensions/ directory.
+
+    Mirrors TypeScript resolveBundledPluginsDir() in src/plugins/bundled-dir.ts:
+    - Checks OPENCLAW_BUNDLED_PLUGINS_DIR env var first
+    - Then walks up the directory tree from this file looking for extensions/
+    """
+    env_override = os.environ.get("OPENCLAW_BUNDLED_PLUGINS_DIR")
+    if env_override:
+        p = Path(env_override)
+        if p.is_dir():
+            return p
+
+    cursor = Path(__file__).resolve().parent
+    for _ in range(6):
+        candidate = cursor / "extensions"
+        if candidate.is_dir() and not (candidate / "__init__.py").exists():
+            # Only use this directory if it is NOT a Python package (i.e., it is a
+            # bundled-plugins directory, not the openclaw/extensions/ infrastructure module).
+            return candidate
+        parent = cursor.parent
+        if parent == cursor:
+            break
+        cursor = parent
+    return None
+
+
+def _discover_plugin_paths(
+    config: dict[str, Any],
+    workspace_dir: Path | None,
+) -> list[tuple[str, Path, str]]:
+    """Discover plugin paths from all sources.
+
+    Returns list of (plugin_id, path, origin) tuples.
+    Origin is "bundled" | "global" | "workspace" | "config".
+    """
+    found: list[tuple[str, Path, str]] = []
+
+    # 0. Bundled extensions shipped with openclaw (project root extensions/ directory).
+    #    Mirrors TS discoverOpenClawPlugins() — bundled source has lowest priority.
+    bundled_dir = _resolve_bundled_plugins_dir()
+    if bundled_dir and bundled_dir.exists():
+        for item in sorted(bundled_dir.iterdir()):
+            if not item.is_dir():
+                continue
+            # Prefer openclaw.plugin.json, fallback to plugin.json
+            plugin_manifest = item / "openclaw.plugin.json"
+            if not plugin_manifest.is_file():
+                plugin_manifest = item / "plugin.json"
+            plugin_py = item / "plugin.py"
+            if plugin_manifest.is_file() and plugin_py.is_file():
+                # Standard bundled extension: openclaw.plugin.json + plugin.py
+                found.append((item.name, plugin_py, "bundled"))
+            elif (item / "__init__.py").exists():
+                # Python package style bundled plugin
+                found.append((item.name, item, "bundled"))
+
+    # 1. Global plugins from ~/.openclaw/plugins/
+    global_dir = Path.home() / ".openclaw" / "plugins"
+    if global_dir.exists():
+        for item in sorted(global_dir.iterdir()):
+            if item.is_dir() and (item / "__init__.py").exists():
+                found.append((item.name, item, "global"))
+            elif item.is_file() and item.suffix == ".py" and not item.name.startswith("_"):
+                found.append((item.stem, item, "global"))
+
+    # 2. Workspace plugins from workspace/.openclaw/plugins/
+    if workspace_dir:
+        ws_plugin_dir = workspace_dir / ".openclaw" / "plugins"
+        if ws_plugin_dir.exists():
+            for item in sorted(ws_plugin_dir.iterdir()):
+                if item.is_dir() and (item / "__init__.py").exists():
+                    found.append((item.name, item, "workspace"))
+                elif item.is_file() and item.suffix == ".py" and not item.name.startswith("_"):
+                    found.append((item.stem, item, "workspace"))
+
+    # 3. Extra load paths from config plugins.loadPaths
+    plugins_config = config.get("plugins") if isinstance(config, dict) else None
+    if isinstance(plugins_config, dict):
+        load_paths = plugins_config.get("loadPaths") or plugins_config.get("load_paths") or []
+        for load_path in load_paths:
+            p = Path(load_path)
+            if p.is_dir():
+                for item in sorted(p.iterdir()):
+                    if item.is_dir() and (item / "__init__.py").exists():
+                        found.append((item.name, item, "config"))
+                    elif item.is_file() and item.suffix == ".py" and not item.name.startswith("_"):
+                        found.append((item.stem, item, "config"))
+
+    return found
+
+
+def _load_plugin_module(plugin_id: str, plugin_path: Path) -> Any | None:
+    """Load a plugin module from a file or package path."""
+    try:
+        if plugin_path.is_dir():
+            init_file = plugin_path / "__init__.py"
+            spec = importlib.util.spec_from_file_location(
+                f"openclaw_plugin_{plugin_id}", init_file
+            )
+        else:
+            spec = importlib.util.spec_from_file_location(
+                f"openclaw_plugin_{plugin_id}", plugin_path
+            )
+
+        if spec is None or spec.loader is None:
+            return None
+
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except Exception as exc:
+        logger.warning(f"Failed to load plugin module '{plugin_id}': {exc}")
+        return None
+
+
+async def load_gateway_plugins(
+    config: dict[str, Any],
+    workspace_dir: Path | str | None = None,
+) -> "PluginRegistry":
+    """Discover and load all gateway plugins.
+
+    Matches TypeScript loadGatewayPlugins() in src/plugins/loader.ts:
+    1. Discover plugin paths from all sources
+    2. For each plugin: load module, inspect for register() / OpenClawPluginDefinition
+    3. Create PluginApi for each plugin
+    4. Call plugin.register(api) to collect registrations
+    5. Return populated PluginRegistry
+
+    Args:
+        config: Current gateway config dict
+        workspace_dir: Workspace directory (for workspace-local plugins)
+
+    Returns:
+        Populated PluginRegistry
+    """
+    from .registry import create_empty_plugin_registry
+    from .api import create_plugin_api
+    from .types import PluginRecord, PluginDiagnostic
+
+    if isinstance(workspace_dir, str):
+        workspace_dir = Path(workspace_dir)
+
+    registry = create_empty_plugin_registry()
+
+    # Respect plugins.enabled / plugins.disabled lists
+    plugins_config = config.get("plugins") if isinstance(config, dict) else {}
+    if not isinstance(plugins_config, dict):
+        plugins_config = {}
+    enabled_list: list[str] | None = plugins_config.get("enabled")
+    disabled_list: list[str] = list(plugins_config.get("disabled") or [])
+
+    plugin_paths = _discover_plugin_paths(config, workspace_dir)
+
+    for plugin_id, plugin_path, origin in plugin_paths:
+        # Check enabled/disabled lists
+        if enabled_list is not None and plugin_id not in enabled_list:
+            continue
+        if plugin_id in disabled_list:
+            record = PluginRecord(
+                id=plugin_id,
+                name=plugin_id,
+                source=str(plugin_path),
+                origin=origin,
+                enabled=False,
+                status="disabled",
+            )
+            registry.plugins.append(record)
+            continue
+
+        module = _load_plugin_module(plugin_id, plugin_path)
+        if module is None:
+            record = PluginRecord(
+                id=plugin_id,
+                name=plugin_id,
+                source=str(plugin_path),
+                origin=origin,
+                enabled=True,
+                status="error",
+                error="Failed to load module",
+            )
+            registry.plugins.append(record)
+            registry.diagnostics.append(PluginDiagnostic(
+                level="error",
+                message=f"Failed to load plugin module '{plugin_id}'",
+                plugin_id=plugin_id,
+                source=str(plugin_path),
+            ))
+            continue
+
+        # Detect plugin definition: can be module-level 'plugin' object,
+        # or module-level 'register' function, or OpenClawPluginDefinition-like dict/object
+        plugin_def = getattr(module, "plugin", None) or getattr(module, "PLUGIN", None)
+        register_fn = None
+        plugin_name = plugin_id
+        plugin_version = None
+        plugin_description = None
+        plugin_kind = None
+        plugin_config_for_plugin: dict[str, Any] | None = None
+
+        if plugin_def is not None:
+            plugin_name = getattr(plugin_def, "name", plugin_id) or plugin_id
+            plugin_version = getattr(plugin_def, "version", None)
+            plugin_description = getattr(plugin_def, "description", None)
+            plugin_kind = getattr(plugin_def, "kind", None)
+            register_fn = getattr(plugin_def, "register", None)
+        else:
+            # Try module-level register() function
+            register_fn = getattr(module, "register", None)
+
+        if register_fn is None:
+            logger.debug(f"Plugin '{plugin_id}' has no register() function, skipping")
+            continue
+
+        # Get per-plugin config if configured in openclaw.json
+        all_plugin_configs = plugins_config.get("configs") or plugins_config.get("pluginConfigs") or {}
+        plugin_config_for_plugin = all_plugin_configs.get(plugin_id)
+
+        api = create_plugin_api(
+            plugin_id=plugin_id,
+            plugin_name=plugin_name,
+            registry=registry,
+            config=config,
+            source=str(plugin_path),
+            version=plugin_version,
+            description=plugin_description,
+            plugin_config=plugin_config_for_plugin,
+            workspace_dir=str(workspace_dir) if workspace_dir else None,
+        )
+
+        try:
+            result = register_fn(api)
+            # Support both sync and async register functions
+            if hasattr(result, "__await__"):
+                import asyncio
+                await result
+        except Exception as exc:
+            logger.error(f"Plugin '{plugin_id}' register() raised: {exc}", exc_info=True)
+            record = PluginRecord(
+                id=plugin_id,
+                name=plugin_name,
+                version=plugin_version,
+                description=plugin_description,
+                kind=plugin_kind,
+                source=str(plugin_path),
+                origin=origin,
+                enabled=True,
+                status="error",
+                error=str(exc),
+            )
+            registry.plugins.append(record)
+            registry.diagnostics.append(PluginDiagnostic(
+                level="error",
+                message=f"Plugin '{plugin_id}' register() failed: {exc}",
+                plugin_id=plugin_id,
+                source=str(plugin_path),
+            ))
+            continue
+
+        # Count contributions from this plugin
+        tool_names = [name for reg in registry.tools if reg.plugin_id == plugin_id for name in reg.names]
+        hook_names = [h.hook_name for h in registry.typed_hooks if h.plugin_id == plugin_id]
+        channel_ids = [getattr(reg.plugin, "id", "") for reg in registry.channels if reg.plugin_id == plugin_id]
+        provider_ids = [reg.provider.id for reg in registry.providers if reg.plugin_id == plugin_id]
+        gateway_methods = [m for m in registry.gateway_handlers if True]  # simplified
+        services = [reg.service.id for reg in registry.services if reg.plugin_id == plugin_id]
+        commands = [reg.command.name for reg in registry.commands if reg.plugin_id == plugin_id]
+        http_handlers = sum(1 for reg in registry.http_handlers if reg.plugin_id == plugin_id)
+
+        record = PluginRecord(
+            id=plugin_id,
+            name=plugin_name,
+            version=plugin_version,
+            description=plugin_description,
+            kind=plugin_kind,
+            source=str(plugin_path),
+            origin=origin,
+            enabled=True,
+            status="loaded",
+            tool_names=tool_names,
+            hook_names=hook_names,
+            channel_ids=channel_ids,
+            provider_ids=provider_ids,
+            gateway_methods=gateway_methods,
+            services=services,
+            commands=commands,
+            http_handlers=http_handlers,
+            hook_count=len(hook_names),
+        )
+        registry.plugins.append(record)
+        logger.info(
+            f"Loaded plugin '{plugin_id}' from {origin} "
+            f"(tools={len(tool_names)}, hooks={len(hook_names)}, channels={len(channel_ids)})"
+        )
+
+    if registry.plugins:
+        loaded = sum(1 for p in registry.plugins if p.status == "loaded")
+        logger.info(f"Plugin loading complete: {loaded}/{len(registry.plugins)} loaded")
+
+    return registry
+
+

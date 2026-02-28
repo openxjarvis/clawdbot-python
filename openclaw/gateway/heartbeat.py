@@ -6,99 +6,252 @@ Executes periodic agent turns in the main session to:
 - Monitor system health
 - Provide status updates
 
-Reference: openclaw/docs/concepts/heartbeat.md
+Reference: openclaw/docs/gateway/heartbeat.md
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Default heartbeat prompt (matches TS)
+DEFAULT_HEARTBEAT_PROMPT = (
+    "Read HEARTBEAT.md if it exists (workspace context). "
+    "Follow it strictly. Do not infer or repeat old tasks from prior chats. "
+    "If nothing needs attention, reply HEARTBEAT_OK."
+)
+
+# Default ack cutoff (TS: ackMaxChars = 300)
+DEFAULT_ACK_MAX_CHARS = 300
+
+
+@dataclass
+class ActiveHoursConfig:
+    """Active hours restriction — mirrors TS HeartbeatActiveHours."""
+
+    start: str = "00:00"      # HH:MM inclusive
+    end: str = "24:00"        # HH:MM exclusive ("24:00" = end of day)
+    timezone: str | None = None  # IANA tz or "user"/"local"; None = host tz
+
+
+@dataclass
+class HeartbeatVisibilityConfig:
+    """Per-channel heartbeat visibility — mirrors TS HeartbeatChannelConfig."""
+
+    show_ok: bool = False       # Send HEARTBEAT_OK ack messages
+    show_alerts: bool = True    # Send alert (non-OK) messages
+    use_indicator: bool = True  # Emit indicator events
 
 
 @dataclass
 class HeartbeatConfig:
-    """Heartbeat configuration"""
-    
-    enabled: bool = True
-    interval_minutes: int = 30  # Default 30m (60m for Anthropic OAuth)
-    active_hours: tuple[int, int] | None = None  # (start_hour, end_hour) in 24h format
-    show_ok: bool = True  # Show OK acknowledgments in channels
-    show_alerts: bool = True  # Show alert messages in channels
-    use_indicator: bool = False  # Use indicator instead of full messages
+    """Heartbeat configuration — mirrors TS HeartbeatConfig.
+
+    Fields intentionally mirror the TS config schema to allow 1-to-1 mapping.
+    """
+
+    # Interval string, e.g. "30m", "1h", "0m" (disabled).  Also accepts int minutes.
+    every: str = "30m"
+
+    # Optional model override for heartbeat runs ("provider/model")
+    model: str | None = None
+
+    # Whether to also deliver a separate "Reasoning:" message when available
+    include_reasoning: bool = False
+
+    # Delivery target: "last" | "none" | channel id (e.g. "whatsapp", "telegram")
+    target: str = "last"
+
+    # Optional recipient override (E.164, Telegram chat-id, etc.)
+    to: str | None = None
+
+    # Optional account id for multi-account channels
+    account_id: str | None = None
+
+    # Custom prompt body (replaces default; sent verbatim)
+    prompt: str = DEFAULT_HEARTBEAT_PROMPT
+
+    # Max chars after HEARTBEAT_OK before it stops being treated as an ack
+    ack_max_chars: int = DEFAULT_ACK_MAX_CHARS
+
+    # Session key override ("main" = agent main session; or explicit key)
+    session: str = "main"
+
+    # Whether to suppress tool error warnings during heartbeat runs
+    suppress_tool_error_warnings: bool = False
+
+    # Active-hours restriction (None = always run)
+    active_hours: ActiveHoursConfig | None = None
+
+    # Per-channel visibility defaults
+    visibility: HeartbeatVisibilityConfig = field(default_factory=HeartbeatVisibilityConfig)
+
+    # Legacy compat aliases
+    @property
+    def enabled(self) -> bool:
+        """True unless interval is "0m" or "0"."""
+        return not self._is_zero_interval()
+
+    @property
+    def interval_minutes(self) -> int:
+        """Parsed interval in minutes."""
+        return _parse_interval_minutes(self.every)
+
+    def _is_zero_interval(self) -> bool:
+        return _parse_interval_minutes(self.every) == 0
+
+
+def _parse_interval_minutes(every: str | int) -> int:
+    """Parse a duration string like "30m", "1h", "90s" to minutes."""
+    if isinstance(every, int):
+        return max(0, every)
+    s = str(every).strip().lower()
+    if not s or s in ("0", "0m", "never"):
+        return 0
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([smhd]?)", s)
+    if not m:
+        return 30
+    val, unit = float(m.group(1)), m.group(2) or "m"
+    if unit == "s":
+        return max(0, int(val / 60))
+    if unit == "m":
+        return max(0, int(val))
+    if unit == "h":
+        return max(0, int(val * 60))
+    if unit == "d":
+        return max(0, int(val * 1440))
+    return max(0, int(val))
+
+
+def _is_heartbeat_ok(text: str, ack_max_chars: int = DEFAULT_ACK_MAX_CHARS) -> bool:
+    """Return True when text is a HEARTBEAT_OK ack with no significant payload.
+
+    Mirrors TS isHeartbeatOk() logic:
+    - Strip leading/trailing HEARTBEAT_OK tokens and whitespace.
+    - If the remainder is <= ack_max_chars, treat as pure ack.
+    - If HEARTBEAT_OK appears in the middle (not at start/end), NOT treated as ack.
+    """
+    stripped = text.strip()
+    upper = stripped.upper()
+
+    starts_with_ok = upper.startswith("HEARTBEAT_OK")
+    ends_with_ok = upper.endswith("HEARTBEAT_OK")
+
+    # If HEARTBEAT_OK is neither at start nor end, it's in the middle — not an ack
+    if not starts_with_ok and not ends_with_ok:
+        # Check if it contains HEARTBEAT_OK at all (in middle)
+        if "HEARTBEAT_OK" in upper:
+            return False
+
+    # Remove leading HEARTBEAT_OK
+    while stripped.upper().startswith("HEARTBEAT_OK"):
+        stripped = stripped[len("HEARTBEAT_OK"):].strip()
+    # Remove trailing HEARTBEAT_OK
+    while stripped.upper().endswith("HEARTBEAT_OK"):
+        stripped = stripped[: -len("HEARTBEAT_OK")].strip()
+
+    # If remaining text still has HEARTBEAT_OK in middle, not an ack
+    if "HEARTBEAT_OK" in stripped.upper():
+        return False
+
+    return len(stripped) <= ack_max_chars
+
+
+def strip_heartbeat_ok(text: str) -> str:
+    """Strip leading/trailing HEARTBEAT_OK from a message body.
+
+    Mirrors TS stripHeartbeatOk().
+    """
+    stripped = text.strip()
+    while stripped.upper().startswith("HEARTBEAT_OK"):
+        stripped = stripped[len("HEARTBEAT_OK"):].strip()
+    while stripped.upper().endswith("HEARTBEAT_OK"):
+        stripped = stripped[: -len("HEARTBEAT_OK")].strip()
+    return stripped
+
+
+def _parse_hhmm(hhmm: str) -> tuple[int, int]:
+    """Parse "HH:MM" or "24:00" → (hours, minutes)."""
+    parts = hhmm.split(":")
+    if len(parts) == 2:
+        return int(parts[0]), int(parts[1])
+    return int(parts[0]), 0
+
+
+def _in_active_hours(cfg: ActiveHoursConfig) -> bool:
+    """Return True if now is within the configured active hours window."""
+    now = datetime.now()
+    # TODO: full IANA timezone support; currently uses local time only
+    h, m = now.hour, now.minute
+    current_mins = h * 60 + m
+    start_h, start_m = _parse_hhmm(cfg.start)
+    end_h, end_m = _parse_hhmm(cfg.end)
+    start_mins = start_h * 60 + start_m
+    # "24:00" is handled as 24*60 = 1440
+    end_mins = end_h * 60 + end_m
+
+    if start_mins <= end_mins:
+        # Normal range
+        return start_mins <= current_mins < end_mins
+    else:
+        # Wraps midnight
+        return current_mins >= start_mins or current_mins < end_mins
 
 
 class HeartbeatManager:
-    """
-    Manage periodic heartbeat agent turns.
-    
+    """Manage periodic heartbeat agent turns.
+
     The heartbeat system executes periodic agent turns in the main session
     to provide health monitoring and keep connections alive.
-    
+
     Features:
     - Configurable interval (default 30m)
-    - Active hours restriction (e.g., 9am-6pm)
-    - HEARTBEAT_OK special handling
-    - Per-channel visibility settings
-    
-    Usage:
-        config = HeartbeatConfig(
-            enabled=True,
-            interval_minutes=30,
-            active_hours=(9, 18)  # 9am-6pm
-        )
-        
-        manager = HeartbeatManager(config, agent_runtime)
-        await manager.start()
-        
-        # Later...
-        await manager.stop()
+    - Active hours restriction with HH:MM granularity
+    - HEARTBEAT_OK special handling with ack_max_chars cutoff
+    - Per-channel visibility settings (show_ok, show_alerts, use_indicator)
+    - Custom prompt, model override, session override
+    - suppressToolErrorWarnings flag
+
+    Mirrors TS HeartbeatManager in openclaw/src/gateway/heartbeat.ts.
     """
-    
+
     def __init__(
-        self, 
-        config: HeartbeatConfig, 
-        agent_runtime,
-        session_key: str = "agent:main:main"
-    ):
-        """
-        Initialize heartbeat manager.
-        
-        Args:
-            config: Heartbeat configuration
-            agent_runtime: Agent runtime for executing turns
-            session_key: Session key for heartbeat turns
-        """
+        self,
+        config: HeartbeatConfig,
+        agent_runtime: Any,
+        session_key: str = "agent:main:main",
+    ) -> None:
         self._config = config
         self._agent_runtime = agent_runtime
         self._session_key = session_key
         self._task: asyncio.Task | None = None
         self._running = False
-    
+
     async def start(self) -> None:
-        """Start heartbeat loop"""
+        """Start heartbeat loop."""
         if not self._config.enabled:
-            logger.info("Heartbeat disabled by config")
+            logger.info("Heartbeat disabled (interval=0)")
             return
-        
         if self._running:
             logger.warning("Heartbeat already running")
             return
-        
         self._running = True
         self._task = asyncio.create_task(self._heartbeat_loop())
         logger.info(
-            f"Heartbeat started: interval={self._config.interval_minutes}m, "
-            f"active_hours={self._config.active_hours}"
+            "Heartbeat started: every=%s (%dm), target=%s",
+            self._config.every,
+            self._config.interval_minutes,
+            self._config.target,
         )
-    
+
     async def stop(self) -> None:
-        """Stop heartbeat loop"""
+        """Stop heartbeat loop."""
         self._running = False
-        
         if self._task:
             self._task.cancel()
             try:
@@ -106,95 +259,184 @@ class HeartbeatManager:
             except asyncio.CancelledError:
                 pass
             self._task = None
-        
         logger.info("Heartbeat stopped")
-    
+
     async def _heartbeat_loop(self) -> None:
-        """Periodic heartbeat execution loop"""
+        """Periodic heartbeat execution loop."""
         while self._running:
             try:
-                # Wait for interval
                 await asyncio.sleep(self._config.interval_minutes * 60)
-                
-                # Check if in active hours
-                if not self._is_active_hour():
-                    logger.debug("Skipping heartbeat: outside active hours")
+                if not self._should_run():
+                    logger.debug("Skipping heartbeat: outside active hours or visibility all-off")
                     continue
-                
-                # Execute heartbeat turn
                 await self._execute_heartbeat()
-                
             except asyncio.CancelledError:
                 break
-            except Exception as e:
-                logger.error(f"Heartbeat execution error: {e}", exc_info=True)
-    
-    def _is_active_hour(self) -> bool:
-        """
-        Check if current hour is within active hours.
-        
-        Returns:
-            True if within active hours or no restriction, False otherwise
-        """
-        if not self._config.active_hours:
-            return True  # No restriction
-        
-        current_hour = datetime.now().hour
-        start, end = self._config.active_hours
-        
-        if start <= end:
-            # Normal range (e.g., 9-18)
-            return start <= current_hour < end
-        else:
-            # Wrap around midnight (e.g., 22-6)
-            return current_hour >= start or current_hour < end
-    
+            except Exception as exc:
+                logger.error("Heartbeat execution error: %s", exc, exc_info=True)
+
+    def _should_run(self) -> bool:
+        """Return True if the heartbeat should fire now."""
+        # Active hours check
+        if self._config.active_hours and not _in_active_hours(self._config.active_hours):
+            return False
+        # If all visibility flags are off, skip (mirrors TS)
+        vis = self._config.visibility
+        if not vis.show_ok and not vis.show_alerts and not vis.use_indicator:
+            return False
+        return True
+
     async def _execute_heartbeat(self) -> None:
-        """
-        Execute heartbeat agent turn.
-        
-        Runs agent in main session with special HEARTBEAT_OK handling.
-        """
+        """Execute heartbeat agent turn and handle HEARTBEAT_OK contract."""
+        logger.info("Executing heartbeat turn (session=%s)", self._session_key)
         try:
-            logger.info("Executing heartbeat turn")
-            
-            # Execute agent turn with heartbeat message
+            content_parts: list[str] = []
             async for event in self._agent_runtime.run_turn(
                 session_key=self._session_key,
-                messages=[{
-                    "role": "user",
-                    "content": "HEARTBEAT_OK"
-                }],
-                stream=True
+                messages=[{"role": "user", "content": self._config.prompt}],
+                stream=True,
             ):
-                # Log events but don't block
-                if event.type == "agent_error":
-                    logger.error(f"Heartbeat error: {event.data}")
-                elif event.type == "agent_complete":
-                    logger.info("Heartbeat completed successfully")
-            
-        except Exception as e:
-            logger.error(f"Heartbeat execution failed: {e}", exc_info=True)
-    
+                etype = getattr(event, "type", None) or (event.get("type") if isinstance(event, dict) else "")
+                data = getattr(event, "data", None) or (event.get("data", {}) if isinstance(event, dict) else {})
+                if etype == "agent_text":
+                    content_parts.append(data.get("text", "") if isinstance(data, dict) else "")
+                elif etype == "agent_error":
+                    logger.error("Heartbeat agent error: %s", data)
+                elif etype == "agent_complete":
+                    logger.debug("Heartbeat agent turn complete")
+
+            full_text = "".join(content_parts).strip()
+            is_ok = _is_heartbeat_ok(full_text, self._config.ack_max_chars)
+            vis = self._config.visibility
+
+            if is_ok:
+                if vis.show_ok:
+                    logger.info("Heartbeat OK (delivering ack)")
+                    await self._deliver(strip_heartbeat_ok(full_text) or "HEARTBEAT_OK")
+                else:
+                    logger.debug("Heartbeat OK — suppressed (show_ok=False)")
+            else:
+                if vis.show_alerts:
+                    logger.info("Heartbeat alert — delivering")
+                    await self._deliver(full_text)
+                else:
+                    logger.debug("Heartbeat alert suppressed (show_alerts=False)")
+
+            if vis.use_indicator:
+                await self._emit_indicator(is_ok)
+
+        except Exception as exc:
+            logger.error("Heartbeat execution failed: %s", exc, exc_info=True)
+
+    async def _deliver(self, text: str) -> None:
+        """Send heartbeat message via the configured target/to/accountId.
+
+        Currently delegates to agent_runtime if it exposes a send() method.
+        If not, logs the message only.
+        """
+        if not text:
+            return
+        if hasattr(self._agent_runtime, "send_heartbeat_message"):
+            await self._agent_runtime.send_heartbeat_message(
+                text=text,
+                target=self._config.target,
+                to=self._config.to,
+                account_id=self._config.account_id,
+            )
+        else:
+            logger.info("Heartbeat message (target=%s): %s", self._config.target, text[:200])
+
+    async def _emit_indicator(self, is_ok: bool) -> None:
+        """Emit a heartbeat indicator event."""
+        if hasattr(self._agent_runtime, "emit_heartbeat_indicator"):
+            await self._agent_runtime.emit_heartbeat_indicator(ok=is_ok)
+
+    async def trigger_now(self) -> None:
+        """Trigger an immediate heartbeat (manual wake).
+
+        Mirrors TS triggerHeartbeatNow() / system event --mode now.
+        """
+        logger.info("Manual heartbeat triggered")
+        await self._execute_heartbeat()
+
+    @property
     def is_running(self) -> bool:
-        """Check if heartbeat is running"""
         return self._running
-    
+
     def get_config(self) -> HeartbeatConfig:
-        """Get current configuration"""
         return self._config
-    
+
     def update_config(self, config: HeartbeatConfig) -> None:
-        """
-        Update configuration (requires restart).
-        
-        Args:
-            config: New heartbeat configuration
-        """
+        """Update configuration (requires restart to take effect)."""
         self._config = config
 
 
+def resolve_heartbeat_config(
+    agent_cfg: dict[str, Any],
+    defaults_cfg: dict[str, Any] | None = None,
+) -> HeartbeatConfig | None:
+    """Build a HeartbeatConfig from agent config dict.
+
+    Merges agents.defaults.heartbeat on top and then agent-specific heartbeat
+    on top of that, mirroring TS config merging.
+
+    Returns None if heartbeat is not configured or interval is 0.
+    """
+    base: dict[str, Any] = {}
+    if defaults_cfg:
+        base.update(defaults_cfg.get("heartbeat") or {})
+    base.update(agent_cfg.get("heartbeat") or {})
+
+    if not base:
+        return None
+
+    every = base.get("every", "30m")
+    if _parse_interval_minutes(str(every)) == 0:
+        return None
+
+    active_hours_raw = base.get("activeHours") or base.get("active_hours")
+    active_hours: ActiveHoursConfig | None = None
+    if active_hours_raw and isinstance(active_hours_raw, dict):
+        active_hours = ActiveHoursConfig(
+            start=active_hours_raw.get("start", "00:00"),
+            end=active_hours_raw.get("end", "24:00"),
+            timezone=active_hours_raw.get("timezone"),
+        )
+
+    vis_raw = base.get("visibility") or {}
+    visibility = HeartbeatVisibilityConfig(
+        show_ok=vis_raw.get("showOk", vis_raw.get("show_ok", False)),
+        show_alerts=vis_raw.get("showAlerts", vis_raw.get("show_alerts", True)),
+        use_indicator=vis_raw.get("useIndicator", vis_raw.get("use_indicator", True)),
+    )
+
+    return HeartbeatConfig(
+        every=str(every),
+        model=base.get("model"),
+        include_reasoning=base.get("includeReasoning", base.get("include_reasoning", False)),
+        target=base.get("target", "last"),
+        to=base.get("to"),
+        account_id=base.get("accountId") or base.get("account_id"),
+        prompt=base.get("prompt", DEFAULT_HEARTBEAT_PROMPT),
+        ack_max_chars=int(base.get("ackMaxChars", base.get("ack_max_chars", DEFAULT_ACK_MAX_CHARS))),
+        session=base.get("session", "main"),
+        suppress_tool_error_warnings=bool(
+            base.get("suppressToolErrorWarnings", base.get("suppress_tool_error_warnings", False))
+        ),
+        active_hours=active_hours,
+        visibility=visibility,
+    )
+
+
 __all__ = [
+    "ActiveHoursConfig",
     "HeartbeatConfig",
     "HeartbeatManager",
+    "HeartbeatVisibilityConfig",
+    "DEFAULT_HEARTBEAT_PROMPT",
+    "DEFAULT_ACK_MAX_CHARS",
+    "resolve_heartbeat_config",
+    "strip_heartbeat_ok",
+    "_is_heartbeat_ok",
+    "_parse_interval_minutes",
 ]

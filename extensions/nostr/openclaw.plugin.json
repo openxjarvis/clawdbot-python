@@ -1,0 +1,13 @@
+{
+  "id": "nostr",
+  "name": "Nostr",
+  "description": "Nostr protocol channel integration.",
+  "channels": [
+    "nostr"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

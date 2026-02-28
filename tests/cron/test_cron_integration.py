@@ -78,7 +78,7 @@ class TestCronServiceIntegration:
         job = CronJob(
             id="test-job",
             name="Test Job",
-            schedule=EverySchedule(interval_ms=60000, type="every"),
+            schedule=EverySchedule(every_ms=60000, type="every"),
             session_target="main",
             payload=SystemEventPayload(kind="systemEvent", text="Test event"),
             enabled=True
@@ -143,9 +143,9 @@ class TestCronServiceIntegration:
         job = CronJob(
             id="test-job",
             name="Test",
-            schedule=AtSchedule(timestamp=datetime.now(timezone.utc).isoformat(), type="at"),
+            schedule=AtSchedule(at=datetime.now(timezone.utc).isoformat(), type="at"),
             session_target="isolated",
-            payload=AgentTurnPayload(kind="agentTurn", prompt="Test"),
+            payload=AgentTurnPayload(kind="agentTurn", message="Test"),
             enabled=True
         )
 
@@ -159,7 +159,7 @@ class TestCronServiceIntegration:
         """Test interval schedule computation"""
         from openclaw.cron.schedule import compute_next_run
 
-        schedule = EverySchedule(interval_ms=60000, type="every")
+        schedule = EverySchedule(every_ms=60000, type="every")
 
         now = datetime.now(timezone.utc)
         now_ms = int(now.timestamp() * 1000)
@@ -173,7 +173,7 @@ class TestCronServiceIntegration:
         from openclaw.cron.schedule import compute_next_run
 
         # Every day at 9 AM
-        schedule = CronSchedule(expression="0 9 * * *", timezone="UTC", type="cron")
+        schedule = CronSchedule(expr="0 9 * * *", tz="UTC", type="cron")
 
         now = datetime.now(timezone.utc)
         now_ms = int(now.timestamp() * 1000)
@@ -191,7 +191,7 @@ class TestCronStore:
         job = CronJob(
             id="job-1",
             name="Test Job",
-            schedule=EverySchedule(interval_ms=60000, type="every"),
+            schedule=EverySchedule(every_ms=60000, type="every"),
             session_target="main",
             payload=SystemEventPayload(kind="systemEvent", text="Test"),
             enabled=True

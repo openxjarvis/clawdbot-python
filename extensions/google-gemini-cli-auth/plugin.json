@@ -1,0 +1,8 @@
+{
+  "id": "google-gemini-cli-auth",
+  "name": "google-gemini-cli-auth",
+  "version": "0.1.0",
+  "description": "Google Gemini CLI authentication provider",
+  "author": "OpenClaw",
+  "main": "plugin.py"
+}

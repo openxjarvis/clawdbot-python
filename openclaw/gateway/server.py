@@ -477,6 +477,22 @@ class GatewayServer:
             system_prompt=self.system_prompt,
         )
 
+        # Register global handler instances so gateway handlers can access runtime
+        from openclaw.gateway.handlers import set_global_instances
+        from openclaw.agents.tools.registry import ToolRegistry
+        if isinstance(tools, ToolRegistry):
+            tool_registry = tools
+        else:
+            tool_registry = ToolRegistry()
+            for t in (tools or []):
+                tool_registry.register(t)
+        set_global_instances(
+            session_manager=session_manager,
+            tool_registry=tool_registry,
+            channel_registry=self.channel_manager,
+            agent_runtime=agent_runtime,
+        )
+
         # Register as observer if agent_runtime provided
         if agent_runtime:
             agent_runtime.add_event_listener(self.on_agent_event)
@@ -698,6 +714,202 @@ class GatewayServer:
         # Otherwise, serve Control UI
         return await self.serve_control_ui(request)
 
+    # ------------------------------------------------------------------
+    # OpenAI / OpenResponses HTTP handlers
+    # Mirrors TS openclaw/src/gateway/server-http-openai.ts
+    # ------------------------------------------------------------------
+
+    async def _handle_chat_completions_route(self, request: web.Request) -> web.Response:
+        """Handle POST /v1/chat/completions (OpenAI-compatible)."""
+        import json as _json
+        from aiohttp import web as _web
+
+        try:
+            from openclaw.gateway.http.chat_completions import (
+                ChatCompletionRequest,
+                handle_chat_completions,
+            )
+
+            # Auth check
+            auth_header = request.headers.get("Authorization", "")
+            if not self._check_http_auth(auth_header):
+                return _web.Response(
+                    status=401,
+                    content_type="application/json",
+                    body=_json.dumps({"error": {"message": "Unauthorized", "type": "auth_error"}}).encode(),
+                )
+
+            body = await request.json()
+            req_model = ChatCompletionRequest(**body)
+            agent_id_header = request.headers.get("x-openclaw-agent-id")
+            result = await handle_chat_completions(
+                request=req_model,
+                agent_runtime=self,
+                authorization=auth_header,
+                x_openclaw_agent_id=agent_id_header,
+            )
+            if hasattr(result, "__aiter__"):
+                # Streaming SSE
+                async def _stream():
+                    async for chunk in result:
+                        yield chunk.encode() if isinstance(chunk, str) else chunk
+
+                return _web.Response(
+                    status=200,
+                    content_type="text/event-stream",
+                    body=b"".join([c.encode() if isinstance(c, str) else c async for c in result]),
+                )
+            return _web.Response(
+                status=200,
+                content_type="application/json",
+                body=_json.dumps(result if isinstance(result, dict) else result.dict()).encode(),
+            )
+        except Exception as exc:
+            logger.error(f"/v1/chat/completions error: {exc}", exc_info=True)
+            return _web.Response(
+                status=500,
+                content_type="application/json",
+                body=_json.dumps({"error": {"message": str(exc), "type": "server_error"}}).encode(),
+            )
+
+    async def _handle_list_models_route(self, request: web.Request) -> web.Response:
+        """Handle GET /v1/models (OpenAI-compatible model list).
+
+        Returns the list of available models.  Mirrors TS GET /v1/models.
+        """
+        import json as _json
+        from aiohttp import web as _web
+        import time as _time
+
+        auth_header = request.headers.get("Authorization", "")
+        if not self._check_http_auth(auth_header):
+            return _web.Response(
+                status=401,
+                content_type="application/json",
+                body=_json.dumps({"error": {"message": "Unauthorized", "type": "auth_error"}}).encode(),
+            )
+
+        try:
+            models = self._list_available_models()
+            return _web.Response(
+                status=200,
+                content_type="application/json",
+                body=_json.dumps({
+                    "object": "list",
+                    "data": [
+                        {
+                            "id": m,
+                            "object": "model",
+                            "created": int(_time.time()),
+                            "owned_by": "openclaw",
+                        }
+                        for m in models
+                    ],
+                }).encode(),
+            )
+        except Exception as exc:
+            logger.error(f"/v1/models error: {exc}", exc_info=True)
+            return _web.Response(
+                status=500,
+                content_type="application/json",
+                body=_json.dumps({"error": {"message": str(exc), "type": "server_error"}}).encode(),
+            )
+
+    async def _handle_responses_route(self, request: web.Request) -> web.Response:
+        """Handle POST /v1/responses (OpenResponses-compatible).
+
+        Mirrors TS POST /v1/responses.
+        """
+        import json as _json
+        from aiohttp import web as _web
+
+        auth_header = request.headers.get("Authorization", "")
+        if not self._check_http_auth(auth_header):
+            return _web.Response(
+                status=401,
+                content_type="application/json",
+                body=_json.dumps({"error": {"message": "Unauthorized", "type": "auth_error"}}).encode(),
+            )
+
+        try:
+            from openclaw.gateway.http.responses import handle_responses_request
+            body = await request.json()
+            agent_id_header = request.headers.get("x-openclaw-agent-id")
+            result = await handle_responses_request(
+                body=body,
+                gateway=self,
+                authorization=auth_header,
+                agent_id_header=agent_id_header,
+            )
+            return _web.Response(
+                status=200,
+                content_type="application/json",
+                body=_json.dumps(result if isinstance(result, dict) else result.dict()).encode(),
+            )
+        except NotImplementedError:
+            return _web.Response(
+                status=501,
+                content_type="application/json",
+                body=_json.dumps({"error": {"message": "Not implemented", "type": "not_implemented"}}).encode(),
+            )
+        except Exception as exc:
+            logger.error(f"/v1/responses error: {exc}", exc_info=True)
+            return _web.Response(
+                status=500,
+                content_type="application/json",
+                body=_json.dumps({"error": {"message": str(exc), "type": "server_error"}}).encode(),
+            )
+
+    def _check_http_auth(self, auth_header: str) -> bool:
+        """Validate HTTP bearer token against gateway auth config.
+
+        Mirrors TS verifyBearerToken() in server-http-openai.ts.
+        Returns True if auth passes or if auth is disabled.
+        """
+        try:
+            gw_auth = getattr(getattr(self.config, "gateway", None), "auth", None)
+            if gw_auth is None:
+                return True
+            mode = getattr(gw_auth, "mode", None) or (gw_auth.get("mode") if isinstance(gw_auth, dict) else None)
+            if mode == "token":
+                expected = getattr(gw_auth, "token", None) or (gw_auth.get("token") if isinstance(gw_auth, dict) else None)
+                if not expected:
+                    return True
+                token = auth_header.removeprefix("Bearer ").strip()
+                return token == expected
+            if mode == "password":
+                expected = getattr(gw_auth, "password", None) or (gw_auth.get("password") if isinstance(gw_auth, dict) else None)
+                if not expected:
+                    return True
+                token = auth_header.removeprefix("Bearer ").strip()
+                return token == expected
+            return True
+        except Exception:
+            return True
+
+    def _list_available_models(self) -> list[str]:
+        """Return available model IDs for /v1/models response.
+
+        Returns a list like ["openclaw:main", "openclaw:beta", ...] based on
+        configured agents plus a generic "openclaw" fallback.
+        """
+        models: list[str] = ["openclaw"]
+        try:
+            agents_cfg = getattr(self.config, "agents", None)
+            agent_list = []
+            if isinstance(agents_cfg, dict):
+                agent_list = agents_cfg.get("list", []) or []
+            elif agents_cfg is not None:
+                agent_list = getattr(agents_cfg, "list", []) or []
+            for entry in agent_list:
+                agent_id = (entry.get("id") if isinstance(entry, dict) else getattr(entry, "id", None))
+                if agent_id:
+                    models.append(f"openclaw:{agent_id}")
+                    models.append(f"agent:{agent_id}")
+        except Exception:
+            pass
+        return models
+
     async def start(self, start_channels: bool = True, enable_tls: bool = False, cert_path: Optional[str] = None, key_path: Optional[str] = None) -> None:
         """
         Start unified Gateway server (HTTP + WebSocket on single port)
@@ -737,6 +949,38 @@ class GatewayServer:
         # Register routes (matches openclaw-ts architecture)
         ui_enabled = getattr(self.config.gateway, 'enable_web_ui', True)
         
+        # ------------------------------------------------------------------
+        # OpenAI-compatible HTTP endpoints
+        # Enabled via config: gateway.http.endpoints.chatCompletions.enabled
+        # and gateway.http.endpoints.responses.enabled
+        # Mirrors TS openclaw/src/gateway/server-http-openai.ts
+        # ------------------------------------------------------------------
+        http_endpoints_cfg = (
+            getattr(getattr(self.config, "gateway", None), "http", None) or {}
+        )
+        if isinstance(http_endpoints_cfg, dict):
+            endpoints_cfg = http_endpoints_cfg.get("endpoints", {}) or {}
+        else:
+            _ep = getattr(http_endpoints_cfg, "endpoints", None)
+            endpoints_cfg = _ep if isinstance(_ep, dict) else {}
+
+        chat_completions_enabled = (
+            endpoints_cfg.get("chatCompletions", {}) or {}
+        ).get("enabled", False) if isinstance(endpoints_cfg, dict) else False
+
+        responses_enabled = (
+            endpoints_cfg.get("responses", {}) or {}
+        ).get("enabled", False) if isinstance(endpoints_cfg, dict) else False
+
+        if chat_completions_enabled:
+            app.router.add_post('/v1/chat/completions', self._handle_chat_completions_route)
+            app.router.add_get('/v1/models', self._handle_list_models_route)
+            logger.info("Registered /v1/chat/completions and /v1/models")
+
+        if responses_enabled:
+            app.router.add_post('/v1/responses', self._handle_responses_route)
+            logger.info("Registered /v1/responses")
+
         if ui_enabled:
             # Root handles both WebSocket upgrade and Control UI
             app.router.add_get('/', self.handle_root)
@@ -764,7 +1008,11 @@ class GatewayServer:
         await runner.setup()
         
         site = web.TCPSite(runner, host, port, ssl_context=ssl_context)
-        await site.start()
+        try:
+            await site.start()
+        except OSError as exc:
+            from openclaw.gateway.error_codes import GatewayLockError
+            raise GatewayLockError(host, port, cause=exc) from exc
         
         logger.info(f"✓ Gateway server running on http{'s' if enable_tls else ''}://{host}:{port}")
         logger.info(f"✓ Control UI available at http{'s' if enable_tls else ''}://{host}:{port}/")

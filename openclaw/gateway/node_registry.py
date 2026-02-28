@@ -81,13 +81,31 @@ class NodeRegistry:
         registry.unregister_node("node_123")
     """
     
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize node registry"""
         self._nodes: dict[str, NodeEntry] = {}  # nodeId -> NodeEntry
         self._conn_to_node: dict[str, str] = {}  # connId -> nodeId
         self._device_to_nodes: dict[str, set[str]] = {}  # deviceId -> {nodeIds}
         # Pending invokes: invocationId -> (future, nodeId, command, timer_handle)
         self._pending_invokes: dict[str, tuple[asyncio.Future[NodeInvokeResult], str, str, asyncio.TimerHandle | None]] = {}
+        # Optional NodeSubscriptionManager for session-based subscriptions
+        # Set via set_subscription_manager() after creation
+        self._subscription_manager: Any | None = None
+        # Optional NodeEventHandler for routing node events
+        self._event_handler: Any | None = None
+
+    def set_subscription_manager(self, manager: Any) -> None:
+        """Wire in the NodeSubscriptionManager for session-based subscriptions.
+
+        Called during gateway bootstrap after both instances are created.
+        Mirrors TS architecture where node registry and subscription manager
+        are created together in server.impl.ts.
+        """
+        self._subscription_manager = manager
+
+    def set_event_handler(self, handler: Any) -> None:
+        """Wire in the NodeEventHandler for routing node events."""
+        self._event_handler = handler
     
     def register_node(
         self,
@@ -158,6 +176,20 @@ class NodeRegistry:
                         ok=False,
                         error={"code": "DISCONNECTED", "message": f"node disconnected ({cmd})"},
                     ))
+
+            # Clean up session subscriptions via NodeSubscriptionManager
+            if self._subscription_manager is not None:
+                try:
+                    self._subscription_manager.unsubscribe_all(node_id)
+                except Exception:
+                    pass
+
+            # Clean up event handler state
+            if self._event_handler is not None:
+                try:
+                    self._event_handler.on_node_disconnect(node_id)
+                except Exception:
+                    pass
 
         return node
 
@@ -398,6 +430,10 @@ class NodeRegistry:
             return True
         return False
     
+    def list_connected(self) -> list[NodeEntry]:
+        """List all currently connected nodes. Mirrors TS listConnected()."""
+        return list(self._nodes.values())
+
     def list_nodes(self) -> list[NodeEntry]:
         """
         List all registered nodes.

@@ -49,6 +49,11 @@ class TelegramChannel(ChannelPlugin):
             supports_reactions=True,
             supports_threads=False,
             supports_polls=True,
+            block_streaming=True,
+            native_commands=True,
+            supports_edit=True,
+            supports_unsend=True,
+            supports_reply=True,
         )
         self._app: Application | None = None
         self._bot_token: str | None = None

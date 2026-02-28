@@ -1,0 +1,13 @@
+{
+  "id": "copilot-proxy",
+  "name": "Copilot Proxy",
+  "description": "Local VS Code Copilot Proxy provider plugin.",
+  "providers": [
+    "copilot-proxy"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

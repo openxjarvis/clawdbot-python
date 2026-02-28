@@ -1,0 +1,8 @@
+{
+  "id": "google-antigravity-auth",
+  "name": "google-antigravity-auth",
+  "version": "0.1.0",
+  "description": "Google Antigravity authentication provider",
+  "author": "OpenClaw",
+  "main": "plugin.py"
+}

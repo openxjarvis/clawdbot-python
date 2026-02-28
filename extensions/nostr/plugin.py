@@ -1,11 +1,21 @@
-"""nostr channel plugin"""
+"""Nostr channel plugin.
 
-from openclaw.channels.nostr import NostrChannel
-from openclaw.channels.registry import get_channel_registry
+Mirrors TypeScript: openclaw/extensions/nostr/index.ts
+"""
+from __future__ import annotations
 
 
-def register(api):
-    """Register nostr channel"""
-    channel = NostrChannel()
-    registry = get_channel_registry()
-    registry.register(channel)
+def register(api) -> None:
+    try:
+        from openclaw.channels.nostr import NostrChannel
+        api.register_channel(NostrChannel())
+    except ImportError:
+        import logging
+        logging.getLogger(__name__).warning("Nostr channel unavailable")
+
+plugin = {
+    "id": "nostr",
+    "name": "Nostr",
+    "description": "Nostr protocol channel integration.",
+    "register": register,
+}

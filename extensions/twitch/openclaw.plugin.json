@@ -1,0 +1,13 @@
+{
+  "id": "twitch",
+  "name": "Twitch",
+  "description": "Twitch streaming channel integration.",
+  "channels": [
+    "twitch"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

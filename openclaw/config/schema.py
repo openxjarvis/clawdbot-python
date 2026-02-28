@@ -158,8 +158,45 @@ class IdentityConfig(BaseModel):
     vibe: str | None = Field(default=None)
 
 
+class SandboxDockerConfig(BaseModel):
+    """Docker-level sandbox configuration."""
+    binds: list[str] = Field(default_factory=list)  # "host:container:mode" strings
+
+
+class SandboxBrowserConfig(BaseModel):
+    """Sandbox browser configuration."""
+    autoStart: bool = Field(default=True)
+    autoStartTimeoutMs: int = Field(default=10_000)
+    allowHostControl: bool = Field(default=False)
+    allowedControlUrls: list[str] | None = Field(default=None)
+    allowedControlHosts: list[str] | None = Field(default=None)
+    allowedControlPorts: list[int] | None = Field(default=None)
+    binds: list[str] | None = Field(default=None)
+
+
 class SandboxConfig(BaseModel):
-    """Sandbox configuration"""
+    """Sandbox configuration.
+
+    Mirrors TS agents.defaults.sandbox / agents.list[].sandbox schema.
+    See: openclaw/docs/gateway/sandboxing.md
+    """
+
+    # When to sandbox: "off" | "non-main" | "all"
+    mode: str = Field(default="off")
+
+    # Container scope: "session" | "agent" | "shared"
+    scope: str = Field(default="session")
+
+    # Workspace access inside sandbox: "none" | "ro" | "rw"
+    workspaceAccess: str = Field(default="none")
+
+    # Docker-level settings (bind mounts etc.)
+    docker: SandboxDockerConfig = Field(default_factory=SandboxDockerConfig)
+
+    # Optional browser sandbox
+    browser: SandboxBrowserConfig | None = Field(default=None)
+
+    # Legacy field kept for backward compat
     sessionToolsVisibility: str = Field(default="spawned")  # "spawned" | "all"
 
 

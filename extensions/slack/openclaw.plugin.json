@@ -1,0 +1,13 @@
+{
+  "id": "slack",
+  "name": "Slack",
+  "description": "Slack bot channel integration.",
+  "channels": [
+    "slack"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

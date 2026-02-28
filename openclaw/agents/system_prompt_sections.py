@@ -461,8 +461,18 @@ def build_runtime_section(
     reasoning_level: str = "off",
 ) -> list[str]:
     """Build the Runtime section (matches TS lines 601-605)."""
+    import platform
+    import sys
+
+    # Always generate at minimum OS/arch/Python info — mirrors TS behavior
     if not runtime_info:
-        return []
+        runtime_info = {}
+    if not runtime_info.get("os"):
+        runtime_info = {**runtime_info, "os": platform.system().lower()}
+    if not runtime_info.get("arch"):
+        runtime_info = {**runtime_info, "arch": platform.machine()}
+    if not runtime_info.get("python_version"):
+        runtime_info = {**runtime_info, "python_version": sys.version.split()[0]}
 
     parts = []
 

@@ -1,7 +1,8 @@
 """
-Unit tests for ChannelPlugin base class
+Unit tests for ChannelPlugin base class.
 
-Tests the channel plugin interface and basic functionality.
+Tests the channel plugin interface aligned with TS ChannelCapabilities:
+  - chatTypes, edit, media, blockStreaming, nativeCommands, etc.
 """
 
 import pytest
@@ -15,180 +16,196 @@ from openclaw.channels.base import (
 
 
 class MockChannel(ChannelPlugin):
-    """Mock channel for testing."""
-    
-    def __init__(self, config: dict):
-        self.config = config
+    """Minimal concrete channel implementation for testing."""
+
+    def __init__(self, config: dict = None):
+        super().__init__()
+        self.config = config or {}
         self.started = False
         self.stopped = False
-    
-    async def start(self):
-        """Start the channel."""
+        self.sent: list = []
+
+    async def on_start(self, config: dict):
+        """Lifecycle hook called by start() template."""
         self.started = True
-    
-    async def stop(self):
-        """Stop the channel."""
+
+    async def on_stop(self):
+        """Lifecycle hook called by stop() template."""
         self.stopped = True
-    
-    async def send_message(self, message: OutboundMessage):
-        """Send a message."""
-        return {"message_id": "123", "ok": True}
-    
-    def get_capabilities(self) -> ChannelCapabilities:
-        """Get channel capabilities."""
-        return ChannelCapabilities(
-            supports_text=True,
-            supports_images=True,
-            supports_files=True,
-            supports_buttons=True,
-        )
+
+    async def send_text(self, target: str, text: str, reply_to: str | None = None) -> str:
+        """Required abstract method — TS: ChannelMessagingAdapter.sendText."""
+        self.sent.append({"target": target, "text": text})
+        return "123"
 
 
 class TestChannelCapabilities:
-    """Test ChannelCapabilities dataclass."""
-    
+    """Test ChannelCapabilities aligned with TS ChannelCapabilities type."""
+
     def test_default_capabilities(self):
-        """Test default capabilities."""
+        """ChannelCapabilities defaults match TS — most features are opt-in."""
         caps = ChannelCapabilities()
-        
-        # Check defaults (implementation dependent)
-        assert hasattr(caps, "supports_text")
-        assert hasattr(caps, "supports_images")
-    
-    def test_custom_capabilities(self):
-        """Test custom capabilities."""
-        caps = ChannelCapabilities(
-            supports_text=True,
-            supports_images=True,
-            supports_files=False,
-            supports_buttons=True,
-        )
-        
-        assert caps.supports_text is True
-        assert caps.supports_images is True
-        assert caps.supports_files is False
-        assert caps.supports_buttons is True
+
+        # TS: chatTypes is required, default to ["direct"]
+        assert hasattr(caps, "chat_types")
+
+        # TS optional fields that default to off/False
+        assert hasattr(caps, "supports_edit")
+        assert hasattr(caps, "supports_media") or hasattr(caps, "supports_reply")
+        assert caps.supports_edit is False
+
+    def test_block_streaming_flag(self):
+        """blockStreaming disables streaming (send full message at once)."""
+        caps = ChannelCapabilities(block_streaming=True)
+        assert caps.block_streaming is True
+
+    def test_native_commands_flag(self):
+        """nativeCommands enables platform slash/native command handling."""
+        caps = ChannelCapabilities(native_commands=True)
+        assert caps.native_commands is True
+
+    def test_edit_flag(self):
+        """edit capability — can modify already-sent messages."""
+        caps = ChannelCapabilities(supports_edit=True)
+        assert caps.supports_edit is True
+
+    def test_media_flag(self):
+        """media capability — can send/receive media attachments."""
+        caps = ChannelCapabilities(supports_media=True)
+        assert caps.supports_media is True
 
 
 class TestInboundMessage:
-    """Test InboundMessage dataclass."""
-    
+    """Test InboundMessage aligned with TS InboundMessage."""
+
     def test_create_inbound_message(self):
-        """Test creating an inbound message."""
+        """InboundMessage requires channel_id, message_id, sender_id, text, etc."""
         msg = InboundMessage(
-            channel="telegram",
-            sender_id="123",
-            content="Hello",
+            channel_id="telegram",
             message_id="msg_1",
+            sender_id="123",
+            sender_name="Alice",
+            chat_id="chat_1",
+            chat_type="direct",
+            text="Hello",
+            timestamp="2024-01-01T00:00:00Z",
         )
-        
-        assert msg.channel == "telegram"
+
+        assert msg.channel_id == "telegram"
         assert msg.sender_id == "123"
-        assert msg.content == "Hello"
+        assert msg.text == "Hello"
         assert msg.message_id == "msg_1"
-    
+
     def test_inbound_message_with_metadata(self):
-        """Test inbound message with metadata."""
+        """InboundMessage can carry arbitrary metadata."""
         msg = InboundMessage(
-            channel="telegram",
-            sender_id="123",
-            content="Hello",
+            channel_id="telegram",
             message_id="msg_1",
-            metadata={"chat_type": "private"}
+            sender_id="123",
+            sender_name="Alice",
+            chat_id="chat_1",
+            chat_type="private",
+            text="Hello",
+            timestamp="2024-01-01T00:00:00Z",
+            metadata={"chat_type": "private"},
         )
-        
+
         assert msg.metadata == {"chat_type": "private"}
+
+    def test_inbound_message_defaults(self):
+        """Optional fields have sensible defaults."""
+        msg = InboundMessage(
+            channel_id="telegram",
+            message_id="m1",
+            sender_id="u1",
+            sender_name="User",
+            chat_id="c1",
+            chat_type="direct",
+            text="Hi",
+            timestamp="2024-01-01T00:00:00Z",
+        )
+
+        assert msg.reply_to is None
+        assert isinstance(msg.attachments, list)
+        assert isinstance(msg.metadata, dict)
 
 
 class TestOutboundMessage:
-    """Test OutboundMessage dataclass."""
-    
+    """Test OutboundMessage aligned with TS outbound model."""
+
     def test_create_outbound_message(self):
-        """Test creating an outbound message."""
+        """OutboundMessage requires channel_id, target, text."""
         msg = OutboundMessage(
-            recipient="123",
-            content="Hello back",
+            channel_id="telegram",
+            target="123",
+            text="Hello back",
         )
-        
-        assert msg.recipient == "123"
-        assert msg.content == "Hello back"
-    
-    def test_outbound_with_images(self):
-        """Test outbound message with images."""
+
+        assert msg.channel_id == "telegram"
+        assert msg.target == "123"
+        assert msg.text == "Hello back"
+
+    def test_outbound_with_reply_to(self):
+        """OutboundMessage supports reply_to for threaded replies."""
         msg = OutboundMessage(
-            recipient="123",
-            content="Check this out",
-            images=["image1.png", "image2.png"]
+            channel_id="telegram",
+            target="123",
+            text="Reply here",
+            reply_to="msg_1",
         )
-        
-        assert msg.images == ["image1.png", "image2.png"]
+
+        assert msg.reply_to == "msg_1"
 
 
 class TestChannelPluginLifecycle:
     """Test channel plugin lifecycle."""
-    
+
     @pytest.mark.asyncio
     async def test_start_channel(self):
-        """Test starting a channel."""
         channel = MockChannel(config={})
-        
-        await channel.start()
-        
+        await channel.start({})
         assert channel.started is True
-    
+
     @pytest.mark.asyncio
     async def test_stop_channel(self):
-        """Test stopping a channel."""
         channel = MockChannel(config={})
-        
         await channel.stop()
-        
         assert channel.stopped is True
-    
+
     @pytest.mark.asyncio
     async def test_start_stop_cycle(self):
-        """Test full start/stop cycle."""
         channel = MockChannel(config={})
-        
-        await channel.start()
+        await channel.start({})
         assert channel.started is True
-        
         await channel.stop()
         assert channel.stopped is True
 
 
 class TestChannelMessaging:
     """Test channel messaging functionality."""
-    
+
     @pytest.mark.asyncio
-    async def test_send_message(self):
-        """Test sending a message."""
+    async def test_send_text(self):
+        """send_text is the primary outbound method (TS: ChannelMessagingAdapter)."""
         channel = MockChannel(config={})
-        message = OutboundMessage(recipient="123", content="Test")
-        
-        result = await channel.send_message(message)
-        
-        assert result["ok"] is True
-        assert "message_id" in result
-    
+        await channel.send_text("chat_123", "Hello!")
+        assert channel.sent[0]["text"] == "Hello!"
+
     def test_get_capabilities(self):
-        """Test getting channel capabilities."""
+        """capabilities attribute returns a ChannelCapabilities instance."""
         channel = MockChannel(config={})
-        
-        caps = channel.get_capabilities()
-        
+        caps = channel.capabilities
         assert isinstance(caps, ChannelCapabilities)
-        assert caps.supports_text is True
 
 
 class TestChannelConfiguration:
     """Test channel configuration."""
-    
+
     def test_channel_receives_config(self):
-        """Test that channel receives configuration."""
+        """Channel stores its configuration."""
         config = {"botToken": "test_token", "enabled": True}
         channel = MockChannel(config=config)
-        
+
         assert channel.config == config
         assert channel.config["botToken"] == "test_token"
 

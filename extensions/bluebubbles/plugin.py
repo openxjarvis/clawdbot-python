@@ -1,11 +1,21 @@
-"""bluebubbles channel plugin"""
+"""BlueBubbles channel plugin.
 
-from openclaw.channels.bluebubbles import BlueBubblesChannel
-from openclaw.channels.registry import get_channel_registry
+Mirrors TypeScript: openclaw/extensions/bluebubbles/index.ts
+"""
+from __future__ import annotations
 
 
-def register(api):
-    """Register bluebubbles channel"""
-    channel = BlueBubblesChannel()
-    registry = get_channel_registry()
-    registry.register(channel)
+def register(api) -> None:
+    try:
+        from openclaw.channels.bluebubbles import BlueBubblesChannel
+        api.register_channel(BlueBubblesChannel())
+    except ImportError:
+        import logging
+        logging.getLogger(__name__).warning("BlueBubbles channel unavailable")
+
+plugin = {
+    "id": "bluebubbles",
+    "name": "BlueBubbles",
+    "description": "BlueBubbles iMessage bridge channel.",
+    "register": register,
+}

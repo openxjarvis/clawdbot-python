@@ -17,18 +17,34 @@ from pathlib import Path
 from typing import Any, Optional, Dict, List
 
 
+def calculate_auth_profile_cooldown_ms(error_count: int) -> int:
+    """Compute exponential cooldown in milliseconds for an auth profile.
+
+    Mirrors TS calculateAuthProfileCooldownMs():
+      schedule: 1min, 5min, 25min, 1h (capped)
+      formula:  min(1h, 1min * 5^(min(errorCount-1, 3)))
+    """
+    normalized = max(1, error_count)
+    ms = 60_000 * (5 ** min(normalized - 1, 3))
+    return min(60 * 60 * 1000, ms)  # cap at 1 hour
+
+
 @dataclass
 class AuthProfile:
-    """
-    Authentication profile for API access
+    """Authentication profile for API access.
+
+    Aligned with TS AuthProfileEntry in auth-profiles/usage.ts.
 
     Attributes:
         id: Unique profile identifier
         provider: Provider name (anthropic, openai, etc.)
         api_key: API key (can be env var name)
         last_used: Last time this profile was used
-        failure_count: Number of consecutive failures
-        cooldown_until: When this profile becomes available again
+        failure_count: Deprecated alias for error_count
+        error_count: Number of consecutive API errors (drives cooldown schedule)
+        cooldown_until: When this profile becomes available again (transient)
+        disabled_until: Long-term billing-related disable expiry (e.g. 5h/24h)
+        disabled_reason: Reason for billing-level disable
         metadata: Additional profile metadata
     """
 
@@ -36,15 +52,34 @@ class AuthProfile:
     provider: str
     api_key: str
     last_used: Optional[datetime] = None
-    failure_count: int = 0
+    failure_count: int = 0          # legacy alias
+    error_count: int = 0            # mirrors TS errorCount
     cooldown_until: Optional[datetime] = None
+    disabled_until: Optional[datetime] = None    # mirrors TS disabledUntil
+    disabled_reason: Optional[str] = None        # mirrors TS disabledReason
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        # Keep failure_count and error_count in sync
+        if self.failure_count and not self.error_count:
+            self.error_count = self.failure_count
+        elif self.error_count and not self.failure_count:
+            self.failure_count = self.error_count
+
     def is_available(self) -> bool:
-        """Check if profile is available (not in cooldown)"""
-        if self.cooldown_until is None:
-            return True
-        return datetime.now(UTC) >= self.cooldown_until
+        """Check if profile is available (not in cooldown AND not billing-disabled)."""
+        now = datetime.now(UTC)
+        if self.disabled_until is not None and now < self.disabled_until:
+            return False
+        if self.cooldown_until is not None and now < self.cooldown_until:
+            return False
+        return True
+
+    def is_billing_disabled(self) -> bool:
+        """Return True if currently in a billing-level disable window."""
+        if self.disabled_until is None:
+            return False
+        return datetime.now(UTC) < self.disabled_until
 
     def get_api_key(self) -> str:
         """
@@ -58,31 +93,43 @@ class AuthProfile:
         return self.api_key
 
     def to_dict(self) -> dict:
-        """Convert to dictionary"""
+        """Convert to dictionary."""
         return {
             "id": self.id,
             "provider": self.provider,
             "api_key": self.api_key,
             "last_used": self.last_used.isoformat() if self.last_used else None,
             "failure_count": self.failure_count,
+            "errorCount": self.error_count,
             "cooldown_until": self.cooldown_until.isoformat() if self.cooldown_until else None,
+            "disabledUntil": self.disabled_until.isoformat() if self.disabled_until else None,
+            "disabledReason": self.disabled_reason,
             "metadata": self.metadata,
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "AuthProfile":
-        """Create from dictionary"""
+        """Create from dictionary."""
+        error_count = data.get("errorCount", data.get("error_count", data.get("failure_count", 0)))
+        disabled_until_raw = data.get("disabledUntil") or data.get("disabled_until")
         return cls(
             id=data["id"],
             provider=data["provider"],
             api_key=data["api_key"],
             last_used=datetime.fromisoformat(data["last_used"]) if data.get("last_used") else None,
-            failure_count=data.get("failure_count", 0),
+            failure_count=data.get("failure_count", error_count),
+            error_count=error_count,
             cooldown_until=(
                 datetime.fromisoformat(data["cooldown_until"])
                 if data.get("cooldown_until")
                 else None
             ),
+            disabled_until=(
+                datetime.fromisoformat(disabled_until_raw)
+                if disabled_until_raw
+                else None
+            ),
+            disabled_reason=data.get("disabledReason") or data.get("disabled_reason"),
             metadata=data.get("metadata", {}),
         )
 

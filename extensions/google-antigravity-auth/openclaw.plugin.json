@@ -1,0 +1,13 @@
+{
+  "id": "google-antigravity-auth",
+  "name": "Google Antigravity Auth",
+  "description": "Google Antigravity OAuth provider plugin.",
+  "providers": [
+    "google-antigravity"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

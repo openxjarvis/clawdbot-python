@@ -127,14 +127,8 @@ class ToolLoopOrchestrator:
         accumulated_text = ""
         all_tool_results: list[ToolResult] = []
         
-        # Add user message to session
-        if images:
-            # If images provided, add them to the message content or metadata
-            session.add_user_message(prompt)
-            # Note: Image handling would need to be added to Session class
-            # For now, we pass images through _stream_single_turn
-        else:
-            session.add_user_message(prompt)
+        # Add user message to session (with optional images)
+        session.add_user_message(prompt, images=images)
         
         while iteration < self.max_iterations:
             iteration += 1

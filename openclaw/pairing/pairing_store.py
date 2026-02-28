@@ -77,14 +77,14 @@ def _resolve_allow_from_path(channel: str, account_id: str | None = None) -> Pat
     """Return path to allowFrom file, optionally scoped to an account.
 
     Mirrors TS resolveAllowFromPath().
-    
-    TS alignment: "default" account_id is treated as empty/None, resulting in
-    telegram-allowFrom.json instead of telegram-default-allowFrom.json.
+
+    TS alignment: only empty / None account_id produces the unscoped filename
+    (telegram-allowFrom.json).  Any non-empty string — including "default" —
+    is treated as a real account ID and included in the filename.
     """
     base = _safe_channel_key(channel)
     normalized = (account_id or "").strip()
-    # TS alignment: treat "default" as empty (openclaw/src/pairing/pairing-store.ts)
-    if not normalized or normalized.lower() == "default":
+    if not normalized:
         return _resolve_credentials_dir() / f"{base}-allowFrom.json"
     return _resolve_credentials_dir() / f"{base}-{_safe_account_key(normalized)}-allowFrom.json"
 

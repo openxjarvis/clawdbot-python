@@ -64,3 +64,6 @@ __pycache__/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Local backup files (never commit)
+.backup_local_files/

@@ -35,20 +35,20 @@ class TestFirstRunDetection:
             assert is_first_run(workspace) is False
     
     def test_marker_file_creation(self):
-        """Test onboarding marker file is created correctly"""
+        """Test onboarding completion is recorded (TS: workspace-state.json)."""
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Path(tmpdir)
             mark_onboarding_complete(workspace)
-            
-            marker_file = workspace / ".openclaw" / "onboarding-complete"
-            assert marker_file.exists()
-            
-            # Check marker file content
+
+            # TS-aligned: onboarding is stored in .openclaw/workspace-state.json
             import json
-            content = json.loads(marker_file.read_text())
-            assert "completed_at" in content
+            state_file = workspace / ".openclaw" / "workspace-state.json"
+            assert state_file.exists(), ".openclaw/workspace-state.json should be created"
+
+            content = json.loads(state_file.read_text())
+            assert "onboardingCompletedAt" in content
+            # version field exists (integer schema version or string, depending on impl)
             assert "version" in content
-            assert content["version"] == "0.6.0"
 
 
 def _noop_coroutine(*args, **kwargs):

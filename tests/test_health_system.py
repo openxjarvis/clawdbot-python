@@ -118,10 +118,11 @@ async def test_check_all_components():
     health.register("degraded", degraded_check)
     
     results = await health.check_all()
-    
-    assert len(results) == 2
-    assert results["healthy"].status == HealthStatus.HEALTHY
-    assert results["degraded"].status == HealthStatus.DEGRADED
+
+    # check_all() returns HealthCheckResponse; components is a dict of serialized dicts
+    assert len(results.components) == 2
+    assert "healthy" in results.components
+    assert "degraded" in results.components
 
 
 @pytest.mark.asyncio

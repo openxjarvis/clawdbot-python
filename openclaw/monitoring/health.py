@@ -91,26 +91,40 @@ class HealthCheck:
         self._check_timeout = 10.0  # seconds
 
     @property
+    def components(self) -> dict[str, Callable]:
+        """
+        Read-only view of registered component check functions.
+        Mirrors TS HealthCheck.components map.
+        """
+        return self._checks
+
+    @property
     def uptime_seconds(self) -> float:
         """Get system uptime in seconds"""
         return (datetime.now(UTC) - self._start_time).total_seconds()
 
     def register(
-        self, name: str, check_fn: Callable[[], Awaitable[bool]], critical: bool = True
+        self,
+        name: str,
+        check_fn: Callable[[], Awaitable[bool]],
+        critical: bool = True,
+        timeout_sec: float | None = None,
     ) -> None:
         """
-        Register a health check
+        Register a health check.
 
         Args:
             name: Component name
-            check_fn: Async function that returns True if healthy
+            check_fn: Async function returning bool or ComponentHealth
             critical: If True, unhealthy status affects overall health
+            timeout_sec: Per-check timeout override (seconds); defaults to self._check_timeout
         """
+        timeout = timeout_sec if timeout_sec is not None else self._check_timeout
 
         async def wrapper() -> ComponentHealth:
             start = datetime.now(UTC)
             try:
-                result = await asyncio.wait_for(check_fn(), timeout=self._check_timeout)
+                result = await asyncio.wait_for(check_fn(), timeout=timeout)
                 elapsed = (datetime.now(UTC) - start).total_seconds() * 1000
 
                 # If check_fn returns a ComponentHealth directly, use it but inject critical flag
@@ -133,7 +147,7 @@ class HealthCheck:
                 return ComponentHealth(
                     name=name,
                     status=HealthStatus.UNHEALTHY,
-                    message="Check timed out",
+                    message="Check timed out (timeout)",
                     last_check=datetime.now(UTC),
                     details={"critical": critical, "error": "timeout"},
                 )
@@ -166,33 +180,20 @@ class HealthCheck:
         self._last_results[name] = result
         return result
 
-    async def check_all(self) -> HealthCheckResponse:
-        """
-        Run all health checks
-
-        Returns:
-            HealthCheckResponse with overall status and component details
-        """
+    async def _run_all_checks(self) -> tuple[dict[str, "ComponentHealth"], "HealthStatus"]:
+        """Internal: run all checks and return (component_map, overall_status)."""
         if not self._checks:
-            return HealthCheckResponse(
-                status=HealthStatus.HEALTHY.value,
-                timestamp=datetime.now(UTC).isoformat(),
-                uptime_seconds=self.uptime_seconds,
-                components={},
-            )
+            return {}, HealthStatus.HEALTHY
 
-        # Run all checks concurrently
         tasks = [self._checks[name]() for name in self._checks]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        raw = await asyncio.gather(*tasks, return_exceptions=True)
 
-        # Process results
-        components = {}
+        component_map: dict[str, ComponentHealth] = {}
         has_critical_failure = False
-        has_non_critical_failure = False
+        has_degraded = False
 
         for i, name in enumerate(self._checks.keys()):
-            result = results[i]
-
+            result = raw[i]
             if isinstance(result, Exception):
                 health = ComponentHealth(
                     name=name,
@@ -202,32 +203,46 @@ class HealthCheck:
                     details={"error": type(result).__name__},
                 )
             else:
-                health = result
+                health = result  # type: ignore[assignment]
 
-            components[name] = health.to_dict()
+            component_map[name] = health
             self._last_results[name] = health
 
-            # Check if critical
             is_critical = health.details.get("critical", True)
-            if health.status == HealthStatus.UNHEALTHY:
-                if is_critical:
-                    has_critical_failure = True
-                else:
-                    has_non_critical_failure = True
+            if health.status == HealthStatus.UNHEALTHY and is_critical:
+                has_critical_failure = True
+            elif health.status in (HealthStatus.UNHEALTHY, HealthStatus.DEGRADED):
+                has_degraded = True
 
-        # Determine overall status
         if has_critical_failure:
-            overall_status = HealthStatus.UNHEALTHY
-        elif has_non_critical_failure:
-            overall_status = HealthStatus.DEGRADED
+            overall = HealthStatus.UNHEALTHY
+        elif has_degraded:
+            overall = HealthStatus.DEGRADED
         else:
-            overall_status = HealthStatus.HEALTHY
+            overall = HealthStatus.HEALTHY
 
+        return component_map, overall
+
+    async def check_all(self) -> "HealthCheckResponse":
+        """
+        Run all health checks and return a HealthCheckResponse envelope.
+
+        Mirrors TS HealthCheck.checkAll() — used by the /health RPC, CLI, and tests.
+        """
+        return await self.get_health()
+
+    async def get_health(self) -> "HealthCheckResponse":
+        """
+        Run all checks and return a HealthCheckResponse envelope.
+
+        Mirrors TS HealthCheck.getHealth() — used by the /health RPC and CLI.
+        """
+        component_map, overall = await self._run_all_checks()
         return HealthCheckResponse(
-            status=overall_status.value,
+            status=overall.value,
             timestamp=datetime.now(UTC).isoformat(),
             uptime_seconds=self.uptime_seconds,
-            components=components,
+            components={name: h.to_dict() for name, h in component_map.items()},
         )
 
     def get_last_results(self) -> dict[str, ComponentHealth]:
@@ -248,8 +263,8 @@ class HealthCheck:
 
         Use for Kubernetes readiness probe
         """
-        result = await self.check_all()
-        return result.status != HealthStatus.UNHEALTHY.value
+        _, overall = await self._run_all_checks()
+        return overall != HealthStatus.UNHEALTHY
 
 
 # Global health check instance

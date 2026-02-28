@@ -178,12 +178,31 @@ class MemorySearchTool:
             return False
 
 
-def register(api):
-    """Register memory search tool"""
-    from openclaw.agents.tools.registry import get_tool_registry
+def register(api) -> None:
+    """Register memory search and add tools via PluginApi.
 
+    Mirrors TypeScript: extensions/memory-lancedb/index.ts
+    Falls back to legacy tool registry if api.register_tool is unavailable.
+    """
     memory_tool = MemorySearchTool()
-    registry = get_tool_registry()
-    registry.register(memory_tool)
+
+    # Use PluginApi.register_tool — accepts (tool_or_factory, opts)
+    # PluginApi stores it in PluginToolRegistration.factory for later use
+    if hasattr(api, "register_tool"):
+        api.register_tool(memory_tool, {"names": [memory_tool.name]})
+    else:
+        # Legacy fallback
+        try:
+            from openclaw.agents.tools.registry import get_tool_registry
+            get_tool_registry().register(memory_tool)
+        except Exception:
+            pass
 
     logger.info("Registered LanceDB memory tool")
+
+plugin = {
+    "id": "memory-lancedb",
+    "name": "Memory (LanceDB)",
+    "description": "Vector memory using LanceDB with auto-capture and auto-recall.",
+    "register": register,
+}

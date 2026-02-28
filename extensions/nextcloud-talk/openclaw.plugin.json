@@ -1,0 +1,13 @@
+{
+  "id": "nextcloud-talk",
+  "name": "Nextcloud Talk",
+  "description": "Nextcloud Talk channel integration.",
+  "channels": [
+    "nextcloud-talk"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

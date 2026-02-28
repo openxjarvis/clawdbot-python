@@ -1,0 +1,8 @@
+{
+  "id": "nextcloud-talk",
+  "name": "Nextcloud Talk Channel",
+  "version": "1.0.0",
+  "description": "Nextcloud Talk messaging integration",
+  "author": "OpenClaw",
+  "main": "plugin.py"
+}

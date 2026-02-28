@@ -1,0 +1,8 @@
+{
+  "id": "thread-ownership",
+  "name": "thread-ownership",
+  "version": "0.1.0",
+  "description": "Thread ownership management",
+  "author": "OpenClaw",
+  "main": "plugin.py"
+}

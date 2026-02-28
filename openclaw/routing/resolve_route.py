@@ -303,14 +303,16 @@ def _pick_first_existing_agent_id(cfg: object, agent_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 def resolve_agent_route(
-    cfg: object,
-    channel: str,
+    cfg: object = None,
+    channel: str = "",
     account_id: Optional[str] = None,
     peer: Optional[RoutePeer] = None,
     parent_peer: Optional[RoutePeer] = None,
     guild_id: Optional[str] = None,
     team_id: Optional[str] = None,
     member_role_ids: Optional[List[str]] = None,
+    *,
+    config: object = None,  # alias for cfg (used in tests and older call sites)
 ) -> ResolvedAgentRoute:
     """
     Resolve agent and session key via binding hierarchy.
@@ -327,6 +329,10 @@ def resolve_agent_route(
 
     Matches TS resolveAgentRoute().
     """
+    # Support `config` as an alias for `cfg` (legacy / test call sites)
+    if cfg is None and config is not None:
+        cfg = config
+
     channel_norm = normalize_token(channel)
     account_id_norm = _normalize_account_id_local(account_id)
 

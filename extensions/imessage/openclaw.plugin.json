@@ -1,0 +1,13 @@
+{
+  "id": "imessage",
+  "name": "iMessage",
+  "description": "iMessage channel integration.",
+  "channels": [
+    "imessage"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

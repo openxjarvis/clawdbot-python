@@ -1,0 +1,8 @@
+{
+  "id": "open-prose",
+  "name": "open-prose",
+  "version": "0.1.0",
+  "description": "Open Prose language tools",
+  "author": "OpenClaw",
+  "main": "plugin.py"
+}

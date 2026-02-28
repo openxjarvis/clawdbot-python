@@ -176,3 +176,127 @@ def cost(
     """Show cost/usage summary"""
     console.print("[yellow]⚠[/yellow]  Cost tracking not yet implemented")
     console.print(f"Would show last {days} days of usage")
+
+
+@gateway_app.command("probe")
+def probe(
+    host: str = typer.Option("127.0.0.1", "--host", help="Gateway host"),
+    port: int = typer.Option(4747, "--port", "-p", help="Gateway HTTP port"),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Ping the Gateway HTTP endpoint and report latency"""
+    import socket
+    import time
+
+    url = f"http://{host}:{port}/health"
+    start = time.monotonic()
+    try:
+        with socket.create_connection((host, port), timeout=5):
+            latency_ms = int((time.monotonic() - start) * 1000)
+        status = "ok"
+        msg = f"Gateway reachable at {host}:{port} ({latency_ms} ms)"
+        if json_output:
+            print(json.dumps({"status": status, "host": host, "port": port, "latency_ms": latency_ms}))
+        else:
+            console.print(f"[green]✓[/green] {msg}")
+    except (ConnectionRefusedError, OSError) as e:
+        status = "error"
+        if json_output:
+            print(json.dumps({"status": status, "host": host, "port": port, "error": str(e)}))
+        else:
+            console.print(f"[red]✗[/red] Gateway not reachable at {host}:{port}: {e}")
+        raise typer.Exit(1)
+
+
+@gateway_app.command("discover")
+def discover(
+    timeout: float = typer.Option(5.0, "--timeout", help="Discovery timeout in seconds"),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Browse Bonjour/mDNS for nearby OpenClaw gateways"""
+    try:
+        from zeroconf import ServiceBrowser, Zeroconf
+
+        SERVICE_TYPE = "_openclaw-gw._tcp.local."
+        found: list[dict] = []
+
+        class _Listener:
+            def add_service(self, zc, type_, name):
+                info = zc.get_service_info(type_, name)
+                if info:
+                    found.append({
+                        "name": name,
+                        "host": socket_addr(info),
+                        "port": info.port,
+                        "properties": {k.decode(): v.decode() if isinstance(v, bytes) else v
+                                       for k, v in (info.properties or {}).items()},
+                    })
+
+            def remove_service(self, *_): pass
+            def update_service(self, *_): pass
+
+        def socket_addr(info):
+            import socket as _s
+            try:
+                return _s.inet_ntoa(info.addresses[0]) if info.addresses else info.server
+            except Exception:
+                return info.server or "unknown"
+
+        zc = Zeroconf()
+        _Listener_inst = _Listener()
+        browser = ServiceBrowser(zc, SERVICE_TYPE, _Listener_inst)
+        import time
+        time.sleep(timeout)
+        zc.close()
+
+        if json_output:
+            print(json.dumps(found, indent=2))
+        else:
+            if not found:
+                console.print("[yellow]No OpenClaw gateways found via mDNS[/yellow]")
+            else:
+                t = Table(title="Discovered Gateways")
+                t.add_column("Name")
+                t.add_column("Host")
+                t.add_column("Port")
+                for gw in found:
+                    t.add_row(gw["name"], gw["host"], str(gw["port"]))
+                console.print(t)
+    except ImportError:
+        console.print("[yellow]⚠[/yellow]  zeroconf not installed. Run: uv add zeroconf")
+        raise typer.Exit(1)
+
+
+@gateway_app.command("health")
+def health(
+    host: str = typer.Option("127.0.0.1", "--host", help="Gateway host"),
+    port: int = typer.Option(4747, "--port", "-p", help="Gateway HTTP port"),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON"),
+):
+    """Call the Gateway health RPC and print a structured summary"""
+    import urllib.request
+    import urllib.error
+
+    url = f"http://{host}:{port}/health"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            data = json.loads(resp.read())
+        if json_output:
+            print(json.dumps(data, indent=2))
+        else:
+            console.print(f"[green]✓[/green] Gateway health: [bold]{data.get('status', 'ok')}[/bold]")
+            for k, v in data.items():
+                if k != "status":
+                    console.print(f"  {k}: {v}")
+    except urllib.error.URLError as e:
+        if json_output:
+            print(json.dumps({"status": "error", "error": str(e)}))
+        else:
+            console.print(f"[red]✗[/red] Could not reach gateway at {host}:{port}: {e}")
+        raise typer.Exit(1)
+    except Exception as e:
+        if json_output:
+            print(json.dumps({"status": "error", "error": str(e)}))
+        else:
+            console.print(f"[red]✗[/red] Gateway health check failed: {e}")
+        raise typer.Exit(1)

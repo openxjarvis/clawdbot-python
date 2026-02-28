@@ -26,8 +26,30 @@ from pathlib import Path
 from typing import Any
 
 from ..agents.runtime import AgentRuntime
-from ..channels.base import ChannelPlugin, InboundMessage, MessageHandler
+from ..channels.base import ChannelPlugin, ChannelAccountSnapshot, InboundMessage, MessageHandler
 from ..events import Event, EventType
+
+# =============================================================================
+# Channel Restart Policy — mirrors TS CHANNEL_RESTART_POLICY
+# =============================================================================
+
+MAX_RESTART_ATTEMPTS = 10
+
+CHANNEL_RESTART_POLICY = {
+    "initial_delay_ms": 5_000,    # 5 s initial backoff
+    "max_delay_ms": 300_000,       # 5 min max backoff
+    "backoff_factor": 2.0,
+}
+
+
+def _compute_backoff_ms(attempt: int) -> float:
+    """Compute backoff delay in ms for a given restart attempt (1-indexed)."""
+    initial = CHANNEL_RESTART_POLICY["initial_delay_ms"]
+    factor = CHANNEL_RESTART_POLICY["backoff_factor"]
+    max_delay = CHANNEL_RESTART_POLICY["max_delay_ms"]
+    delay = initial * (factor ** (attempt - 1))
+    return min(delay, max_delay)
+
 
 # Channel event type constants
 class ChannelEventType:
@@ -172,6 +194,17 @@ class ChannelManager:
 
         # Event listeners
         self._event_listeners: list[ChannelEventListener] = []
+
+        # Restart tracking — mirrors TS restartAttempts Map
+        # Key: channel_id (or "channel_id:account_id" for multi-account)
+        self._restart_attempts: dict[str, int] = {}
+
+        # Channels that were manually stopped — suppress auto-restart
+        # Mirrors TS manuallyStopped Set
+        self._manually_stopped: set[str] = set()
+
+        # Per-channel background tasks (for abort on stop)
+        self._channel_tasks: dict[str, asyncio.Task] = {}
 
         # Running state
         self._running = False
@@ -388,7 +421,18 @@ class ChannelManager:
 
         logger.debug(f"Configured channel {channel_id}: {config}")
 
-    def set_runtime(self, channel_id: str, runtime: AgentRuntime) -> None:
+    def set_default_runtime(self, runtime: "AgentRuntime") -> None:
+        """
+        Replace the default AgentRuntime used for all channels without an explicit
+        per-channel runtime.  Mirrors TS ChannelManager.setDefaultRuntime().
+
+        Args:
+            runtime: New default AgentRuntime instance.
+        """
+        self.default_runtime = runtime
+        logger.info("Default channel runtime updated")
+
+    def set_runtime(self, channel_id: str, runtime: "AgentRuntime") -> None:
         """
         Set custom AgentRuntime for a channel
 
@@ -475,6 +519,57 @@ class ChannelManager:
             await self._emit_event(ChannelEventType.ERROR, channel_id, {"error": str(e)})
             return False
 
+    async def _start_channel_with_backoff(self, channel_id: str) -> None:
+        """Start a channel and automatically restart it with backoff on failure.
+
+        Mirrors TS startChannelInternal() restart logic in server-channels.ts.
+        Runs as a background task; exits when manually stopped or max retries reached.
+        """
+        rkey = channel_id
+        self._manually_stopped.discard(rkey)
+        self._restart_attempts.pop(rkey, None)
+
+        while True:
+            success = await self.start_channel(channel_id)
+
+            # Wait for channel to finish (it runs until stopped or errors)
+            channel = self._channels.get(channel_id)
+            if channel and hasattr(channel, "_running"):
+                # Poll until channel stops running or is manually stopped
+                try:
+                    while channel._running and rkey not in self._manually_stopped:
+                        await asyncio.sleep(1.0)
+                except asyncio.CancelledError:
+                    break
+
+            if rkey in self._manually_stopped:
+                logger.debug(f"Channel {channel_id} manually stopped — not restarting")
+                break
+
+            attempt = self._restart_attempts.get(rkey, 0) + 1
+            self._restart_attempts[rkey] = attempt
+
+            if attempt > MAX_RESTART_ATTEMPTS:
+                logger.error(
+                    f"Channel {channel_id} giving up after {MAX_RESTART_ATTEMPTS} restart attempts"
+                )
+                break
+
+            delay_ms = _compute_backoff_ms(attempt)
+            delay_s = delay_ms / 1000.0
+            logger.info(
+                f"Channel {channel_id} auto-restart attempt {attempt}/{MAX_RESTART_ATTEMPTS} "
+                f"in {delay_s:.1f}s"
+            )
+
+            try:
+                await asyncio.sleep(delay_s)
+            except asyncio.CancelledError:
+                break
+
+            if rkey in self._manually_stopped:
+                break
+
     async def stop_channel(self, channel_id: str) -> bool:
         """
         Stop a specific channel
@@ -485,6 +580,15 @@ class ChannelManager:
         Returns:
             True if stopped successfully
         """
+        # Mark as manually stopped to suppress auto-restart
+        self._manually_stopped.add(channel_id)
+        self._restart_attempts.pop(channel_id, None)
+
+        # Cancel the background task if running
+        task = self._channel_tasks.pop(channel_id, None)
+        if task and not task.done():
+            task.cancel()
+
         channel = self._channels.get(channel_id)
         if not channel:
             logger.warning(f"Channel not found or not started: {channel_id}")
@@ -528,24 +632,102 @@ class ChannelManager:
         return await self.start_channel(channel_id)
 
     async def start_all(self) -> dict[str, bool]:
-        """
-        Start all enabled channels
+        """Start all enabled channels, with auto-restart backoff in background.
+
+        Mirrors TS startChannels() — launches each enabled channel in a background
+        task that automatically restarts with exponential backoff on failure.
 
         Returns:
-            Dict mapping channel_id to success status
+            Dict mapping channel_id to initial start success status
         """
         self._running = True
-        results = {}
+        results: dict[str, bool] = {}
 
         for channel_id, env in self._runtime_envs.items():
-            if env.enabled:
-                results[channel_id] = await self.start_channel(channel_id)
+            if not env.enabled:
+                continue
+
+            # Start the channel once to get immediate feedback
+            ok = await self.start_channel(channel_id)
+            results[channel_id] = ok
+
+            # Launch background task for auto-restart management
+            # The task monitors the channel and restarts it with backoff
+            if ok:
+                self._manually_stopped.discard(channel_id)
+                task = asyncio.create_task(
+                    self._monitor_channel_for_restart(channel_id),
+                    name=f"channel-monitor-{channel_id}",
+                )
+                self._channel_tasks[channel_id] = task
 
         return results
 
+    async def _monitor_channel_for_restart(self, channel_id: str) -> None:
+        """Background task: monitor a running channel and restart it with backoff.
+
+        Runs continuously until the channel is manually stopped or max retries exceeded.
+        Mirrors TS trackedPromise restart loop in server-channels.ts.
+        """
+        rkey = channel_id
+        while True:
+            channel = self._channels.get(channel_id)
+
+            # Wait until channel stops running
+            try:
+                while (
+                    channel is not None
+                    and getattr(channel, "_running", False)
+                    and rkey not in self._manually_stopped
+                ):
+                    await asyncio.sleep(2.0)
+                    channel = self._channels.get(channel_id)
+            except asyncio.CancelledError:
+                return
+
+            if rkey in self._manually_stopped:
+                return
+
+            # Channel stopped unexpectedly — attempt restart with backoff
+            attempt = self._restart_attempts.get(rkey, 0) + 1
+            self._restart_attempts[rkey] = attempt
+
+            if attempt > MAX_RESTART_ATTEMPTS:
+                logger.error(
+                    f"Channel {channel_id}: giving up after {MAX_RESTART_ATTEMPTS} restart attempts"
+                )
+                return
+
+            delay_ms = _compute_backoff_ms(attempt)
+            delay_s = delay_ms / 1000.0
+            logger.info(
+                f"Channel {channel_id}: auto-restart attempt {attempt}/{MAX_RESTART_ATTEMPTS} "
+                f"in {delay_s:.1f}s"
+            )
+
+            env = self._runtime_envs.get(channel_id)
+            if env:
+                env.state = ChannelState.STOPPED
+
+            try:
+                await asyncio.sleep(delay_s)
+            except asyncio.CancelledError:
+                return
+
+            if rkey in self._manually_stopped:
+                return
+
+            await self.start_channel(channel_id)
+
     async def stop_all(self) -> None:
-        """Stop all running channels"""
+        """Stop all running channels, cancelling auto-restart tasks."""
         self._running = False
+
+        # Cancel all background monitor tasks
+        for channel_id, task in list(self._channel_tasks.items()):
+            if not task.done():
+                task.cancel()
+        self._channel_tasks.clear()
 
         for channel_id, channel in list(self._channels.items()):
             if channel.is_running():
@@ -587,6 +769,29 @@ class ChannelManager:
     def list_enabled(self) -> list[str]:
         """List enabled channel IDs"""
         return [ch_id for ch_id, env in self._runtime_envs.items() if env.enabled]
+
+    def get_runtime_snapshot(self) -> dict[str, dict[str, Any]]:
+        """Return runtime status snapshot for all channels.
+
+        Mirrors TS getRuntimeSnapshot() in server-channels.ts.
+        """
+        snapshot: dict[str, dict[str, Any]] = {}
+        for channel_id in self.list_channels():
+            env = self._runtime_envs.get(channel_id)
+            channel = self._channels.get(channel_id)
+            snap: dict[str, Any] = {
+                "channel_id": channel_id,
+                "enabled": env.enabled if env else False,
+                "configured": True,
+                "running": channel.is_running() if channel else False,
+                "state": env.state.value if env else "registered",
+                "last_error": env.error if env else None,
+                "started_at": env.started_at if env else None,
+                "reconnect_attempts": self._restart_attempts.get(channel_id, 0),
+                "manually_stopped": channel_id in self._manually_stopped,
+            }
+            snapshot[channel_id] = snap
+        return snapshot
 
     def get_all_channels(self) -> list[dict[str, Any]]:
         """

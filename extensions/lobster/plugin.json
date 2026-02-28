@@ -1,0 +1,8 @@
+{
+  "id": "lobster",
+  "name": "lobster",
+  "version": "0.1.0",
+  "description": "Lobster integration",
+  "author": "OpenClaw",
+  "main": "plugin.py"
+}

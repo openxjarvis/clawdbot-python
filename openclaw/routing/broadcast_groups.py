@@ -25,17 +25,40 @@ BroadcastStrategy = Literal["parallel", "sequential"]
 
 
 def _get_broadcast_group_config(cfg: dict[str, Any], group_id: str) -> dict[str, Any] | None:
-    """Return the broadcast group config for *group_id*, or None."""
-    # Support both 'broadcastGroups' (Python/test style) and 'broadcast' (TS style)
-    broadcast = cfg.get("broadcastGroups") or {}
-    if group_id in broadcast:
-        return broadcast[group_id]
-    # Also try legacy 'broadcast' key (TS format: broadcast[peer_id] = [...agents])
-    legacy = cfg.get("broadcast") or {}
-    if group_id in legacy:
-        agents = legacy[group_id]
-        if isinstance(agents, list):
-            return {"agents": agents}
+    """Return the broadcast group config for *group_id*, or None.
+
+    Primary config key is ``broadcast`` (aligned with TS docs).
+    ``broadcastGroups`` is supported as an alias for backward compatibility.
+
+    TS format (primary):
+      broadcast:
+        strategy: parallel | sequential   # optional top-level default
+        <peer_id>: ["agent1", "agent2"]   # value is a list of agent ids
+
+    Python extended format (also accepted under both keys):
+      broadcast:
+        <peer_id>:
+          agents: ["agent1", "agent2"]
+          strategy: parallel | sequential
+    """
+    # Primary key: 'broadcast' (TS canonical)
+    primary = cfg.get("broadcast") or {}
+    if isinstance(primary, dict) and group_id in primary:
+        val = primary[group_id]
+        if isinstance(val, list):
+            return {"agents": val}
+        if isinstance(val, dict):
+            return val  # return any dict, not just ones with "agents" key
+
+    # Fallback: 'broadcastGroups' (legacy Python alias)
+    legacy = cfg.get("broadcastGroups") or {}
+    if isinstance(legacy, dict) and group_id in legacy:
+        val = legacy[group_id]
+        if isinstance(val, list):
+            return {"agents": val}
+        if isinstance(val, dict):
+            return val  # return any dict, not just ones with "agents" key
+
     return None
 
 
@@ -80,8 +103,8 @@ def get_broadcast_strategy(cfg: dict[str, Any], group_id: str | None = None) -> 
                 return strategy
             return "parallel"
 
-    # Fallback: top-level broadcast strategy
-    broadcast_cfg = cfg.get("broadcastGroups") or cfg.get("broadcast") or {}
+    # Fallback: top-level strategy in 'broadcast' (TS canonical) or 'broadcastGroups' (alias)
+    broadcast_cfg = cfg.get("broadcast") or cfg.get("broadcastGroups") or {}
     strategy = broadcast_cfg.get("strategy", "parallel") if isinstance(broadcast_cfg, dict) else "parallel"
     if strategy not in ("parallel", "sequential"):
         return "parallel"
