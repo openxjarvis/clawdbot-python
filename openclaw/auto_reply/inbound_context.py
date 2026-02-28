@@ -83,7 +83,13 @@ class MsgContext(BaseModel):
     
     CommandAuthorized: bool = False
     """Whether sender is authorized for commands"""
-    
+
+    CommandSource: Optional[str] = None
+    """Command source: 'native' (slash command) or None for regular messages. Mirrors TS CommandSource."""
+
+    MediaUrl: Optional[str] = None
+    """Single media URL (legacy compat; prefer MediaUrls list)."""
+
     # Channel routing
     OriginatingChannel: Optional[str] = None
     """Original channel where message came from"""

@@ -1017,9 +1017,19 @@ class ChannelManager:
                 
                 logger.info(f"[{channel_id}] Built session key: {session_key}")
                 
+                # Propagate command metadata from InboundMessage (set by command_dispatcher.py)
+                _meta = message.metadata or {}
+                _command_authorized = bool(_meta.get("command_authorized", False))
+                _command_body = _meta.get("command_body") or message.text or ""
+                _command_source = _meta.get("command_source") or (
+                    "native" if _meta.get("event_type") == "command" else None
+                )
+
                 ctx = MsgContext(
                     Body=message.text or "",
                     RawBody=message.text or "",
+                    BodyForAgent=_command_body or message.text or "",
+                    CommandBody=_command_body or message.text or "",
                     SessionKey=session_key,  # Use proper session key
                     From=message.sender_id,
                     To=channel_id,
@@ -1029,12 +1039,14 @@ class ChannelManager:
                     ConversationLabel=f"{channel_id}:{message.chat_id}",
                     OriginatingChannel=channel_id,
                     OriginatingTo=message.chat_id,
+                    CommandAuthorized=_command_authorized,
+                    CommandSource=_command_source,  # type: ignore[call-arg]
                 )
-                
+
                 # Add reply context if present
                 if message.reply_to:
                     ctx.ReplyToId = message.reply_to
-                
+
                 # Add media metadata if present (legacy URL-based path)
                 if message.metadata:
                     media_url = message.metadata.get("file_url") or message.metadata.get("photo_url")

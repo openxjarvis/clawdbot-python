@@ -292,15 +292,11 @@ class CanvasTool(AgentTool):
             gateway_opts["url"] = params["gatewayUrl"]
         if params.get("gatewayToken"):
             gateway_opts["token"] = params["gatewayToken"]
-        try:
-            return await resolve_node_id(
-                gateway_opts=gateway_opts,
-                query=node,
-                allow_default=True,
-            )
-        except Exception as exc:
-            logger.warning("Could not resolve node via gateway (%s); using 'default-node'", exc)
-            return node or "default-node"
+        return await resolve_node_id(
+            gateway_opts=gateway_opts,
+            query=node,
+            allow_default=True,
+        )
 
     async def _invoke(
         self,

@@ -13,7 +13,7 @@ from telegram.ext import Application, ContextTypes, MessageHandler, CommandHandl
 from ..chat_commands import ChatCommandExecutor, ChatCommandParser
 from ..base import ChannelCapabilities, ChannelPlugin, InboundMessage
 from .i18n_support import register_lang_handlers
-from .commands_extended import register_extended_commands
+from .commands_extended import register_extended_commands  # noqa: F401 – kept for backward compat, not used directly
 from .update_offset_store import (
     read_telegram_update_offset,
     write_telegram_update_offset,
@@ -187,10 +187,13 @@ class TelegramChannel(ChannelPlugin):
 
         # Register i18n language switching handlers
         register_lang_handlers(self._app)
-        
-        # Register extended commands
-        register_extended_commands(self._app)
-        
+
+        # NOTE: register_extended_commands() is intentionally NOT called here.
+        # All slash-command handlers are registered later in _register_dynamic_command_handlers()
+        # via the proper command pipeline (command_pipeline.py).  The old extended-command
+        # handlers required bot_data["agent_runtime"] which is never populated, producing the
+        # "Command cannot be executed" error.
+
         # Add callback query handler for inline keyboards
         self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
 

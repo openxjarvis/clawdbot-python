@@ -179,15 +179,22 @@ async def run_command(
     session_key: str,
     runtime: Any,
 ) -> ReplyPayload | None:
-    """Route a slash-command to the appropriate handler."""
+    """Route a slash-command to the appropriate handler.
+
+    Returns None if no handler claims the command — the caller should then fall
+    through to the normal agent turn (mirrors TS behaviour: unrecognised native
+    commands are still dispatched to the agent with the full command text).
+    """
     try:
         from openclaw.auto_reply.reply.commands import dispatch_command
-        return await dispatch_command(command_name, args_text, ctx, cfg, session_key, runtime)
+        result = await dispatch_command(command_name, args_text, ctx, cfg, session_key, runtime)
+        return result  # None means "fall through to agent"
     except ImportError:
         pass
     except Exception as exc:
         logger.warning(f"Command /{command_name} failed: {exc}")
-    return ReplyPayload(text=f"Unknown command: /{command_name}")
+        return ReplyPayload(text=f"Command failed: /{command_name}: {exc}")
+    return None
 
 
 # ---------------------------------------------------------------------------

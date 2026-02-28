@@ -16,8 +16,10 @@ from ..get_reply import ReplyPayload
 
 logger = logging.getLogger(__name__)
 
-_THINK_LEVELS = {"off", "low", "medium", "high"}
-_VERBOSE_LEVELS = {"off", "on", "low", "medium", "high"}
+# Mirrors TS ThinkLevel: "off"|"minimal"|"low"|"medium"|"high"|"xhigh"
+_THINK_LEVELS = {"off", "minimal", "low", "medium", "high", "xhigh"}
+# Mirrors TS VerboseLevel: "off"|"on"|"full"
+_VERBOSE_LEVELS = {"off", "on", "full"}
 
 
 def _build_model_alias_index_from_cfg(cfg: Any) -> dict[str, Any]:
@@ -71,10 +73,6 @@ def get_model_aliases(cfg: Any | None) -> dict[str, str]:
             "o3": "openai/o3",
         }
     return aliases
-
-_THINK_LEVELS = {"off", "low", "medium", "high"}
-_VERBOSE_LEVELS = {"off", "on", "low", "medium", "high"}
-
 
 async def handle_model_command(
     name: str,
@@ -163,23 +161,43 @@ async def _handle_list_models(ctx: Any, cfg: dict[str, Any]) -> ReplyPayload:
 # /think [off|low|medium|high]
 # ---------------------------------------------------------------------------
 
+def _normalize_think_level(raw: str) -> str | None:
+    """Mirrors TS normalizeThinkLevel: 'off'|'minimal'|'low'|'medium'|'high'|'xhigh'."""
+    key = raw.strip().lower()
+    if not key:
+        return None
+    if key in ("off", "false", "no", "0", "none", "disable", "disabled"):
+        return "off"
+    if key in ("minimal", "min"):
+        return "minimal"
+    if key in ("low", "lite", "light", "quick"):
+        return "low"
+    if key in ("medium", "med", "default", "normal"):
+        return "medium"
+    if key in ("high", "deep", "extended"):
+        return "high"
+    if key in ("xhigh", "extra-high", "max", "maximum", "extreme"):
+        return "xhigh"
+    return None
+
+
 async def _handle_think(
     args: str,
     ctx: Any,
     cfg: dict[str, Any],
     session_key: str,
 ) -> ReplyPayload:
-    level = args.strip().lower()
-    if not level:
-        # Show current
+    raw = args.strip()
+    if not raw:
         entry = _load_session_entry(session_key, cfg)
         current = (entry or {}).get("thinkLevel") or "medium"
-        return ReplyPayload(text=f"Current thinking level: {current}")
-    if level not in _THINK_LEVELS:
-        return ReplyPayload(text=f"Invalid think level: {level}\nChoose from: {', '.join(_THINK_LEVELS)}")
+        return ReplyPayload(text=f"Think: {current}")
+    level = _normalize_think_level(raw)
+    if level is None:
+        return ReplyPayload(text=f"Invalid think level: {raw}\nChoose from: off, minimal, low, medium, high, xhigh")
     try:
         _update_session_field(session_key, cfg, "thinkLevel", level)
-        return ReplyPayload(text=f"Thinking level set to: {level}")
+        return ReplyPayload(text=f"Think: {level}")
     except Exception as exc:
         return ReplyPayload(text=f"Could not set think level: {exc}")
 
@@ -188,22 +206,37 @@ async def _handle_think(
 # /verbose [off|on|low|medium|high]
 # ---------------------------------------------------------------------------
 
+def _normalize_verbose_level(raw: str) -> str | None:
+    """Mirrors TS normalizeVerboseLevel / normalizeOnOffFullLevel."""
+    key = raw.strip().lower()
+    if not key:
+        return None
+    if key in ("off", "false", "no", "0"):
+        return "off"
+    if key in ("full", "all", "everything"):
+        return "full"
+    if key in ("on", "minimal", "true", "yes", "1"):
+        return "on"
+    return None
+
+
 async def _handle_verbose(
     args: str,
     ctx: Any,
     cfg: dict[str, Any],
     session_key: str,
 ) -> ReplyPayload:
-    level = args.strip().lower()
-    if not level:
+    raw = args.strip()
+    if not raw:
         entry = _load_session_entry(session_key, cfg)
         current = (entry or {}).get("verboseLevel") or "off"
-        return ReplyPayload(text=f"Current verbose level: {current}")
-    if level not in _VERBOSE_LEVELS:
-        return ReplyPayload(text=f"Invalid verbose level: {level}\nChoose from: {', '.join(_VERBOSE_LEVELS)}")
+        return ReplyPayload(text=f"Verbose: {current}")
+    level = _normalize_verbose_level(raw)
+    if level is None:
+        return ReplyPayload(text=f"Invalid verbose level: {raw}\nChoose from: on, off, full")
     try:
         _update_session_field(session_key, cfg, "verboseLevel", level)
-        return ReplyPayload(text=f"Verbose level set to: {level}")
+        return ReplyPayload(text=f"Verbose: {level}")
     except Exception as exc:
         return ReplyPayload(text=f"Could not set verbose level: {exc}")
 
@@ -212,23 +245,37 @@ async def _handle_verbose(
 # /reasoning [off|auto|high]
 # ---------------------------------------------------------------------------
 
+def _normalize_reasoning_level(raw: str) -> str | None:
+    """Mirrors TS normalizeReasoningLevel: 'off'|'on'|'stream'."""
+    key = raw.strip().lower()
+    if not key:
+        return None
+    if key in ("off", "false", "no", "0", "hide", "hidden", "disable", "disabled"):
+        return "off"
+    if key in ("on", "true", "yes", "1", "show", "visible", "enable", "enabled"):
+        return "on"
+    if key in ("stream", "streaming", "draft", "live"):
+        return "stream"
+    return None
+
+
 async def _handle_reasoning(
     args: str,
     ctx: Any,
     cfg: dict[str, Any],
     session_key: str,
 ) -> ReplyPayload:
-    level = args.strip().lower()
-    valid = {"off", "auto", "high"}
-    if not level:
+    raw = args.strip()
+    if not raw:
         entry = _load_session_entry(session_key, cfg)
-        current = (entry or {}).get("reasoningLevel") or "auto"
-        return ReplyPayload(text=f"Current reasoning level: {current}")
-    if level not in valid:
-        return ReplyPayload(text=f"Invalid reasoning level: {level}\nChoose from: {', '.join(valid)}")
+        current = (entry or {}).get("reasoningLevel") or "on"
+        return ReplyPayload(text=f"Reasoning: {current}")
+    level = _normalize_reasoning_level(raw)
+    if level is None:
+        return ReplyPayload(text=f"Invalid reasoning level: {raw}\nChoose from: on, off, stream")
     try:
         _update_session_field(session_key, cfg, "reasoningLevel", level)
-        return ReplyPayload(text=f"Reasoning level set to: {level}")
+        return ReplyPayload(text=f"Reasoning: {level}")
     except Exception as exc:
         return ReplyPayload(text=f"Could not set reasoning level: {exc}")
 
