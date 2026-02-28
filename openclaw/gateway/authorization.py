@@ -75,8 +75,7 @@ METHOD_REQUIREMENTS = {
     "device.token.rotate": [Scope.ADMIN, Scope.PAIRING],
     "device.token.revoke": [Scope.ADMIN, Scope.PAIRING],
     
-    # Node-only methods
-    "node.invoke": [Role.NODE],
+    # Node-only methods (responses/events sent BY the node back to gateway)
     "node.invoke.result": [Role.NODE],
     "node.event": [Role.NODE],
     "skills.bins": [Role.NODE],
@@ -107,63 +106,112 @@ READ_ONLY_METHODS = {
     "cron.list",
     "cron.status",
     "node.list",
+    "node.describe",
     "device.pair.list",
     "logs.tail",
 }
 
 
+# Write methods (write or admin scope required) — mirrors TS WRITE_METHODS
+WRITE_METHODS = {
+    "send",
+    "agent",
+    "agent.wait",
+    "wake",
+    "talk.mode",
+    "tts.enable",
+    "tts.disable",
+    "tts.convert",
+    "tts.setProvider",
+    "voicewake.set",
+    "node.invoke",  # operator calls this to send a command TO a node
+    "chat.send",
+    "chat.abort",
+    "browser.request",
+}
+
+
+# Node-role-only methods — only clients that connected with role="node" may call these
+NODE_ROLE_METHODS = {
+    "node.invoke.result",
+    "node.event",
+    "skills.bins",
+}
+
+
 def authorize_gateway_method(method: str, auth_context: AuthContext) -> bool:
     """
-    Authorize method call based on role and scopes
-    
-    Args:
-        method: Method name
-        auth_context: Authentication context
-        
-    Returns:
-        True if authorized, False otherwise
+    Authorize method call based on role and scopes.
+
+    Mirrors the TypeScript authorizeGatewayMethod in server-methods.ts:
+    - NODE_ROLE_METHODS  → only role="node" clients
+    - role="node"        → may only call NODE_ROLE_METHODS
+    - role="operator"    → needs matching scope for restricted methods;
+                           admin scope bypasses all checks
     """
+    role = auth_context.role or Role.OPERATOR
+    scopes = auth_context.scopes or set()
+
     # Public methods always allowed
     if method in PUBLIC_METHODS:
         return True
-    
-    # Check read-only methods
-    if method in READ_ONLY_METHODS:
-        # Read scope or admin scope
-        if Scope.READ in auth_context.scopes or Scope.ADMIN in auth_context.scopes:
+
+    # NODE_ROLE_METHODS: only node clients may call these
+    if method in NODE_ROLE_METHODS:
+        if role == Role.NODE:
             return True
-        # Default: allow for operator role
-        if auth_context.role == Role.OPERATOR:
-            return True
-    
-    # Check specific requirements
+        logger.warning(
+            f"Authorization denied for {method}: only node role allowed, got role={role}"
+        )
+        return False
+
+    # Node clients may ONLY call NODE_ROLE_METHODS
+    if role == Role.NODE:
+        logger.warning(f"Node attempted unauthorized method: {method}")
+        return False
+
+    if role != Role.OPERATOR:
+        logger.warning(f"Authorization denied for {method}: unknown role={role}")
+        return False
+
+    # Admin scope grants access to everything
+    if Scope.ADMIN in scopes:
+        return True
+
+    # Check method-specific requirements (admin/approvals/pairing scopes)
     requirements = METHOD_REQUIREMENTS.get(method)
     if requirements:
         for requirement in requirements:
-            # Check role match
-            if requirement == auth_context.role:
+            if requirement in scopes:
                 return True
-            
-            # Check scope match
-            if requirement in auth_context.scopes:
-                return True
-        
-        # No match found
         logger.warning(
-            f"Authorization denied for {method}: "
-            f"role={auth_context.role}, scopes={auth_context.scopes}, "
-            f"required={requirements}"
+            f"Permission denied: method={method}, role={role}, "
+            f"scopes={scopes}, required={requirements}"
         )
         return False
-    
-    # Default: allow for operator role
-    if auth_context.role == Role.OPERATOR:
+
+    # Approval-only methods
+    if method in {"exec.approvals.get", "exec.approvals.set",
+                  "exec.approvals.node.get", "exec.approvals.node.set"}:
+        if Scope.APPROVALS not in scopes:
+            logger.warning(f"Permission denied: method={method} requires operator.approvals")
+            return False
         return True
-    
-    # Node role: deny unknown methods
-    if auth_context.role == Role.NODE:
-        logger.warning(f"Node attempted unauthorized method: {method}")
-        return False
-    
-    # Default: allow
+
+    # Read methods: read or write scope sufficient
+    if method in READ_ONLY_METHODS:
+        if Scope.READ in scopes or Scope.WRITE in scopes:
+            return True
+        # Fallback: operator with no scopes can still read (matches TS default behaviour)
+        return True
+
+    # Write methods: write scope required
+    if method in WRITE_METHODS:
+        if Scope.WRITE in scopes:
+            return True
+        # Fallback: operator with no explicit scopes can still write
+        # (matches TS: empty scopes + operator role passes write methods)
+        return True
+
+    # Anything else: allow for operator role (default permissive)
     return True

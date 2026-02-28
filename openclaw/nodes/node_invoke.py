@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import shutil
-import subprocess
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 logger = logging.getLogger(__name__)
@@ -269,12 +270,229 @@ async def _handle_system_run(params: dict, skill_bins: SkillBinsProvider | None)
 # ---------------------------------------------------------------------------
 
 def _handle_system_which(params: dict) -> dict:
-    bins: list = params.get("bins") or []
-    result: dict[str, str | None] = {}
-    for b in bins:
-        if isinstance(b, str) and b.strip():
-            result[b] = shutil.which(b.strip())
-    return {"ok": True, "payload": result}
+    bins_param = params.get("bins") or []
+    found: dict[str, str] = {}
+    for b in bins_param:
+        if not isinstance(b, str) or not b.strip():
+            continue
+        path = shutil.which(b.strip())
+        if path:
+            found[b.strip()] = path
+    return {"ok": True, "payload": {"bins": found}}
+
+
+# ---------------------------------------------------------------------------
+# system.execApprovals helpers
+# ---------------------------------------------------------------------------
+
+def _resolve_exec_approvals_path() -> str:
+    """Return the path to the exec-approvals JSON file.
+
+    Mirrors TS resolveExecApprovalsPath (defaults to ~/.openclaw/exec-approvals.json).
+    """
+    env_path = os.environ.get("OPENCLAW_EXEC_APPROVALS_PATH")
+    if env_path:
+        return env_path
+    return str(Path.home() / ".openclaw" / "exec-approvals.json")
+
+
+def _hash_file_contents(path: str) -> str:
+    """SHA-256 hash of file contents (hex), or empty string if file missing."""
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _read_exec_approvals_snapshot() -> dict:
+    """Read exec approvals file and return a snapshot dict.
+
+    Mirrors TS readExecApprovalsSnapshot.
+    """
+    path = _resolve_exec_approvals_path()
+    exists = os.path.isfile(path)
+    file_content: dict = {}
+    if exists:
+        try:
+            with open(path) as fh:
+                file_content = json.load(fh)
+        except Exception:
+            file_content = {}
+    return {
+        "path": path,
+        "exists": exists,
+        "hash": _hash_file_contents(path) if exists else "",
+        "file": file_content,
+    }
+
+
+def _redact_exec_approvals(file: dict) -> dict:
+    """Redact sensitive socket paths from exec approvals file.
+
+    Mirrors TS redactExecApprovals.
+    """
+    if not isinstance(file, dict):
+        return file
+    redacted = dict(file)
+    if "socketPath" in redacted:
+        redacted["socketPath"] = "[redacted]"
+    return redacted
+
+
+def _save_exec_approvals(file: dict) -> None:
+    """Write the exec approvals file.
+
+    Mirrors TS saveExecApprovals.
+    """
+    path = _resolve_exec_approvals_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        json.dump(file, fh, indent=2)
+
+
+async def _handle_exec_approvals_get() -> dict:
+    """Handle system.execApprovals.get — returns the approvals snapshot."""
+    try:
+        snapshot = _read_exec_approvals_snapshot()
+        return {
+            "ok": True,
+            "payload": {
+                "path": snapshot["path"],
+                "exists": snapshot["exists"],
+                "hash": snapshot["hash"],
+                "file": _redact_exec_approvals(snapshot["file"]),
+            },
+        }
+    except Exception as exc:
+        msg = str(exc)
+        code = "TIMEOUT" if "timed out" in msg.lower() else "INVALID_REQUEST"
+        return {"ok": False, "error": {"code": code, "message": msg}}
+
+
+async def _handle_exec_approvals_set(params_json: str | None) -> dict:
+    """Handle system.execApprovals.set — writes updated exec approvals file."""
+    try:
+        if not params_json:
+            raise ValueError("INVALID_REQUEST: paramsJSON required")
+        params = json.loads(params_json)
+        file_data = params.get("file")
+        if not file_data or not isinstance(file_data, dict):
+            raise ValueError("INVALID_REQUEST: exec approvals file required")
+        base_hash = params.get("baseHash")
+        if base_hash is not None:
+            snapshot = _read_exec_approvals_snapshot()
+            if base_hash != snapshot["hash"]:
+                raise ValueError(
+                    "CONFLICT: exec approvals file has been modified since last read"
+                )
+        _save_exec_approvals(file_data)
+        snapshot = _read_exec_approvals_snapshot()
+        return {
+            "ok": True,
+            "payload": {
+                "path": snapshot["path"],
+                "exists": snapshot["exists"],
+                "hash": snapshot["hash"],
+                "file": _redact_exec_approvals(snapshot["file"]),
+            },
+        }
+    except Exception as exc:
+        return {"ok": False, "error": {"code": "INVALID_REQUEST", "message": str(exc)}}
+
+
+# ---------------------------------------------------------------------------
+# Node event emission helpers
+# ---------------------------------------------------------------------------
+
+async def send_node_event(
+    gateway_client: Any,
+    event: str,
+    payload: Any,
+) -> None:
+    """Send a node event to the gateway (best-effort, never raises).
+
+    Mirrors TS sendNodeEvent from invoke.ts.
+    """
+    if not gateway_client or not hasattr(gateway_client, "request"):
+        return
+    try:
+        await gateway_client.request("node.event", {
+            "event": event,
+            "payloadJSON": json.dumps(payload) if payload is not None else None,
+        })
+    except Exception:
+        pass
+
+
+def _build_exec_event_payload(
+    session_key: str,
+    run_id: str,
+    command: str | None = None,
+    exit_code: int | None = None,
+    timed_out: bool | None = None,
+    success: bool | None = None,
+    output: str | None = None,
+    reason: str | None = None,
+) -> dict:
+    """Build an exec event payload, truncating output to OUTPUT_EVENT_TAIL.
+
+    Mirrors TS buildExecEventPayload.
+    """
+    payload: dict = {
+        "sessionKey": session_key,
+        "runId": run_id,
+        "host": "node",
+    }
+    if command is not None:
+        payload["command"] = command
+    if exit_code is not None:
+        payload["exitCode"] = exit_code
+    if timed_out is not None:
+        payload["timedOut"] = timed_out
+    if success is not None:
+        payload["success"] = success
+    if reason is not None:
+        payload["reason"] = reason
+    if output:
+        trimmed = output.strip()
+        if trimmed:
+            truncated, _ = _truncate_output(trimmed, OUTPUT_EVENT_TAIL)
+            payload["output"] = truncated
+    return payload
+
+
+async def send_exec_finished_event(
+    gateway_client: Any,
+    session_key: str,
+    run_id: str,
+    cmd_text: str,
+    result: dict,
+) -> None:
+    """Emit an exec.finished node event after a successful command run.
+
+    Mirrors TS sendExecFinishedEvent.
+    """
+    combined = "\n".join(
+        s for s in [
+            result.get("stdout"),
+            result.get("stderr"),
+            result.get("error"),
+        ] if s
+    )
+    await send_node_event(
+        gateway_client,
+        "exec.finished",
+        _build_exec_event_payload(
+            session_key=session_key,
+            run_id=run_id,
+            command=cmd_text,
+            exit_code=result.get("exitCode"),
+            timed_out=result.get("timedOut"),
+            success=result.get("success"),
+            output=combined or None,
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +508,50 @@ async def handle_invoke(
 
     Mirrors handleInvoke() from invoke.ts.
     """
+    command = payload.command
+
+    # ---------- system.execApprovals.get ----------
+    if command == "system.execApprovals.get":
+        result = await _handle_exec_approvals_get()
+        result_params = build_node_invoke_result_params(payload, result)
+        if gateway_client and hasattr(gateway_client, "request"):
+            try:
+                await gateway_client.request("node.invoke.result", result_params)
+            except Exception as e:
+                logger.warning(f"[node_invoke] failed to send invoke result: {e}")
+        return
+
+    # ---------- system.execApprovals.set ----------
+    if command == "system.execApprovals.set":
+        result = await _handle_exec_approvals_set(payload.params_json)
+        result_params = build_node_invoke_result_params(payload, result)
+        if gateway_client and hasattr(gateway_client, "request"):
+            try:
+                await gateway_client.request("node.invoke.result", result_params)
+            except Exception as e:
+                logger.warning(f"[node_invoke] failed to send invoke result: {e}")
+        return
+
+    # ---------- browser.proxy ----------
+    if command == "browser.proxy":
+        try:
+            from openclaw.nodes.invoke_browser import run_browser_proxy_command
+            payload_json = await run_browser_proxy_command(payload.params_json)
+            result = {"ok": True, "payloadJSON": payload_json}
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "error": {"code": "INVALID_REQUEST", "message": str(exc)},
+            }
+        result_params = build_node_invoke_result_params(payload, result)
+        if gateway_client and hasattr(gateway_client, "request"):
+            try:
+                await gateway_client.request("node.invoke.result", result_params)
+            except Exception as e:
+                logger.warning(f"[node_invoke] failed to send invoke result: {e}")
+        return
+
+    # ---------- remaining commands ----------
     raw_params: dict = {}
     if payload.params_json:
         try:
@@ -298,16 +560,16 @@ async def handle_invoke(
             pass
 
     try:
-        if payload.command == "system.run":
+        if command == "system.run":
             result = await _handle_system_run(raw_params, skill_bins)
-        elif payload.command == "system.which":
+        elif command == "system.which":
             result = _handle_system_which(raw_params)
         else:
             result = {
                 "ok": False,
                 "error": {
-                    "code": "UNKNOWN_COMMAND",
-                    "message": f"unknown command: {payload.command}",
+                    "code": "UNAVAILABLE",
+                    "message": "command not supported",
                 },
             }
     except Exception as e:

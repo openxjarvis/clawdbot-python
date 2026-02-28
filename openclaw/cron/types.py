@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +140,62 @@ class CronUsageSummary:
             "cache_read_tokens": self.cache_read_tokens,
             "cache_write_tokens": self.cache_write_tokens,
         }.items() if v is not None}
+
+
+# ---------------------------------------------------------------------------
+# Run telemetry and outcome (TS: CronRunTelemetry, CronRunOutcome)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CronRunTelemetry:
+    """Telemetry for a single cron job run (TS: CronRunTelemetry)."""
+    model: str | None = None
+    provider: str | None = None
+    usage: CronUsageSummary | None = None
+
+
+@dataclass
+class CronRunOutcome:
+    """Outcome of a cron job run (TS: CronRunOutcome)."""
+    status: Literal["ok", "error", "skipped"] = "ok"
+    error: str | None = None
+    summary: str | None = None
+    session_id: str | None = None
+    session_key: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Input shapes for service methods (TS: CronJobCreate, CronJobPatch)
+# ---------------------------------------------------------------------------
+
+class CronJobCreate(TypedDict, total=False):
+    """Input shape for creating a new cron job (TS: CronJobCreate)."""
+    name: str
+    description: str
+    enabled: bool
+    agent_id: str
+    session_key: str
+    schedule: dict[str, Any]
+    session_target: Literal["main", "isolated"]
+    wake_mode: Literal["next-heartbeat", "now"]
+    payload: dict[str, Any]
+    delivery: dict[str, Any]
+    delete_after_run: bool
+
+
+class CronJobPatch(TypedDict, total=False):
+    """Input shape for updating an existing cron job (TS: CronJobPatch)."""
+    name: str
+    description: str
+    enabled: bool
+    agent_id: str
+    session_key: str
+    schedule: dict[str, Any]
+    session_target: Literal["main", "isolated"]
+    wake_mode: Literal["next-heartbeat", "now"]
+    payload: dict[str, Any]
+    delivery: dict[str, Any]
+    delete_after_run: bool
 
 
 # ---------------------------------------------------------------------------

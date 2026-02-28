@@ -94,6 +94,13 @@ class GatewayRPCClient:
                                 "platform": "python",
                                 "mode": "rpc",
                             },
+                            # Mirrors TS gateway/call.ts: role=operator + full scopes
+                            "role": "operator",
+                            "scopes": [
+                                "operator.admin",
+                                "operator.approvals",
+                                "operator.pairing",
+                            ],
                         },
                         "id": connect_id,
                     }

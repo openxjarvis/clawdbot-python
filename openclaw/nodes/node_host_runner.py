@@ -93,10 +93,20 @@ async def run_node_host(opts: NodeHostRunOptions) -> None:
     display_name = (opts.display_name or "").strip() or config.display_name or await _get_machine_display_name()
     config.display_name = display_name
 
+    # TLS: opts value → config gateway.tls.enabled fallback, mirrors TS:
+    # tls: opts.gatewayTls ?? loadConfig().gateway?.tls?.enabled ?? false
+    _tls_fallback: bool = False
+    try:
+        from openclaw.config.loader import load_config as _lc
+        _bootstrap_cfg = _lc() or {}
+        _tls_fallback = bool(_bootstrap_cfg.get("gateway", {}).get("tls", {}).get("enabled", False))
+    except Exception:
+        pass
+
     gateway_cfg = NodeHostGatewayConfig(
         host=opts.gateway_host,
         port=opts.gateway_port,
-        tls=opts.gateway_tls,
+        tls=opts.gateway_tls if opts.gateway_tls else _tls_fallback,
         tls_fingerprint=opts.gateway_tls_fingerprint,
     )
     config.gateway = gateway_cfg
@@ -116,10 +126,67 @@ async def run_node_host(opts: NodeHostRunOptions) -> None:
         logger.error("[node_host] GatewayClient not available — cannot start node host")
         return
 
-    token: str | None = (
-        os.environ.get("OPENCLAW_GATEWAY_TOKEN", "").strip() or config.token or None
-    )
+    # Read full config for token resolution and browser proxy detection
+    # Mirrors TS runner.ts: loadConfig() then check gateway.mode / nodeHost.browserProxy
+    _full_cfg: dict = {}
+    try:
+        from openclaw.config.loader import load_config
+        _full_cfg = load_config() or {}
+    except Exception:
+        pass
+
+    _gateway_mode = _full_cfg.get("gateway", {}).get("mode", "local")
+    _is_remote = _gateway_mode == "remote"
+
+    # Token resolution: env → remote token (if remote mode) → auth token (local mode)
+    token: str | None = os.environ.get("OPENCLAW_GATEWAY_TOKEN", "").strip() or None
+    if not token:
+        if _is_remote:
+            token = (
+                _full_cfg.get("gateway", {}).get("remote", {}).get("token", "").strip() or None
+            )
+        else:
+            token = (
+                _full_cfg.get("gateway", {}).get("auth", {}).get("token", "").strip()
+                or config.token
+                or None
+            )
+
     password: str | None = os.environ.get("OPENCLAW_GATEWAY_PASSWORD", "").strip() or None
+    if not password:
+        if _is_remote:
+            password = (
+                _full_cfg.get("gateway", {}).get("remote", {}).get("password", "").strip() or None
+            )
+        else:
+            password = (
+                _full_cfg.get("gateway", {}).get("auth", {}).get("password", "").strip() or None
+            )
+
+    # Browser proxy detection — mirrors TS: cfg.nodeHost?.browserProxy?.enabled !== false
+    _browser_proxy_cfg = _full_cfg.get("nodeHost", {}).get("browserProxy", {})
+    _browser_enabled_in_cfg = _browser_proxy_cfg.get("enabled", True) is not False
+    _browser_proxy_enabled = False
+    if _browser_enabled_in_cfg:
+        try:
+            from openclaw.browser.config import resolve_browser_config
+            _resolved_browser = resolve_browser_config(
+                _full_cfg.get("browser"), _full_cfg
+            )
+            _browser_proxy_enabled = bool(
+                getattr(_resolved_browser, "enabled", False)
+            )
+        except Exception:
+            pass
+
+    _caps = ["system"] + (["browser"] if _browser_proxy_enabled else [])
+    _commands = [
+        "system.run",
+        "system.which",
+        "system.execApprovals.get",
+        "system.execApprovals.set",
+        *(["browser.proxy"] if _browser_proxy_enabled else []),
+    ]
 
     client_kwargs: dict = {
         "url": url,
@@ -128,7 +195,8 @@ async def run_node_host(opts: NodeHostRunOptions) -> None:
         "client_display_name": display_name,
         "mode": "node",
         "role": "node",
-        "caps": ["system"],
+        "caps": _caps,
+        "commands": _commands,
         "path_env": path_env,
     }
     if token:
