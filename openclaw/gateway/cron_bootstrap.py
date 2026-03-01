@@ -542,10 +542,27 @@ async def _deliver_via_channels(
                             # Resolve relative paths against known workspace locations
                             resolved_url = media_url
                             if not media_url.startswith(("http://", "https://", "file://", "/")):
-                                # Search order: cron workspace, CWD, home
+                                # Search order:
+                                # 1. cron session workspace
+                                # 2. all agent workspaces under ~/.openclaw/workspace/
+                                #    (covers files made in Telegram / other sessions)
+                                # 3. CWD
+                                # 4. home dir
                                 search_dirs = []
                                 if _cron_workspace:
                                     search_dirs.append(Path(_cron_workspace))
+                                _oc_workspace_root = Path.home() / ".openclaw" / "workspace"
+                                if _oc_workspace_root.is_dir():
+                                    try:
+                                        for _ws_dir in sorted(
+                                            _oc_workspace_root.iterdir(),
+                                            key=lambda p: p.stat().st_mtime,
+                                            reverse=True,  # newest workspaces first
+                                        ):
+                                            if _ws_dir.is_dir() and _ws_dir not in search_dirs:
+                                                search_dirs.append(_ws_dir)
+                                    except Exception:
+                                        pass
                                 search_dirs.append(Path.cwd())
                                 search_dirs.append(Path.home())
                                 for search_dir in search_dirs:

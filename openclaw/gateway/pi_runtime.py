@@ -895,6 +895,11 @@ class PiAgentRuntime:
                             candidate_model,
                         )
 
+                    # Resolve provider/model_id early so they are always in scope
+                    # for usage normalisation at end of attempt (line ~1384).
+                    provider = candidate_model.split("/")[0] if "/" in candidate_model else "google"
+                    model_id = candidate_model.split("/")[-1] if "/" in candidate_model else candidate_model
+
                     # Acquire the session write lock for the full attempt duration.
                     # Mirrors TS run/attempt.ts: acquireSessionWriteLock held across the
                     # entire attempt so concurrent writes cannot corrupt the session file.
