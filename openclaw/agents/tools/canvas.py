@@ -126,6 +126,13 @@ class CanvasTool(AgentTool):
         if not action:
             return ToolResult(success=False, content="", error="action required")
 
+        # Fast-path param validation for actions with obvious required fields.
+        # Validate BEFORE calling _resolve_node_id (which makes a gateway RPC call)
+        # so we don't waste a round-trip on obviously invalid requests.
+        early_error = self._validate_action_params(action, params)
+        if early_error:
+            return ToolResult(success=False, content="", error=early_error)
+
         try:
             node_id = await self._resolve_node_id(params)
             result = await self._dispatch_action(action, node_id, params)
@@ -142,6 +149,26 @@ class CanvasTool(AgentTool):
         except Exception as e:
             logger.error("Canvas tool error: %s", e, exc_info=True)
             return ToolResult(success=False, content="", error=str(e))
+
+    def _validate_action_params(self, action: str, params: dict[str, Any]) -> str | None:
+        """Return an error string if required action params are missing, else None.
+
+        Called BEFORE node resolution to fail fast without a gateway round-trip.
+        Mirrors TS readStringParam(..., {required: true}) calls in canvas-tool.ts.
+        """
+        if action == "eval":
+            if not (params.get("javaScript") or "").strip():
+                return "javaScript required"
+        elif action == "navigate":
+            url = (params.get("url") or "").strip() or (params.get("target") or "").strip()
+            if not url:
+                return "url required"
+        elif action == "a2ui_push":
+            jsonl = (params.get("jsonl") or "").strip()
+            jsonl_path = (params.get("jsonlPath") or "").strip()
+            if not jsonl and not jsonl_path:
+                return "jsonl or jsonlPath required"
+        return None
 
     async def _dispatch_action(
         self,

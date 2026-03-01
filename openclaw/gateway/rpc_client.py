@@ -105,31 +105,42 @@ class GatewayRPCClient:
                         "id": connect_id,
                     }
 
-                    # Drain any server-push events (e.g. connect.challenge) first
+                    # Drain any server-push events (e.g. connect.challenge) first.
+                    # The server pushes a connect.challenge event immediately on open,
+                    # before the client sends anything — drain it here.
+                    # If we accidentally read a response that already has an id (rare
+                    # in tests), save it so we don't discard it.
+                    _pre_received_connect_response: dict | None = None
                     try:
                         while True:
                             raw = await asyncio.wait_for(ws.recv(), timeout=0.5)
                             msg = json.loads(raw)
-                            # Stop draining once we see a response with our id
-                            # (shouldn't happen before we send, but be safe)
                             if msg.get("id") is not None:
+                                # Unexpectedly pre-received a response frame — save it,
+                                # don't discard it (mirrors TS: never drop framed data)
+                                _pre_received_connect_response = msg
                                 break
-                            # Pure event — keep draining
+                            # Pure server event (no id) — drain and continue
                     except asyncio.TimeoutError:
-                        pass  # No more server events waiting
+                        pass  # Normal path: server sent challenge, now quiet
 
                     await ws.send(json.dumps(connect_request))
 
-                    # Wait for the connect response, skipping any interleaved events
-                    while True:
-                        connect_response_data = await asyncio.wait_for(ws.recv(), timeout=10)
-                        connect_response = json.loads(connect_response_data)
-                        # Skip server-pushed events (no "id" field or event key)
-                        if "event" in connect_response and "id" not in connect_response:
-                            continue
-                        if connect_response.get("id") != connect_id:
-                            continue
-                        break
+                    # Wait for the connect response, skipping any interleaved events.
+                    # Use the pre-received frame if the drain loop happened to read it.
+                    connect_response: dict
+                    if _pre_received_connect_response is not None:
+                        connect_response = _pre_received_connect_response
+                    else:
+                        while True:
+                            connect_response_data = await asyncio.wait_for(ws.recv(), timeout=10)
+                            connect_response = json.loads(connect_response_data)
+                            # Skip server-pushed events (no "id" field or event key)
+                            if "event" in connect_response and "id" not in connect_response:
+                                continue
+                            if connect_response.get("id") != connect_id:
+                                continue
+                            break
 
                     # Check for connect error
                     if connect_response.get("type") == "res" and not connect_response.get("ok", True):
