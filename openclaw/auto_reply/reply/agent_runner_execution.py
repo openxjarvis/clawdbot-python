@@ -105,6 +105,7 @@ async def run_agent_turn_with_fallback(
     images: list[str] | None = None,
     run_id: str | None = None,
     session_key: str | None = None,
+    typing_signaler: Any | None = None,  # TypingSignaler | None
 ) -> tuple[str, bool]:
     """Execute an agent turn with automatic retry on transient errors.
 
@@ -130,6 +131,13 @@ async def run_agent_turn_with_fallback(
         response_text = ""
         has_error = False
 
+        # Signal run start for typing indicator (mode=instant starts immediately)
+        if typing_signaler:
+            try:
+                await typing_signaler.signal_run_start()
+            except Exception:
+                pass
+
         try:
             async for event in runtime.run_turn(
                 session,
@@ -153,6 +161,20 @@ async def run_agent_turn_with_fallback(
                             chunk = chunk.get("text", "")
                         if chunk:
                             response_text += str(chunk)
+                            # Refresh typing TTL as text arrives — mirrors TS
+                            # typing.startTypingOnText() on each text delta
+                            if typing_signaler:
+                                try:
+                                    await typing_signaler.signal_text_delta(str(chunk))
+                                except Exception:
+                                    pass
+                    elif evt_type in (EventType.AGENT_TOOL_USE, "tool_use", "tool_call", "agent.tool_use"):
+                        # Tool execution started — keep typing indicator alive
+                        if typing_signaler:
+                            try:
+                                await typing_signaler.signal_tool_start()
+                            except Exception:
+                                pass
                     elif evt_type in (EventType.ERROR, "error", "agent.error"):
                         err_msg = event_data.get("message", str(event_data))
                         logger.error("run_agent_turn_with_fallback: agent error: %s", err_msg)

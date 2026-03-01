@@ -118,6 +118,28 @@ class TimeoutError(AgentError):
         )
 
 
+def is_runner_abort_error(exc: BaseException) -> bool:
+    """Return True if *exc* represents a deliberate abort/cancellation signal.
+
+    Mirrors TS ``isRunnerAbortError`` from agents/abort.ts:
+    ``err.name === "AbortError" || err.message.includes("aborted")``
+
+    In Python the abort signal arrives as one of:
+    - ``asyncio.CancelledError`` (generator cancellation / wait_for timeout)
+    - Any exception whose class name is ``AbortError``
+    - Any exception whose message contains "aborted"
+    """
+    import asyncio as _asyncio
+
+    if isinstance(exc, _asyncio.CancelledError):
+        return True
+    cls_name = type(exc).__name__
+    if cls_name == "AbortError":
+        return True
+    msg = str(exc).lower()
+    return "aborted" in msg
+
+
 def classify_error(error: Exception) -> ErrorCategory:
     """
     Classify an exception into an error category

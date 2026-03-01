@@ -52,12 +52,17 @@ def resolve_active_run_queue_action(
 
     is_active = is_embedded_pi_run_active(session_id)
 
-    # Heartbeat messages are always dropped — they shouldn't queue up
+    # When there is no active run, run immediately (or drop heartbeats when idle).
+    # Mirrors TS: !isActive check comes first; a heartbeat with no active run
+    # returns "run-now" in TS so the turn immediately sends the heartbeat reply.
+    if not is_active:
+        if is_heartbeat:
+            return "drop"
+        return "run-now"
+
+    # Active run: heartbeat is always silently dropped
     if is_heartbeat:
         return "drop"
-
-    if not is_active:
-        return "run-now"
 
     mode = (queue_settings.mode if queue_settings else None) or "followup"
 

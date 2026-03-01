@@ -103,7 +103,12 @@ class ReplyDispatcher:
         self._processing = False
         self._completed = False
         self._idle_event = asyncio.Event()
-        self._pending_count = 0
+        # Start at 1 (a "reservation") so that _check_idle cannot fire before
+        # mark_complete() is called, even if the queue is momentarily empty.
+        # Mirrors TS: pending starts at 1, decremented in a microtask inside
+        # markComplete().  This prevents premature idle when mark_complete is
+        # called before any send_block_reply / send_final_reply has been enqueued.
+        self._pending_count = 1
 
         # Accumulated streaming buffer
         self._current_text = ""
@@ -138,8 +143,23 @@ class ReplyDispatcher:
 
         Mirrors TS ``markComplete``.  ``wait_for_idle`` will resolve once
         the queue is drained.
+
+        The reservation decrement is deferred via ``call_soon`` so that any
+        synchronous enqueue calls made right before ``mark_complete`` have a
+        chance to increment ``_pending_count`` first, preventing a false-idle
+        race (mirrors TS microtask scheduling of the pending decrement).
         """
         self._completed = True
+        try:
+            loop = asyncio.get_running_loop()
+            loop.call_soon(self._release_reservation)
+        except RuntimeError:
+            # No running loop — release immediately (e.g. in tests)
+            self._release_reservation()
+
+    def _release_reservation(self) -> None:
+        """Release the initial reservation and check for idle."""
+        self._pending_count = max(0, self._pending_count - 1)
         self._check_idle()
 
     async def wait_for_idle(self) -> None:

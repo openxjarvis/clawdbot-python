@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from typing import Callable, Awaitable, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -24,6 +25,10 @@ if TYPE_CHECKING:
     from openclaw.auto_reply.reply.queue import FollowupRun
 
 logger = logging.getLogger(__name__)
+
+# Followup runs use a shorter timeout than primary runs — a stuck followup
+# must not block the entire drain queue forever.
+FOLLOWUP_TIMEOUT_S = 300.0  # 5 minutes
 
 
 # ---------------------------------------------------------------------------
@@ -40,10 +45,23 @@ def create_followup_runner(ctx: "ReplyContext") -> Callable[["FollowupRun"], Awa
     """
     from openclaw.auto_reply.reply.agent_runner import ReplyContext, _execute_agent_turn, _deliver_response
     from openclaw.auto_reply.reply.queue import FollowupRun
-    import uuid
 
     async def run_followup(queued: FollowupRun) -> None:
         """Execute a single queued followup turn."""
+        from openclaw.auto_reply.reply.typing import create_typing_controller
+
+        # Create a fresh TypingController for this followup so the user sees a
+        # typing indicator while the queued message is being processed.
+        # Mirrors TS createFollowupRunner — the TypingController reference is
+        # shared across the primary run and followup runner, but in Python we
+        # create a new one per followup since the original is sealed after the
+        # primary run completes.
+        followup_typing_ctrl = None
+        if ctx.typing_send_fn:
+            followup_typing_ctrl = create_typing_controller(
+                on_reply_start=ctx.typing_send_fn,
+            )
+
         # Build a ctx variant for the followup run
         followup_ctx = ReplyContext(
             session_id=ctx.session_id,
@@ -61,7 +79,8 @@ def create_followup_runner(ctx: "ReplyContext") -> Callable[["FollowupRun"], Awa
             system_prompt=ctx.system_prompt,
             originating_channel=queued.originating_channel or ctx.originating_channel,
             originating_to=queued.originating_to or ctx.originating_to,
-            typing_ctrl=None,  # no typing indicator for followups
+            typing_ctrl=followup_typing_ctrl,
+            typing_send_fn=ctx.typing_send_fn,
         )
 
         run_id = str(uuid.uuid4())
@@ -71,8 +90,31 @@ def create_followup_runner(ctx: "ReplyContext") -> Callable[["FollowupRun"], Awa
             queued.prompt[:40],
         )
 
+        # Start typing indicator immediately so user sees "typing..." feedback
+        # before the agent turn begins (can be a long-running operation).
+        if followup_typing_ctrl:
+            try:
+                await followup_typing_ctrl.on_reply_start()
+                await followup_typing_ctrl.start_typing_loop()
+            except Exception:
+                pass
+
         try:
-            response_text, has_error = await _execute_agent_turn(followup_ctx, run_id)
+            try:
+                response_text, has_error = await asyncio.wait_for(
+                    _execute_agent_turn(followup_ctx, run_id),
+                    timeout=FOLLOWUP_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "followup_runner: timed out after %.0fs for session %s",
+                    FOLLOWUP_TIMEOUT_S,
+                    followup_ctx.session_id[:8],
+                )
+                from openclaw.agents.pi_embedded import abort_embedded_pi_run, clear_active_embedded_run
+                abort_embedded_pi_run(followup_ctx.session_id)
+                clear_active_embedded_run(followup_ctx.session_id, run_id)
+                return
             if response_text or has_error:
                 await _deliver_response(followup_ctx, response_text, has_error)
         except Exception as exc:
@@ -81,6 +123,14 @@ def create_followup_runner(ctx: "ReplyContext") -> Callable[["FollowupRun"], Awa
                 followup_ctx.session_id[:8],
                 exc,
             )
+        finally:
+            # Always stop typing indicator once the followup run finishes
+            if followup_typing_ctrl:
+                try:
+                    followup_typing_ctrl.mark_run_complete()
+                    followup_typing_ctrl.mark_dispatch_idle()
+                except Exception:
+                    pass
 
     return run_followup
 

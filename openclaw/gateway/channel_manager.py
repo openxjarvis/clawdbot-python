@@ -1231,6 +1231,10 @@ class ChannelManager:
                 await typing_ctrl.on_reply_start()
                 await typing_ctrl.start_typing_loop()
 
+                # Keep the raw send_typing fn on ctx so that followup_runner can
+                # create a *fresh* TypingController for each queued turn — mirrors
+                # TS createFollowupRunner receiving the TypingController reference.
+
                 # Build image data URLs from inbound attachments, and transcribe audio.
                 # Mirrors TS bot-message-context.ts allMedia / audio-preflight flow.
                 inbound_images: list[str] | None = None
@@ -1340,6 +1344,7 @@ class ChannelManager:
                     originating_channel=channel_id,
                     originating_to=message.chat_id,
                     typing_ctrl=typing_ctrl,
+                    typing_send_fn=_send_typing,
                 )
 
                 # Fire-and-forget: handler returns immediately.

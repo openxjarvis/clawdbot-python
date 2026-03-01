@@ -64,6 +64,16 @@ def _is_quota_error(exc: BaseException) -> bool:
     return any(p.search(msg) for p in _QUOTA_PATTERNS)
 
 
+def _is_abort_error(exc: BaseException) -> bool:
+    """Return True when exc represents a deliberate abort/cancellation.
+
+    Delegates to agents/errors.py so the logic is kept in one place.
+    Mirrors TS ``isRunnerAbortError``.
+    """
+    from openclaw.agents.errors import is_runner_abort_error
+    return is_runner_abort_error(exc)
+
+
 def _trim_tool_call_names_in_event(event: Any) -> None:
     """Trim whitespace from tool call names in a pi event.
 
@@ -548,10 +558,87 @@ class PiAgentRuntime:
             logger.info("Truncated oversized tool results in session %s", session_id[:8])
         return truncated_any
 
+    async def _wait_for_session_idle(self, pi_session: Any, timeout: float = 30.0) -> bool:
+        """Wait until *pi_session* is no longer actively streaming.
+
+        Mirrors TS ``flushPendingToolResultsAfterIdle`` / ``waitForIdle``.
+        Returns True when session becomes idle before *timeout*, False on timeout.
+
+        This prevents injecting synthetic tool-result events while a tool call
+        is still in-flight, which would cause "missing tool result" errors.
+        """
+        deadline = asyncio.get_event_loop().time() + timeout
+        while True:
+            # Check known idle indicators on pi_session
+            is_idle = False
+            if hasattr(pi_session, "is_idle"):
+                try:
+                    is_idle = bool(pi_session.is_idle())
+                except Exception:
+                    is_idle = True  # assume idle on error
+            elif hasattr(pi_session, "_is_running"):
+                is_idle = not getattr(pi_session, "_is_running", False)
+            else:
+                is_idle = True  # cannot determine — assume idle
+
+            if is_idle:
+                return True
+
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                return False
+
+            await asyncio.sleep(min(0.1, remaining))
+
     def _resolve_max_retry_iterations(self, profile_count: int = 1) -> int:
         """Compute max retry iterations.  Mirrors TS ``resolveMaxRunRetryIterations``."""
         raw = self.BASE_RUN_RETRY_ITERATIONS + profile_count * self.RUN_RETRY_ITERATIONS_PER_PROFILE
         return min(self.MAX_RUN_RETRY_ITERATIONS, max(self.MIN_RUN_RETRY_ITERATIONS, raw))
+
+    def _build_extra_params(
+        self,
+        provider: str,
+        model: str,
+        auth_profile: Any | None = None,
+    ) -> dict[str, Any]:
+        """Build provider-specific extra params for pi_session.prompt().
+
+        Mirrors TS ``buildExtraParams`` from ``pi-embedded-runner/extra-params.ts``.
+
+        Covers:
+        - Anthropic prompt caching (``cache_control`` headers on system prompt)
+        - OpenRouter provider routing headers
+        - Z.AI tool-stream flag
+        - Upstream model ID injection for compatibility
+
+        Returns:
+            Dict of extra params to pass to pi_session.prompt() if supported.
+            Empty dict if no special params are needed.
+        """
+        extra: dict[str, Any] = {}
+
+        prov = (provider or "").lower()
+
+        if "anthropic" in prov or "claude" in model.lower():
+            # Enable prompt-caching beta for Anthropic — reduces cost & latency
+            extra["anthropic_beta"] = ["prompt-caching-2024-07-31"]
+            extra["cache_control"] = {"type": "ephemeral"}
+
+        if "openrouter" in prov:
+            # Route to the upstream provider that owns the model
+            upstream = model.split("/")[-1] if "/" in model else model
+            extra["x-openrouter-provider"] = {"order": [upstream], "allow_fallbacks": False}
+
+        if "z.ai" in prov or "z-ai" in prov:
+            extra["z_ai_tool_stream"] = True
+
+        # Inject auth profile custom headers if available
+        if auth_profile and hasattr(auth_profile, "extra_headers"):
+            hdrs = getattr(auth_profile, "extra_headers", None)
+            if isinstance(hdrs, dict) and hdrs:
+                extra["extra_headers"] = hdrs
+
+        return extra
 
     def _resolve_auth_profile_candidates(self, provider: str) -> list[str]:
         """Return ordered list of auth profile IDs for the provider.
@@ -786,577 +873,647 @@ class PiAgentRuntime:
         current_profile_idx = 0
         current_think_level: str | None = None  # set on fallback
 
-        for retry_iteration in range(max_retry):
-            # Apply auth profile (if available)
-            if auth_profile_ids and current_profile_idx < len(auth_profile_ids):
-                pid = auth_profile_ids[current_profile_idx]
-                self._apply_auth_profile(pid)
+        try:
+            for retry_iteration in range(max_retry):
+                # Apply auth profile (if available)
+                if auth_profile_ids and current_profile_idx < len(auth_profile_ids):
+                    pid = auth_profile_ids[current_profile_idx]
+                    self._apply_auth_profile(pid)
 
-            last_error: Exception | None = None
-            context_tokens = 0
-            _context_overflow = False
-            _auth_error = False
+                last_error: Exception | None = None
+                context_tokens = 0
+                _context_overflow = False
+                _auth_error = False
 
-            for attempt, candidate_model in enumerate(candidates):
-                is_fallback = attempt > 0
+                for attempt, candidate_model in enumerate(candidates):
+                    is_fallback = attempt > 0
 
-                if is_fallback:
-                    logger.warning(
-                        "Model %r quota/rate-limit exceeded — retrying with fallback %r",
-                        candidates[attempt - 1],
-                        candidate_model,
-                    )
-
-                # Get or create the session, then switch model if needed
-                try:
-                    pi_session = self._get_or_create_pi_session(session_id, extra_tools)
-                except Exception as exc:
-                    logger.error(f"Session creation failed: {exc}", exc_info=True)
-                    yield Event(
-                        type=EventType.ERROR,
-                        source="pi-runtime",
-                        session_id=session_id,
-                        data={"message": f"Session creation failed: {exc}"},
-                    )
-                    return
-
-                # Register as the active embedded run — enables steer/abort from outside
-                if _active_handle is None:
-                    _active_handle = EmbeddedPiRunHandle(
-                        run_id=_run_id,
-                        session_key=_session_key,
-                        pi_session=pi_session,
-                    )
-                    set_active_embedded_run(session_id, _active_handle, _session_key)
-
-                # Switch model when using a fallback or explicit override
-                if candidate_model != self.model_str or is_fallback:
-                    try:
-                        m = _resolve_model(candidate_model)
-                        await pi_session.set_model(m)
-                    
-                        # CRITICAL FIX: Adjust thinking_level based on model capabilities
-                        # When falling back from a reasoning model to a non-reasoning model,
-                        # we must clear the thinking_level or the API will return 400.
-                        if hasattr(m, "reasoning"):
-                            if m.reasoning:
-                                # New model supports reasoning — set thinking_level
-                                try:
-                                    pi_session.set_thinking_level("low")
-                                    logger.info("Set thinking_level=low for reasoning model %s", m.id)
-                                except Exception as exc:
-                                    logger.debug("Could not set thinking level: %s", exc)
-                            else:
-                                # New model does NOT support reasoning — clear thinking_level
-                                try:
-                                    pi_session.set_thinking_level("off")
-                                    logger.info("Cleared thinking_level for non-reasoning model %s", m.id)
-                                except Exception as exc:
-                                    logger.debug("Could not clear thinking level: %s", exc)
-                    
-                        logger.info("Switched session %s to model %r", session_id[:8], candidate_model)
-                    except Exception as exc:
-                        logger.warning("Model switch to %r failed: %s", candidate_model, exc)
-
-                # Apply system prompt on every turn, with Anthropic refusal scrub
-                effective_prompt = system_prompt or self.system_prompt
-                if effective_prompt:
-                    from openclaw.agents.context import scrub_anthropic_refusal_magic
-                    is_anthropic = "anthropic" in candidate_model.lower() or "claude" in candidate_model.lower()
-                    if is_anthropic:
-                        effective_prompt = scrub_anthropic_refusal_magic(effective_prompt)
-                    pi_session._agent.set_system_prompt(effective_prompt)
-                    logger.debug(
-                        "Applied system prompt (%d chars) to session %s",
-                        len(effective_prompt), session_id[:8],
-                    )
-
-                # Bridge pi events → async queue
-                event_queue: asyncio.Queue[Any] = asyncio.Queue()
-                _SENTINEL = object()
-                _quota_error: list[Exception] = []  # mutable cell to communicate error out
-
-                _prev_text: list[str] = [""]
-
-                def on_event(pi_event: Any) -> None:
-                    from openclaw.events import Event, EventType  # noqa: F811
-
-                    # Trim tool call names before any other processing
-                    _trim_tool_call_names_in_event(pi_event)
-
-                    # pi can emit both AgentEvent objects and plain dicts
-                    if isinstance(pi_event, dict):
-                        etype = pi_event.get("type")
-                    else:
-                        etype = getattr(pi_event, "type", None)
-
-                    if etype == "message_update":
-                        if isinstance(pi_event, dict):
-                            msg = pi_event.get("message")
-                        else:
-                            msg = getattr(pi_event, "message", None)
-                        if isinstance(msg, dict):
-                            content = msg.get("content", [])
-                        else:
-                            content = getattr(msg, "content", []) if msg else []
-                        full_text = ""
-                        for chunk in content:
-                            if isinstance(chunk, dict):
-                                t = chunk.get("text") if chunk.get("type") == "text" else None
-                            else:
-                                t = getattr(chunk, "text", None)
-                            if t and isinstance(t, str):
-                                full_text += t
-                        delta = full_text[len(_prev_text[0]):]
-                        _prev_text[0] = full_text
-                        if delta:
-                            event_queue.put_nowait(Event(
-                                type=EventType.TEXT,
-                                source="pi-session",
-                                session_id=session_id,
-                                data={"text": delta},
-                            ))
-                        return
-
-                    if etype in ("message_start", "turn_start", "agent_start"):
-                        _prev_text[0] = ""
-
-                    if etype in ("agent_end", "turn_end"):
-                        if isinstance(pi_event, dict):
-                            msgs = pi_event.get("messages") or []
-                            msg = pi_event.get("message")
-                        else:
-                            msgs = getattr(pi_event, "messages", None) or []
-                            msg = getattr(pi_event, "message", None)
-                        if not isinstance(msgs, list):
-                            msgs = [msgs] if msgs else []
-                        if msg:
-                            msgs = [msg] + list(msgs)
-                        for m in msgs:
-                            # m may be a dict (pi emits some events as plain dicts)
-                            if isinstance(m, dict):
-                                err = m.get("error_message") or m.get("errorMessage")
-                            else:
-                                err = getattr(m, "error_message", None)
-                            if err:
-                                logger.error("pi agent error (stop_reason=error): %s", err)
-                                # Check whether this is a quota error so the outer
-                                # loop can decide to try a fallback model.
-                                synthetic = RuntimeError(str(err))
-                                if _is_quota_error(synthetic):
-                                    _quota_error.append(synthetic)
-                                else:
-                                    event_queue.put_nowait(Event(
-                                        type=EventType.ERROR,
-                                        source="pi-session",
-                                        session_id=session_id,
-                                        data={"message": str(err)},
-                                    ))
-                                return
-
-                    from openclaw.agents.agent_session import _convert_pi_event
-                    oc_event = _convert_pi_event(pi_event, session_id)
-                    if oc_event is not None:
-                        event_queue.put_nowait(oc_event)
-
-                unsub = pi_session.subscribe(on_event)
-
-                async def _run_prompt(
-                    _pi_session: Any = pi_session,
-                    _images: list[str] | None = images,
-                ) -> None:
-                    try:
-                        logger.debug(f"[{session_id[:8]}] Starting _run_prompt with message length: {len(message)}")
-                        pi_images = None
-                        if _images:
-                            try:
-                                from pi_ai.types import ImageContent
-                                import base64 as _b64
-                                pi_images = []
-                                for img_ref in _images:
-                                    if isinstance(img_ref, str) and img_ref.startswith("data:"):
-                                        header, data_str = img_ref.split(",", 1)
-                                        mime_type = header.split(";")[0].split(":", 1)[1]
-                                        img_bytes = _b64.b64decode(data_str)
-                                        b64_data = _b64.b64encode(img_bytes).decode()
-                                        pi_images.append(ImageContent(type="image", data=b64_data, mime_type=mime_type))
-                                    elif isinstance(img_ref, str) and img_ref.startswith(("http://", "https://")):
-                                        import httpx
-                                        resp = httpx.get(img_ref, timeout=30.0)
-                                        if resp.status_code == 200:
-                                            mime_type = resp.headers.get("content-type", "image/jpeg").split(";")[0]
-                                            b64_data = _b64.b64encode(resp.content).decode()
-                                            pi_images.append(ImageContent(type="image", data=b64_data, mime_type=mime_type))
-                            except Exception as img_exc:
-                                logger.warning("Failed to convert images: %s", img_exc)
-                                pi_images = None
-                    
-                        # Phase 2: Token monitoring - estimate before sending
-                        from openclaw.agents.compaction.functions import estimate_messages_tokens, should_compact
-                        from openclaw.agents.context_window_guard import resolve_and_guard_context_window
-                    
-                        # Dynamically resolve context window using guard
-                        provider = candidate_model.split('/')[0] if '/' in candidate_model else 'google'
-                        model_id = candidate_model.split('/')[-1] if '/' in candidate_model else candidate_model
-                    
-                        # Get model context window if available
-                        model_context_window = None
-                        if hasattr(_pi_session, '_agent') and hasattr(_pi_session._agent, '_model'):
-                            agent_model = _pi_session._agent._model
-                            if hasattr(agent_model, 'contextWindow'):
-                                model_context_window = agent_model.contextWindow
-                    
-                        # Resolve and guard context window
-                        guard_result = resolve_and_guard_context_window(
-                            cfg=self.config,
-                            provider=provider,
-                            model_id=model_id,
-                            model_context_window=model_context_window,
-                            default_tokens=1_048_576,
+                    if is_fallback:
+                        logger.warning(
+                            "Model %r quota/rate-limit exceeded — retrying with fallback %r",
+                            candidates[attempt - 1],
+                            candidate_model,
                         )
-                    
-                        context_window = guard_result.tokens
-                    
-                        # Log warnings if needed
-                        if guard_result.should_block:
-                            logger.error(
-                                f"Context window too small: {context_window} tokens < 16K "
-                                f"(source: {guard_result.source})"
-                            )
-                        elif guard_result.should_warn:
-                            logger.warning(
-                                f"Context window is small: {context_window} tokens < 32K "
-                                f"(source: {guard_result.source})"
-                            )
-                        else:
-                            logger.debug(f"Context window: {context_window} tokens (source: {guard_result.source})")
-                    
-                        # Use nonlocal to modify the outer scope variable
-                        nonlocal context_tokens
-                        context_tokens = 0
-                    
-                        try:
-                            if hasattr(_pi_session, '_conversation_history'):
-                                # Phase 5: Apply context pruning before token estimation
-                                try:
-                                    from openclaw.agents.context_pruning.pruner import prune_context_messages
-                                    from openclaw.agents.context_pruning.cache_ttl import read_last_cache_ttl_timestamp
-                                
-                                    # Get context pruning settings from config (ensure config is not None)
-                                    agents_config = (self.config or {}).get('agents', {})
-                                    defaults = agents_config.get('defaults', {})
-                                    pruning_config = defaults.get('contextPruning', {})
-                                
-                                    context_pruning_settings = {
-                                        'mode': pruning_config.get('mode', 'off'),
-                                        'ttl': pruning_config.get('ttl', '5m'),
-                                        'softTrimRatio': pruning_config.get('softTrimRatio', 0.3),
-                                        'hardClearRatio': pruning_config.get('hardClearRatio', 0.5),
-                                        'keepLastAssistants': pruning_config.get('keepLastAssistants', 3),
-                                        'softTrim': pruning_config.get('softTrim', {
-                                            'maxChars': 4000,
-                                            'headChars': 1500,
-                                            'tailChars': 1500,
-                                        }),
-                                        'hardClear': pruning_config.get('hardClear', {
-                                            'enabled': True,
-                                            'placeholder': '[Old tool result content cleared]',
-                                        }),
-                                        'tools': pruning_config.get('tools', {
-                                            'prunable': ['Read', 'Grep', 'Shell'],
-                                        }),
-                                        'minPrunableToolChars': pruning_config.get('minPrunableToolChars', 50000),
-                                    }
-                                
-                                    # Get last cache touch timestamp for TTL mode
-                                    last_cache_touch = None
-                                    if hasattr(self, 'session_manager') and self.session_manager:
-                                        last_cache_touch = read_last_cache_ttl_timestamp(self.session_manager)
-                                
-                                    original_len = len(_pi_session._conversation_history)
-                                    pruned_history = prune_context_messages(
-                                        messages=_pi_session._conversation_history,
-                                        settings=context_pruning_settings,
-                                        ctx={'model': {'contextWindow': context_window}},
-                                        last_cache_touch_at=last_cache_touch,
-                                    )
-                                
-                                    if pruned_history != _pi_session._conversation_history:
-                                        _pi_session._conversation_history = pruned_history
-                                        logger.debug(f"Context pruning applied: {original_len} messages processed")
-                                    else:
-                                        logger.debug("Context pruning: no changes needed")
-                                except Exception as prune_exc:
-                                    logger.debug(f"Context pruning skipped: {prune_exc}")
-                            
-                                context_tokens = estimate_messages_tokens(_pi_session._conversation_history)
-                                logger.debug(f"Estimated context tokens: {context_tokens}")
-                            
-                                # Phase 3: Auto-compaction trigger (Safeguard)
-                                # Get compaction settings from config (ensure config is not None)
-                                agents_config = (self.config or {}).get('agents', {})
-                                defaults = agents_config.get('defaults', {})
-                                compaction_config = defaults.get('compaction', {})
-                            
-                                compaction_settings = {
-                                    'enabled': compaction_config.get('enabled', True),
-                                    'reserveTokens': compaction_config.get('reserveTokens', 16384),
-                                    'keepRecentTokens': compaction_config.get('keepRecentTokens', 20000),
-                                }
-                            
-                                if should_compact(context_tokens, context_window, compaction_settings):
-                                    logger.warning(
-                                        f"Auto-compaction triggered: {context_tokens} tokens "
-                                        f"exceeds threshold ({context_window - compaction_settings['reserveTokens']})"
-                                    )
-                                
-                                    # Phase 3: Execute compaction
-                                    try:
-                                        compaction_result = await self._execute_compaction(
-                                            session_id=session_id,
-                                            pi_session=_pi_session,
-                                            context_window=context_window,
-                                            compaction_settings=compaction_settings,
-                                        )
-                                        if compaction_result and isinstance(compaction_result, dict):
-                                            summary = compaction_result.get('summary', '')
-                                            logger.info(f"Compaction completed: {summary[:100]}...")
-                                        else:
-                                            logger.info("Using history limiting as fallback compaction strategy")
-                                    except Exception as e:
-                                        logger.error(f"Compaction failed: {e}", exc_info=True)
-                                        logger.info("Falling back to history limiting")
-                                elif context_tokens > context_window * 0.9:
-                                    logger.warning(
-                                        f"Context tokens ({context_tokens}) approaching limit ({context_window})"
-                                    )
-                        except Exception as e:
-                            logger.debug(f"Token estimation failed: {e}")
-                    
-                        # --- Plugin Hook: llm_input (observe prompt before LLM) ---
-                        if self._hook_runner and self._hook_runner.has_hooks("llm_input"):
-                            try:
-                                await self._hook_runner.run_llm_input(
-                                    {"message": message, "model": candidate_model},
-                                    self._build_agent_ctx(session_id),
-                                )
-                            except Exception as exc:
-                                logger.debug(f"llm_input hook failed: {exc}")
 
-                        logger.debug(f"[{session_id[:8]}] Calling pi_session.prompt")
-                        if _active_handle is not None:
-                            _active_handle.is_streaming = True
-                        try:
-                            await _pi_session.prompt(message, pi_images)
-                        finally:
-                            if _active_handle is not None:
-                                _active_handle.is_streaming = False
-                        logger.debug(f"[{session_id[:8]}] pi_session.prompt completed")
-
-                        # --- Plugin Hook: llm_output (observe LLM output) ---
-                        if self._hook_runner and self._hook_runner.has_hooks("llm_output"):
-                            try:
-                                await self._hook_runner.run_llm_output(
-                                    {"model": candidate_model},
-                                    self._build_agent_ctx(session_id),
-                                )
-                            except Exception as exc:
-                                logger.debug(f"llm_output hook failed: {exc}")
-                    except Exception as exc:
-                        logger.error(f"[{session_id[:8]}] _run_prompt error: {exc}", exc_info=True)
-                        if _is_quota_error(exc):
-                            _quota_error.append(exc)
-                        else:
-                            from openclaw.events import Event, EventType  # noqa: F811
-                            event_queue.put_nowait(Event(
-                                type=EventType.ERROR,
-                                source="pi-runtime",
-                                session_id=session_id,
-                                data={"message": str(exc)},
-                            ))
-                    finally:
-                        event_queue.put_nowait(_SENTINEL)
-
-                prompt_task = asyncio.create_task(_run_prompt())
-                collected_events: list[Any] = []
-
-                try:
-                    while True:
-                        try:
-                            event = await event_queue.get()
-                            if event is _SENTINEL:
-                                break
-                            collected_events.append(event)
-                        except Exception as queue_exc:
-                            logger.error(f"[{session_id[:8]}] Event queue get error: {queue_exc}", exc_info=True)
-                            break
-                finally:
-                    unsub()
-                    if not prompt_task.done():
-                        prompt_task.cancel()
-                        try:
-                            await prompt_task
-                        except asyncio.CancelledError:
-                            pass
-
-                # If a quota error was detected and we have more fallbacks, retry
-                if _quota_error and attempt < len(candidates) - 1:
-                    last_error = _quota_error[0]
-                    # Evict the session so the fallback model gets a fresh session
-                    # that won't be confused by the failed turn's internal state
-                    self.evict_session(session_id)
-                    continue
-
-                # No quota error (or no more fallbacks) — yield collected events
-                if is_fallback and not _quota_error:
-                    # Inform the client which fallback model was used
-                    yield Event(
-                        type=EventType.TEXT,
-                        source="pi-runtime",
-                        session_id=session_id,
-                        data={"text": f"[Using fallback model: {candidate_model}]\n"},
-                    )
-
-                for ev in collected_events:
+                    # Acquire the session write lock for the full attempt duration.
+                    # Mirrors TS run/attempt.ts: acquireSessionWriteLock held across the
+                    # entire attempt so concurrent writes cannot corrupt the session file.
+                    # We store the context manager and release it explicitly at every exit
+                    # point (before return / before continue) using _release_attempt_lock().
+                    _attempt_lock_ctx = None
                     try:
-                        await self._dispatch_event(ev)
-                        yield ev
-                    except Exception as dispatch_exc:
-                        logger.error(f"[{session_id[:8]}] Event dispatch error: {dispatch_exc}", exc_info=True)
+                        from openclaw.agents.session_lock import acquire_session_write_lock_cached
+                        from openclaw.config.sessions.transcripts import get_session_transcript_path
+                        _session_file = get_session_transcript_path(session_id)
+                        _attempt_lock_ctx = acquire_session_write_lock_cached(_session_file, max_hold_ms=600_000)
+                        await _attempt_lock_ctx.__aenter__()
+                    except Exception as _lock_exc:
+                        logger.debug("Could not acquire session write lock for %s: %s", session_id[:8], _lock_exc)
+                        _attempt_lock_ctx = None
+
+                    async def _release_attempt_lock() -> None:
+                        nonlocal _attempt_lock_ctx
+                        if _attempt_lock_ctx is not None:
+                            try:
+                                await _attempt_lock_ctx.__aexit__(None, None, None)
+                            except Exception:
+                                pass
+                            _attempt_lock_ctx = None
+
+                    # Get or create the session, then switch model if needed
+                    try:
+                        pi_session = self._get_or_create_pi_session(session_id, extra_tools)
+                    except Exception as exc:
+                        logger.error(f"Session creation failed: {exc}", exc_info=True)
+                        await _release_attempt_lock()
                         yield Event(
                             type=EventType.ERROR,
                             source="pi-runtime",
                             session_id=session_id,
-                            data={"message": f"Event dispatch failed: {dispatch_exc}"},
+                            data={"message": f"Session creation failed: {exc}"},
                         )
+                        return
 
-                # Phase 2: Update session token statistics after successful run
-                try:
-                    from openclaw.agents.session_entry import update_session_entry_tokens
-                
-                    # Extract usage info from events if available
-                    input_tokens = 0
-                    output_tokens = 0
-                    for evt in collected_events:
-                        if hasattr(evt, 'data') and isinstance(evt.data, dict):
-                            usage = evt.data.get('usage', {})
-                            if usage:
-                                input_tokens += usage.get('input_tokens', 0) or usage.get('inputTokens', 0)
-                                output_tokens += usage.get('output_tokens', 0) or usage.get('outputTokens', 0)
-                
-                    # Update SessionEntry if we have usage data or context estimate
-                    if input_tokens or output_tokens or context_tokens:
-                        await update_session_entry_tokens(
-                            session_manager=getattr(self, 'session_manager', None),
-                            session_id=session_id,
-                            input_tokens=input_tokens,
-                            output_tokens=output_tokens,
-                            context_tokens=context_tokens if context_tokens > 0 else None,
+                    # Register as the active embedded run — enables steer/abort from outside
+                    if _active_handle is None:
+                        _active_handle = EmbeddedPiRunHandle(
+                            run_id=_run_id,
+                            session_key=_session_key,
+                            pi_session=pi_session,
                         )
+                        set_active_embedded_run(session_id, _active_handle, _session_key)
+
+                    # Switch model when using a fallback or explicit override
+                    if candidate_model != self.model_str or is_fallback:
+                        try:
+                            m = _resolve_model(candidate_model)
+                            await pi_session.set_model(m)
+                    
+                            # CRITICAL FIX: Adjust thinking_level based on model capabilities
+                            # When falling back from a reasoning model to a non-reasoning model,
+                            # we must clear the thinking_level or the API will return 400.
+                            if hasattr(m, "reasoning"):
+                                if m.reasoning:
+                                    # New model supports reasoning — set thinking_level
+                                    try:
+                                        pi_session.set_thinking_level("low")
+                                        logger.info("Set thinking_level=low for reasoning model %s", m.id)
+                                    except Exception as exc:
+                                        logger.debug("Could not set thinking level: %s", exc)
+                                else:
+                                    # New model does NOT support reasoning — clear thinking_level
+                                    try:
+                                        pi_session.set_thinking_level("off")
+                                        logger.info("Cleared thinking_level for non-reasoning model %s", m.id)
+                                    except Exception as exc:
+                                        logger.debug("Could not clear thinking level: %s", exc)
+                    
+                            logger.info("Switched session %s to model %r", session_id[:8], candidate_model)
+                        except Exception as exc:
+                            logger.warning("Model switch to %r failed: %s", candidate_model, exc)
+
+                    # Apply system prompt on every turn, with Anthropic refusal scrub
+                    effective_prompt = system_prompt or self.system_prompt
+                    if effective_prompt:
+                        from openclaw.agents.context import scrub_anthropic_refusal_magic
+                        is_anthropic = "anthropic" in candidate_model.lower() or "claude" in candidate_model.lower()
+                        if is_anthropic:
+                            effective_prompt = scrub_anthropic_refusal_magic(effective_prompt)
+                        pi_session._agent.set_system_prompt(effective_prompt)
                         logger.debug(
-                            f"Updated session tokens: input={input_tokens}, "
-                            f"output={output_tokens}, context={context_tokens}"
+                            "Applied system prompt (%d chars) to session %s",
+                            len(effective_prompt), session_id[:8],
                         )
-                except Exception as e:
-                    logger.warning(f"Failed to update session token statistics: {e}")
 
-                # --- Plugin Hook: agent_end (fire-and-forget, parallel) ---
-                if self._hook_runner and self._hook_runner.has_hooks("agent_end") and not _quota_error:
+                    # Bridge pi events → async queue
+                    event_queue: asyncio.Queue[Any] = asyncio.Queue()
+                    _SENTINEL = object()
+                    _quota_error: list[Exception] = []  # mutable cell to communicate error out
+
+                    _prev_text: list[str] = [""]
+
+                    def on_event(pi_event: Any) -> None:
+                        from openclaw.events import Event, EventType  # noqa: F811
+
+                        # Trim tool call names before any other processing
+                        _trim_tool_call_names_in_event(pi_event)
+
+                        # pi can emit both AgentEvent objects and plain dicts
+                        if isinstance(pi_event, dict):
+                            etype = pi_event.get("type")
+                        else:
+                            etype = getattr(pi_event, "type", None)
+
+                        if etype == "message_update":
+                            if isinstance(pi_event, dict):
+                                msg = pi_event.get("message")
+                            else:
+                                msg = getattr(pi_event, "message", None)
+                            if isinstance(msg, dict):
+                                content = msg.get("content", [])
+                            else:
+                                content = getattr(msg, "content", []) if msg else []
+                            full_text = ""
+                            for chunk in content:
+                                if isinstance(chunk, dict):
+                                    t = chunk.get("text") if chunk.get("type") == "text" else None
+                                else:
+                                    t = getattr(chunk, "text", None)
+                                if t and isinstance(t, str):
+                                    full_text += t
+                            delta = full_text[len(_prev_text[0]):]
+                            _prev_text[0] = full_text
+                            if delta:
+                                event_queue.put_nowait(Event(
+                                    type=EventType.TEXT,
+                                    source="pi-session",
+                                    session_id=session_id,
+                                    data={"text": delta},
+                                ))
+                            return
+
+                        if etype in ("message_start", "turn_start", "agent_start"):
+                            _prev_text[0] = ""
+
+                        if etype in ("agent_end", "turn_end"):
+                            if isinstance(pi_event, dict):
+                                msgs = pi_event.get("messages") or []
+                                msg = pi_event.get("message")
+                            else:
+                                msgs = getattr(pi_event, "messages", None) or []
+                                msg = getattr(pi_event, "message", None)
+                            if not isinstance(msgs, list):
+                                msgs = [msgs] if msgs else []
+                            if msg:
+                                msgs = [msg] + list(msgs)
+                            for m in msgs:
+                                # m may be a dict (pi emits some events as plain dicts)
+                                if isinstance(m, dict):
+                                    err = m.get("error_message") or m.get("errorMessage")
+                                else:
+                                    err = getattr(m, "error_message", None)
+                                if err:
+                                    logger.error("pi agent error (stop_reason=error): %s", err)
+                                    # Check whether this is a quota error so the outer
+                                    # loop can decide to try a fallback model.
+                                    synthetic = RuntimeError(str(err))
+                                    if _is_abort_error(synthetic):
+                                        # Clean abort — exit silently, no retry
+                                        event_queue.put_nowait(_SENTINEL)
+                                        return
+                                    if _is_quota_error(synthetic):
+                                        _quota_error.append(synthetic)
+                                    else:
+                                        event_queue.put_nowait(Event(
+                                            type=EventType.ERROR,
+                                            source="pi-session",
+                                            session_id=session_id,
+                                            data={"message": str(err)},
+                                        ))
+                                    return
+
+                        from openclaw.agents.agent_session import _convert_pi_event
+                        oc_event = _convert_pi_event(pi_event, session_id)
+                        if oc_event is not None:
+                            event_queue.put_nowait(oc_event)
+
+                    unsub = pi_session.subscribe(on_event)
+
+                    async def _run_prompt(
+                        _pi_session: Any = pi_session,
+                        _images: list[str] | None = images,
+                    ) -> None:
+                        try:
+                            logger.debug(f"[{session_id[:8]}] Starting _run_prompt with message length: {len(message)}")
+                            pi_images = None
+                            if _images:
+                                try:
+                                    from pi_ai.types import ImageContent
+                                    import base64 as _b64
+                                    pi_images = []
+                                    for img_ref in _images:
+                                        if isinstance(img_ref, str) and img_ref.startswith("data:"):
+                                            header, data_str = img_ref.split(",", 1)
+                                            mime_type = header.split(";")[0].split(":", 1)[1]
+                                            img_bytes = _b64.b64decode(data_str)
+                                            b64_data = _b64.b64encode(img_bytes).decode()
+                                            pi_images.append(ImageContent(type="image", data=b64_data, mime_type=mime_type))
+                                        elif isinstance(img_ref, str) and img_ref.startswith(("http://", "https://")):
+                                            import httpx
+                                            resp = httpx.get(img_ref, timeout=30.0)
+                                            if resp.status_code == 200:
+                                                mime_type = resp.headers.get("content-type", "image/jpeg").split(";")[0]
+                                                b64_data = _b64.b64encode(resp.content).decode()
+                                                pi_images.append(ImageContent(type="image", data=b64_data, mime_type=mime_type))
+                                except Exception as img_exc:
+                                    logger.warning("Failed to convert images: %s", img_exc)
+                                    pi_images = None
+                    
+                            # Phase 2: Token monitoring - estimate before sending
+                            from openclaw.agents.compaction.functions import estimate_messages_tokens, should_compact
+                            from openclaw.agents.context_window_guard import resolve_and_guard_context_window
+                    
+                            # Dynamically resolve context window using guard
+                            provider = candidate_model.split('/')[0] if '/' in candidate_model else 'google'
+                            model_id = candidate_model.split('/')[-1] if '/' in candidate_model else candidate_model
+                    
+                            # Get model context window if available
+                            model_context_window = None
+                            if hasattr(_pi_session, '_agent') and hasattr(_pi_session._agent, '_model'):
+                                agent_model = _pi_session._agent._model
+                                if hasattr(agent_model, 'contextWindow'):
+                                    model_context_window = agent_model.contextWindow
+                    
+                            # Resolve and guard context window
+                            guard_result = resolve_and_guard_context_window(
+                                cfg=self.config,
+                                provider=provider,
+                                model_id=model_id,
+                                model_context_window=model_context_window,
+                                default_tokens=1_048_576,
+                            )
+                    
+                            context_window = guard_result.tokens
+                    
+                            # Log warnings if needed
+                            if guard_result.should_block:
+                                logger.error(
+                                    f"Context window too small: {context_window} tokens < 16K "
+                                    f"(source: {guard_result.source})"
+                                )
+                            elif guard_result.should_warn:
+                                logger.warning(
+                                    f"Context window is small: {context_window} tokens < 32K "
+                                    f"(source: {guard_result.source})"
+                                )
+                            else:
+                                logger.debug(f"Context window: {context_window} tokens (source: {guard_result.source})")
+                    
+                            # Use nonlocal to modify the outer scope variable
+                            nonlocal context_tokens
+                            context_tokens = 0
+                    
+                            try:
+                                if hasattr(_pi_session, '_conversation_history'):
+                                    # Phase 5: Apply context pruning before token estimation
+                                    try:
+                                        from openclaw.agents.context_pruning.pruner import prune_context_messages
+                                        from openclaw.agents.context_pruning.cache_ttl import read_last_cache_ttl_timestamp
+                                
+                                        # Get context pruning settings from config (ensure config is not None)
+                                        agents_config = (self.config or {}).get('agents', {})
+                                        defaults = agents_config.get('defaults', {})
+                                        pruning_config = defaults.get('contextPruning', {})
+                                
+                                        context_pruning_settings = {
+                                            'mode': pruning_config.get('mode', 'off'),
+                                            'ttl': pruning_config.get('ttl', '5m'),
+                                            'softTrimRatio': pruning_config.get('softTrimRatio', 0.3),
+                                            'hardClearRatio': pruning_config.get('hardClearRatio', 0.5),
+                                            'keepLastAssistants': pruning_config.get('keepLastAssistants', 3),
+                                            'softTrim': pruning_config.get('softTrim', {
+                                                'maxChars': 4000,
+                                                'headChars': 1500,
+                                                'tailChars': 1500,
+                                            }),
+                                            'hardClear': pruning_config.get('hardClear', {
+                                                'enabled': True,
+                                                'placeholder': '[Old tool result content cleared]',
+                                            }),
+                                            'tools': pruning_config.get('tools', {
+                                                'prunable': ['Read', 'Grep', 'Shell'],
+                                            }),
+                                            'minPrunableToolChars': pruning_config.get('minPrunableToolChars', 50000),
+                                        }
+                                
+                                        # Get last cache touch timestamp for TTL mode
+                                        last_cache_touch = None
+                                        if hasattr(self, 'session_manager') and self.session_manager:
+                                            last_cache_touch = read_last_cache_ttl_timestamp(self.session_manager)
+                                
+                                        original_len = len(_pi_session._conversation_history)
+                                        pruned_history = prune_context_messages(
+                                            messages=_pi_session._conversation_history,
+                                            settings=context_pruning_settings,
+                                            ctx={'model': {'contextWindow': context_window}},
+                                            last_cache_touch_at=last_cache_touch,
+                                        )
+                                
+                                        if pruned_history != _pi_session._conversation_history:
+                                            _pi_session._conversation_history = pruned_history
+                                            logger.debug(f"Context pruning applied: {original_len} messages processed")
+                                        else:
+                                            logger.debug("Context pruning: no changes needed")
+                                    except Exception as prune_exc:
+                                        logger.debug(f"Context pruning skipped: {prune_exc}")
+                            
+                                    context_tokens = estimate_messages_tokens(_pi_session._conversation_history)
+                                    logger.debug(f"Estimated context tokens: {context_tokens}")
+                            
+                                    # Phase 3: Auto-compaction trigger (Safeguard)
+                                    # Get compaction settings from config (ensure config is not None)
+                                    agents_config = (self.config or {}).get('agents', {})
+                                    defaults = agents_config.get('defaults', {})
+                                    compaction_config = defaults.get('compaction', {})
+                            
+                                    compaction_settings = {
+                                        'enabled': compaction_config.get('enabled', True),
+                                        'reserveTokens': compaction_config.get('reserveTokens', 16384),
+                                        'keepRecentTokens': compaction_config.get('keepRecentTokens', 20000),
+                                    }
+                            
+                                    if should_compact(context_tokens, context_window, compaction_settings):
+                                        logger.warning(
+                                            f"Auto-compaction triggered: {context_tokens} tokens "
+                                            f"exceeds threshold ({context_window - compaction_settings['reserveTokens']})"
+                                        )
+                                
+                                        # Phase 3: Execute compaction (300s hard timeout — mirrors TS compactionSafetyTimeout)
+                                        try:
+                                            compaction_result = await asyncio.wait_for(
+                                                self._execute_compaction(
+                                                    session_id=session_id,
+                                                    pi_session=_pi_session,
+                                                    context_window=context_window,
+                                                    compaction_settings=compaction_settings,
+                                                ),
+                                                timeout=300.0,
+                                            )
+                                            if compaction_result and isinstance(compaction_result, dict):
+                                                summary = compaction_result.get('summary', '')
+                                                logger.info(f"Compaction completed: {summary[:100]}...")
+                                            else:
+                                                logger.info("Using history limiting as fallback compaction strategy")
+                                        except Exception as e:
+                                            logger.error(f"Compaction failed: {e}", exc_info=True)
+                                            logger.info("Falling back to history limiting")
+                                    elif context_tokens > context_window * 0.9:
+                                        logger.warning(
+                                            f"Context tokens ({context_tokens}) approaching limit ({context_window})"
+                                        )
+                            except Exception as e:
+                                logger.debug(f"Token estimation failed: {e}")
+                    
+                            # --- Plugin Hook: llm_input (observe prompt before LLM) ---
+                            if self._hook_runner and self._hook_runner.has_hooks("llm_input"):
+                                try:
+                                    await self._hook_runner.run_llm_input(
+                                        {"message": message, "model": candidate_model},
+                                        self._build_agent_ctx(session_id),
+                                    )
+                                except Exception as exc:
+                                    logger.debug(f"llm_input hook failed: {exc}")
+
+                            logger.debug(f"[{session_id[:8]}] Calling pi_session.prompt")
+                            if _active_handle is not None:
+                                _active_handle.is_streaming = True
+                            try:
+                                # Build provider-specific extra params (cache_control, OpenRouter headers, etc.)
+                                _extra_params = self._build_extra_params(provider, model_id)
+                                import inspect as _inspect
+                                _prompt_sig = _inspect.signature(_pi_session.prompt)
+                                if "extra_params" in _prompt_sig.parameters and _extra_params:
+                                    await _pi_session.prompt(message, pi_images, extra_params=_extra_params)
+                                else:
+                                    await _pi_session.prompt(message, pi_images)
+                            finally:
+                                if _active_handle is not None:
+                                    _active_handle.is_streaming = False
+                            logger.debug(f"[{session_id[:8]}] pi_session.prompt completed")
+
+                            # --- Plugin Hook: llm_output (observe LLM output) ---
+                            if self._hook_runner and self._hook_runner.has_hooks("llm_output"):
+                                try:
+                                    await self._hook_runner.run_llm_output(
+                                        {"model": candidate_model},
+                                        self._build_agent_ctx(session_id),
+                                    )
+                                except Exception as exc:
+                                    logger.debug(f"llm_output hook failed: {exc}")
+                        except Exception as exc:
+                            if _is_abort_error(exc):
+                                # Deliberate abort — exit cleanly without retry or error event
+                                logger.info("[%s] Run aborted cleanly", session_id[:8])
+                            elif _is_quota_error(exc):
+                                logger.error(f"[{session_id[:8]}] _run_prompt error: {exc}", exc_info=True)
+                                _quota_error.append(exc)
+                            else:
+                                logger.error(f"[{session_id[:8]}] _run_prompt error: {exc}", exc_info=True)
+                                from openclaw.events import Event, EventType  # noqa: F811
+                                event_queue.put_nowait(Event(
+                                    type=EventType.ERROR,
+                                    source="pi-runtime",
+                                    session_id=session_id,
+                                    data={"message": str(exc)},
+                                ))
+                        finally:
+                            event_queue.put_nowait(_SENTINEL)
+
+                    prompt_task = asyncio.create_task(_run_prompt())
+                    collected_events: list[Any] = []
+
                     try:
-                        asyncio.create_task(self._hook_runner.run_agent_end(
-                            {"session_key": session_id, "model": candidate_model},
-                            self._build_agent_ctx(session_id),
-                        ))
-                    except Exception as exc:
-                        logger.debug(f"agent_end hook failed: {exc}")
+                        while True:
+                            try:
+                                event = await event_queue.get()
+                                if event is _SENTINEL:
+                                    break
+                                collected_events.append(event)
+                            except Exception as queue_exc:
+                                logger.error(f"[{session_id[:8]}] Event queue get error: {queue_exc}", exc_info=True)
+                                break
+                    finally:
+                        unsub()
+                        if not prompt_task.done():
+                            prompt_task.cancel()
+                            try:
+                                await prompt_task
+                            except asyncio.CancelledError:
+                                pass
 
-                # If quota error and NO more fallbacks — check auth profile rotation
-                if _quota_error:
-                    _auth_error = True
-                    # Try next auth profile before giving up
-                    if current_profile_idx + 1 < len(auth_profile_ids):
-                        pid = auth_profile_ids[current_profile_idx]
-                        if pid and self._rotation_manager:
-                            self._rotation_manager.mark_failure(pid, reason="rate_limit", is_rate_limit=True)
-                        current_profile_idx += 1
+                    # If a quota error was detected and we have more fallbacks, retry
+                    if _quota_error and attempt < len(candidates) - 1:
+                        last_error = _quota_error[0]
+                        # Evict the session so the fallback model gets a fresh session
+                        # that won't be confused by the failed turn's internal state
                         self.evict_session(session_id)
-                        logger.info("Auth profile rotated to index %d, retrying", current_profile_idx)
-                        break  # break inner candidates loop to retry in outer loop
-                    # No more profiles — emit error and return
-                    err_msg = (
-                        f"Quota exceeded for all configured models "
-                        f"({', '.join(candidates)}). "
-                        "Please check your API plan or add more fallback models in "
-                        "`agents.defaults.model.fallbacks`."
-                    )
-                    err_event = Event(
-                        type=EventType.ERROR,
-                        source="pi-runtime",
-                        session_id=session_id,
-                        data={"message": err_msg},
-                    )
-                    await self._dispatch_event(err_event)
-                    yield err_event
-
-                # Mark auth profile as good on success
-                if not _quota_error and auth_profile_ids and current_profile_idx < len(auth_profile_ids):
-                    pid = auth_profile_ids[current_profile_idx]
-                    if pid and self._rotation_manager:
-                        self._rotation_manager.mark_success(pid)
-
-                return  # done — either success or exhausted all candidates
-
-                # end of inner candidates loop
-
-            # Outer retry: if _auth_error was set and we broke out for rotation, continue
-            if _auth_error and current_profile_idx < len(auth_profile_ids):
-                continue
-
-            # Outer retry: context overflow — try compaction then truncation
-            if _context_overflow:
-                pi_session_for_compact = self._pool.get(session_id)
-                if pi_session_for_compact and overflow_compaction_attempts < self.MAX_OVERFLOW_COMPACTION_ATTEMPTS:
-                    overflow_compaction_attempts += 1
-                    try:
-                        agents_config = (self.config or {}).get("agents", {})
-                        defaults = agents_config.get("defaults", {})
-                        compaction_config = defaults.get("compaction", {})
-                        compaction_settings = {
-                            "enabled": compaction_config.get("enabled", True),
-                            "reserveTokens": compaction_config.get("reserveTokens", 16384),
-                            "keepRecentTokens": compaction_config.get("keepRecentTokens", 20000),
-                        }
-                        result = await self._execute_compaction(
-                            session_id, pi_session_for_compact, 1_048_576, compaction_settings
-                        )
-                        if result:
-                            logger.info("Retry compaction succeeded, retrying turn")
-                            continue
-                    except Exception as compact_exc:
-                        logger.warning("Retry compaction failed: %s", compact_exc)
-                # Compaction exhausted — try truncation
-                if pi_session_for_compact:
-                    truncated = await self._truncate_oversized_tool_results(session_id, pi_session_for_compact)
-                    if truncated:
-                        logger.info("Truncated oversized results, retrying turn")
+                        await _release_attempt_lock()
                         continue
 
-            # No retry condition met — exit
-            break
+                    # No quota error (or no more fallbacks) — yield collected events
+                    if is_fallback and not _quota_error:
+                        # Inform the client which fallback model was used
+                        yield Event(
+                            type=EventType.TEXT,
+                            source="pi-runtime",
+                            session_id=session_id,
+                            data={"text": f"[Using fallback model: {candidate_model}]\n"},
+                        )
 
-        # end of outer retry loop
+                    for ev in collected_events:
+                        try:
+                            await self._dispatch_event(ev)
+                            yield ev
+                        except Exception as dispatch_exc:
+                            logger.error(f"[{session_id[:8]}] Event dispatch error: {dispatch_exc}", exc_info=True)
+                            yield Event(
+                                type=EventType.ERROR,
+                                source="pi-runtime",
+                                session_id=session_id,
+                                data={"message": f"Event dispatch failed: {dispatch_exc}"},
+                            )
 
-        if last_error:
-            yield Event(
-                type=EventType.ERROR,
-                source="pi-runtime",
-                session_id=session_id,
-                data={"message": str(last_error)},
-            )
+                    # Phase 2: Update session token statistics after successful run
+                    try:
+                        from openclaw.agents.session_entry import update_session_entry_tokens
+                        from openclaw.agents.usage import normalize_usage, persist_run_session_usage
 
-        # Deregister active run — must happen even on error
-        if _active_handle is not None:
-            clear_active_embedded_run(session_id, _active_handle.run_id)
+                        # Extract raw usage from events (take the last usage event with data)
+                        raw_usage: dict[str, Any] = {}
+                        input_tokens = 0
+                        output_tokens = 0
+                        for evt in collected_events:
+                            if hasattr(evt, 'data') and isinstance(evt.data, dict):
+                                u = evt.data.get('usage', {})
+                                if u:
+                                    raw_usage.update(u)
+                                    input_tokens += u.get('input_tokens', 0) or u.get('inputTokens', 0)
+                                    output_tokens += u.get('output_tokens', 0) or u.get('outputTokens', 0)
+
+                        # Normalise usage across providers (mirrors TS normalizeUsage)
+                        norm = normalize_usage(raw_usage or None, provider=provider)
+                        if norm.get("input_tokens") or norm.get("output_tokens"):
+                            persist_run_session_usage(
+                                session_id,
+                                norm,
+                                session_manager=getattr(self, "session_manager", None),
+                            )
+                            logger.debug(
+                                "Usage (normalised): in=%s out=%s cache_read=%s cache_create=%s",
+                                norm.get("input_tokens"),
+                                norm.get("output_tokens"),
+                                norm.get("cache_read_tokens"),
+                                norm.get("cache_creation_tokens"),
+                            )
+
+                        # Update SessionEntry if we have usage data or context estimate
+                        if input_tokens or output_tokens or context_tokens:
+                            await update_session_entry_tokens(
+                                session_manager=getattr(self, 'session_manager', None),
+                                session_id=session_id,
+                                input_tokens=input_tokens,
+                                output_tokens=output_tokens,
+                                context_tokens=context_tokens if context_tokens > 0 else None,
+                            )
+                            logger.debug(
+                                f"Updated session tokens: input={input_tokens}, "
+                                f"output={output_tokens}, context={context_tokens}"
+                            )
+                    except Exception as e:
+                        logger.warning(f"Failed to update session token statistics: {e}")
+
+                    # --- Plugin Hook: agent_end (fire-and-forget, parallel) ---
+                    if self._hook_runner and self._hook_runner.has_hooks("agent_end") and not _quota_error:
+                        try:
+                            asyncio.create_task(self._hook_runner.run_agent_end(
+                                {"session_key": session_id, "model": candidate_model},
+                                self._build_agent_ctx(session_id),
+                            ))
+                        except Exception as exc:
+                            logger.debug(f"agent_end hook failed: {exc}")
+
+                    # If quota error and NO more fallbacks — check auth profile rotation
+                    if _quota_error:
+                        _auth_error = True
+                        # Try next auth profile before giving up
+                        if current_profile_idx + 1 < len(auth_profile_ids):
+                            pid = auth_profile_ids[current_profile_idx]
+                            if pid and self._rotation_manager:
+                                self._rotation_manager.mark_failure(pid, reason="rate_limit", is_rate_limit=True)
+                            current_profile_idx += 1
+                            self.evict_session(session_id)
+                            logger.info("Auth profile rotated to index %d, retrying", current_profile_idx)
+                            break  # break inner candidates loop to retry in outer loop
+                        # No more profiles — emit error and return
+                        err_msg = (
+                            f"Quota exceeded for all configured models "
+                            f"({', '.join(candidates)}). "
+                            "Please check your API plan or add more fallback models in "
+                            "`agents.defaults.model.fallbacks`."
+                        )
+                        err_event = Event(
+                            type=EventType.ERROR,
+                            source="pi-runtime",
+                            session_id=session_id,
+                            data={"message": err_msg},
+                        )
+                        await self._dispatch_event(err_event)
+                        yield err_event
+
+                    # Mark auth profile as good on success
+                    if not _quota_error and auth_profile_ids and current_profile_idx < len(auth_profile_ids):
+                        pid = auth_profile_ids[current_profile_idx]
+                        if pid and self._rotation_manager:
+                            self._rotation_manager.mark_success(pid)
+
+                    await _release_attempt_lock()
+                    return  # done — either success or exhausted all candidates
+
+                    # end of inner candidates loop
+
+                # Outer retry: if _auth_error was set and we broke out for rotation, continue
+                if _auth_error and current_profile_idx < len(auth_profile_ids):
+                    continue
+
+                # Outer retry: context overflow — try compaction then truncation
+                if _context_overflow:
+                    pi_session_for_compact = self._pool.get(session_id)
+                    if pi_session_for_compact and overflow_compaction_attempts < self.MAX_OVERFLOW_COMPACTION_ATTEMPTS:
+                        overflow_compaction_attempts += 1
+                        try:
+                            agents_config = (self.config or {}).get("agents", {})
+                            defaults = agents_config.get("defaults", {})
+                            compaction_config = defaults.get("compaction", {})
+                            compaction_settings = {
+                                "enabled": compaction_config.get("enabled", True),
+                                "reserveTokens": compaction_config.get("reserveTokens", 16384),
+                                "keepRecentTokens": compaction_config.get("keepRecentTokens", 20000),
+                            }
+                            result = await asyncio.wait_for(
+                                self._execute_compaction(
+                                    session_id, pi_session_for_compact, 1_048_576, compaction_settings
+                                ),
+                                timeout=300.0,
+                            )
+                            if result:
+                                logger.info("Retry compaction succeeded, retrying turn")
+                                continue
+                        except Exception as compact_exc:
+                            logger.warning("Retry compaction failed: %s", compact_exc)
+                    # Compaction exhausted — try truncation
+                    if pi_session_for_compact:
+                        truncated = await self._truncate_oversized_tool_results(session_id, pi_session_for_compact)
+                        if truncated:
+                            logger.info("Truncated oversized results, retrying turn")
+                            continue
+
+                # No retry condition met — exit
+                break
+
+            # end of outer retry loop
+
+            if last_error:
+                yield Event(
+                    type=EventType.ERROR,
+                    source="pi-runtime",
+                    session_id=session_id,
+                    data={"message": str(last_error)},
+                )
+
+        finally:
+            # Deregister active run — runs on normal exit AND GeneratorExit/cancellation
+            if _active_handle is not None:
+                clear_active_embedded_run(session_id, _active_handle.run_id)
 
     # ------------------------------------------------------------------
     # Abort running session

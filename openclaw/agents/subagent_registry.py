@@ -187,6 +187,13 @@ class SubagentRegistry:
             if not entry:
                 return
 
+            # Forward to global pub-sub (mirrors TS onAgentEvent emission in subagent-lifecycle-events.ts)
+            try:
+                from openclaw.infra.agent_events import emit_agent_event
+                emit_agent_event({"type": "agent_lifecycle", "phase": phase, "runId": run_id, **event_data})
+            except Exception:
+                pass
+
             if phase == "start":
                 # Clear any pending lifecycle error since the run actually started
                 pending = self._pending_lifecycle_errors.pop(run_id, None)
@@ -623,6 +630,47 @@ class SubagentRegistry:
         
         return runs
 
+    # ------------------------------------------------------------------
+    # Periodic sweeper — mirrors TS sweepSubagentRuns()
+    # ------------------------------------------------------------------
+
+    async def _sweep_loop(self) -> None:
+        """Background task that periodically GC's timed-out registry entries.
+
+        Mirrors TS ``sweepSubagentRuns`` — called on a 60s interval.
+        Removes entries whose ``archive_at_ms`` has passed so that the
+        in-memory dict doesn't grow unbounded.
+        """
+        SWEEP_INTERVAL_S = 60.0
+        while True:
+            await asyncio.sleep(SWEEP_INTERVAL_S)
+            try:
+                self._sweep_once()
+            except Exception as exc:
+                logger.warning("Subagent registry sweeper error: %s", exc)
+
+    def _sweep_once(self) -> None:
+        """Run one sweep pass — remove archived/expired entries."""
+        now_ms = int(time.time() * 1000)
+        to_delete: list[str] = []
+        for run_id, entry in self._runs.items():
+            if entry.archive_at_ms and now_ms >= entry.archive_at_ms:
+                to_delete.append(run_id)
+        for run_id in to_delete:
+            self._runs.pop(run_id, None)
+            logger.debug("Sweeper: archived subagent run %s", run_id)
+        if to_delete:
+            self._persist()
+
+    def start_sweeper(self) -> asyncio.Task:
+        """Start the periodic sweeper as an asyncio background task.
+
+        Call this once after the event loop is running (e.g. from bootstrap).
+        """
+        task = asyncio.create_task(self._sweep_loop(), name="subagent-registry-sweeper")
+        logger.debug("Subagent registry sweeper started")
+        return task
+
 
 # Global registry instance
 _registry: SubagentRegistry | None = None
@@ -641,7 +689,13 @@ def get_subagent_registry() -> SubagentRegistry:
     return get_global_registry()
 
 
-def init_subagent_registry():
-    """Initialize and restore subagent registry"""
+def init_subagent_registry() -> SubagentRegistry:
+    """Initialize, restore, and start the sweeper for the global subagent registry."""
     registry = get_global_registry()
     registry.restore_once()
+    try:
+        registry.start_sweeper()
+    except RuntimeError:
+        # No running event loop — sweeper will be started later by bootstrap
+        pass
+    return registry

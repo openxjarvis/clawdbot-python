@@ -396,8 +396,11 @@ def schedule_followup_drain(
                         logger.warning(f"Followup drain error: {exc}")
         finally:
             queue.draining = False
-            # Clean up empty queue
-            if not queue.items and queue.dropped_count == 0:
+            # Mirrors TS: if new items arrived while we were draining, schedule
+            # another drain pass so they are not silently lost.
+            if queue.items:
+                schedule_followup_drain(key, run_followup)
+            elif queue.dropped_count == 0:
                 _FOLLOWUP_QUEUES.pop(key, None)
 
     try:

@@ -185,6 +185,109 @@ def create_typing_controller(
 
 
 # ---------------------------------------------------------------------------
+# TypingSignaler — mirrors TS createTypingSignaler from typing-mode.ts
+# ---------------------------------------------------------------------------
+
+SILENT_REPLY_TOKEN = "NO_REPLY"
+
+
+class TypingSignaler:
+    """Wraps a TypingController with mode-aware signal methods.
+
+    Mirrors TS ``createTypingSignaler`` from ``auto-reply/reply/typing-mode.ts``.
+
+    Different typing modes determine when the indicator starts:
+    - "instant"  — start immediately when the run begins
+    - "message"  — start when the first message block starts
+    - "thinking" — start when reasoning/thinking text arrives
+    - "never"    — never start
+    """
+
+    def __init__(
+        self,
+        typing: "TypingController",
+        mode: str = "instant",
+        is_heartbeat: bool = False,
+    ) -> None:
+        self._typing = typing
+        self.mode = mode
+        self._disabled = is_heartbeat or mode == "never"
+        self._should_start_immediately = mode == "instant"
+        self._should_start_on_message = mode == "message"
+        self._should_start_on_text = mode in ("instant", "message")
+        self._should_start_on_reasoning = mode == "thinking"
+        self._has_renderable_text = False
+
+    def _is_renderable(self, text: str | None) -> bool:
+        trimmed = (text or "").strip()
+        if not trimmed:
+            return False
+        return trimmed != SILENT_REPLY_TOKEN
+
+    async def signal_run_start(self) -> None:
+        """Called at the start of a model run."""
+        if self._disabled or not self._should_start_immediately:
+            return
+        await self._typing.start_typing_loop()
+
+    async def signal_message_start(self) -> None:
+        """Called when the first message block begins."""
+        if self._disabled or not self._should_start_on_message:
+            return
+        if not self._has_renderable_text:
+            return
+        await self._typing.start_typing_loop()
+
+    async def signal_text_delta(self, text: str | None = None) -> None:
+        """Called on each text chunk from the model."""
+        if self._disabled:
+            return
+        renderable = self._is_renderable(text)
+        if renderable:
+            self._has_renderable_text = True
+        elif (text or "").strip():
+            return
+        if self._should_start_on_text:
+            await self._typing.start_typing_on_text(text)
+            return
+        if self._should_start_on_reasoning:
+            if not self._typing.is_active():
+                await self._typing.start_typing_loop()
+            self._typing.refresh_typing_ttl()
+
+    async def signal_reasoning_delta(self) -> None:
+        """Called on reasoning/thinking text chunks."""
+        if self._disabled or not self._should_start_on_reasoning:
+            return
+        if not self._has_renderable_text:
+            return
+        await self._typing.start_typing_loop()
+        self._typing.refresh_typing_ttl()
+
+    async def signal_tool_start(self) -> None:
+        """Called when a tool call begins — keeps indicator alive during tool use."""
+        if self._disabled:
+            return
+        if not self._typing.is_active():
+            await self._typing.start_typing_loop()
+            self._typing.refresh_typing_ttl()
+            return
+        self._typing.refresh_typing_ttl()
+
+
+def create_typing_signaler(
+    typing: "TypingController",
+    mode: str = "instant",
+    is_heartbeat: bool = False,
+) -> TypingSignaler:
+    """Create a TypingSignaler wrapping *typing* for the given *mode*.
+
+    Mirrors TS ``createTypingSignaler`` from ``typing-mode.ts``.
+    """
+    return TypingSignaler(typing=typing, mode=mode, is_heartbeat=is_heartbeat)
+
+
+# ---------------------------------------------------------------------------
 # Typing mode resolution (mirrors typing-mode.ts)
 # ---------------------------------------------------------------------------
 

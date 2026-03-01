@@ -49,6 +49,10 @@ class ReplyContext:
     originating_channel: str | None = None
     originating_to: Any | None = None
     typing_ctrl: Any | None = None       # TypingController or None
+    # Raw send_typing callback — stored so followup runner can create fresh
+    # TypingControllers for each queued turn (mirrors TS: typing passed through
+    # to createFollowupRunner so each followup can restart the indicator).
+    typing_send_fn: Callable[[], Awaitable[None]] | None = None
     timeout_ms: int = DEFAULT_AGENT_TIMEOUT_MS
     abort_event: asyncio.Event | None = None  # set to abort mid-run
 
@@ -93,10 +97,16 @@ async def run_prepared_reply(ctx: ReplyContext) -> None:
                 "run_prepared_reply: steered message into active run for %s",
                 ctx.session_id[:8],
             )
-            if ctx.typing_ctrl:
-                ctx.typing_ctrl.mark_run_complete()
-                ctx.typing_ctrl.mark_dispatch_idle()
-            return
+            # steer-backlog dual action: mirrors TS shouldSteer && shouldFollowup.
+            # When mode is "steer-backlog", steer the active run AND also enqueue
+            # the message as a followup so it is re-processed after the run ends.
+            mode = (ctx.queue_settings.mode if ctx.queue_settings else None) or "followup"
+            if mode not in ("steer-backlog", "steer+backlog"):
+                if ctx.typing_ctrl:
+                    ctx.typing_ctrl.mark_run_complete()
+                    ctx.typing_ctrl.mark_dispatch_idle()
+                return
+            # Fall through to enqueue-followup for steer-backlog modes
         # Steer failed (not streaming) — fall through to enqueue
         action = "enqueue-followup"
 
@@ -164,9 +174,12 @@ async def _run_agent_now(ctx: ReplyContext) -> None:
                 timeout_s,
                 ctx.session_id[:8],
             )
-            # Abort the active run
-            from openclaw.agents.pi_embedded import abort_embedded_pi_run
+            from openclaw.agents.pi_embedded import abort_embedded_pi_run, clear_active_embedded_run
             abort_embedded_pi_run(ctx.session_id)
+            # Defense-in-depth: explicitly clear the stale handle so new messages
+            # get "run-now" instead of "enqueue-followup" forever.  The run_id
+            # guard inside clear_active_embedded_run prevents clearing a newer run.
+            clear_active_embedded_run(ctx.session_id, run_id)
             return
 
         await _deliver_response(ctx, response_text, has_error)
@@ -201,6 +214,13 @@ async def _execute_agent_turn(
     Uses ``run_agent_turn_with_fallback`` for compaction + transient retry.
     """
     from openclaw.auto_reply.reply.agent_runner_execution import run_agent_turn_with_fallback
+    from openclaw.auto_reply.reply.typing import create_typing_signaler
+
+    # Build a TypingSignaler for this turn so typing is refreshed on each text
+    # delta and tool start — mirrors TS createTypingSignaler wiring in get-reply.ts
+    typing_signaler = None
+    if ctx.typing_ctrl:
+        typing_signaler = create_typing_signaler(ctx.typing_ctrl, mode="instant")
 
     return await run_agent_turn_with_fallback(
         ctx.runtime,
@@ -212,6 +232,7 @@ async def _execute_agent_turn(
         images=ctx.images,
         run_id=run_id,
         session_key=ctx.session_key,
+        typing_signaler=typing_signaler,
     )
 
 
