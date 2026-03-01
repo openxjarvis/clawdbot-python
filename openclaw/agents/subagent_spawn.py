@@ -32,8 +32,16 @@ SUBAGENT_SPAWN_ACCEPTED_NOTE = (
     "auto-announces on completion, do not poll/sleep. "
     "The response will be sent back as an agent message."
 )
+SUBAGENT_SPAWN_SESSION_ACCEPTED_NOTE = (
+    "thread-bound session stays active after completion. "
+    "Results are auto-announced."
+)
 
+SUBAGENT_SPAWN_MODES: list[str] = ["run", "session"]
 AGENT_LANE_SUBAGENT = "subagent"
+
+
+SpawnSubagentMode = Literal["run", "session"]
 
 
 @dataclass
@@ -48,6 +56,8 @@ class SpawnSubagentParams:
     runTimeoutSeconds: int | None = None
     cleanup: Literal["delete", "keep"] = "keep"
     expectsCompletionMessage: bool = False
+    mode: SpawnSubagentMode = "run"
+    thread: bool = False
 
 
 @dataclass
@@ -459,6 +469,9 @@ async def spawn_subagent_direct(
                 error=f"agentId is not allowed for sessions_spawn (allowed: {allowed_text})",
             )
     
+    # Validate mode (mirrors TS lines ~148-155)
+    mode = params.mode if params.mode in SUBAGENT_SPAWN_MODES else "run"
+
     # Generate child session key (mirrors TS line 148)
     child_session_key = f"agent:{target_agent_id}:subagent:{uuid.uuid4()}"
     child_depth = caller_depth + 1
@@ -597,6 +610,29 @@ async def spawn_subagent_direct(
         f"[Subagent Task]: {task}",
     ])
     
+    # Thread binding for session mode (mirrors TS ensureThreadBindingForSubagentSpawn)
+    if mode == "session" and params.thread and gateway is not None:
+        try:
+            from openclaw.gateway.api.sessions_methods import SessionsPatchMethod
+
+            patch_method = SessionsPatchMethod()
+            mock_connection = type("MockConnection", (), {"gateway": gateway})()
+            thread_id = ctx.agentThreadId or str(uuid.uuid4())
+            await patch_method.execute(
+                mock_connection,
+                {
+                    "key": child_session_key,
+                    "patch": {"threadId": str(thread_id), "threadBound": True},
+                },
+            )
+            logger.debug("Thread binding set for session-mode subagent %s", child_session_key)
+        except Exception as exc:
+            logger.warning("Thread binding failed for %s: %s", child_session_key, exc)
+
+    # In session mode, override cleanup to "keep" (session stays after completion)
+    if mode == "session":
+        cleanup = "keep"
+
     # Launch agent run (mirrors TS lines 244-282)
     child_idem = str(uuid.uuid4())
     child_run_id = child_idem
@@ -657,10 +693,11 @@ async def spawn_subagent_direct(
     )
     
     # Return success (mirrors TS lines 298-304)
+    note = SUBAGENT_SPAWN_SESSION_ACCEPTED_NOTE if mode == "session" else SUBAGENT_SPAWN_ACCEPTED_NOTE
     return SpawnSubagentResult(
         status="accepted",
         childSessionKey=child_session_key,
         runId=child_run_id,
-        note=SUBAGENT_SPAWN_ACCEPTED_NOTE,
+        note=note,
         modelApplied=model_applied if resolved_model else None,
     )

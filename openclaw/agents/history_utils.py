@@ -533,11 +533,56 @@ def read_session_transcript(
     return messages
 
 
+def apply_transcript_policy(
+    messages: list[dict[str, Any]],
+    policy: TranscriptPolicy,
+) -> list[dict[str, Any]]:
+    """Apply a resolved :class:`TranscriptPolicy` to *messages*.
+
+    Mirrors TS ``applyTranscriptPolicy()`` — runs each sanitization step that
+    the policy enables.  The heavy per-provider validators
+    (``validate_gemini_turns``, ``validate_anthropic_turns``) are imported on
+    demand to avoid circular-import issues.
+    """
+    out = list(messages)
+
+    if policy.repair_tool_use_result_pairing:
+        try:
+            from openclaw.agents.compaction.functions import _repair_tool_use_result_pairing
+            out = _repair_tool_use_result_pairing(out)
+        except Exception:
+            logger.debug("repair_tool_use_result_pairing unavailable", exc_info=True)
+
+    if policy.validate_gemini_turns:
+        try:
+            from openclaw.agents.context import validate_gemini_turns
+            out = validate_gemini_turns(out)
+        except Exception:
+            logger.debug("validate_gemini_turns unavailable", exc_info=True)
+
+    if policy.validate_anthropic_turns:
+        try:
+            from openclaw.agents.context import validate_anthropic_turns
+            out = validate_anthropic_turns(out)
+        except Exception:
+            logger.debug("validate_anthropic_turns unavailable", exc_info=True)
+
+    if policy.apply_google_turn_ordering:
+        try:
+            from openclaw.agents.context import validate_gemini_turns
+            out = validate_gemini_turns(out)
+        except Exception:
+            logger.debug("apply_google_turn_ordering unavailable", exc_info=True)
+
+    return out
+
+
 __all__ = [
     "TranscriptPolicy",
     "TranscriptSanitizeMode",
     "ToolCallIdMode",
     "SanitizeThoughtSignaturesConfig",
     "resolve_transcript_policy",
+    "apply_transcript_policy",
     "sanitize_session_history",
 ]

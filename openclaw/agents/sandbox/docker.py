@@ -169,7 +169,7 @@ def normalize_docker_limit(value: str | int | None) -> str | None:
 
 @dataclass
 class DockerSandboxConfig:
-    """Docker sandbox configuration"""
+    """Docker sandbox configuration — mirrors TS sandbox/docker.ts security defaults."""
     
     image: str = DEFAULT_SANDBOX_IMAGE
     memory: str | None = None  # e.g. "512m", "1g"
@@ -180,6 +180,14 @@ class DockerSandboxConfig:
     network_mode: str = "bridge"  # "bridge", "none", "host"
     env: dict[str, str] = field(default_factory=dict)
     volumes: dict[str, str] = field(default_factory=dict)  # host_path: container_path
+
+    # Security hardening (aligned with TS docker.ts createSandboxArgs)
+    read_only_root: bool = True
+    cap_drop_all: bool = True
+    no_new_privileges: bool = True
+    pids_limit: int = 256
+    seccomp_profile: str | None = None  # path or "default"
+    apparmor_profile: str | None = None  # profile name
     
     def to_dict(self) -> dict[str, Any]:
         """Convert to dict for hashing"""
@@ -193,6 +201,10 @@ class DockerSandboxConfig:
             "network_mode": self.network_mode,
             "env": self.env,
             "volumes": self.volumes,
+            "read_only_root": self.read_only_root,
+            "cap_drop_all": self.cap_drop_all,
+            "no_new_privileges": self.no_new_privileges,
+            "pids_limit": self.pids_limit,
         }
 
 
@@ -258,6 +270,23 @@ class DockerSandbox:
                 if soft is not None:
                     args.extend(["--ulimit", f"{name}={soft}:{hard}"])
         
+        # Security hardening (mirrors TS createSandboxArgs)
+        if self.config.cap_drop_all:
+            args.extend(["--cap-drop", "ALL"])
+        if self.config.no_new_privileges:
+            args.extend(["--security-opt", "no-new-privileges"])
+        if self.config.read_only_root:
+            args.append("--read-only")
+            # Writable tmpfs for /tmp and /run when root is read-only
+            args.extend(["--tmpfs", "/tmp:rw,noexec,nosuid,size=256m"])
+            args.extend(["--tmpfs", "/run:rw,noexec,nosuid,size=64m"])
+        if self.config.pids_limit > 0:
+            args.extend(["--pids-limit", str(self.config.pids_limit)])
+        if self.config.seccomp_profile:
+            args.extend(["--security-opt", f"seccomp={self.config.seccomp_profile}"])
+        if self.config.apparmor_profile:
+            args.extend(["--security-opt", f"apparmor={self.config.apparmor_profile}"])
+
         # Network
         args.extend(["--network", self.config.network_mode])
         

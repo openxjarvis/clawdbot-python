@@ -92,14 +92,18 @@ class OllamaProvider(LLMProvider):
         """
         client = self.get_client()
         ollama_messages = self._format_messages(messages)
+        num_ctx = kwargs.get("num_ctx") or kwargs.get("context_window")
+        options: dict = {
+            "num_predict": max_tokens,
+            "temperature": kwargs.get("temperature", 0.7),
+        }
+        if num_ctx and isinstance(num_ctx, int) and num_ctx > 0:
+            options["num_ctx"] = num_ctx
         request_data = {
             "model": model or self.model,
             "messages": ollama_messages,
             "stream": True,
-            "options": {
-                "num_predict": max_tokens,
-                "temperature": kwargs.get("temperature", 0.7),
-            },
+            "options": options,
         }
         if kwargs.get("stop"):
             request_data["options"]["stop"] = kwargs["stop"]
@@ -160,15 +164,18 @@ class OllamaProvider(LLMProvider):
             ollama_messages.append({"role": msg.role, "content": msg.content})
 
         try:
-            # Build request
+            num_ctx = kwargs.get("num_ctx") or kwargs.get("context_window")
+            stream_options: dict = {
+                "num_predict": max_tokens,
+                "temperature": kwargs.get("temperature", 0.7),
+            }
+            if num_ctx and isinstance(num_ctx, int) and num_ctx > 0:
+                stream_options["num_ctx"] = num_ctx
             request_data = {
                 "model": self.model,
                 "messages": ollama_messages,
                 "stream": True,
-                "options": {
-                    "num_predict": max_tokens,
-                    "temperature": kwargs.get("temperature", 0.7),
-                },
+                "options": stream_options,
             }
 
             # Stream request

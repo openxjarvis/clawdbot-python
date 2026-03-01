@@ -719,15 +719,19 @@ class SessionsCompactMethod:
             }
 
         transcript_path = get_session_transcript_path(target.canonical_key)
-        archived_path = ""
-        if transcript_path.exists():
-            archive_name = f"{transcript_path.stem}_compaction_{int(time.time() * 1000)}{transcript_path.suffix}"
-            archive_path = transcript_path.parent / archive_name
-            transcript_path.rename(archive_path)
-            archived_path = str(archive_path)
 
         kept_lines = lines[-max_lines:]
-        save_session_transcript(target.canonical_key, "\n".join(kept_lines) + "\n")
+
+        from openclaw.agents.session_lock import acquire_session_write_lock_cached
+        async with acquire_session_write_lock_cached(transcript_path):
+            archived_path = ""
+            if transcript_path.exists():
+                archive_name = f"{transcript_path.stem}_compaction_{int(time.time() * 1000)}{transcript_path.suffix}"
+                archive_path = transcript_path.parent / archive_name
+                transcript_path.rename(archive_path)
+                archived_path = str(archive_path)
+
+            save_session_transcript(target.canonical_key, "\n".join(kept_lines) + "\n")
         
         # Update store: clear token counts, increment compaction count
         def mutator(store_dict: Dict[str, SessionEntry]) -> None:

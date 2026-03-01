@@ -151,8 +151,32 @@ def _convert_pi_event(pi_event: Any, session_id: str) -> Any | None:
 # Tool adapter: openclaw AgentToolBase → pi_agent AgentTool
 # ---------------------------------------------------------------------------
 
-def _wrap_openclaw_tool(oc_tool: Any) -> Any:
-    """Wrap an openclaw tool in a pi_agent.AgentTool-compatible object."""
+# ---------------------------------------------------------------------------
+# Per-session tool loop detection state (mirrors TS getDiagnosticSessionState)
+# ---------------------------------------------------------------------------
+_tool_loop_states: dict[str, Any] = {}
+
+
+def _get_tool_loop_state(session_id: str) -> Any:
+    """Get or create per-session tool loop detection state."""
+    from openclaw.agents.tool_loop_detection import SessionState
+    if session_id not in _tool_loop_states:
+        _tool_loop_states[session_id] = SessionState()
+    return _tool_loop_states[session_id]
+
+
+def clear_tool_loop_state(session_id: str) -> None:
+    """Clear tool loop detection state for a session (e.g. on reset)."""
+    _tool_loop_states.pop(session_id, None)
+
+
+def _wrap_openclaw_tool(oc_tool: Any, session_id: str | None = None) -> Any:
+    """Wrap an openclaw tool in a pi_agent.AgentTool-compatible object.
+
+    When *session_id* is provided, tool loop detection is applied before each
+    invocation — mirroring TS ``wrapToolWithBeforeToolCallHook`` which calls
+    ``detectToolCallLoop`` and ``recordToolCall``.
+    """
     from pi_agent.types import AgentTool, AgentToolResult
     from pi_ai.types import TextContent
 
@@ -171,18 +195,46 @@ def _wrap_openclaw_tool(oc_tool: Any) -> Any:
         signal: asyncio.Event | None = None,
         on_update: Any | None = None,
     ) -> AgentToolResult:
+        # --- Tool loop detection (before_tool_call) ---
+        if session_id:
+            try:
+                from openclaw.agents.tool_loop_detection import (
+                    detect_tool_call_loop,
+                    record_tool_call,
+                    record_tool_call_outcome,
+                    mark_warning_shown,
+                )
+
+                state = _get_tool_loop_state(session_id)
+                detection = detect_tool_call_loop(state, name, args)
+                if detection.stuck:
+                    if detection.warning_key:
+                        mark_warning_shown(state, detection.warning_key)
+                    if detection.level == "critical":
+                        logger.error("Tool loop CRITICAL: %s", detection.message)
+                        record_tool_call(state, name, args)
+                        return AgentToolResult(
+                            content=[TextContent(text=detection.message or "Tool loop detected — blocked")],
+                            details=None,
+                        )
+                    else:
+                        logger.warning("Tool loop WARNING: %s", detection.message)
+                record_tool_call(state, name, args)
+            except Exception as loop_exc:
+                logger.debug("Tool loop detection error: %s", loop_exc)
+
+        # --- Execute the actual tool ---
+        tool_error: Exception | None = None
+        raw_result: Any = None
         try:
             import inspect as _inspect
             _sig = _inspect.signature(oc_tool.execute)
             _params = _sig.parameters
             _kwargs: dict[str, Any] = {}
 
-            # Inject tool_call_id only if the tool accepts it
             if "tool_call_id" in _params:
                 _kwargs["tool_call_id"] = tool_call_id
 
-            # Find the name of the dict/args parameter (may be "params", "args", etc.)
-            # It is the first parameter that isn't self / tool_call_id / signal / on_update.
             _SKIP = {"self", "tool_call_id", "signal", "on_update"}
             _dict_param = next(
                 (n for n in _params if n not in _SKIP),
@@ -191,7 +243,6 @@ def _wrap_openclaw_tool(oc_tool: Any) -> Any:
             if _dict_param is not None:
                 _kwargs[_dict_param] = args
             else:
-                # Fallback: positional
                 _kwargs["params"] = args
 
             if "signal" in _params:
@@ -199,18 +250,36 @@ def _wrap_openclaw_tool(oc_tool: Any) -> Any:
             if "on_update" in _params:
                 _kwargs["on_update"] = on_update
 
-            raw = await oc_tool.execute(**_kwargs)
-            # Convert openclaw AgentToolResult to pi_agent AgentToolResult
-            if hasattr(raw, "content"):
-                content = [TextContent(text=str(c)) for c in raw.content]
-            elif isinstance(raw, str):
-                content = [TextContent(text=raw)]
+            raw_result = await oc_tool.execute(**_kwargs)
+            if hasattr(raw_result, "content"):
+                content = [TextContent(text=str(c)) for c in raw_result.content]
+            elif isinstance(raw_result, str):
+                content = [TextContent(text=raw_result)]
             else:
-                content = [TextContent(text=str(raw))]
-            return AgentToolResult(content=content, details=getattr(raw, "details", None))
+                content = [TextContent(text=str(raw_result))]
+            result = AgentToolResult(content=content, details=getattr(raw_result, "details", None))
         except Exception as exc:
+            tool_error = exc
             logger.error("Tool %r execute error: %s", name, exc, exc_info=True)
-            return AgentToolResult(content=[TextContent(text=f"Error: {exc}")], details=None)
+            result = AgentToolResult(content=[TextContent(text=f"Error: {exc}")], details=None)
+
+        # --- Record tool outcome (after_tool_call) ---
+        if session_id:
+            try:
+                from openclaw.agents.tool_loop_detection import record_tool_call_outcome
+
+                state = _get_tool_loop_state(session_id)
+                record_tool_call_outcome(
+                    state, name,
+                    result=getattr(raw_result, "__dict__", raw_result) if raw_result else None,
+                    outcome="error" if tool_error else "success",
+                    params=args,
+                    error=tool_error,
+                )
+            except Exception as outcome_exc:
+                logger.debug("Tool loop outcome recording error: %s", outcome_exc)
+
+        return result
 
     return AgentTool(
         name=name,

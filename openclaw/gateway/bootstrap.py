@@ -79,6 +79,7 @@ class GatewayBootstrap:
     def __init__(self):
         self.config = None
         self.runtime = None
+        self.provider = None  # legacy alias for self.runtime
         self.session_manager = None
         self.server = None
         self.tool_registry = None
@@ -655,17 +656,41 @@ class GatewayBootstrap:
             logger.warning(f"Heartbeat runner failed: {e}")
         results["steps_completed"] += 1
         
+        # Step 18.5: Initialize QueueManager (mirrors TS command-queue + server-lanes)
+        logger.info("Step 18.5: Initializing QueueManager")
+        try:
+            from openclaw.agents.queuing.queue import QueueManager
+            from openclaw.agents.queuing.lanes import CommandLane
+            self.queue_manager = QueueManager(max_concurrent_per_session=1, max_concurrent_global=10)
+            cfg_dict = _config_as_dict(self.config)
+            agents_defaults = (cfg_dict.get("agents") or {}).get("defaults") or {}
+            main_concurrent = int(agents_defaults.get("maxConcurrent") or 4)
+            subagent_cfg = agents_defaults.get("subagents") or {}
+            subagent_concurrent = int(subagent_cfg.get("maxConcurrent") or 8)
+            cron_concurrent = int((cfg_dict.get("cron") or {}).get("maxConcurrentRuns") or 1)
+            self.queue_manager.set_lane_concurrency(CommandLane.MAIN, main_concurrent)
+            self.queue_manager.set_lane_concurrency(CommandLane.SUBAGENT, subagent_concurrent)
+            self.queue_manager.set_lane_concurrency(CommandLane.CRON, cron_concurrent)
+            logger.info(
+                "QueueManager initialized (main=%d, subagent=%d, cron=%d)",
+                main_concurrent, subagent_concurrent, cron_concurrent,
+            )
+        except Exception as e:
+            logger.warning(f"QueueManager init failed: {e}")
+            self.queue_manager = None
+        results["steps_completed"] += 0.5
+
         # Step 19: Set global handler instances
         logger.info("Step 19: Setting global handler instances")
         try:
             from .handlers import set_global_instances
-            # gateway is created later in Step 22, so pass None here
             set_global_instances(
                 self.session_manager,
                 self.tool_registry,
                 self.channel_manager,
                 self.runtime,
-                None  # wizard_handler will be set after server creation
+                None,  # wizard_handler will be set after server creation
+                queue_manager=self.queue_manager,
             )
         except Exception as e:
             logger.debug(f"Handler globals setup (optional): {e}")

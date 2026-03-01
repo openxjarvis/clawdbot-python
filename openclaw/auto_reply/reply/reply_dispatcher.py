@@ -1,10 +1,13 @@
-"""Reply dispatcher for sending messages back to channels
+"""Reply dispatcher for sending messages back to channels.
+
+Mirrors TypeScript ``openclaw/src/auto-reply/reply/reply-dispatcher.ts``.
 
 Handles:
-- Tool result dispatch
-- Block reply dispatch (streaming)
-- Final reply dispatch
-- Message queueing and sequencing
+- Serialized tool-result / block / final delivery chain
+- ``mark_complete`` to signal no more replies are expected
+- Idle detection: only resolves idle when ``mark_complete`` + no pending messages
+- Module-level dispatcher registry for gateway-restart coordination
+- ``normalize_reply_payload`` — response prefix, heartbeat token strip
 """
 from __future__ import annotations
 
@@ -16,216 +19,260 @@ from typing import Any, Callable, Awaitable
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Heartbeat token — mirrors TS HEARTBEAT_TOKEN / SILENT_REPLY_TOKEN
+# ---------------------------------------------------------------------------
+
+HEARTBEAT_TOKEN = "[[heartbeat]]"
+SILENT_REPLY_TOKEN = "[[silent]]"
+
+
+# ---------------------------------------------------------------------------
+# QueuedMessage
+# ---------------------------------------------------------------------------
+
 @dataclass
 class QueuedMessage:
-    """Queued outbound message"""
-    
-    type: str  # "tool_result", "block", "final"
+    """A single outbound message waiting to be delivered."""
+
+    kind: str  # "tool_result" | "block" | "final"
     content: str
     metadata: dict[str, Any] = field(default_factory=dict)
     tool_call_id: str | None = None
 
 
+# ---------------------------------------------------------------------------
+# Normalize payload — mirrors TS normalizeReplyPayload
+# ---------------------------------------------------------------------------
+
+def normalize_reply_payload(
+    text: str | None,
+    *,
+    response_prefix: str | None = None,
+    strip_heartbeat: bool = True,
+) -> str | None:
+    """Normalize a reply payload before delivery.
+
+    - Strips ``HEARTBEAT_TOKEN`` / ``SILENT_REPLY_TOKEN`` from the text.
+    - Optionally prepends ``response_prefix``.
+    - Returns ``None`` when the resulting text is empty (silent reply).
+
+    Mirrors TS ``normalizeReplyPayload``.
+    """
+    if not text:
+        return None
+    result = text
+    if strip_heartbeat:
+        result = result.replace(HEARTBEAT_TOKEN, "").replace(SILENT_REPLY_TOKEN, "")
+    result = result.strip()
+    if not result:
+        return None
+    if response_prefix:
+        result = response_prefix + result
+    return result
+
+
+# ---------------------------------------------------------------------------
+# ReplyDispatcher
+# ---------------------------------------------------------------------------
+
 class ReplyDispatcher:
+    """Serialized delivery chain for tool / block / final replies.
+
+    Mirrors TS ``ReplyDispatcher``:
+    - All sends go through a single async chain to maintain ordering.
+    - ``mark_complete()`` signals that no more messages will be enqueued.
+    - ``wait_for_idle()`` resolves only after ``mark_complete`` **and** the
+      delivery queue is empty.
     """
-    Reply dispatcher for sending messages to channels
-    
-    Provides:
-    - Message queueing
-    - Streaming support
-    - Tool result dispatch
-    - Error handling
-    """
-    
+
     def __init__(
         self,
-        channel_send_fn: Callable[[str, dict], Awaitable[Any]],
+        channel_send_fn: Callable[..., Awaitable[Any]],
         channel_id: str,
         thread_id: str | None = None,
-    ):
-        """
-        Initialize reply dispatcher
-        
-        Args:
-            channel_send_fn: Function to send message to channel
-            channel_id: Target channel ID
-            thread_id: Optional thread ID
-        """
+        response_prefix: str | None = None,
+    ) -> None:
         self.channel_send_fn = channel_send_fn
         self.channel_id = channel_id
         self.thread_id = thread_id
-        
-        # Message queue
+        self.response_prefix = response_prefix
+
         self._queue: asyncio.Queue[QueuedMessage] = asyncio.Queue()
-        self._processing = False
         self._processor_task: asyncio.Task | None = None
-        
-        # Current message being built (for streaming)
-        self._current_message = ""
-        self._current_metadata: dict[str, Any] = {}
-    
-    async def send_tool_result(
-        self,
-        tool_call_id: str,
-        result: str,
-    ) -> None:
-        """
-        Send tool execution result
-        
-        Args:
-            tool_call_id: Tool call ID
-            result: Tool result
-        """
-        message = QueuedMessage(
-            type="tool_result",
-            content=result,
-            tool_call_id=tool_call_id,
-        )
-        
-        await self._queue.put(message)
-        
-        # Start processor if not running
-        if not self._processing:
-            self._start_processor()
-    
-    async def send_block_reply(
-        self,
-        text: str,
-        metadata: dict[str, Any] | None = None,
-    ) -> None:
-        """
-        Send streaming block reply
-        
-        Accumulates text and sends when threshold reached or final.
-        
-        Args:
-            text: Text block
-            metadata: Optional metadata
-        """
-        self._current_message += text
-        
+        self._processing = False
+        self._completed = False
+        self._idle_event = asyncio.Event()
+        self._pending_count = 0
+
+        # Accumulated streaming buffer
+        self._current_text = ""
+        self._current_meta: dict[str, Any] = {}
+
+    # -----------------------------------------------------------------------
+    # Public send API
+    # -----------------------------------------------------------------------
+
+    async def send_tool_result(self, tool_call_id: str, result: str) -> None:
+        """Enqueue a tool-result message.  Mirrors TS ``sendToolResult``."""
+        await self._enqueue(QueuedMessage(kind="tool_result", content=result, tool_call_id=tool_call_id))
+
+    async def send_block_reply(self, text: str, metadata: dict[str, Any] | None = None) -> None:
+        """Accumulate a streaming block.  Flushes at 500-char threshold."""
+        self._current_text += text
         if metadata:
-            self._current_metadata.update(metadata)
-        
-        # Check if we should flush (simple threshold for now)
-        if len(self._current_message) >= 500:
-            await self._flush_current_message()
-    
-    async def send_final_reply(
-        self,
-        text: str = "",
-        metadata: dict[str, Any] | None = None,
-    ) -> None:
-        """
-        Send final reply
-        
-        Flushes any accumulated message and marks as final.
-        
-        Args:
-            text: Optional final text
-            metadata: Optional metadata
-        """
+            self._current_meta.update(metadata)
+        if len(self._current_text) >= 500:
+            await self._flush(is_final=False)
+
+    async def send_final_reply(self, text: str = "", metadata: dict[str, Any] | None = None) -> None:
+        """Flush accumulated text and mark as final.  Mirrors TS ``sendFinalReply``."""
         if text:
-            self._current_message += text
-        
+            self._current_text += text
         if metadata:
-            self._current_metadata.update(metadata)
-        
-        # Flush
-        await self._flush_current_message(is_final=True)
-    
-    async def _flush_current_message(self, is_final: bool = False) -> None:
-        """Flush current accumulated message"""
-        if not self._current_message:
-            return
-        
-        message = QueuedMessage(
-            type="final" if is_final else "block",
-            content=self._current_message,
-            metadata=self._current_metadata.copy(),
-        )
-        
-        await self._queue.put(message)
-        
-        # Reset
-        self._current_message = ""
-        self._current_metadata = {}
-        
-        # Start processor if not running
-        if not self._processing:
-            self._start_processor()
-    
+            self._current_meta.update(metadata)
+        await self._flush(is_final=True)
+
+    def mark_complete(self) -> None:
+        """Signal that no more messages will be enqueued.
+
+        Mirrors TS ``markComplete``.  ``wait_for_idle`` will resolve once
+        the queue is drained.
+        """
+        self._completed = True
+        self._check_idle()
+
     async def wait_for_idle(self) -> None:
-        """Wait for all queued messages to be sent"""
-        # Wait for queue to be empty
-        await self._queue.join()
-        
-        # Wait for processor to finish
-        if self._processor_task:
-            await self._processor_task
-    
-    def _start_processor(self) -> None:
-        """Start message processor task"""
+        """Wait until ``mark_complete`` is called and all messages are sent.
+
+        Mirrors TS ``waitForIdle``.
+        """
+        await self._idle_event.wait()
+
+    def get_queued_counts(self) -> dict[str, int]:
+        """Return counts per kind.  Mirrors TS ``getQueuedCounts``."""
+        counts: dict[str, int] = {"tool_result": 0, "block": 0, "final": 0}
+        # Iterate current queue snapshot
+        items = list(self._queue._queue)  # type: ignore[attr-defined]
+        for msg in items:
+            counts[msg.kind] = counts.get(msg.kind, 0) + 1
+        return counts
+
+    # -----------------------------------------------------------------------
+    # Internal
+    # -----------------------------------------------------------------------
+
+    async def _flush(self, is_final: bool = False) -> None:
+        if not self._current_text:
+            if is_final:
+                self._check_idle()
+            return
+        normalized = normalize_reply_payload(
+            self._current_text,
+            response_prefix=self.response_prefix if is_final else None,
+        )
+        self._current_text = ""
+        self._current_meta = {}
+        if normalized is None:
+            if is_final:
+                self._check_idle()
+            return
+        await self._enqueue(QueuedMessage(kind="final" if is_final else "block", content=normalized))
+
+    async def _enqueue(self, msg: QueuedMessage) -> None:
+        self._pending_count += 1
+        await self._queue.put(msg)
+        self._ensure_processor()
+
+    def _ensure_processor(self) -> None:
         if self._processor_task and not self._processor_task.done():
             return
-        
         self._processing = True
         self._processor_task = asyncio.create_task(self._process_queue())
-    
+
     async def _process_queue(self) -> None:
-        """Process message queue"""
         try:
             while True:
                 try:
-                    # Get message with timeout
-                    message = await asyncio.wait_for(
-                        self._queue.get(),
-                        timeout=0.5
-                    )
-                    
-                    # Send message
-                    await self._send_message(message)
-                    
-                    # Mark done
-                    self._queue.task_done()
-                    
+                    msg = await asyncio.wait_for(self._queue.get(), timeout=0.5)
                 except asyncio.TimeoutError:
-                    # No messages, check if we should stop
                     if self._queue.empty():
                         break
-                    
-        except Exception as e:
-            logger.error(f"Error processing message queue: {e}", exc_info=True)
-        
+                    continue
+                try:
+                    await self._deliver(msg)
+                finally:
+                    self._queue.task_done()
+                    self._pending_count = max(0, self._pending_count - 1)
+                    self._check_idle()
+        except Exception as exc:
+            logger.error("ReplyDispatcher: queue processor error: %s", exc, exc_info=True)
         finally:
             self._processing = False
-    
-    async def _send_message(self, message: QueuedMessage) -> None:
-        """
-        Send message to channel
-        
-        Args:
-            message: Message to send
-        """
+            self._check_idle()
+
+    async def _deliver(self, msg: QueuedMessage) -> None:
         try:
-            # Build send params
-            params = {
-                "text": message.content,
-                "thread_id": self.thread_id,
-                **message.metadata,
-            }
-            
-            # Add tool_call_id if present
-            if message.tool_call_id:
-                params["tool_call_id"] = message.tool_call_id
-            
-            # Send
+            params: dict[str, Any] = {"text": msg.content}
+            if self.thread_id:
+                params["thread_id"] = self.thread_id
+            if msg.tool_call_id:
+                params["tool_call_id"] = msg.tool_call_id
+            params.update(msg.metadata)
             await self.channel_send_fn(self.channel_id, params)
-            
-            logger.debug(
-                f"Sent {message.type} message: "
-                f"{len(message.content)} chars"
-            )
-            
-        except Exception as e:
-            logger.error(f"Error sending message: {e}", exc_info=True)
+        except Exception as exc:
+            logger.error("ReplyDispatcher: delivery error: %s", exc, exc_info=True)
+
+    def _check_idle(self) -> None:
+        """Resolve the idle event when complete + nothing pending."""
+        if self._completed and self._pending_count == 0 and self._queue.empty():
+            self._idle_event.set()
+
+
+# ---------------------------------------------------------------------------
+# Global dispatcher registry — mirrors TS dispatcher-registry.ts
+# ---------------------------------------------------------------------------
+
+_DISPATCHER_REGISTRY: dict[str, ReplyDispatcher] = {}
+
+
+def register_dispatcher(key: str, dispatcher: ReplyDispatcher) -> None:
+    """Register *dispatcher* under *key* for gateway-restart coordination."""
+    _DISPATCHER_REGISTRY[key] = dispatcher
+
+
+def unregister_dispatcher(key: str) -> None:
+    """Remove the dispatcher for *key*."""
+    _DISPATCHER_REGISTRY.pop(key, None)
+
+
+async def wait_for_all_dispatchers_idle(timeout_ms: int = 30_000) -> None:
+    """Wait for all registered dispatchers to reach idle state.
+
+    Used by the gateway restart sentinel before re-execing the process.
+    Mirrors TS ``waitForDispatchersIdle``.
+    """
+    dispatchers = list(_DISPATCHER_REGISTRY.values())
+    if not dispatchers:
+        return
+    tasks = [asyncio.create_task(d.wait_for_idle()) for d in dispatchers]
+    try:
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=timeout_ms / 1000.0)
+    except asyncio.TimeoutError:
+        logger.warning("wait_for_all_dispatchers_idle: timed out after %dms", timeout_ms)
+    finally:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+
+
+__all__ = [
+    "QueuedMessage",
+    "ReplyDispatcher",
+    "normalize_reply_payload",
+    "register_dispatcher",
+    "unregister_dispatcher",
+    "wait_for_all_dispatchers_idle",
+    "HEARTBEAT_TOKEN",
+    "SILENT_REPLY_TOKEN",
+]

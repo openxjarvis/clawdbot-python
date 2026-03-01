@@ -274,6 +274,51 @@ def get_followup_queue_depth(key: str) -> int:
 # Drain — mirrors TS queue/drain.ts
 # ---------------------------------------------------------------------------
 
+def _has_cross_channel_items(items: list[FollowupRun]) -> bool:
+    """Return True when items originate from multiple channels.
+
+    Mirrors TS ``hasCrossChannelItems`` in ``queue/drain.ts``.
+    """
+    channels: set[str] = set()
+    for item in items:
+        ch = (item.originating_channel or "").strip()
+        to = str((item.originating_to or "")).strip()
+        channels.add(f"{ch}::{to}")
+    return len(channels) > 1
+
+
+def _build_collect_prompt(items: list[FollowupRun], summary_lines: list[str]) -> str:
+    """Build a merged prompt for collect mode.
+
+    Mirrors TS ``buildCollectPrompt`` in ``utils/queue-helpers.ts``.
+    """
+    title = "[Queued messages while agent was busy]"
+    body_parts: list[str] = []
+    if summary_lines:
+        preview = "Dropped messages (summarized):\n" + "\n".join(f"- {s}" for s in summary_lines)
+        body_parts.append(preview)
+    for item in items:
+        body_parts.append(item.prompt.strip())
+    return title + "\n\n" + "\n\n".join(body_parts)
+
+
+async def _wait_for_debounce(queue: "_FollowupQueueState") -> None:
+    """Wait until debounce window has elapsed since the last enqueue.
+
+    Mirrors TS ``waitForQueueDebounce``: waits until
+    ``now - last_enqueued_at >= debounce_ms``, polling every 50 ms.
+    """
+    if queue.debounce_ms <= 0:
+        return
+    deadline_s = queue.debounce_ms / 1000.0
+    while True:
+        elapsed = time.time() - queue.last_enqueued_at / 1000.0
+        remaining = deadline_s - elapsed
+        if remaining <= 0:
+            return
+        await asyncio.sleep(min(remaining, 0.05))
+
+
 def schedule_followup_drain(
     key: str,
     run_followup: Callable[[FollowupRun], Awaitable[None]],
@@ -291,21 +336,19 @@ def schedule_followup_drain(
     async def _drain() -> None:
         try:
             while queue.items or queue.dropped_count > 0:
-                # Debounce
-                if queue.debounce_ms > 0:
-                    await asyncio.sleep(queue.debounce_ms / 1000.0)
+                # Debounce: wait until debounce_ms has passed since last enqueue
+                # (mirrors TS waitForQueueDebounce — NOT a fixed sleep)
+                await _wait_for_debounce(queue)
 
                 if not queue.items:
                     break
 
-                if queue.mode == "collect" and len(queue.items) > 1:
+                cross_channel = _has_cross_channel_items(queue.items)
+
+                if queue.mode == "collect" and len(queue.items) > 1 and not cross_channel:
                     # Collect mode: merge all queued prompts into one run
                     first = queue.items[0]
-                    prompts = [r.prompt for r in queue.items]
-                    summary_prefix = ""
-                    if queue.dropped_count > 0 and queue.summary_lines:
-                        summary_prefix = "Previous messages:\n" + "\n".join(queue.summary_lines) + "\n\n"
-                    merged_prompt = summary_prefix + "\n\n".join(prompts)
+                    merged_prompt = _build_collect_prompt(queue.items, queue.summary_lines)
                     queue.items.clear()
                     queue.dropped_count = 0
                     queue.summary_lines = []
@@ -323,23 +366,24 @@ def schedule_followup_drain(
                     except Exception as exc:
                         logger.warning(f"Followup drain error (collect): {exc}")
                 else:
-                    # Flush summary prefix into a synthetic run if needed
+                    # Individual drain (cross-channel or non-collect mode)
+                    # Flush dropped-item summary into the next run if needed
                     if queue.dropped_count > 0 and queue.summary_lines:
                         summary = "Previous messages:\n" + "\n".join(queue.summary_lines)
                         queue.dropped_count = 0
                         queue.summary_lines = []
                         if queue.items:
-                            # Prepend summary to the next run's prompt
+                            first = queue.items[0]
                             queue.items[0] = FollowupRun(
-                                prompt=summary + "\n\n" + queue.items[0].prompt,
-                                run=queue.items[0].run,
-                                enqueued_at=queue.items[0].enqueued_at,
-                                message_id=queue.items[0].message_id,
-                                summary_line=queue.items[0].summary_line,
-                                originating_channel=queue.items[0].originating_channel,
-                                originating_to=queue.items[0].originating_to,
-                                originating_account_id=queue.items[0].originating_account_id,
-                                originating_thread_id=queue.items[0].originating_thread_id,
+                                prompt=summary + "\n\n" + first.prompt,
+                                run=first.run,
+                                enqueued_at=first.enqueued_at,
+                                message_id=first.message_id,
+                                summary_line=first.summary_line,
+                                originating_channel=first.originating_channel,
+                                originating_to=first.originating_to,
+                                originating_account_id=first.originating_account_id,
+                                originating_thread_id=first.originating_thread_id,
                             )
 
                     if not queue.items:
@@ -352,9 +396,16 @@ def schedule_followup_drain(
                         logger.warning(f"Followup drain error: {exc}")
         finally:
             queue.draining = False
+            # Clean up empty queue
+            if not queue.items and queue.dropped_count == 0:
+                _FOLLOWUP_QUEUES.pop(key, None)
 
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         loop.create_task(_drain())
     except RuntimeError:
-        pass
+        try:
+            loop = asyncio.get_event_loop()
+            loop.create_task(_drain())
+        except RuntimeError:
+            pass

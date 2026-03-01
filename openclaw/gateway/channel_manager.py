@@ -1211,20 +1211,14 @@ class ChannelManager:
                     workspace_root = str(_workspace_root)
                     logger.info(f"[{channel_id}] Session workspace: {session_workspace}")
 
-                # Process through Agent Runtime
-                response_text = ""
-                has_error = False
-
                 # Use BodyForAgent (properly formatted with sender metadata for groups)
                 message_text = ctx.BodyForAgent or ctx.Body
 
-                logger.info(f"[{channel_id}] Starting run_turn with {len(self.tools)} tools")
+                logger.info(f"[{channel_id}] Starting dispatch with {len(self.tools)} tools")
 
                 from openclaw.auto_reply.reply.typing import create_typing_controller
-                from openclaw.events import EventType
 
                 # Wire up typing indicator (mirrors TS bot-message-dispatch.ts)
-                # send_typing() is defined on TelegramChannel; ignore for other channel types.
                 _typing_target = str(message.chat_id)
                 async def _send_typing() -> None:
                     if hasattr(channel, "send_typing"):
@@ -1287,157 +1281,79 @@ class ChannelManager:
                                 f"[{channel_id}] Audio transcription failed: {_audio_err}"
                             )
 
-                # Stream events via run_turn() async generator.
-                # This is the only correct pattern: pi_coding_agent emits events
-                # synchronously into an asyncio.Queue inside run_turn(), so they
-                # are never lost regardless of await scheduling.  The old approach
-                # (AgentSession.subscribe + collect after prompt()) missed every
-                # event because asyncio.ensure_future tasks hadn't run yet.
-                async for event in runtime.run_turn(
-                    session,
-                    message_text,
-                    tools=self.tools,
-                    system_prompt=self.system_prompt,
-                    images=inbound_images,
-                ):
-                    try:
-                        evt_type = getattr(event, "type", "")
-                        event_data: dict = {}
-                        if hasattr(event, "data"):
-                            if event.data is None:
-                                event_data = {}
-                            elif isinstance(event.data, dict):
-                                event_data = event.data
-                            else:
-                                logger.warning(f"[{channel_id}] Unexpected event.data type: {type(event.data)}")
-                                event_data = {}
-
-                        if evt_type in (EventType.TEXT, EventType.TEXT_DELTA, "text", "text_delta"):
-                            text_chunk = event_data.get("text") or event_data.get("delta") or ""
-                            if isinstance(text_chunk, dict):
-                                text_chunk = text_chunk.get("text", "")
-                            text_chunk = str(text_chunk) if text_chunk else ""
-                            if text_chunk:
-                                response_text += text_chunk
-                                logger.debug(f"[{channel_id}] delta: {text_chunk[:80]!r}")
-
-                        elif evt_type in (EventType.ERROR, "error", "agent.error"):
-                            error_msg = event_data.get("message", "Unknown error")
-                            logger.error(f"[{channel_id}] Agent error: {error_msg}")
-                            has_error = True
-
-                        elif evt_type in (EventType.AGENT_FILE_GENERATED, "agent.file_generated"):
-                            file_path = event_data.get("file_path")
-                            file_type = event_data.get("file_type", "document")
-                            caption = event_data.get("caption", "")
-                            if file_path and Path(file_path).exists():
-                                logger.info(f"[{channel_id}] Sending generated file: {file_path}")
-                                try:
-                                    await channel.send_media(
-                                        target=message.chat_id,
-                                        media_url=file_path,
-                                        media_type=file_type,
-                                        caption=caption,
-                                    )
-                                    logger.info(f"[{channel_id}] Sent file: {Path(file_path).name}")
-                                except Exception as e:
-                                    logger.error(f"Failed to send file: {e}", exc_info=True)
-                            else:
-                                logger.warning(f"[{channel_id}] File missing: {file_path}")
-                    except Exception as evt_err:
-                        logger.error(f"[{channel_id}] Event processing error: {evt_err}", exc_info=True)
-                        has_error = True
-                        continue
-
-                logger.info(f"[{channel_id}] Accumulated response length: {len(response_text)}")
-
-                # Agent run finished — stop typing indicator
-                typing_ctrl.mark_run_complete()
-
-                # Parse MEDIA: tokens from response text (mirrors TS splitMediaFromOutput)
-                from openclaw.auto_reply.media_parse import split_media_from_output
-                from openclaw.media.mime import MediaKind, detect_mime, media_kind_from_mime
-
-                media_result = split_media_from_output(response_text)
-                # Use cleaned text (MEDIA: lines removed) as the text to send
-                display_text = media_result.text if media_result.text is not None else response_text
-
-                # Send response back
-                if display_text:
-                    await channel.send_text(
-                        target=message.chat_id,
-                        text=display_text,
-                        reply_to=message.message_id,
-                    )
-                    logger.info(f"📤 [{channel_id}] Sent response to {message.chat_id}")
-
-                # Send any media files found in MEDIA: tokens
-                all_media = []
-                if media_result.media_url:
-                    all_media.append(media_result.media_url)
-                if media_result.media_urls:
-                    all_media.extend(media_result.media_urls)
-                for media_url in all_media:
-                    try:
-                        # Resolve relative paths — try candidates in priority order:
-                        #  1. session workspace  (agent-specific subdirectory)
-                        #  2. workspace root     (main ~/.openclaw/workspace, where
-                        #                         document_gen saves presentations/)
-                        #  3. home-dir expansion (~/ prefix)
-                        resolved_url = media_url
-                        if not media_url.startswith(("http://", "https://", "file://", "/")):
-                            _search_dirs = []
-                            if session_workspace:
-                                _search_dirs.append(Path(session_workspace))
-                            if workspace_root:
-                                _search_dirs.append(Path(workspace_root))
-                            found = False
-                            for _base in _search_dirs:
-                                _candidate = _base / media_url
-                                if _candidate.exists():
-                                    resolved_url = str(_candidate)
-                                    logger.info(f"[{channel_id}] Resolved relative path to: {resolved_url}")
-                                    found = True
-                                    break
-                            if not found:
-                                home_candidate = Path(media_url).expanduser()
-                                if home_candidate.exists():
-                                    resolved_url = str(home_candidate)
-
-                        mime = detect_mime(resolved_url)
-                        kind = media_kind_from_mime(mime)
-                        media_type = kind.value if kind != MediaKind.UNKNOWN else "document"
+                # Build a channel send function for the ReplyContext
+                async def _channel_send(
+                    text: str | None,
+                    target: Any,
+                    *,
+                    reply_to: Any = None,
+                    media_url: str | None = None,
+                    media_type: str | None = None,
+                    **_kw: Any,
+                ) -> None:
+                    if media_url:
                         await channel.send_media(
-                            target=message.chat_id,
-                            media_url=resolved_url,
-                            media_type=media_type,
-                            reply_to=message.message_id,
+                            target=target,
+                            media_url=media_url,
+                            media_type=media_type or "document",
+                            reply_to=reply_to,
                         )
-                        logger.info(f"📎 [{channel_id}] Sent media file: {resolved_url}")
-                    except Exception as media_err:
-                        logger.error(f"[{channel_id}] Failed to send media {media_url}: {media_err}")
+                    elif text:
+                        await channel.send_text(
+                            target=target,
+                            text=text,
+                            reply_to=reply_to,
+                        )
 
-                if not display_text and not all_media:
-                    logger.warning(f"[{channel_id}] No response text generated")
-                    # Send user-visible notification only when no text AND no media
-                    if not has_error:
-                        try:
-                            await channel.send_text(
-                                target=message.chat_id,
-                                text="⚠️ Model returned empty response. Please try rephrasing your question or reducing context length.",
-                                reply_to=message.message_id,
-                            )
-                        except Exception as send_err:
-                            logger.error(f"Failed to send empty response notification: {send_err}")
+                # Resolve session_id for active-run tracking
+                session_id_for_run = session.session_id if session else session_key
 
-                # Dispatch complete — tear down typing indicator
-                typing_ctrl.mark_dispatch_idle()
+                # Resolve queue settings from session entry
+                from openclaw.auto_reply.reply.queue import QueueSettings
+                _queue_settings = QueueSettings()
+                if self.session_manager:
+                    try:
+                        _entry = self.session_manager.get_session_entry(session_key)
+                        if _entry and hasattr(_entry, "queueMode") and _entry.queueMode:
+                            _queue_settings.mode = _entry.queueMode
+                    except Exception:
+                        pass
+
+                # Build ReplyContext and dispatch via pipeline
+                # (steer / enqueue-followup / interrupt / run-now)
+                from openclaw.auto_reply.reply.agent_runner import ReplyContext, run_prepared_reply
+
+                reply_ctx = ReplyContext(
+                    session_id=session_id_for_run,
+                    session_key=session_key,
+                    message_text=message_text,
+                    runtime=runtime,
+                    session=session,
+                    tools=self.tools,
+                    channel_send=_channel_send,
+                    chat_target=message.chat_id,
+                    channel_id=channel_id,
+                    reply_to_id=message.message_id,
+                    queue_settings=_queue_settings,
+                    images=inbound_images,
+                    system_prompt=self.system_prompt,
+                    originating_channel=channel_id,
+                    originating_to=message.chat_id,
+                    typing_ctrl=typing_ctrl,
+                )
+
+                # Fire-and-forget: handler returns immediately.
+                # run_prepared_reply handles steer/queue/run logic and will
+                # call typing_ctrl.mark_run_complete() / mark_dispatch_idle()
+                # on its own when the turn finishes.
+                asyncio.ensure_future(run_prepared_reply(reply_ctx))
 
             except Exception as e:
-                typing_ctrl.cleanup()
-                has_error = True
-                logger.error(f"Error processing message: {e}", exc_info=True)
-                # Optionally send error message
+                try:
+                    typing_ctrl.cleanup()
+                except Exception:
+                    pass
+                logger.error(f"Error dispatching message: {e}", exc_info=True)
                 try:
                     await channel.send_text(
                         target=message.chat_id,

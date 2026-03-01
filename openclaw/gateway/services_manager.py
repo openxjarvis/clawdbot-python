@@ -3,9 +3,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
+import sys
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -116,13 +118,42 @@ class ServicesManager:
         logger.info("✅ Gateway services stopped")
     
     async def _handle_restart(self) -> None:
-        """Handle restart request"""
+        """Handle restart request — mirrors TS run-loop.ts SIGUSR1 handler.
+
+        Steps:
+        1. Mark gateway as draining (reject new enqueues).
+        2. Wait for active tasks to finish (30s timeout).
+        3. Reset all lanes.
+        4. Stop services, then re-exec the process.
+        """
         logger.info("Restart requested, initiating graceful restart...")
-        # TODO: Implement actual restart logic
-        # This would typically:
-        # 1. Save state
-        # 2. Stop services
-        # 3. Re-exec process
+
+        # Step 1+2: Drain queues
+        try:
+            from openclaw.agents.queuing.queue import QueueManager
+            from openclaw.gateway.handlers import _queue_manager
+
+            if _queue_manager is not None:
+                _queue_manager.mark_gateway_draining()
+                drain_result = await _queue_manager.wait_for_active_tasks(timeout_ms=30_000)
+                if drain_result.get("drained"):
+                    logger.info("All active tasks drained before restart")
+                else:
+                    logger.warning("Timed out waiting for active tasks — proceeding with restart")
+                _queue_manager.reset_all_lanes()
+                _queue_manager.unmark_gateway_draining()
+        except Exception as exc:
+            logger.warning("Queue drain during restart failed: %s", exc)
+
+        # Step 3: Stop services
+        await self.stop_services()
+
+        # Step 4: Re-exec process
+        logger.info("Re-executing process for in-place restart...")
+        try:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception as exc:
+            logger.error("Re-exec failed: %s — falling back to in-process restart", exc)
 
 
 __all__ = ["ServicesManager", "RestartSentinel", "InternalHooksManager"]

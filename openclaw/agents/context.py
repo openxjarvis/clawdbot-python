@@ -1137,4 +1137,26 @@ __all__ = [
     "CONTEXT_WINDOW_WARN_BELOW_TOKENS",
     "CHARS_PER_TOKEN_ESTIMATE",
     "TOKEN_BUFFER_RATIO",
+    "scrub_anthropic_refusal_magic",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Anthropic Refusal Magic Scrub — mirrors TS scrubAnthropicRefusalMagic()
+# ---------------------------------------------------------------------------
+
+# The exact trigger string that Anthropic models sometimes embed in training
+# data and that causes false-positive refusals when echoed back.
+_ANTHROPIC_MAGIC_TRIGGER = "Human: "
+_ANTHROPIC_MAGIC_REPLACEMENT = "H: "
+
+
+def scrub_anthropic_refusal_magic(prompt: str) -> str:
+    """Remove known Anthropic refusal-trigger strings from a prompt.
+
+    Mirrors TS ``scrubAnthropicRefusalMagic()`` in run.ts.
+    Only modifies the prompt when the trigger is present.
+    """
+    if _ANTHROPIC_MAGIC_TRIGGER not in prompt:
+        return prompt
+    return prompt.replace(_ANTHROPIC_MAGIC_TRIGGER, _ANTHROPIC_MAGIC_REPLACEMENT)

@@ -20,6 +20,14 @@ from .subagent_registry_store import (
 
 logger = logging.getLogger(__name__)
 
+# Mirrors TS LIFECYCLE_ERROR_RETRY_GRACE_MS
+LIFECYCLE_ERROR_RETRY_GRACE_MS = 15_000
+# Announce retry constants — aligned with TS subagent-registry.ts
+MIN_ANNOUNCE_RETRY_DELAY_MS = 1_000
+MAX_ANNOUNCE_RETRY_DELAY_MS = 8_000
+MAX_ANNOUNCE_RETRY_COUNT = 3
+ANNOUNCE_EXPIRY_MS = 5 * 60_000  # 5 min
+
 
 @dataclass
 class SubagentRunRecord:
@@ -70,6 +78,9 @@ class SubagentRegistry:
         self._event_listeners: dict[str, list[asyncio.Event]] = {}
         self._lock = asyncio.Lock()
         self._config = config or {}
+        self._lifecycle_listener_installed = False
+        # Pending lifecycle errors with grace period (mirrors TS schedulePendingLifecycleError)
+        self._pending_lifecycle_errors: dict[str, asyncio.TimerHandle | asyncio.Task] = {}
     
     def _resolve_archive_after_ms(self) -> int | None:
         """
@@ -151,6 +162,76 @@ class SubagentRegistry:
         
         return record
     
+    # ------------------------------------------------------------------
+    # Lifecycle event listener — mirrors TS ensureLifecycleListener/onAgentEvent
+    # ------------------------------------------------------------------
+
+    def ensure_lifecycle_listener(self, gateway: Any) -> None:
+        """Install a lifecycle event listener on the gateway.
+
+        When the gateway emits ``agent`` lifecycle events (start, error, end),
+        this handler updates the corresponding SubagentRunRecord.  A 15-second
+        grace period is used for transient errors before treating them as
+        terminal, matching the TS ``LIFECYCLE_ERROR_RETRY_GRACE_MS``.
+        """
+        if self._lifecycle_listener_installed:
+            return
+        self._lifecycle_listener_installed = True
+
+        async def _on_lifecycle(event_data: dict[str, Any]) -> None:
+            run_id = event_data.get("runId")
+            phase = event_data.get("phase")
+            if not run_id or not phase:
+                return
+            entry = self._runs.get(run_id)
+            if not entry:
+                return
+
+            if phase == "start":
+                # Clear any pending lifecycle error since the run actually started
+                pending = self._pending_lifecycle_errors.pop(run_id, None)
+                if pending and hasattr(pending, "cancel"):
+                    pending.cancel()
+                entry.started_at = int(time.time() * 1000)
+                self._persist()
+
+            elif phase == "error":
+                reason = event_data.get("reason", "unknown")
+                # Schedule a pending lifecycle error with grace period
+                pending = self._pending_lifecycle_errors.pop(run_id, None)
+                if pending and hasattr(pending, "cancel"):
+                    pending.cancel()
+
+                async def _fire_lifecycle_error() -> None:
+                    await asyncio.sleep(LIFECYCLE_ERROR_RETRY_GRACE_MS / 1000.0)
+                    self._pending_lifecycle_errors.pop(run_id, None)
+                    # Re-check: if run ended normally in the meantime, skip
+                    re_entry = self._runs.get(run_id)
+                    if re_entry and re_entry.ended_at is None:
+                        self.mark_subagent_ended(run_id, outcome={"status": "error", "error": reason})
+                        logger.warning(
+                            "Subagent %s ended via lifecycle error (after %dms grace): %s",
+                            run_id, LIFECYCLE_ERROR_RETRY_GRACE_MS, reason,
+                        )
+
+                self._pending_lifecycle_errors[run_id] = asyncio.create_task(_fire_lifecycle_error())
+
+            elif phase == "end":
+                # Clear pending error and mark completed
+                pending = self._pending_lifecycle_errors.pop(run_id, None)
+                if pending and hasattr(pending, "cancel"):
+                    pending.cancel()
+                if entry.ended_at is None:
+                    self.mark_subagent_ended(run_id, outcome={"status": "completed"})
+
+        # Register listener on gateway
+        if hasattr(gateway, "add_lifecycle_listener"):
+            gateway.add_lifecycle_listener(_on_lifecycle)
+        elif hasattr(gateway, "on"):
+            gateway.on("agent_lifecycle", _on_lifecycle)
+        else:
+            logger.debug("Gateway does not support lifecycle listener registration")
+
     async def wait_for_subagent_completion(
         self,
         run_id: str,

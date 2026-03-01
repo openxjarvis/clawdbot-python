@@ -45,11 +45,70 @@ from .update_offset_store import (
 
 logger = logging.getLogger(__name__)
 
-# Exponential backoff config for Conflict errors — mirrors TS monitor.ts
-_CONFLICT_BACKOFF_INITIAL = 2.0   # seconds
-_CONFLICT_BACKOFF_MAX = 30.0      # seconds
-_CONFLICT_BACKOFF_FACTOR = 1.8
-_CONFLICT_MAX_RETRY_TIME = 5 * 60 # 5 minutes total
+# Reconnect policy — mirrors TS TELEGRAM_POLL_RESTART_POLICY
+_POLL_BACKOFF_INITIAL = 2.0       # seconds (TS initialMs: 2000)
+_POLL_BACKOFF_MAX = 30.0          # seconds (TS maxMs: 30000)
+_POLL_BACKOFF_FACTOR = 1.8        # TS factor: 1.8
+_POLL_JITTER = 0.25               # TS jitter: 0.25
+_MAX_RETRY_TIME_S = 60 * 60       # 1 hour (TS maxRetryTime: 60 min)
+_POLL_TIMEOUT_S = 30              # matches TS grammY fetch.timeout: 30
+_HEALTH_CHECK_INTERVAL_S = 60     # health check interval
+_HEALTH_CHECK_TIMEOUT_S = 15      # get_me() timeout
+_HEALTH_MAX_FAILURES = 3          # consecutive failures before forced restart
+
+# Backwards-compat aliases used in existing code
+_CONFLICT_BACKOFF_INITIAL = _POLL_BACKOFF_INITIAL
+_CONFLICT_BACKOFF_MAX = _POLL_BACKOFF_MAX
+_CONFLICT_BACKOFF_FACTOR = _POLL_BACKOFF_FACTOR
+_CONFLICT_MAX_RETRY_TIME = 5 * 60
+
+
+# ---------------------------------------------------------------------------
+# Network error classification — mirrors TS isRecoverableTelegramNetworkError
+# ---------------------------------------------------------------------------
+
+_RECOVERABLE_ERROR_CODES = frozenset({
+    "ECONNRESET", "ECONNREFUSED", "EPIPE", "ETIMEDOUT",
+    "ESOCKETTIMEDOUT", "ENETUNREACH", "EHOSTUNREACH",
+    "ENOTFOUND", "ECONNABORTED",
+})
+
+_RECOVERABLE_ERROR_NAMES = frozenset({
+    "AbortError", "TimeoutError", "ConnectTimeoutError",
+    "RequestError", "FetchError",
+})
+
+_RECOVERABLE_MSG_FRAGMENTS = (
+    "network error", "socket hang up", "timeout", "econnreset",
+    "undici", "fetch failed", "ETIMEDOUT", "ECONNREFUSED",
+    "ENOTFOUND", "read ECONNRESET", "write EPIPE",
+)
+
+
+def _is_recoverable_network_error(exc: BaseException) -> bool:
+    """Return True when *exc* looks like a transient network error.
+
+    Mirrors TS ``isRecoverableTelegramNetworkError``.
+    """
+    import telegram.error as tg_err
+
+    if isinstance(exc, (tg_err.NetworkError, tg_err.TimedOut)):
+        return True
+
+    msg = str(exc).lower()
+    name = type(exc).__name__
+
+    if name in _RECOVERABLE_ERROR_NAMES:
+        return True
+    if any(frag.lower() in msg for frag in _RECOVERABLE_MSG_FRAGMENTS):
+        return True
+
+    # Recurse into cause chain (mirrors TS recursive inspection)
+    cause = getattr(exc, "__cause__", None) or getattr(exc, "__context__", None)
+    if cause is not None and cause is not exc:
+        return _is_recoverable_network_error(cause)
+
+    return False
 
 
 class TelegramChannel(ChannelPlugin):
@@ -306,14 +365,22 @@ class TelegramChannel(ChannelPlugin):
         )
 
         self._running = True
-        self._conflict_backoff = _CONFLICT_BACKOFF_INITIAL
+        self._conflict_backoff = _POLL_BACKOFF_INITIAL
+        # Launch background health monitor
+        self._health_monitor_task: asyncio.Task | None = asyncio.create_task(
+            self._run_health_monitor()
+        )
         logger.info("Telegram channel started")
 
     async def stop(self) -> None:
         """Stop Telegram bot"""
+        self._running = False
         self._conflict_recovery_in_progress = False
         if self._conflict_retry_task and not self._conflict_retry_task.done():
             self._conflict_retry_task.cancel()
+        health_task = getattr(self, "_health_monitor_task", None)
+        if health_task and not health_task.done():
+            health_task.cancel()
         if self._app:
             logger.info("Stopping Telegram channel...")
             try:
@@ -328,11 +395,10 @@ class TelegramChannel(ChannelPlugin):
     async def _handle_polling_error(
         self, update: object, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """PTB global error handler — mirrors TS monitor.ts conflict detection.
+        """PTB global error handler — mirrors TS monitor.ts error handling.
 
-        On a 409 Conflict (another getUpdates call is active), we stop polling
-        and schedule a restart with exponential backoff so we don't hammer the
-        API or block indefinitely.
+        Handles Conflict (409), recoverable network errors, and unknown errors
+        with appropriate restart / retry strategies.
         """
         import telegram.error as tg_err
 
@@ -346,45 +412,79 @@ class TelegramChannel(ChannelPlugin):
                 return
             logger.warning(
                 "Telegram Conflict (another bot instance is polling): %s — "
-                "retrying in %.1fs (backoff)",
+                "restarting with backoff",
                 exc,
-                self._conflict_backoff,
             )
-            # Cancel any previous retry task before scheduling a new one
-            if self._conflict_retry_task and not self._conflict_retry_task.done():
-                self._conflict_retry_task.cancel()
-            self._conflict_retry_task = asyncio.create_task(
-                self._restart_polling_after_conflict()
-            )
-        elif isinstance(exc, tg_err.NetworkError):
-            logger.warning("Telegram network error (will auto-retry): %s", exc)
-        elif isinstance(exc, tg_err.TimedOut):
-            logger.debug("Telegram request timed out (will auto-retry): %s", exc)
-        else:
-            logger.error("Unhandled Telegram error: %s", exc, exc_info=exc)
+            self._schedule_polling_restart(reason="conflict")
 
-    async def _restart_polling_after_conflict(self) -> None:
-        """Stop polling, wait with exponential backoff, then resume."""
+        elif _is_recoverable_network_error(exc):
+            # Network errors are transient — force a polling restart
+            # (mirrors TS unhandled-rejection handler for network errors)
+            logger.warning("Telegram recoverable network error — scheduling restart: %s", exc)
+            self._schedule_polling_restart(reason="network")
+
+        elif isinstance(exc, tg_err.TimedOut):
+            logger.debug("Telegram request timed out (auto-retry by PTB): %s", exc)
+
+        elif isinstance(exc, tg_err.InvalidToken):
+            logger.critical("Telegram InvalidToken — will not retry: %s", exc)
+
+        else:
+            logger.error("Unhandled Telegram error: %s", exc, exc_info=True)
+
+    def _schedule_polling_restart(self, reason: str = "unknown") -> None:
+        """Schedule a polling restart, cancelling any in-progress restart."""
+        if self._conflict_recovery_in_progress:
+            return
+        if self._conflict_retry_task and not self._conflict_retry_task.done():
+            self._conflict_retry_task.cancel()
+        self._conflict_retry_task = asyncio.create_task(
+            self._restart_polling_after_conflict(reason=reason)
+        )
+
+    async def _restart_polling_after_conflict(self, reason: str = "unknown") -> None:
+        """Stop polling, wait with exponential backoff, then resume.
+
+        Mirrors TS ``runPollingCycle`` restart logic with
+        ``TELEGRAM_POLL_RESTART_POLICY``.
+        """
         if self._conflict_recovery_in_progress:
             return
         self._conflict_recovery_in_progress = True
         try:
+            import random
             wait = self._conflict_backoff
-            # Increase backoff for the next conflict (capped)
+            jitter = wait * _POLL_JITTER * (2 * random.random() - 1)
+            wait_with_jitter = max(0.5, wait + jitter)
+
+            # Increase backoff for the next failure (capped)
             self._conflict_backoff = min(
-                self._conflict_backoff * _CONFLICT_BACKOFF_FACTOR,
-                _CONFLICT_BACKOFF_MAX,
+                self._conflict_backoff * _POLL_BACKOFF_FACTOR,
+                _POLL_BACKOFF_MAX,
             )
-            logger.info("Pausing polling for %.1fs before restart", wait)
-            await asyncio.sleep(wait)
+            logger.info(
+                "Polling restart (%s): pausing %.1fs before retry",
+                reason,
+                wait_with_jitter,
+            )
+            await asyncio.sleep(wait_with_jitter)
 
             if not self._running or self._app is None:
                 return
 
+            # Persist current update offset before stopping
+            if self._account_id and self._app.updater:
+                try:
+                    current_offset = getattr(self._app.updater, "_last_update_id", None)
+                    if current_offset is not None and current_offset > 0:
+                        write_telegram_update_offset(self._account_id, current_offset)
+                except Exception:
+                    pass
+
             try:
                 await self._app.updater.stop()
-            except Exception as exc:
-                logger.debug("Updater stop during conflict recovery: %s", exc)
+            except Exception as stop_exc:
+                logger.debug("Updater stop during restart (%s): %s", reason, stop_exc)
 
             try:
                 await self._app.updater.start_polling(
@@ -392,17 +492,51 @@ class TelegramChannel(ChannelPlugin):
                     drop_pending_updates=False,
                 )
                 # Reset backoff on successful restart
-                self._conflict_backoff = _CONFLICT_BACKOFF_INITIAL
-                logger.info("Polling restarted after conflict backoff")
-            except Exception as exc:
-                logger.error("Failed to restart polling: %s", exc)
+                self._conflict_backoff = _POLL_BACKOFF_INITIAL
+                logger.info("Polling restarted after %s (backoff reset)", reason)
+            except Exception as start_exc:
+                logger.error("Failed to restart polling (%s): %s", reason, start_exc)
                 self._conflict_recovery_in_progress = False
-                # Schedule another retry
-                self._conflict_retry_task = asyncio.create_task(
-                    self._restart_polling_after_conflict()
-                )
+                self._schedule_polling_restart(reason=reason)
         finally:
             self._conflict_recovery_in_progress = False
+
+    async def _run_health_monitor(self) -> None:
+        """Periodically check that the bot is reachable.
+
+        Mirrors TS EnhancedTelegramChannel health check: calls ``get_me()``
+        every ``_HEALTH_CHECK_INTERVAL_S`` seconds.  After
+        ``_HEALTH_MAX_FAILURES`` consecutive failures, forces a polling
+        restart.
+        """
+        failures = 0
+        while self._running and self._app is not None:
+            try:
+                await asyncio.sleep(_HEALTH_CHECK_INTERVAL_S)
+                if not self._running or self._app is None:
+                    break
+                await asyncio.wait_for(
+                    self._app.bot.get_me(),
+                    timeout=_HEALTH_CHECK_TIMEOUT_S,
+                )
+                failures = 0  # reset on success
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                failures += 1
+                logger.warning(
+                    "Telegram health check failed (%d/%d): %s",
+                    failures,
+                    _HEALTH_MAX_FAILURES,
+                    exc,
+                )
+                if failures >= _HEALTH_MAX_FAILURES:
+                    logger.error(
+                        "Telegram health check failed %d times — forcing polling restart",
+                        failures,
+                    )
+                    failures = 0
+                    self._schedule_polling_restart(reason="health-check-failure")
 
     async def send_typing(self, target: str) -> None:
         """Send a 'typing…' chat action to show the bot is processing."""

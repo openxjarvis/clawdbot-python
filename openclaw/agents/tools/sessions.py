@@ -322,6 +322,15 @@ class SessionsSpawnTool(AgentTool):
                     "enum": ["delete", "keep"],
                     "description": "Whether to delete the session after the run completes. Default: 'keep'.",
                 },
+                "mode": {
+                    "type": "string",
+                    "enum": ["run", "session"],
+                    "description": "Spawn mode: 'run' (default, fire-and-forget) or 'session' (thread-bound, stays active).",
+                },
+                "thread": {
+                    "type": "boolean",
+                    "description": "Bind spawn to a thread (only for mode='session'). Default: false.",
+                },
             },
             "required": ["task"],
         }
@@ -339,6 +348,10 @@ class SessionsSpawnTool(AgentTool):
         cleanup = params.get("cleanup", "keep")
         if cleanup not in ("delete", "keep"):
             cleanup = "keep"
+        mode = params.get("mode", "run")
+        if mode not in ("run", "session"):
+            mode = "run"
+        thread = bool(params.get("thread", False))
         run_timeout_seconds = params.get("runTimeoutSeconds")
         if run_timeout_seconds is not None:
             try:

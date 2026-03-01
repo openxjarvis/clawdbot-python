@@ -47,6 +47,7 @@ _channel_registry: Any | None = None
 _agent_runtime: Any | None = None
 _wizard_handler: Any | None = None
 _plugin_manager: Any | None = None
+_queue_manager: Any | None = None
 
 RESET_COMMAND_RE = re.compile(r"^/(new|reset)(?:\s+([\s\S]*))?$", re.IGNORECASE)
 BARE_SESSION_RESET_PROMPT = (
@@ -59,15 +60,16 @@ BARE_SESSION_RESET_PROMPT = (
 )
 
 
-def set_global_instances(session_manager, tool_registry, channel_registry, agent_runtime, wizard_handler=None):
+def set_global_instances(session_manager, tool_registry, channel_registry, agent_runtime, wizard_handler=None, queue_manager=None):
     """Set global instances for handlers to use"""
-    global _session_manager, _tool_registry, _channel_registry, _agent_runtime, _wizard_handler, _plugin_manager
+    global _session_manager, _tool_registry, _channel_registry, _agent_runtime, _wizard_handler, _plugin_manager, _queue_manager
     _session_manager = session_manager
     _tool_registry = tool_registry
     _channel_registry = channel_registry
     _agent_runtime = agent_runtime
     _wizard_handler = wizard_handler
     _plugin_manager = None
+    _queue_manager = queue_manager
 
 
 def _get_current_config() -> dict:
@@ -497,10 +499,30 @@ async def handle_agent(connection: Any, params: dict[str, Any]) -> dict[str, Any
     if dedupe_key and gateway is not None:
         gateway.agent_dedupe[dedupe_key] = accepted
 
-    # Launch background agent turn and stream events
-    task = asyncio.create_task(
-        _run_agent_turn(connection, run_id, session, message, tools, model, images=images)
-    )
+    # Launch background agent turn via queue lanes (mirrors TS nested enqueue pattern)
+    async def _agent_task() -> None:
+        await _run_agent_turn(
+            connection, run_id, session, message, tools, model,
+            images=images, extra_system_prompt=extra_system_prompt,
+        )
+
+    if _queue_manager is not None:
+        from openclaw.agents.queuing.lanes import CommandLane
+
+        session_lane_key = session_key or session_id or run_id
+        if lane == "subagent":
+            resolved_lane = CommandLane.SUBAGENT
+        elif lane == "cron":
+            resolved_lane = CommandLane.CRON
+        elif lane == "nested":
+            resolved_lane = CommandLane.NESTED
+        else:
+            resolved_lane = CommandLane.MAIN
+        task = asyncio.create_task(
+            _queue_manager.enqueue_session_then_lane(session_lane_key, resolved_lane, _agent_task)
+        )
+    else:
+        task = asyncio.create_task(_agent_task())
 
     if gateway is not None:
         if not hasattr(gateway, "active_runs"):
@@ -554,6 +576,7 @@ async def _run_agent_turn(
     model: Any,
     *,
     images: list[dict[str, Any]] | None = None,
+    extra_system_prompt: str | None = None,
 ) -> None:
     """Execute agent turn and stream events — matches TS agentCommand fire-and-forget."""
     seq = 0
@@ -577,6 +600,12 @@ async def _run_agent_turn(
         run_kwargs: dict[str, Any] = {}
         if images:
             run_kwargs["images"] = images
+        if extra_system_prompt:
+            run_kwargs["system_prompt"] = extra_system_prompt
+        run_kwargs["run_id"] = run_id
+        session_key_for_run = getattr(session, "session_key", None) or getattr(session, "session_id", None)
+        if session_key_for_run:
+            run_kwargs["session_key"] = session_key_for_run
         async for event in _agent_runtime.run_turn(session, message, tools, model, **run_kwargs):
             evt_type = getattr(event, "type", "")
             stream = "assistant"

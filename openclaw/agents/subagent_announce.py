@@ -579,6 +579,36 @@ async def run_subagent_announce_flow(
     return did_announce
 
 
+# ---------------------------------------------------------------------------
+# Transient / permanent error classification — mirrors TS subagent-announce.ts
+# ---------------------------------------------------------------------------
+
+_PERMANENT_ERROR_PATTERNS = [
+    "unsupported channel", "chat not found", "user not found",
+    "session not found", "forbidden", "unauthorized",
+]
+_TRANSIENT_ERROR_PATTERNS = [
+    "unavailable", "gateway timeout", "econnreset", "etimedout",
+    "epipe", "econnrefused", "network", "internal server error",
+    "service unavailable",
+]
+
+# Retry delays aligned with TS DIRECT_ANNOUNCE_TRANSIENT_RETRY_DELAYS_MS
+_DIRECT_ANNOUNCE_RETRY_DELAYS_S = [5.0, 10.0, 20.0]
+
+
+def _classify_delivery_error(err: str) -> str:
+    """Return 'permanent', 'transient', or 'unknown'."""
+    lower = err.lower()
+    for pat in _PERMANENT_ERROR_PATTERNS:
+        if pat in lower:
+            return "permanent"
+    for pat in _TRANSIENT_ERROR_PATTERNS:
+        if pat in lower:
+            return "transient"
+    return "unknown"
+
+
 async def _deliver_subagent_announcement(
     *,
     requester_session_key: str,
@@ -589,47 +619,82 @@ async def _deliver_subagent_announcement(
     expects_completion_message: bool,
     gateway: Any = None,
 ) -> dict[str, Any]:
-    """
-    Deliver announcement to requester session.
-    
-    Simplified version of TS deliverSubagentAnnouncement.
-    
-    Returns:
-        {"delivered": bool, "path": str, "error": str | None}
+    """Deliver announcement to requester session.
+
+    Mirrors TS ``runSubagentAnnounceDispatch`` with two strategies:
+    - ``expects_completion_message=True``:  direct first, queue fallback.
+    - ``expects_completion_message=False``: queue first, direct fallback.
+
+    Direct delivery retries transient errors with exponential backoff
+    (5s, 10s, 20s) matching TS ``DIRECT_ANNOUNCE_TRANSIENT_RETRY_DELAYS_MS``.
     """
     if not gateway:
         return {"delivered": False, "path": "none", "error": "No gateway"}
-    
-    try:
-        # Direct delivery (simplified - mirrors TS sendSubagentAnnounceDirectly)
+
+    async def _try_direct() -> dict[str, Any]:
+        """Attempt direct delivery via handle_agent with transient retry."""
         from openclaw.gateway.handlers import handle_agent
-        
+
         mock_connection = type("MockConnection", (), {"gateway": gateway})()
-        
-        agent_params = {
+        agent_params: dict[str, Any] = {
             "message": trigger_message,
             "sessionKey": requester_session_key,
             "deliver": not requester_is_subagent,
         }
-        
-        # Add origin info for non-subagent requesters
         if not requester_is_subagent and requester_origin:
-            if requester_origin.get("channel"):
-                agent_params["channel"] = requester_origin["channel"]
-            if requester_origin.get("to"):
-                agent_params["to"] = requester_origin["to"]
-            if requester_origin.get("accountId"):
-                agent_params["accountId"] = requester_origin["accountId"]
-            if requester_origin.get("threadId"):
-                agent_params["threadId"] = str(requester_origin["threadId"])
-        
-        await handle_agent(mock_connection, agent_params)
-        
-        return {"delivered": True, "path": "direct"}
-    
-    except Exception as err:
-        return {
-            "delivered": False,
-            "path": "direct",
-            "error": str(err),
-        }
+            for k in ("channel", "to", "accountId", "threadId"):
+                val = requester_origin.get(k)
+                if val:
+                    agent_params[k] = str(val)
+
+        last_error: str | None = None
+        for attempt_idx in range(1 + len(_DIRECT_ANNOUNCE_RETRY_DELAYS_S)):
+            try:
+                await handle_agent(mock_connection, agent_params)
+                return {"delivered": True, "path": "direct"}
+            except Exception as exc:
+                last_error = str(exc)
+                kind = _classify_delivery_error(last_error)
+                if kind == "permanent":
+                    return {"delivered": False, "path": "direct", "error": last_error}
+                if attempt_idx < len(_DIRECT_ANNOUNCE_RETRY_DELAYS_S):
+                    delay = _DIRECT_ANNOUNCE_RETRY_DELAYS_S[attempt_idx]
+                    logger.warning(
+                        "Announce direct delivery transient error (attempt %d): %s — retrying in %.0fs",
+                        attempt_idx + 1, last_error, delay,
+                    )
+                    await asyncio.sleep(delay)
+        return {"delivered": False, "path": "direct", "error": last_error}
+
+    async def _try_queue() -> dict[str, Any]:
+        """Attempt queue-based delivery (steer/enqueue into session)."""
+        try:
+            from openclaw.gateway.handlers import handle_agent
+
+            mock_connection = type("MockConnection", (), {"gateway": gateway})()
+            agent_params: dict[str, Any] = {
+                "message": trigger_message,
+                "sessionKey": requester_session_key,
+                "deliver": False,
+            }
+            await handle_agent(mock_connection, agent_params)
+            return {"delivered": True, "path": "queued"}
+        except Exception as exc:
+            return {"delivered": False, "path": "queued", "error": str(exc)}
+
+    # Dispatch strategy — mirrors TS subagent-announce-dispatch.ts
+    if expects_completion_message:
+        # Direct first, queue fallback
+        result = await _try_direct()
+        if result.get("delivered"):
+            return result
+        fallback = await _try_queue()
+        if fallback.get("delivered"):
+            return fallback
+        return result  # return original direct error
+    else:
+        # Queue first, direct fallback
+        result = await _try_queue()
+        if result.get("delivered"):
+            return result
+        return await _try_direct()

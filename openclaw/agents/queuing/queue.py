@@ -27,6 +27,10 @@ DropPolicy = Literal["old", "new", "summarize"]
 DEFAULT_WARN_AFTER_MS: int = 2_000
 
 
+class GatewayDrainingError(RuntimeError):
+    """Raised when the gateway is draining and rejecting new enqueues."""
+
+
 class QueueManager:
     """
     Manage session and global execution lanes
@@ -38,19 +42,13 @@ class QueueManager:
     """
 
     def __init__(self, max_concurrent_per_session: int = 1, max_concurrent_global: int = 10):
-        """
-        Initialize queue manager
-
-        Args:
-            max_concurrent_per_session: Max concurrent per session
-            max_concurrent_global: Max concurrent globally
-        """
         self.max_concurrent_per_session = max_concurrent_per_session
         self.max_concurrent_global = max_concurrent_global
 
         self._session_lanes: dict[str, Lane] = {}
         self._global_lane = Lane("global", max_concurrent_global)
-        
+        self._gateway_draining = False
+
         # Fixed lanes with predefined concurrency (aligned with TS)
         self._fixed_lanes: dict[CommandLane, Lane] = {
             CommandLane.MAIN: Lane(CommandLane.MAIN.value, LANE_DEFAULTS[CommandLane.MAIN]),
@@ -102,21 +100,9 @@ class QueueManager:
         on_wait: Callable[[int, int], None] | None = None,
         drop_policy: DropPolicy | None = None,
     ) -> T:
-        """
-        Enqueue task in a specific command lane.
-
-        Args:
-            lane: CommandLane enum value.
-            task: Async function to execute.
-            timeout: Optional timeout in seconds.
-            warn_after_ms: Log a warning if the task waits longer than this (default 2s).
-            on_wait: Optional callback ``(wait_ms, queued_ahead)`` fired when warn threshold exceeded.
-            drop_policy: How to handle overload: 'old' drops oldest, 'new' rejects this task,
-                         'summarize' merges into a backlog message.
-
-        Returns:
-            Task result.
-        """
+        """Enqueue task in a specific command lane."""
+        if self._gateway_draining:
+            raise GatewayDrainingError("Gateway is draining, rejecting new enqueue")
         lane_instance = self.get_lane(lane)
         enqueued_at = time.monotonic()
 
@@ -170,20 +156,9 @@ class QueueManager:
         on_wait: Callable[[int, int], None] | None = None,
         drop_policy: DropPolicy | None = None,
     ) -> T:
-        """
-        Enqueue task in session lane.
-
-        Args:
-            session_id: Session identifier.
-            task: Async function to execute.
-            timeout: Optional timeout in seconds.
-            warn_after_ms: Warn threshold in ms (default 2 s).
-            on_wait: Callback ``(wait_ms, queued_ahead)`` fired on warn.
-            drop_policy: 'old', 'new', or 'summarize' overload policy.
-
-        Returns:
-            Task result.
-        """
+        """Enqueue task in session lane."""
+        if self._gateway_draining:
+            raise GatewayDrainingError("Gateway is draining, rejecting new enqueue")
         lane = self.get_session_lane(session_id)
         enqueued_at = time.monotonic()
 
@@ -243,22 +218,69 @@ class QueueManager:
         This ensures:
         1. Only one request per session at a time
         2. Global concurrency limit is respected
-
-        Args:
-            session_id: Session identifier
-            task: Async function to execute
-            timeout: Optional timeout
-
-        Returns:
-            Task result
         """
+        if self._gateway_draining:
+            raise GatewayDrainingError("Gateway is draining, rejecting new enqueue")
         session_lane = self.get_session_lane(session_id)
 
-        # Enqueue in session lane, which then enqueues in global
         async def wrapped_task():
             return await self._global_lane.enqueue(task, timeout)
 
         return await session_lane.enqueue(wrapped_task, timeout)
+
+    async def enqueue_session_then_lane(
+        self,
+        session_key: str,
+        lane: CommandLane,
+        task: Callable[[], Coroutine[Any, Any, T]],
+        timeout: float | None = None,
+    ) -> T:
+        """Enqueue in session lane first, then in a command lane.
+
+        Mirrors TS ``enqueueSession(() => enqueueGlobal(...))``.
+        Session lane serializes per-session; command lane caps global concurrency.
+        """
+        if self._gateway_draining:
+            raise GatewayDrainingError("Gateway is draining, rejecting new enqueue")
+        session_lane = self.get_session_lane(session_key)
+
+        async def wrapped_task():
+            return await self.enqueue_in_lane(lane, task, timeout=timeout)
+
+        return await session_lane.enqueue(wrapped_task, timeout)
+
+    def mark_gateway_draining(self) -> None:
+        """Reject new enqueues. Mirrors TS ``markGatewayDraining()``."""
+        self._gateway_draining = True
+        logger.info("Gateway marked as draining — new enqueues will be rejected")
+
+    def unmark_gateway_draining(self) -> None:
+        """Re-allow enqueues after a restart cycle."""
+        self._gateway_draining = False
+
+    async def wait_for_active_tasks(self, timeout_ms: int = 30_000) -> dict[str, Any]:
+        """Poll until all lanes are idle or *timeout_ms* elapses.
+
+        Mirrors TS ``waitForActiveTasks(timeoutMs)``.
+        Returns ``{"drained": True}`` on success, ``{"drained": False}`` on timeout.
+        """
+        poll_interval = 0.05  # 50 ms
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while time.monotonic() < deadline:
+            total_active = self.get_active_task_count()
+            if total_active == 0:
+                return {"drained": True}
+            await asyncio.sleep(poll_interval)
+        return {"drained": False}
+
+    def get_active_task_count(self) -> int:
+        """Total number of active tasks across all lanes."""
+        total = self._global_lane.active
+        for lane in self._fixed_lanes.values():
+            total += lane.active
+        for lane in self._session_lanes.values():
+            total += lane.active
+        return total
 
     async def cleanup_session(self, session_id: str) -> None:
         """

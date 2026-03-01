@@ -45,9 +45,9 @@ class SessionWriteLock:
     def lock_file(self) -> Path:
         return self._lock_file
 
-    async def acquire(self, max_hold_ms: int = _DEFAULT_MAX_HOLD_MS) -> "SessionWriteLock":
-        """Async context manager – acquire then release."""
-        return self
+    def acquire(self, max_hold_ms: int = _DEFAULT_MAX_HOLD_MS) -> "AcquireContext":
+        """Return an async context manager that acquires/releases the lock."""
+        return AcquireContext(self, max_hold_ms)
 
     async def __aenter__(self) -> "SessionWriteLock":
         return self
@@ -117,6 +117,19 @@ class AcquireContext:
         self._lock._release()
 
 
+_lock_registry: dict[str, SessionWriteLock] = {}
+_registry_lock = asyncio.Lock()
+
+
+async def _get_or_create_lock(session_file: str | Path) -> SessionWriteLock:
+    """Return (or create) the canonical lock for *session_file*."""
+    key = str(Path(session_file).resolve())
+    async with _registry_lock:
+        if key not in _lock_registry:
+            _lock_registry[key] = SessionWriteLock(session_file)
+        return _lock_registry[key]
+
+
 def acquire_session_write_lock(
     session_file: str | Path,
     max_hold_ms: int = _DEFAULT_MAX_HOLD_MS,
@@ -136,3 +149,31 @@ def acquire_session_write_lock(
     """
     lock = SessionWriteLock(session_file)
     return AcquireContext(lock, max_hold_ms)
+
+
+def acquire_session_write_lock_cached(
+    session_file: str | Path,
+    max_hold_ms: int = _DEFAULT_MAX_HOLD_MS,
+) -> "_CachedAcquireContext":
+    """Like :func:`acquire_session_write_lock` but reuses locks per path.
+
+    This avoids creating a new lock object on every call and matches the TS
+    pattern of keeping a per-session lock map.
+    """
+    return _CachedAcquireContext(session_file, max_hold_ms)
+
+
+class _CachedAcquireContext:
+    def __init__(self, session_file: str | Path, max_hold_ms: int) -> None:
+        self._session_file = session_file
+        self._max_hold_ms = max_hold_ms
+        self._lock: Optional[SessionWriteLock] = None
+
+    async def __aenter__(self) -> SessionWriteLock:
+        self._lock = await _get_or_create_lock(self._session_file)
+        await self._lock._acquire_inner(self._max_hold_ms)
+        return self._lock
+
+    async def __aexit__(self, *_: object) -> None:
+        if self._lock is not None:
+            self._lock._release()

@@ -106,6 +106,55 @@ class SandboxFsBridge:
             writable=writable,
         )
 
+    async def assert_path_safety(self, file_path: str, cwd: str | None = None) -> SandboxResolvedPath:
+        """Resolve and verify a path is safe to access.
+
+        Mirrors TS ``assertPathSafety()`` in fs-bridge.ts:
+        1. Resolve the logical path.
+        2. Use ``readlink -f`` inside the container to get the canonical path.
+        3. Reject if canonical path escapes the allowed mount boundary.
+        4. Reject if canonical path differs due to symlink traversal outside workspace.
+
+        Raises ``PermissionError`` on unsafe paths.
+        """
+        resolved = self.resolve_path(file_path, cwd)
+        abs_path = resolved.container_path
+
+        # Canonical resolution via docker exec readlink -f
+        result = await self._run_command(
+            'set -eu; readlink -f -- "$1" 2>/dev/null || echo "$1"',
+            args=[abs_path],
+            allow_failure=True,
+        )
+        canonical = result["stdout"].strip()
+        if not canonical:
+            canonical = abs_path
+
+        mount_boundary = self.container_workdir.rstrip("/")
+
+        # Check mount boundary escape
+        if not canonical.startswith(mount_boundary + "/") and canonical != mount_boundary:
+            raise PermissionError(
+                f"Path escapes mount boundary: {abs_path} resolves to {canonical} "
+                f"(outside {mount_boundary})"
+            )
+
+        # Detect symlink traversal: the normalized logical path should be a prefix of canonical
+        norm_logical = posixpath.normpath(abs_path)
+        if canonical != norm_logical:
+            if not canonical.startswith(mount_boundary + "/"):
+                raise PermissionError(
+                    f"Symlink traversal detected: {abs_path} -> {canonical} "
+                    f"(escapes {mount_boundary})"
+                )
+            logger.debug(
+                "Path resolved via symlink: %s -> %s (within boundary)", abs_path, canonical
+            )
+
+        # Update resolved with canonical path
+        resolved.container_path = canonical
+        return resolved
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -130,16 +179,8 @@ class SandboxFsBridge:
         encoding: str = "utf-8",
         mkdir: bool = True,
     ) -> None:
-        """Write *data* to *file_path* inside the container.
-
-        Args:
-            file_path: Target path (absolute or relative).
-            data: Bytes or string to write.
-            cwd: Working directory for resolving relative paths.
-            encoding: Encoding when *data* is a string.
-            mkdir: If ``True`` (default), create parent directories.
-        """
-        target = self.resolve_path(file_path, cwd)
+        """Write *data* to *file_path* inside the container."""
+        target = await self.assert_path_safety(file_path, cwd)
         self._ensure_write_access(target, "write files")
 
         if isinstance(data, str):
@@ -158,7 +199,7 @@ class SandboxFsBridge:
 
     async def mkdirp(self, file_path: str, cwd: str | None = None) -> None:
         """Create directory *file_path* (and parents) inside the container."""
-        target = self.resolve_path(file_path, cwd)
+        target = await self.assert_path_safety(file_path, cwd)
         self._ensure_write_access(target, "create directories")
         await self._run_command('set -eu; mkdir -p -- "$1"', args=[target.container_path])
 
@@ -170,7 +211,7 @@ class SandboxFsBridge:
         force: bool = True,
     ) -> None:
         """Remove *file_path* inside the container."""
-        target = self.resolve_path(file_path, cwd)
+        target = await self.assert_path_safety(file_path, cwd)
         self._ensure_write_access(target, "remove files")
 
         flags: list[str] = []
@@ -187,8 +228,8 @@ class SandboxFsBridge:
         self, from_path: str, to_path: str, cwd: str | None = None
     ) -> None:
         """Move *from_path* to *to_path* inside the container."""
-        src = self.resolve_path(from_path, cwd)
-        dst = self.resolve_path(to_path, cwd)
+        src = await self.assert_path_safety(from_path, cwd)
+        dst = await self.assert_path_safety(to_path, cwd)
         self._ensure_write_access(src, "rename files")
         self._ensure_write_access(dst, "rename files")
         script = (

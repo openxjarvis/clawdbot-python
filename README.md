@@ -1,20 +1,81 @@
 # OpenXJarvis (openclaw-python)
 
-> **Jarvis lives here.** A pure Python clone of OpenClaw — the most powerful personal AI gateway you can run.
+> A Python implementation of [OpenClaw](https://github.com/openclaw/openclaw) — a self-hosted personal AI assistant you can run anywhere.
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![MIT License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Tested: Telegram + Gemini](https://img.shields.io/badge/Tested-Telegram%20%2B%20Gemini-green.svg)](#tested-configurations)
 
-**Keywords:** AI agent framework · autonomous agent · LLM gateway · multi-channel chatbot · self-hosted AI assistant · Python AI · Telegram bot · Discord bot · personal AI · agent orchestration
+---
+
+> ⚠️ **Beta Notice** — This project is in early beta and currently solo-developed. Bugs and rough edges are expected. We are iterating fast — updates are frequent. **Our first goal is full alignment with OpenClaw (TypeScript).** Feedback and bug reports are very welcome!
+>
+> ⚠️ **测试版声明** — 本项目目前处于测试初期阶段，由我一个人开发，存在部分 bug 和不完善之处。目前更新非常频繁，正在快速迭代中。**第一个目标是完全对齐 OpenClaw（TypeScript 版）。** 欢迎进群反馈问题和需求！
+
+---
+
+## Quick Start
+
+**Prerequisites:** Python 3.11+ · [uv](https://docs.astral.sh/uv/) · a Telegram bot token · an LLM API key (Gemini / OpenAI / Claude)
+
+```bash
+# 1. Install uv (skip if you have it)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 2. Clone both repos as siblings
+mkdir my-workspace && cd my-workspace
+git clone https://github.com/openxjarvis/pi-mono-python.git
+git clone https://github.com/openxjarvis/openclaw-python.git
+
+# 3. Install
+cd openclaw-python
+uv sync
+
+# 4. Run the setup wizard (one-time — enter your API keys interactively)
+uv run openclaw onboard
+
+# 5. Start
+uv run openclaw start
+```
+
+Open **http://localhost:18789** for the Web UI, or just message your Telegram bot. That's it.
+
+> **Updating:** `git pull && uv sync` in `openclaw-python/`, then restart.
+
+---
 
 ## What is This?
 
-**OpenXJarvis** is a complete Python implementation of [OpenClaw](https://github.com/openclaw/openclaw) — continuously aligned with the TypeScript reference. Think of it as your personal AI operating system: an autonomous agent platform that connects messaging channels (Telegram, WhatsApp, Discord, Slack, IRC, Signal, Google Chat, iMessage), integrates with cutting-edge LLM providers (OpenAI GPT-5.2/5.3, Claude Opus 4.5/4.6, Google Gemini 3.x/2.5, AWS Bedrock, Ollama), manages persistent memory and long-term context, schedules autonomous tasks via cron, and provides a beautiful Web UI for agent orchestration.
+**OpenXJarvis** is a Python implementation of [OpenClaw](https://github.com/openclaw/openclaw), continuously aligned with the TypeScript reference. It is a self-hosted personal AI gateway that:
 
-**Why "Jarvis"?** Because this isn't just another chatbot framework or AI assistant wrapper. This is a production-grade agent framework — a self-hosted personal AI that learns, remembers, and operates autonomously. Every feature, every alignment improvement, every new capability lands here.
+- Connects to messaging channels: **Telegram**, WhatsApp, Discord, Slack, IRC, and more
+- Works with major LLM providers: **Gemini**, Claude, GPT, DeepSeek, Grok, Ollama
+- Manages persistent memory and long-term context across sessions
+- Schedules autonomous tasks via a built-in cron system
+- Provides a Web UI for chat, session management, and configuration
 
-**This project stays synchronized with OpenClaw.** We track upstream changes and continuously merge improvements. You're not choosing between Python and TypeScript — you're choosing the same powerful platform in your preferred language.
+**This project stays synchronized with OpenClaw.** We track upstream changes and continuously port improvements. You get the same powerful platform in Python.
+
+---
+
+## Current Progress
+
+| Area | Status |
+|------|--------|
+| Core agent loop + session management | ✅ Working |
+| Telegram channel | ✅ Working |
+| Web UI | ✅ Working |
+| Cron scheduler | ✅ Working |
+| Active run registry (steer / abort) | ✅ Implemented |
+| Fire-and-forget dispatch (no blocking) | ✅ Implemented |
+| Followup queue + collect mode | ✅ Implemented |
+| Telegram reconnection robustness | ✅ Improved |
+| Agent fallback + error recovery | ✅ Implemented |
+| Sub-agents (spawn, registry, announce) | ✅ Implemented |
+| Sub-agent session mode + thread binding | ✅ Implemented |
+| Sandbox (Docker + security hardening) | ✅ Implemented |
+| WhatsApp / Discord / Slack / IRC / Signal | ✅ Code complete, runtime verification in progress |
+| Full OpenClaw alignment | 🔧 Active development |
 
 ---
 
