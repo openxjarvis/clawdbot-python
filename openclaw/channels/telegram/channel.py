@@ -908,16 +908,31 @@ class TelegramChannel(ChannelPlugin):
             overflow_text = caption[_CAPTION_LIMIT:]
             caption = caption[:_CAPTION_LIMIT]
 
+        # Telegram Bot API hard limit for uploads via the public API
+        _TELEGRAM_MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
+        # Write timeout scales with file size: at least 60s, +1s per MB
+        _BASE_WRITE_TIMEOUT = 60.0
+
         media_source = media_url
         is_local_file = False
+        write_timeout = _BASE_WRITE_TIMEOUT
 
         # Detect local file (no URL scheme)
         if not media_url.startswith(("http://", "https://", "file://")):
             file_path = Path(media_url).expanduser()
             if file_path.exists() and file_path.is_file():
+                file_size = file_path.stat().st_size
+                if file_size > _TELEGRAM_MAX_UPLOAD_BYTES:
+                    size_mb = file_size / (1024 * 1024)
+                    raise ValueError(
+                        f"File too large for Telegram Bot API ({size_mb:.1f} MB, limit 50 MB): {file_path.name}. "
+                        "Consider compressing the file or sharing it via a URL."
+                    )
+                # Scale write timeout by file size (1 second per MB, min 60s)
+                write_timeout = max(_BASE_WRITE_TIMEOUT, file_size / (1024 * 1024))
                 media_source = open(file_path, "rb")  # noqa: WPS515 — closed in finally
                 is_local_file = True
-                logger.info("Sending local file: %s", file_path)
+                logger.info("Sending local file: %s (%.1f MB)", file_path, file_size / (1024 * 1024))
             else:
                 raise FileNotFoundError(
                     f"Media file not found: {media_url!r}. "
@@ -933,6 +948,7 @@ class TelegramChannel(ChannelPlugin):
                     caption=caption,
                     parse_mode="Markdown" if caption else None,
                     reply_to_message_id=reply_id,
+                    write_timeout=write_timeout,
                 )
             elif media_type == "video":
                 msg = await self._app.bot.send_video(
@@ -941,6 +957,7 @@ class TelegramChannel(ChannelPlugin):
                     caption=caption,
                     parse_mode="Markdown" if caption else None,
                     reply_to_message_id=reply_id,
+                    write_timeout=write_timeout,
                 )
             elif media_type == "animation":
                 msg = await self._app.bot.send_animation(
@@ -949,6 +966,7 @@ class TelegramChannel(ChannelPlugin):
                     caption=caption,
                     parse_mode="Markdown" if caption else None,
                     reply_to_message_id=reply_id,
+                    write_timeout=write_timeout,
                 )
             elif media_type == "voice":
                 try:
@@ -958,6 +976,7 @@ class TelegramChannel(ChannelPlugin):
                         caption=caption,
                         parse_mode="Markdown" if caption else None,
                         reply_to_message_id=reply_id,
+                        write_timeout=write_timeout,
                     )
                 except Exception as voice_err:
                     logger.warning("send_voice failed (%s), falling back to document", voice_err)
@@ -971,6 +990,7 @@ class TelegramChannel(ChannelPlugin):
                         caption=caption,
                         parse_mode="Markdown" if caption else None,
                         reply_to_message_id=reply_id,
+                        write_timeout=write_timeout,
                     )
             elif media_type in ("audio",):
                 msg = await self._app.bot.send_audio(
@@ -979,6 +999,7 @@ class TelegramChannel(ChannelPlugin):
                     caption=caption,
                     parse_mode="Markdown" if caption else None,
                     reply_to_message_id=reply_id,
+                    write_timeout=write_timeout,
                 )
             else:
                 # Default: send as document (covers pptx, pdf, zip, etc.)
@@ -988,6 +1009,7 @@ class TelegramChannel(ChannelPlugin):
                     caption=caption,
                     parse_mode="Markdown" if caption else None,
                     reply_to_message_id=reply_id,
+                    write_timeout=write_timeout,
                 )
 
             # Record sent message for reaction tracking

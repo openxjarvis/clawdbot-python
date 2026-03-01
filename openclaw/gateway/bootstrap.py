@@ -421,11 +421,14 @@ class GatewayBootstrap:
             # Register new tools
             from ..agents.tools.gateway import GatewayTool
             self.tool_registry.register(GatewayTool())
-            
-            # TODO: Add AgentsListTool and SessionStatusTool when available
-            # from ..agents.tools.gateway import AgentsListTool, SessionStatusTool
-            # self.tool_registry.register(AgentsListTool(config=self.config))
-            # self.tool_registry.register(SessionStatusTool(session_manager=self.session_manager))
+
+            # AgentsListTool — lets agent enumerate configured sub-agents (TS: agents-list-tool.ts)
+            try:
+                from ..agents.tools.agents_list import AgentsListTool
+                cfg_dict = _config_as_dict(self.config)
+                self.tool_registry.register(AgentsListTool(config=cfg_dict))
+            except Exception as _e:
+                logger.debug("AgentsListTool registration skipped: %s", _e)
             
             tool_count = len(self.tool_registry.list_tools())
             logger.info(f"Registered {tool_count} tools")

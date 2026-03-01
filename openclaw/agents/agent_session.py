@@ -202,15 +202,15 @@ def _wrap_openclaw_tool(oc_tool: Any, session_id: str | None = None) -> Any:
                     detect_tool_call_loop,
                     record_tool_call,
                     record_tool_call_outcome,
-                    mark_warning_shown,
                 )
 
                 state = _get_tool_loop_state(session_id)
                 detection = detect_tool_call_loop(state, name, args)
                 if detection.stuck:
-                    if detection.warning_key:
-                        mark_warning_shown(state, detection.warning_key)
                     if detection.level == "critical":
+                        # Critical: always block. Do NOT add to shown_warnings —
+                        # critical blocks must fire every time the condition holds
+                        # (mirrors TS: no shouldEmitLoopWarning check for critical).
                         logger.error("Tool loop CRITICAL: %s", detection.message)
                         record_tool_call(state, name, args)
                         return AgentToolResult(
@@ -218,6 +218,8 @@ def _wrap_openclaw_tool(oc_tool: Any, session_id: str | None = None) -> Any:
                             details=None,
                         )
                     else:
+                        # Warning: bucket-throttled deduplication handled inside
+                        # detect_tool_call_loop via _should_emit_loop_warning.
                         logger.warning("Tool loop WARNING: %s", detection.message)
                 record_tool_call(state, name, args)
             except Exception as loop_exc:

@@ -49,6 +49,8 @@ class SessionState:
     """Session state for tool loop detection."""
     tool_call_history: deque[ToolCallRecord] = field(default_factory=lambda: deque(maxlen=TOOL_CALL_HISTORY_SIZE))
     shown_warnings: set[str] = field(default_factory=set)
+    # Bucket-throttled warning deduplication — mirrors TS toolLoopWarningBuckets Map
+    warning_buckets: dict[str, int] = field(default_factory=dict)
 
 
 def _stable_stringify(value: Any) -> str:
@@ -163,87 +165,132 @@ def _get_time_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _get_no_progress_streak(
+    history: list[Any],
+    tool_name: str,
+    args_hash: str,
+) -> tuple[int, str | None]:
+    """Compute consecutive no-progress streak for a specific tool+args combo.
+
+    Mirrors TS ``getNoProgressStreak``:
+    - Iterates history newest-first
+    - Counts only records for this tool_name + args_hash that have a result_hash
+    - Streak resets when result_hash changes (progress was made)
+    Returns (streak_count, latest_result_hash).
+    """
+    streak = 0
+    latest_result_hash: str | None = None
+
+    for rec in reversed(history):
+        if rec.tool_name != tool_name or rec.hash != args_hash:
+            continue
+        if not rec.result_hash:
+            continue
+        if latest_result_hash is None:
+            latest_result_hash = rec.result_hash
+            streak = 1
+        elif rec.result_hash == latest_result_hash:
+            streak += 1
+        else:
+            break
+
+    return streak, latest_result_hash
+
+
+# Bucket size for warning throttling — emit once per 10-call increment.
+_LOOP_WARNING_BUCKET_SIZE = 10
+_MAX_LOOP_WARNING_KEYS = 256
+
+
+def _should_emit_loop_warning(state: SessionState, warning_key: str, count: int) -> bool:
+    """Bucket-throttled warning deduplication — mirrors TS shouldEmitLoopWarning.
+
+    Emits once per LOOP_WARNING_BUCKET_SIZE increment (default: every 10 calls).
+    """
+    bucket = count // _LOOP_WARNING_BUCKET_SIZE
+    last_bucket = state.warning_buckets.get(warning_key, 0)
+    if bucket <= last_bucket:
+        return False
+
+    state.warning_buckets[warning_key] = bucket
+    # Evict oldest key to cap map size
+    if len(state.warning_buckets) > _MAX_LOOP_WARNING_KEYS:
+        oldest = next(iter(state.warning_buckets))
+        del state.warning_buckets[oldest]
+    return True
+
+
 def detect_tool_call_loop(
     state: SessionState,
     tool_name: str,
     params: Any,
     config: dict[str, Any] | None = None,
 ) -> LoopDetectionResult:
-    """
-    Detect if agent is stuck in a tool call loop.
-    
-    Mirrors TypeScript detectToolCallLoop().
-    
-    Checks for:
-    1. Generic Repeat: Same tool + params repeated
-    2. Known Poll No Progress: Polling tools with no progress
-    3. Ping Pong: Two tools alternating with no progress
-    4. Global Circuit Breaker: Too many total calls
-    
-    Args:
-        state: Session state with tool call history
-        tool_name: Current tool name
-        params: Current tool parameters
-        config: Optional configuration dict
-        
-    Returns:
-        LoopDetectionResult with detection info
+    """Detect if agent is stuck in a tool call loop.
+
+    Mirrors TypeScript ``detectToolCallLoop()``.
+
+    Checks:
+    1. Global Circuit Breaker — no-progress streak for this tool >= globalThreshold
+    2. Known Poll No Progress — polling tools with no-progress streak >= critical/warning
+    3. Ping Pong — two tools alternating with no progress
+    4. Generic Repeat — same non-poll tool called >= warningThreshold times
+
+    Key TS alignment fixes:
+    - Global circuit breaker uses no-progress *streak* (same result), not total history length
+    - Critical-level detections always block (no shown_warnings deduplication)
+    - Warning-level detections use bucket throttling (emit once per 10-call increment)
     """
     if not state or not state.tool_call_history:
         return LoopDetectionResult(stuck=False)
-    
+
     history = list(state.tool_call_history)
     current_hash = hash_tool_call(tool_name, params)
-    
-    # Get thresholds from config (with defaults)
+
     warning_threshold = config.get("warningThreshold", WARNING_THRESHOLD) if config else WARNING_THRESHOLD
     critical_threshold = config.get("criticalThreshold", CRITICAL_THRESHOLD) if config else CRITICAL_THRESHOLD
     global_threshold = config.get("globalThreshold", GLOBAL_CIRCUIT_BREAKER_THRESHOLD) if config else GLOBAL_CIRCUIT_BREAKER_THRESHOLD
-    
+
     is_known_poll = _is_known_poll_tool_call(tool_name, params)
 
-    # Count exact matches (same tool + same args hash, regardless of result)
-    exact_matches = [rec for rec in history if rec.hash == current_hash]
-    exact_count = len(exact_matches)
-    
-    # Detector 2: Known Poll No Progress
-    # Matches TS: command_status, or process with action=poll|log
-    if _is_known_poll_tool_call(tool_name, params):
-        # Find records with matching args hash
-        same_args_records = [
-            rec for rec in history
-            if rec.tool_name == tool_name and rec.hash == current_hash and rec.result_hash
-        ]
-        no_progress_streak = 0
-        latest_result_hash: str | None = None
-        for rec in reversed(same_args_records):
-            if latest_result_hash is None:
-                latest_result_hash = rec.result_hash
-                no_progress_streak = 1
-            elif rec.result_hash == latest_result_hash:
-                no_progress_streak += 1
-            else:
-                break
+    # Detector 1 (TS order): Global Circuit Breaker
+    # Uses the no-progress streak (same tool + same args + same result), not len(history).
+    # Critical blocks ALWAYS fire — no shown_warnings deduplication (mirrors TS).
+    no_progress_streak, latest_result_hash = _get_no_progress_streak(history, tool_name, current_hash)
+    if no_progress_streak >= global_threshold:
+        warning_key = f"global:{tool_name}:{current_hash}:{latest_result_hash or 'none'}"
+        return LoopDetectionResult(
+            stuck=True,
+            level="critical",
+            detector="global_circuit_breaker",
+            count=no_progress_streak,
+            message=(
+                f"CRITICAL: {tool_name} has repeated identical no-progress outcomes "
+                f"{no_progress_streak} times. Session execution blocked by global circuit breaker."
+            ),
+            warning_key=warning_key,
+        )
 
+    # Detector 2: Known Poll No Progress
+    if is_known_poll:
         if no_progress_streak >= critical_threshold:
             warning_key = f"poll:{tool_name}:{current_hash}:{latest_result_hash or 'none'}"
-            if warning_key not in state.shown_warnings:
-                return LoopDetectionResult(
-                    stuck=True,
-                    level="critical",
-                    detector="known_poll_no_progress",
-                    count=no_progress_streak,
-                    message=(
-                        f"CRITICAL: Called {tool_name} with identical arguments and no progress "
-                        f"{no_progress_streak} times. This appears to be a stuck polling loop. "
-                        "Session execution blocked to prevent resource waste."
-                    ),
-                    warning_key=warning_key,
-                )
+            return LoopDetectionResult(
+                stuck=True,
+                level="critical",
+                detector="known_poll_no_progress",
+                count=no_progress_streak,
+                message=(
+                    f"CRITICAL: Called {tool_name} with identical arguments and no progress "
+                    f"{no_progress_streak} times. This appears to be a stuck polling loop. "
+                    "Session execution blocked to prevent resource waste."
+                ),
+                warning_key=warning_key,
+            )
 
         if no_progress_streak >= warning_threshold:
             warning_key = f"poll:{tool_name}:{current_hash}:{latest_result_hash or 'none'}"
-            if warning_key not in state.shown_warnings:
+            if _should_emit_loop_warning(state, warning_key, no_progress_streak):
                 return LoopDetectionResult(
                     stuck=True,
                     level="warning",
@@ -256,38 +303,27 @@ def detect_tool_call_loop(
                     ),
                     warning_key=warning_key,
                 )
-    
+
     # Detector 3: Ping Pong
-    # Check for alternating pattern between two tools
     if len(history) >= 6:
         last_6 = history[-6:]
-        
-        # Extract tool names
         tool_names = [rec.tool_name for rec in last_6]
-        
-        # Check if alternating between 2 tools
         unique_tools = list(set(tool_names))
         if len(unique_tools) == 2:
             tool_a, tool_b = unique_tools
-            
-            # Check if pattern is alternating (A, B, A, B, A, B)
             is_alternating = True
             expected_tool = tool_a if tool_names[0] == tool_a else tool_b
-            
-            for i, actual_tool in enumerate(tool_names):
+            for actual_tool in tool_names:
                 if actual_tool != expected_tool:
                     is_alternating = False
                     break
                 expected_tool = tool_b if expected_tool == tool_a else tool_a
-            
+
             if is_alternating:
-                # Check if results are not changing
                 result_hashes = [rec.result_hash for rec in last_6 if rec.result_hash]
-                unique_results = len(set(result_hashes))
-                
-                if unique_results <= 2 and len(result_hashes) >= 4:
+                if len(set(result_hashes)) <= 2 and len(result_hashes) >= 4:
                     warning_key = f"ping_pong_{min(tool_a, tool_b)}_{max(tool_a, tool_b)}"
-                    if warning_key not in state.shown_warnings:
+                    if _should_emit_loop_warning(state, warning_key, len(last_6)):
                         return LoopDetectionResult(
                             stuck=True,
                             level="warning",
@@ -297,39 +333,24 @@ def detect_tool_call_loop(
                             paired_tool_name=tool_b if tool_name == tool_a else tool_a,
                             warning_key=warning_key,
                         )
-    
-    # Detector 4: Generic Repeat (warning only, non-poll tools only).
-    # Mirrors TS: only checked when !knownPollTool.
-    if not is_known_poll and exact_count >= warning_threshold:
-        warning_key = f"generic:{tool_name}:{current_hash}"
-        if warning_key not in state.shown_warnings:
-            return LoopDetectionResult(
-                stuck=True,
-                level="warning",
-                detector="generic_repeat",
-                count=exact_count,
-                message=(
-                    f"WARNING: You have called {tool_name} {exact_count} times with identical "
-                    "arguments. If this is not making progress, stop retrying and report the task as failed."
-                ),
-                warning_key=warning_key,
-            )
 
-    # Detector 5: Global Circuit Breaker (based on no-progress streak in full history).
-    if len(history) >= global_threshold:
-        warning_key = f"global:{tool_name}:{current_hash}:circuit"
-        if warning_key not in state.shown_warnings:
-            return LoopDetectionResult(
-                stuck=True,
-                level="critical",
-                detector="global_circuit_breaker",
-                count=len(history),
-                message=(
-                    f"CRITICAL: {tool_name} has repeated identical no-progress outcomes "
-                    f"{len(history)} times. Session execution blocked by global circuit breaker."
-                ),
-                warning_key=warning_key,
-            )
+    # Detector 4: Generic Repeat (warning only, non-poll tools only).
+    if not is_known_poll:
+        exact_count = sum(1 for rec in history if rec.hash == current_hash)
+        if exact_count >= warning_threshold:
+            warning_key = f"generic:{tool_name}:{current_hash}"
+            if _should_emit_loop_warning(state, warning_key, exact_count):
+                return LoopDetectionResult(
+                    stuck=True,
+                    level="warning",
+                    detector="generic_repeat",
+                    count=exact_count,
+                    message=(
+                        f"WARNING: You have called {tool_name} {exact_count} times with identical "
+                        "arguments. If this is not making progress, stop retrying and report the task as failed."
+                    ),
+                    warning_key=warning_key,
+                )
 
     return LoopDetectionResult(stuck=False)
 

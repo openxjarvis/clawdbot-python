@@ -344,12 +344,22 @@ async def dispatch_reply_from_config(
         user_text = ctx.BodyForAgent or ctx.Body
         session.add_user_message(user_text)
         
+        # Collect image URLs from context (mirrors TS MsgContext → images passing)
+        images: list[str] | None = None
+        media_urls = list(ctx.MediaUrls or [])
+        if ctx.MediaUrl and ctx.MediaUrl not in media_urls:
+            media_urls.insert(0, ctx.MediaUrl)
+        if ctx.MediaPath and ctx.MediaPath not in media_urls:
+            media_urls.insert(0, ctx.MediaPath)
+        if media_urls:
+            images = media_urls
+
         # Run agent turn
         async for event in runtime.run_turn(
             session=session,
             message=user_text,
             tools=None,  # Tools provided by runtime
-            images=None,  # TODO: Handle images
+            images=images,
         ):
             # Check abort signal
             if abort_signal.aborted:

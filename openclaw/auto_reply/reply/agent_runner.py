@@ -48,6 +48,7 @@ class ReplyContext:
     system_prompt: str | None = None
     originating_channel: str | None = None
     originating_to: Any | None = None
+    session_workspace: str | None = None  # agent workspace dir for media root search
     typing_ctrl: Any | None = None       # TypingController or None
     # Raw send_typing callback — stored so followup runner can create fresh
     # TypingControllers for each queued turn (mirrors TS: typing passed through
@@ -236,6 +237,59 @@ async def _execute_agent_turn(
     )
 
 
+def _get_local_media_roots(session_workspace: str | None = None) -> list["Path"]:
+    """Return ordered list of local directories to search for media files.
+
+    Mirrors TS ``getAgentScopedMediaLocalRoots`` from
+    ``openclaw/src/media/local-roots.ts``.  The search order mirrors TS:
+    tmpDir → ~/.openclaw/media → agents → workspace → sandboxes → session workspace.
+    """
+    import tempfile
+    from pathlib import Path
+
+    state_dir = Path.home() / ".openclaw"
+    roots: list[Path] = [
+        Path(tempfile.gettempdir()) / "openclaw",
+        state_dir / "media",
+        state_dir / "agents",
+        state_dir / "workspace",
+        state_dir / "sandboxes",
+    ]
+    if session_workspace:
+        ws = Path(session_workspace).resolve()
+        if ws not in roots:
+            roots.append(ws)
+    return roots
+
+
+def _resolve_media_path(raw_url: str, session_workspace: str | None = None) -> str:
+    """Resolve a raw media URL/path to an existing absolute path.
+
+    1. HTTP(S) / file:// URLs → returned as-is.
+    2. Absolute paths that exist → returned as-is.
+    3. Otherwise: search local media roots for the filename (TS alignment).
+    Returns the resolved path, or the original string if nothing is found.
+    """
+    from pathlib import Path
+
+    if raw_url.startswith(("http://", "https://", "file://")):
+        return raw_url
+
+    p = Path(raw_url).expanduser()
+    if p.is_absolute() and p.exists():
+        return str(p)
+
+    # Search local roots by filename (mirrors TS local-roots fallback)
+    filename = p.name
+    for root in _get_local_media_roots(session_workspace):
+        candidate = root / filename
+        if candidate.exists():
+            logger.debug("Resolved media %r → %s", raw_url, candidate)
+            return str(candidate)
+
+    return raw_url
+
+
 async def _deliver_response(
     ctx: ReplyContext,
     response_text: str,
@@ -243,7 +297,6 @@ async def _deliver_response(
 ) -> None:
     """Deliver accumulated response text back to the channel."""
     from openclaw.auto_reply.media_parse import split_media_from_output
-    from pathlib import Path
 
     if not response_text and not has_error:
         return
@@ -259,14 +312,12 @@ async def _deliver_response(
             await ctx.channel_send(display_text, ctx.chat_target, reply_to=ctx.reply_to_id)
 
         # Send media files
+        session_workspace: str | None = getattr(ctx, "session_workspace", None)
         for media_url in ([media_result.media_url] if media_result.media_url else []) + (media_result.media_urls or []):
             if not media_url:
                 continue
             try:
-                if not media_url.startswith(("http://", "https://", "file://", "/")):
-                    candidate = Path.home() / ".openclaw" / "workspace" / media_url
-                    if candidate.exists():
-                        media_url = str(candidate)
+                media_url = _resolve_media_path(media_url, session_workspace)
                 from openclaw.media.mime import detect_mime, MediaKind, media_kind_from_mime
                 mime = detect_mime(media_url)
                 kind = media_kind_from_mime(mime)

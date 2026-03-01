@@ -1343,6 +1343,7 @@ class ChannelManager:
                     system_prompt=self.system_prompt,
                     originating_channel=channel_id,
                     originating_to=message.chat_id,
+                    session_workspace=session_workspace,
                     typing_ctrl=typing_ctrl,
                     typing_send_fn=_send_typing,
                 )

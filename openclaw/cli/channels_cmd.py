@@ -117,18 +117,24 @@ def add(
         console.print("[red]Error:[/red] Token is required")
         raise typer.Exit(1)
     
-    # Build channel config
-    channel_config = {
-        "enabled": True,
-        "bot_token": token,
-        "dm_policy": dm_policy,
-    }
-    
-    if account_id:
-        channel_config["account_id"] = account_id
-    
-    # Update config
-    setattr(config.channels, channel, channel_config)
+    # Build channel config as proper Pydantic model so model_dump() emits
+    # camelCase keys (botToken / dmPolicy) matching the TS config format.
+    if channel == "telegram":
+        from ..config.schema import TelegramChannelConfig, ChannelsConfig
+        tg_cfg = TelegramChannelConfig(
+            enabled=True,
+            botToken=token,
+            dmPolicy=dm_policy,
+        )
+        if not config.channels:
+            config.channels = ChannelsConfig()
+        config.channels.telegram = tg_cfg
+    else:
+        from ..config.schema import ChannelConfig, ChannelsConfig
+        ch_cfg = ChannelConfig(enabled=True, botToken=token, dmPolicy=dm_policy)
+        if not config.channels:
+            config.channels = ChannelsConfig()
+        setattr(config.channels, channel, ch_cfg)
     
     # Save
     try:

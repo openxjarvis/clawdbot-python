@@ -1872,23 +1872,45 @@ async def handle_wizard_status(connection: Any, params: dict[str, Any]) -> dict[
         return await _wizard_handler.wizard_status(params)
     return {"error": "Wizard handler not available"}
 
-# Additional Talk Mode handlers
+# Additional Talk Mode handlers (mirrors TS talk-mode-handler.ts)
+_TALK_MODE_DEFAULTS: dict[str, Any] = {
+    "enabled": False,
+    "provider": "openai",
+    "model": "whisper-1",
+    "language": "en",
+}
+
 @register_handler("talk.mode.get")
 async def handle_talk_mode_get(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Get talk mode configuration"""
-    return {
-        "enabled": False,  # TODO: Get from config
-        "provider": "openai",
-        "model": "whisper-1",
-        "language": "en",
-    }
+    """Get talk mode configuration — reads live config (mirrors TS talkMode.get)."""
+    try:
+        from openclaw.config.loader import load_config
+        cfg = load_config()
+        cfg_dict = cfg.model_dump() if hasattr(cfg, "model_dump") else {}
+        talk_cfg = (cfg_dict.get("talk") or {}) if isinstance(cfg_dict, dict) else {}
+        return {**_TALK_MODE_DEFAULTS, **talk_cfg}
+    except Exception:
+        return dict(_TALK_MODE_DEFAULTS)
 
 
 @register_handler("talk.mode.set")
 async def handle_talk_mode_set(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Set talk mode configuration"""
-    # TODO: Update config
-    return {"success": True, "config": params}
+    """Set talk mode configuration — persists to live config (mirrors TS talkMode.set)."""
+    try:
+        from openclaw.gateway.config_service import get_config_service
+        svc = get_config_service()
+        patch: dict[str, Any] = {}
+        for key in ("enabled", "provider", "model", "language"):
+            if key in params:
+                patch[key] = params[key]
+        if patch:
+            current = svc.get_config()
+            talk = dict(current.get("talk") or {})
+            talk.update(patch)
+            svc.patch_config({"talk": talk})
+        return {"success": True, "config": {**_TALK_MODE_DEFAULTS, **patch}}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 
 @register_handler("talk.mode")

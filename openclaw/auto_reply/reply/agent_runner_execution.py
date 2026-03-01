@@ -178,6 +178,11 @@ async def run_agent_turn_with_fallback(
                     elif evt_type in (EventType.ERROR, "error", "agent.error"):
                         err_msg = event_data.get("message", str(event_data))
                         logger.error("run_agent_turn_with_fallback: agent error: %s", err_msg)
+                        # Transient server errors (500/502/503/504) should be
+                        # retried. Raise so the outer except block catches it
+                        # and applies the standard backoff-retry logic.
+                        if _is_transient_http_error(RuntimeError(err_msg)):
+                            raise RuntimeError(err_msg)
                         has_error = True
                 except Exception as evt_exc:
                     logger.error("Event processing error: %s", evt_exc)
