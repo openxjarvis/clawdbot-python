@@ -464,9 +464,10 @@ def build_runtime_section(
     import platform
     import sys
 
-    # Always generate at minimum OS/arch/Python info — mirrors TS behavior
-    if not runtime_info:
-        runtime_info = {}
+    # No info (None) → omit the section. Empty dict → auto-populate OS/arch/Python.
+    if runtime_info is None:
+        return []
+
     if not runtime_info.get("os"):
         runtime_info = {**runtime_info, "os": platform.system().lower()}
     if not runtime_info.get("arch"):

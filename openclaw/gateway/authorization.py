@@ -138,6 +138,12 @@ NODE_ROLE_METHODS = {
     "skills.bins",
 }
 
+# Methods that node clients are also permitted to call (in addition to NODE_ROLE_METHODS)
+NODE_ALLOWED_METHODS = {
+    "node.invoke",
+    "node.canvas.capability.refresh",
+}
+
 
 def authorize_gateway_method(method: str, auth_context: AuthContext) -> bool:
     """
@@ -165,8 +171,10 @@ def authorize_gateway_method(method: str, auth_context: AuthContext) -> bool:
         )
         return False
 
-    # Node clients may ONLY call NODE_ROLE_METHODS
+    # Node clients may call NODE_ROLE_METHODS and NODE_ALLOWED_METHODS
     if role == Role.NODE:
+        if method in NODE_ALLOWED_METHODS:
+            return True
         logger.warning(f"Node attempted unauthorized method: {method}")
         return False
 

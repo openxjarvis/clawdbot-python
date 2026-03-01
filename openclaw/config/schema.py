@@ -433,9 +433,15 @@ class SkillsConfig(BaseModel):
     disable: list[str] | None = Field(default=None)
 
 
+class PluginEntryConfig(BaseModel):
+    """Individual plugin entry configuration (mirrors TS plugins.entries[name])"""
+    enabled: bool = Field(default=True)
+
+
 class PluginsConfig(BaseModel):
     """Plugins configuration"""
 
+    entries: dict[str, PluginEntryConfig] | None = Field(default=None)
     enable: list[str] | None = Field(default=None)
     disable: list[str] | None = Field(default=None)
 
@@ -509,8 +515,8 @@ class InternalHooksConfig(BaseModel):
 
 
 class HooksConfig(BaseModel):
-    """Hooks configuration"""
-    enabled: bool = Field(default=True)
+    """Hooks configuration — TS does not write top-level enabled; use None to omit it"""
+    enabled: bool | None = Field(default=None)
     internal: InternalHooksConfig | None = Field(default=None)
 
 

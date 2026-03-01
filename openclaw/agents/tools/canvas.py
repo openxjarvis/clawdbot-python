@@ -18,6 +18,12 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+# Module-level alias for testability
+try:
+    from openclaw.gateway.rpc_client import create_client
+except ImportError:
+    create_client = None  # type: ignore[assignment]
+
 from ..types import AgentToolResult, TextContent
 from .base import AgentTool, ToolResult
 from .common_results import image_result, json_result
@@ -134,8 +140,10 @@ class CanvasTool(AgentTool):
             return ToolResult(success=False, content="", error=early_error)
 
         try:
-            node_id = await self._resolve_node_id(params)
-            result = await self._dispatch_action(action, node_id, params)
+            # Create a single shared RPC client for both node resolution and invocation
+            client = await self._make_client(params)
+            node_id = await self._resolve_node_id_with_client(client, params)
+            result = await self._dispatch_action(action, node_id, params, client=client)
             # result is an AgentToolResult; convert to legacy ToolResult
             text_parts = [
                 c.text for c in result.content if hasattr(c, "text")
@@ -175,6 +183,7 @@ class CanvasTool(AgentTool):
         action: str,
         node_id: str,
         params: dict[str, Any],
+        client: Any = None,
     ) -> AgentToolResult:
         """Dispatch canvas action. Returns AgentToolResult."""
 
@@ -195,11 +204,11 @@ class CanvasTool(AgentTool):
             if placement:
                 invoke_params["placement"] = placement
 
-            await self._invoke(node_id, "canvas.present", invoke_params, params)
+            await self._invoke(node_id, "canvas.present", invoke_params, params, client=client)
             return json_result({"ok": True})
 
         elif action == "hide":
-            await self._invoke(node_id, "canvas.hide", None, params)
+            await self._invoke(node_id, "canvas.hide", None, params, client=client)
             return json_result({"ok": True})
 
         elif action == "navigate":
@@ -209,14 +218,14 @@ class CanvasTool(AgentTool):
             ) or None
             if not url:
                 raise ValueError("url required")
-            await self._invoke(node_id, "canvas.navigate", {"url": url}, params)
+            await self._invoke(node_id, "canvas.navigate", {"url": url}, params, client=client)
             return json_result({"ok": True})
 
         elif action == "eval":
             javascript = params.get("javaScript", "").strip()
             if not javascript:
                 raise ValueError("javaScript required")
-            raw = await self._invoke(node_id, "canvas.eval", {"javaScript": javascript}, params)
+            raw = await self._invoke(node_id, "canvas.eval", {"javaScript": javascript}, params, client=client)
             result_val = raw.get("payload", {}).get("result") if isinstance(raw, dict) else None
             if result_val:
                 return AgentToolResult(
@@ -226,7 +235,7 @@ class CanvasTool(AgentTool):
             return json_result({"ok": True})
 
         elif action == "snapshot":
-            return await self._handle_snapshot(node_id, params)
+            return await self._handle_snapshot(node_id, params, client=client)
 
         elif action == "a2ui_push":
             jsonl = (params.get("jsonl") or "").strip()
@@ -238,11 +247,11 @@ class CanvasTool(AgentTool):
             if not jsonl.strip():
                 raise ValueError("jsonl or jsonlPath required")
 
-            await self._invoke(node_id, "canvas.a2ui.pushJSONL", {"jsonl": jsonl}, params)
+            await self._invoke(node_id, "canvas.a2ui.pushJSONL", {"jsonl": jsonl}, params, client=client)
             return json_result({"ok": True})
 
         elif action == "a2ui_reset":
-            await self._invoke(node_id, "canvas.a2ui.reset", None, params)
+            await self._invoke(node_id, "canvas.a2ui.reset", None, params, client=client)
             return json_result({"ok": True})
 
         else:
@@ -252,6 +261,7 @@ class CanvasTool(AgentTool):
         self,
         node_id: str,
         params: dict[str, Any],
+        client: Any = None,
     ) -> AgentToolResult:
         """Handle canvas snapshot action.
 
@@ -278,7 +288,7 @@ class CanvasTool(AgentTool):
         if quality is not None:
             invoke_params["quality"] = int(quality)
 
-        raw = await self._invoke(node_id, "canvas.snapshot", invoke_params, params)
+        raw = await self._invoke(node_id, "canvas.snapshot", invoke_params, params, client=client)
 
         payload = raw.get("payload", {}) if isinstance(raw, dict) else {}
         if not isinstance(payload, dict):
@@ -306,24 +316,50 @@ class CanvasTool(AgentTool):
             details={"format": payload_format},
         )
 
-    async def _resolve_node_id(self, params: dict[str, Any]) -> str:
-        """Resolve node ID from params via gateway query.
+    async def _make_client(self, params: dict[str, Any]) -> Any:
+        """Create RPC client based on params. Uses module-level create_client for testability."""
+        gateway_url = params.get("gatewayUrl")
+        gateway_token = params.get("gatewayToken")
+        if gateway_url:
+            from openclaw.gateway.rpc_client import GatewayRPCClient  # noqa: PLC0415
+            return GatewayRPCClient(url=gateway_url, auth_token=gateway_token)
+        import openclaw.agents.tools.canvas as _self  # noqa: PLC0415
+        _cc = _self.create_client
+        if _cc is None:
+            from openclaw.gateway.rpc_client import create_client as _cc  # noqa: PLC0415
+        return await _cc()
+
+    async def _resolve_node_id_with_client(self, client: Any, params: dict[str, Any]) -> str:
+        """Resolve node ID using an already-created client.
 
         Mirrors TS resolveNodeId(gatewayOpts, node, true) from nodes-utils.ts.
-        Falls back to first connected node if no node specified (allowDefault=True).
+        If no explicit node is specified, returns "" to let the gateway use the default.
+        Only calls node.list when an explicit node name/ID is specified and needs resolving.
         """
-        from .nodes_utils import resolve_node_id
-        node = (params.get("node") or "").strip() or None
-        gateway_opts: dict[str, Any] = {}
-        if params.get("gatewayUrl"):
-            gateway_opts["url"] = params["gatewayUrl"]
-        if params.get("gatewayToken"):
-            gateway_opts["token"] = params["gatewayToken"]
-        return await resolve_node_id(
-            gateway_opts=gateway_opts,
-            query=node,
-            allow_default=True,
-        )
+        node = (params.get("node") or "").strip()
+        if not node:
+            # No explicit node — use empty string (gateway picks the default canvas node)
+            return ""
+        # Explicit node name/ID specified — resolve via gateway
+        from .nodes_utils import resolve_node_id_from_list, _parse_node_list  # noqa: PLC0415
+        try:
+            res = await client.call("node.list", {})
+            nodes = _parse_node_list(res)
+        except Exception:
+            nodes = []
+        try:
+            return resolve_node_id_from_list(nodes, node, allow_default=False)
+        except (ValueError, KeyError):
+            return node  # Return as-is if resolution fails
+
+    async def _resolve_node_id(self, params: dict[str, Any]) -> str:
+        """Resolve node ID from params — creates its own client.
+
+        Kept for backward compatibility; use _resolve_node_id_with_client when
+        a shared client is available.
+        """
+        client = await self._make_client(params)
+        return await self._resolve_node_id_with_client(client, params)
 
     async def _invoke(
         self,
@@ -331,14 +367,13 @@ class CanvasTool(AgentTool):
         command: str,
         invoke_params: dict[str, Any] | None,
         tool_params: dict[str, Any],
+        client: Any = None,
     ) -> dict[str, Any]:
         """Invoke a canvas command on a node via gateway RPC.
 
         Mirrors TS `invoke()` closure in canvas-tool.ts (lines 70-76):
         calls callGatewayTool("node.invoke", opts, { nodeId, command, params, idempotencyKey })
         """
-        gateway_url = tool_params.get("gatewayUrl")
-        gateway_token = tool_params.get("gatewayToken")
         timeout_ms = tool_params.get("timeoutMs", 20000)
         idempotency_key = str(uuid.uuid4())
 
@@ -348,12 +383,8 @@ class CanvasTool(AgentTool):
         )
 
         try:
-            from openclaw.gateway.rpc_client import GatewayRPCClient, create_client
-
-            if gateway_url:
-                client = GatewayRPCClient(url=gateway_url, auth_token=gateway_token)
-            else:
-                client = await create_client()
+            if client is None:
+                client = await self._make_client(tool_params)
 
             result = await client.call("node.invoke", {
                 "nodeId": node_id,

@@ -259,8 +259,7 @@ def ensure_agent_workspace(
     user_path = workspace_dir / DEFAULT_USER_FILENAME
     heartbeat_path = workspace_dir / DEFAULT_HEARTBEAT_FILENAME
     bootstrap_path = workspace_dir / DEFAULT_BOOTSTRAP_FILENAME
-    # BOOT.md is intentionally NOT auto-created — matches TS behavior.
-    # It is user-created (or created by tools) and only read if present.
+    boot_path = workspace_dir / DEFAULT_BOOT_FILENAME
 
     # Load templates
     try:
@@ -275,6 +274,12 @@ def ensure_agent_workspace(
         logger.error("Failed to load templates: %s", exc)
         return result
 
+    # Load BOOT.md template (non-fatal if missing)
+    try:
+        boot_template: str | None = load_template(DEFAULT_BOOT_FILENAME)
+    except FileNotFoundError:
+        boot_template = None
+
     # Write standard bootstrap files (write-if-missing)
     write_file_if_missing(agents_path, agents_template)
     write_file_if_missing(soul_path, soul_template)
@@ -282,6 +287,8 @@ def ensure_agent_workspace(
     write_file_if_missing(identity_path, identity_template)
     write_file_if_missing(user_path, user_template)
     write_file_if_missing(heartbeat_path, heartbeat_template)
+    if boot_template is not None:
+        write_file_if_missing(boot_path, boot_template)
 
     # -----------------------------------------------------------------------
     # workspace-state.json auto-detection — port of TS lines 316-360
@@ -310,12 +317,17 @@ def ensure_agent_workspace(
 
     # Case 3: No seed record and no BOOTSTRAP.md → legacy migration path
     if not state.get("bootstrapSeededAt") and not state.get("onboardingCompletedAt") and not bootstrap_exists:
-        # If USER.md or IDENTITY.md differ from their templates the workspace
-        # was already personalised — treat as onboarding complete (TS lines 333-354).
+        # If AGENTS.md, USER.md, or IDENTITY.md differ from their templates the
+        # workspace was already personalised — treat as onboarding complete.
         try:
+            agents_content = agents_path.read_text(encoding="utf-8") if agents_path.exists() else ""
             identity_content = identity_path.read_text(encoding="utf-8") if identity_path.exists() else ""
             user_content = user_path.read_text(encoding="utf-8") if user_path.exists() else ""
-            legacy_completed = (identity_content != identity_template or user_content != user_template)
+            legacy_completed = (
+                agents_content != agents_template
+                or identity_content != identity_template
+                or user_content != user_template
+            )
         except Exception:
             legacy_completed = False
 
@@ -352,6 +364,7 @@ def ensure_agent_workspace(
         "user_path": user_path,
         "heartbeat_path": heartbeat_path,
         "bootstrap_path": bootstrap_path,
+        "boot_path": boot_path if boot_path.exists() else None,
     })
     return result
 

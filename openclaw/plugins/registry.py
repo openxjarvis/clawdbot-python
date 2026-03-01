@@ -76,20 +76,83 @@ class PluginRegistryApi:
         return self._data.hooks
 
 
-def create_plugin_registry() -> PluginRegistry:
-    """Create a new empty PluginRegistry. Alias for create_empty_plugin_registry."""
-    return create_empty_plugin_registry()
+def create_plugin_registry(plugin_logger=None) -> "ConcretePluginApi":
+    """Create a new empty plugin registry API.
+
+    Args:
+        plugin_logger: Optional logger; accepted for API compatibility but unused
+                       (logging uses the module logger internally).
+    """
+    return ConcretePluginApi(create_empty_plugin_registry())
+
+
+def clear_plugin_commands() -> None:
+    """Clear global plugin command registrations (used in tests)."""
+    pass  # Commands live on the registry instance, not globally
 
 
 class ConcretePluginApi:
-    """Concrete implementation stub for backward-compat.
+    """Registry API for a single plugin instance.
 
-    New code should use PluginApi from api.py instead.
+    Returned by create_plugin_registry() — provides register_tool(),
+    register_provider(), etc. methods that write into an underlying PluginRegistry.
     """
 
-    def __init__(self, plugin_id: str, registry: PluginRegistry) -> None:
+    def __init__(self, registry: PluginRegistry, plugin_id: str = "") -> None:
         self.id = plugin_id
         self._registry = registry
+
+    @property
+    def registry(self) -> PluginRegistry:
+        return self._registry
+
+    def create_api(self, record: "PluginRecord", config: Any = None) -> "ConcretePluginApi":
+        """Return a plugin-scoped API sub-handle."""
+        return ConcretePluginApi(self._registry, plugin_id=record.id)
+
+    def register_tool(self, record: "PluginRecord", factory: Callable, names: list[str] | None = None) -> None:
+        reg = PluginToolRegistration(plugin_id=record.id, factory=factory, names=names or [], source=record.source)
+        self._registry.tools.append(reg)
+
+    def register_provider(self, record: "PluginRecord", provider: Any) -> None:
+        from .types import PluginProviderRegistration, PluginDiagnostic
+        provider_id = getattr(provider, "id", str(id(provider)))
+        # Duplicate check — add diagnostic instead of raising
+        if any(getattr(r, "provider", None) is not None and getattr(r.provider, "id", None) == provider_id
+               for r in self._registry.providers):
+            self._registry.diagnostics.append(
+                PluginDiagnostic(plugin_id=record.id, level="error",
+                                 message=f"Provider '{provider_id}' already registered",
+                                 source=record.source)
+            )
+            return
+        reg = PluginProviderRegistration(plugin_id=record.id, provider=provider, source=record.source)
+        self._registry.providers.append(reg)
+        record.provider_ids.append(provider_id)
+
+    def register_http_handler(self, record: "PluginRecord", handler: Callable) -> None:
+        reg = PluginHttpRegistration(plugin_id=record.id, handler=handler, source=record.source)
+        self._registry.http_handlers.append(reg)
+        record.http_handlers += 1
+
+    def register_http_route(self, record: "PluginRecord", path: str, handler: Callable) -> None:
+        from .types import PluginDiagnostic
+        if any(getattr(r, "path", None) == path for r in self._registry.http_routes):
+            self._registry.diagnostics.append(
+                PluginDiagnostic(plugin_id=record.id, level="error",
+                                 message=f"HTTP route '{path}' already registered",
+                                 source=record.source)
+            )
+            return
+        reg = PluginHttpRouteRegistration(plugin_id=record.id, path=path, handler=handler, source=record.source)
+        self._registry.http_routes.append(reg)
+
+    def register_command(self, record: "PluginRecord", cmd: Any) -> None:
+        reg = PluginCommandRegistration(plugin_id=record.id, command=cmd, source=record.source)
+        self._registry.commands.append(reg)
+        cmd_name = getattr(cmd, "name", "")
+        if cmd_name and cmd_name not in record.commands:
+            record.commands.append(cmd_name)
 
 
 __all__ = [
@@ -112,4 +175,5 @@ __all__ = [
     "PluginGatewayMethodRegistration",
     "create_empty_plugin_registry",
     "create_plugin_registry",
+    "clear_plugin_commands",
 ]

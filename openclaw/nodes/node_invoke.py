@@ -271,14 +271,12 @@ async def _handle_system_run(params: dict, skill_bins: SkillBinsProvider | None)
 
 def _handle_system_which(params: dict) -> dict:
     bins_param = params.get("bins") or []
-    found: dict[str, str] = {}
+    found: dict[str, str | None] = {}
     for b in bins_param:
         if not isinstance(b, str) or not b.strip():
             continue
-        path = shutil.which(b.strip())
-        if path:
-            found[b.strip()] = path
-    return {"ok": True, "payload": {"bins": found}}
+        found[b.strip()] = shutil.which(b.strip()) or None
+    return {"ok": True, "payload": found}
 
 
 # ---------------------------------------------------------------------------

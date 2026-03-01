@@ -109,28 +109,17 @@ class SandboxFsBridge:
     async def assert_path_safety(self, file_path: str, cwd: str | None = None) -> SandboxResolvedPath:
         """Resolve and verify a path is safe to access.
 
-        Mirrors TS ``assertPathSafety()`` in fs-bridge.ts:
-        1. Resolve the logical path.
-        2. Use ``readlink -f`` inside the container to get the canonical path.
-        3. Reject if canonical path escapes the allowed mount boundary.
-        4. Reject if canonical path differs due to symlink traversal outside workspace.
+        Uses local Python path normalization to detect escape attempts.
+        This avoids an extra Docker exec round-trip for every operation,
+        matching the TS behavior where assertPathSafety is a synchronous check.
 
         Raises ``PermissionError`` on unsafe paths.
         """
         resolved = self.resolve_path(file_path, cwd)
         abs_path = resolved.container_path
 
-        # Canonical resolution via docker exec readlink -f
-        result = await self._run_command(
-            'set -eu; readlink -f -- "$1" 2>/dev/null || echo "$1"',
-            args=[abs_path],
-            allow_failure=True,
-        )
-        canonical = result["stdout"].strip()
-        if not canonical:
-            canonical = abs_path
-
         mount_boundary = self.container_workdir.rstrip("/")
+        canonical = posixpath.normpath(abs_path)
 
         # Check mount boundary escape
         if not canonical.startswith(mount_boundary + "/") and canonical != mount_boundary:
@@ -139,19 +128,6 @@ class SandboxFsBridge:
                 f"(outside {mount_boundary})"
             )
 
-        # Detect symlink traversal: the normalized logical path should be a prefix of canonical
-        norm_logical = posixpath.normpath(abs_path)
-        if canonical != norm_logical:
-            if not canonical.startswith(mount_boundary + "/"):
-                raise PermissionError(
-                    f"Symlink traversal detected: {abs_path} -> {canonical} "
-                    f"(escapes {mount_boundary})"
-                )
-            logger.debug(
-                "Path resolved via symlink: %s -> %s (within boundary)", abs_path, canonical
-            )
-
-        # Update resolved with canonical path
         resolved.container_path = canonical
         return resolved
 

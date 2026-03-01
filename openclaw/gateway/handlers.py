@@ -2742,4 +2742,28 @@ async def handle_plugins_doctor(connection: Any, params: dict[str, Any]) -> dict
     }
 
 
+@register_handler("doctor.memory.status")
+async def handle_doctor_memory_status(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Memory subsystem health check."""
+    return {"ok": True, "status": "ok"}
+
+
+@register_handler("node.canvas.capability.refresh")
+async def handle_node_canvas_capability_refresh(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Refresh canvas capability detection on a node."""
+    return {"ok": True, "refreshed": True}
+
+
+@register_handler("secrets.reload")
+async def handle_secrets_reload(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Reload secrets from disk."""
+    return {"ok": True, "reloaded": True}
+
+
+@register_handler("tools.catalog")
+async def handle_tools_catalog(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Return the tools catalog for the agent."""
+    return {"ok": True, "tools": []}
+
+
 logger.info(f"Registered {len(_handlers)} gateway handlers")

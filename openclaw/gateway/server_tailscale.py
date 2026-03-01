@@ -21,9 +21,11 @@ async def start_gateway_tailscale_exposure(config: dict) -> dict | None:
         Dict with Tailscale info or None
     """
     tailscale_config = config.get("tailscale", {})
-    
-    if not tailscale_config.get("enabled", False):
-        logger.info("Tailscale exposure disabled")
+
+    # TS uses mode != "off" — not an "enabled" boolean flag
+    _ts_mode = tailscale_config.get("mode", "off")
+    if _ts_mode == "off":
+        logger.info("Tailscale exposure disabled (mode=off)")
         return None
     
     logger.info("Starting Tailscale exposure")

@@ -55,6 +55,49 @@ class Message(BaseModel):
         return msg
 
 
+class _HistoryProxy:
+    """List-like proxy over Session.messages that returns dicts for item access.
+
+    This allows:
+    - ``session.history.append({"role": "user", "content": "hello"})``
+    - ``session.history[0]["content"]``
+    - ``len(session.history)``
+    - ``for msg in session.history``
+    """
+
+    __slots__ = ("_session",)
+
+    def __init__(self, session: "Session") -> None:
+        self._session = session
+
+    def __len__(self) -> int:
+        return len(self._session.messages)
+
+    def __iter__(self):
+        for msg in self._session.messages:
+            yield msg if isinstance(msg, dict) else msg.model_dump()
+
+    def __getitem__(self, index):
+        msg = self._session.messages[index]
+        return msg if isinstance(msg, dict) else msg.model_dump()
+
+    def append(self, item) -> None:
+        if isinstance(item, Message):
+            self._session.messages.append(item)
+        elif isinstance(item, dict):
+            try:
+                self._session.messages.append(Message(**item))
+            except Exception:
+                self._session.messages.append(item)  # type: ignore[arg-type]
+        else:
+            self._session.messages.append(item)  # type: ignore[arg-type]
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, list):
+            return list(self) == other
+        return NotImplemented
+
+
 class Session(BaseModel):
     """
     Manages a conversation session with persistence
@@ -63,6 +106,7 @@ class Session(BaseModel):
     session_id: str
     workspace_dir: Path
     session_key: str | None = None  # Optional session key for reference
+    agent_id: str | None = None     # Agent identifier (optional, for display)
     messages: list[Message] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
@@ -75,24 +119,35 @@ class Session(BaseModel):
 
     def __init__(
         self,
-        session_id: str,
+        session_id: str | None = None,
         workspace_dir: Path | None = None,
         session_key: str | None = None,
         *,
         sessions_dir_override: Path | None = None,
-        **kwargs
+        agent_id: str | None = None,
+        **kwargs,
     ):
         """
         Initialize session with UUID.
-        
+
         Args:
-            session_id: Session UUID (NOT session key)
-            workspace_dir: Workspace directory
-            session_key: Optional session key for reference (e.g., "agent:main:telegram:dm:123")
+            session_id: Session UUID or simple key.  Auto-generated if omitted.
+            workspace_dir: Workspace directory.
+            session_key: Optional session key for reference.
+            agent_id: Optional agent identifier stored on the session.
         """
+        import uuid as _uuid_mod
+        if session_id is None:
+            session_id = str(_uuid_mod.uuid4())
         if workspace_dir is None:
             workspace_dir = Path.home() / ".openclaw" / "workspace"
-        super().__init__(session_id=session_id, workspace_dir=workspace_dir, session_key=session_key, **kwargs)
+        super().__init__(
+            session_id=session_id,
+            workspace_dir=workspace_dir,
+            session_key=session_key,
+            agent_id=agent_id,
+            **kwargs,
+        )
 
         # Set sessions directory override for workspace-scoped sessions
         if sessions_dir_override is not None:
@@ -111,6 +166,29 @@ class Session(BaseModel):
         # Load existing session if exists
         if self._session_file.exists() and not self.messages:
             self._load()
+
+    @property
+    def history(self) -> "_HistoryProxy":
+        """Alias for .messages — returns a proxy that supports dict-style access
+        and .append() that writes back to self.messages.
+        """
+        return _HistoryProxy(self)
+
+    @history.setter
+    def history(self, value: list) -> None:
+        """Accept list of dicts or Message objects."""
+        parsed = []
+        for item in value:
+            if isinstance(item, Message):
+                parsed.append(item)
+            elif isinstance(item, dict):
+                try:
+                    parsed.append(Message(**item))
+                except Exception:
+                    parsed.append(item)
+            else:
+                parsed.append(item)
+        self.messages = parsed  # type: ignore[assignment]
 
     @property
     def _sessions_dir(self) -> Path:
@@ -194,9 +272,16 @@ class Session(BaseModel):
     def _save(self) -> None:
         """Save session to disk"""
         try:
+            def _msg_to_dict(msg: Any) -> dict:
+                if isinstance(msg, dict):
+                    return msg
+                return msg.model_dump()
+
             data = {
                 "session_id": self.session_id,
-                "messages": [msg.model_dump() for msg in self.messages],
+                "session_key": self.session_key,
+                "agent_id": self.agent_id,
+                "messages": [_msg_to_dict(msg) for msg in self.messages],
                 "metadata": self.metadata,
                 "created_at": self.created_at,
                 "updated_at": self.updated_at,
@@ -212,10 +297,24 @@ class Session(BaseModel):
             with open(self._session_file) as f:
                 data = json.load(f)
 
-            self.messages = [Message(**msg) for msg in data.get("messages", [])]
+            loaded_msgs = []
+            for m in data.get("messages", []):
+                if isinstance(m, dict):
+                    try:
+                        loaded_msgs.append(Message(**m))
+                    except Exception:
+                        loaded_msgs.append(m)
+                else:
+                    loaded_msgs.append(m)
+            self.messages = loaded_msgs  # type: ignore[assignment]
             self.metadata = data.get("metadata", {})
             self.created_at = data.get("created_at", self.created_at)
             self.updated_at = data.get("updated_at", self.updated_at)
+            # Restore fields that _save now persists
+            if data.get("session_key") and not self.session_key:
+                self.session_key = data["session_key"]
+            if data.get("agent_id") and not self.agent_id:
+                self.agent_id = data["agent_id"]
         except Exception as e:
             logger.error(f"Failed to load session: {e}")
 
@@ -591,6 +690,49 @@ class SessionManager:
         
         return self._sessions[session_id]
 
+    def create_session(
+        self,
+        session_key: str | None = None,
+        *,
+        agent_id: str | None = None,
+    ) -> "Session":
+        """Create (or get if already exists) a session by session_key.
+
+        Saves the session immediately so it can be re-loaded later.
+        """
+        import uuid as _uuid
+        if session_key:
+            # Use session_key as session_id for simple sessions so they can
+            # be retrieved by key via get_session(session_key).
+            sid = session_key
+        else:
+            sid = f"{agent_id or 'session'}-{_uuid.uuid4().hex[:8]}"
+
+        if sid in self._sessions:
+            return self._sessions[sid]
+
+        # Create a fresh session — always empty (this is "create", not "load or create").
+        session = Session(
+            session_id=sid,
+            workspace_dir=self.workspace_dir,
+            session_key=session_key or sid,
+            agent_id=agent_id,
+            sessions_dir_override=self._sessions_dir,
+        )
+        # Discard any messages that may have been loaded from a stale disk file
+        session.messages = []
+
+        self._sessions[sid] = session
+        session._save()
+        return session
+
+    def save_session(self, session: "Session") -> None:
+        """Persist a session to disk.
+
+        Convenience wrapper used by external code and tests.
+        """
+        session._save()
+
     def get_or_create(self, session_id: str | None = None, session_key: str | None = None) -> "Session":
         """
         Backward-compatible get-or-create entrypoint.
@@ -617,12 +759,13 @@ class SessionManager:
         if sid in self._sessions:
             return self._sessions[sid]
 
-        # Simple (non-agent-key) sessions live in workspace_dir/.sessions/
-        # so they are portable and workspace-scoped (mirrors TS local session storage).
+        # Simple (non-agent-key) sessions — store in workspace_dir/.sessions/
+        # so they are portable and workspace-scoped (mirrors TS local storage).
         session = Session(
             session_id=sid,
             workspace_dir=self.workspace_dir,
             session_key=sid,
+            # No sessions_dir_override → uses workspace_dir/.sessions
         )
         self._sessions[sid] = session
         # Persist immediately so list_sessions() can discover it.
@@ -644,23 +787,67 @@ class SessionManager:
         """
         return self.get_or_create_session(session_key=session_key)
 
-    def get_session(self, session_id: str) -> Session:
+    def get_session(self, session_id: str) -> "Session":
         """
-        Get or create a session (legacy method)
+        Get or create a session by session_id (or session_key).
+
+        Auto-creates if not found (after scanning disk).  Loads from disk if a
+        saved file exists with that id.
 
         Args:
-            session_id: Unique session identifier
+            session_id: Session UUID, simple id, or session key.
 
         Returns:
-            Session instance
+            Session instance (always non-None).
         """
-        if session_id not in self._sessions:
-            self._sessions[session_id] = Session(
+        # 1. Check in-memory cache by session_id
+        if session_id in self._sessions:
+            return self._sessions[session_id]
+
+        # 2. Check in-memory cache by session_key
+        for s in self._sessions.values():
+            if s.session_key == session_id:
+                return s
+
+        # 3. Try loading from disk by session_id stem (loads prior messages)
+        candidate_file = self._sessions_dir / f"{session_id}.json"
+        if candidate_file.exists():
+            session = Session(
                 session_id,
                 self.workspace_dir,
                 sessions_dir_override=self._sessions_dir,
             )
-        return self._sessions[session_id]
+            self._sessions[session_id] = session
+            return session
+
+        # 4. Scan disk files and match by session_key field
+        if self._sessions_dir.exists():
+            for f in self._sessions_dir.glob("*.json"):
+                if f.name in ("session_map.json", "sessions.json"):
+                    continue
+                try:
+                    import json as _json
+                    data = _json.loads(f.read_text())
+                    if data.get("session_key") == session_id:
+                        loaded_id = data.get("session_id", f.stem)
+                        session = Session(
+                            loaded_id,
+                            self.workspace_dir,
+                            sessions_dir_override=self._sessions_dir,
+                        )
+                        self._sessions[loaded_id] = session
+                        return session
+                except Exception:
+                    continue
+
+        # 5. Auto-create: session doesn't exist on disk → create new
+        session = Session(
+            session_id,
+            self.workspace_dir,
+            sessions_dir_override=self._sessions_dir,
+        )
+        self._sessions[session_id] = session
+        return session
 
     def list_sessions(self) -> list[str]:
         """
@@ -673,14 +860,20 @@ class SessionManager:
             Sorted list of session keys.
         """
         disk_sessions: set[str] = set()
+        # Scan canonical sessions dir (agent-key sessions)
         if self._sessions_dir.exists():
             for f in self._sessions_dir.glob("*.json"):
-                # Exclude index/map files
+                if f.name not in ("session_map.json", "sessions.json"):
+                    disk_sessions.add(f.stem)
+
+        # Also scan workspace_dir/.sessions (simple/workspace-scoped sessions)
+        legacy_dir = self.workspace_dir / ".sessions"
+        if legacy_dir.exists() and legacy_dir != self._sessions_dir:
+            for f in legacy_dir.glob("*.json"):
                 if f.name not in ("session_map.json", "sessions.json"):
                     disk_sessions.add(f.stem)
 
         # Include in-memory simple sessions (where session_id == their key)
-        # These are sessions created by get_or_create() but not yet saved
         for sid, session in self._sessions.items():
             if session.session_id == sid:
                 disk_sessions.add(sid)

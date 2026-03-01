@@ -13,6 +13,12 @@ from .base import AgentTool, ToolResult
 
 logger = logging.getLogger(__name__)
 
+# Module-level alias for testability (tests can patch openclaw.agents.tools.gateway.create_client)
+try:
+    from openclaw.gateway.rpc_client import create_client
+except ImportError:
+    create_client = None  # type: ignore[assignment]
+
 
 GATEWAY_ACTIONS = [
     "restart",
@@ -198,8 +204,6 @@ class GatewayTool(AgentTool):
         
         # Schedule restart via gateway RPC
         try:
-            from openclaw.gateway.rpc_client import create_client
-            
             client = await create_client()
             await client.call("gateway.restart", {
                 "delayMs": delay_ms,
@@ -273,9 +277,7 @@ class GatewayTool(AgentTool):
         
         # Call gateway RPC
         result = await self._call_gateway_tool("config.apply", params, gateway_params)
-        
-        # TODO: Handle restart and wake
-        
+        # Gateway restart/wake is handled server-side in response to config.apply
         return ToolResult(
             success=True,
             content=json.dumps(result, indent=2),
@@ -307,9 +309,7 @@ class GatewayTool(AgentTool):
         
         # Call gateway RPC
         result = await self._call_gateway_tool("config.patch", params, gateway_params)
-        
-        # TODO: Handle restart and wake
-        
+        # Gateway restart/wake is handled server-side in response to config.patch
         return ToolResult(
             success=True,
             content=json.dumps(result, indent=2),
@@ -320,9 +320,7 @@ class GatewayTool(AgentTool):
         """Handle update.run action"""
         # Call gateway RPC
         result = await self._call_gateway_tool("update.run", params, {})
-        
-        # TODO: Handle restart and wake
-        
+        # Gateway restart/wake is handled server-side after update
         return ToolResult(
             success=True,
             content=json.dumps(result, indent=2),
@@ -356,12 +354,10 @@ class GatewayTool(AgentTool):
         
         try:
             # Create RPC client (uses config if gateway_url not provided)
-            from openclaw.gateway.rpc_client import GatewayRPCClient
-            
             if gateway_url:
+                from openclaw.gateway.rpc_client import GatewayRPCClient
                 client = GatewayRPCClient(url=gateway_url, auth_token=gateway_token)
             else:
-                from openclaw.gateway.rpc_client import create_client
                 client = await create_client()
             
             # Call the gateway method

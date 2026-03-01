@@ -35,9 +35,12 @@ def _resolve_credentials_dir() -> Path:
     # Respect explicit override first (env var kept for compatibility)
     oauth_override = os.environ.get("OPENCLAW_OAUTH_DIR", "").strip()
     if oauth_override:
-        return Path(oauth_override).expanduser().resolve()
-    # TS uses stateDir/credentials (src/config/paths.ts resolveOAuthDir)
-    return Path(state_dir) / "credentials"
+        creds = Path(oauth_override).expanduser().resolve()
+    else:
+        # TS uses stateDir/credentials (src/config/paths.ts resolveOAuthDir)
+        creds = Path(state_dir) / "credentials"
+    creds.mkdir(parents=True, exist_ok=True)
+    return creds
 
 
 def _safe_channel_key(channel: str) -> str:
@@ -84,7 +87,8 @@ def _resolve_allow_from_path(channel: str, account_id: str | None = None) -> Pat
     """
     base = _safe_channel_key(channel)
     normalized = (account_id or "").strip()
-    if not normalized:
+    # Treat "default" as no account (produces unscoped filename), matching TS
+    if not normalized or normalized.lower() == "default":
         return _resolve_credentials_dir() / f"{base}-allowFrom.json"
     return _resolve_credentials_dir() / f"{base}-{_safe_account_key(normalized)}-allowFrom.json"
 

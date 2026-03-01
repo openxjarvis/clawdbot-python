@@ -100,7 +100,7 @@ class TestCompleteSystemFlow:
         )
         
         workspace = tmp_path / "workspace"
-        manager = SessionManager(workspace_dir=workspace)
+        manager = SessionManager(workspace_dir=workspace, base_dir=tmp_path)
         
         # Simulate multi-turn conversation
         session = manager.get_or_create_session(

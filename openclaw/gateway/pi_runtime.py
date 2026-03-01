@@ -108,6 +108,20 @@ def _trim_tool_call_names_in_event(event: Any) -> None:
                     block.name = trimmed
 
 
+class PiSession:
+    """Lightweight wrapper around pi_coding_agent.AgentSession for testability.
+
+    Exposes only the fields that PiAgentRuntime and its tests need to mock.
+    """
+
+    def __init__(self, session_id: str | None = None, **kwargs: Any) -> None:
+        self.session_id = session_id or ""
+        self.history: list[Any] = kwargs.get("history", [])
+
+    async def run(self, *args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError("PiSession.run must be implemented by subclass or mock")
+
+
 class PiAgentRuntime:
     """Gateway-level runtime powered by pi_coding_agent.AgentSession.
 
@@ -130,14 +144,18 @@ class PiAgentRuntime:
         fallback_models: list[str] | None = None,
         cwd: str | Path | None = None,
         system_prompt: str | None = None,
-        config: dict[str, Any] | None = None,
+        config: Any = None,
         hook_runner: Any | None = None,
+        *,
+        workspace_dir: str | Path | None = None,
     ) -> None:
         self.model_str = model
         self.model_candidates: list[str] = [model] + list(fallback_models or [])
-        self.cwd = str(cwd) if cwd else None
+        # workspace_dir is an alias for cwd (accepted for API compatibility)
+        self.cwd = str(workspace_dir or cwd) if (workspace_dir or cwd) else None
         self.system_prompt = system_prompt
-        self.config = config or {}
+        self._config = config  # keep original mock/object intact
+        self.config = config if isinstance(config, dict) else {}
 
         self._hook_runner: Any | None = hook_runner
 
@@ -458,15 +476,21 @@ class PiAgentRuntime:
                     previous_summary=None,
                 )
             
-            # Step 3: Enrich summary with tool failures and file ops
-            enriched_summary = enrich_compaction_summary(
-                base_summary=summary,
-                messages_to_summarize=dropped_messages,
-                turn_prefix_messages=[],
-                file_ops=None,  # Would need to track file ops
-                workspace_dir=self.cwd,
-                include_workspace_context=True,
-            )
+            # Step 3: Enrich summary with tool failures and file ops — only in
+            # "safeguard" mode (mirrors TS: safeguard extension applied only when
+            # compaction.mode === "safeguard").
+            _compaction_mode = compaction_settings.get('mode', 'safeguard')
+            if _compaction_mode == 'safeguard':
+                enriched_summary = enrich_compaction_summary(
+                    base_summary=summary,
+                    messages_to_summarize=dropped_messages,
+                    turn_prefix_messages=[],
+                    file_ops=None,
+                    workspace_dir=self.cwd,
+                    include_workspace_context=True,
+                )
+            else:
+                enriched_summary = summary
             
             # Step 4: Update session history with compacted version
             # Insert summary as a system-like message at the beginning of kept messages
@@ -1223,10 +1247,11 @@ class PiAgentRuntime:
                             
                                     compaction_settings = {
                                         'enabled': compaction_config.get('enabled', True),
+                                        'mode': compaction_config.get('mode', 'safeguard'),
                                         'reserveTokens': compaction_config.get('reserveTokens', 16384),
                                         'keepRecentTokens': compaction_config.get('keepRecentTokens', 20000),
                                     }
-                            
+
                                     if should_compact(context_tokens, context_window, compaction_settings):
                                         logger.warning(
                                             f"Auto-compaction triggered: {context_tokens} tokens "
@@ -1481,6 +1506,7 @@ class PiAgentRuntime:
                             compaction_config = defaults.get("compaction", {})
                             compaction_settings = {
                                 "enabled": compaction_config.get("enabled", True),
+                                "mode": compaction_config.get("mode", "safeguard"),
                                 "reserveTokens": compaction_config.get("reserveTokens", 16384),
                                 "keepRecentTokens": compaction_config.get("keepRecentTokens", 20000),
                             }

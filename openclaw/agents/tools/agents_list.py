@@ -68,28 +68,33 @@ class AgentsListTool(AgentTool):
             allow_agents = []
             allow_any = False
             
+            all_agents = [
+                entry for entry in agents_list if entry.get("id")
+            ]
+            all_agent_ids = [entry.get("id") for entry in all_agents]
+
             if current_agent_config:
                 subagents_config = current_agent_config.get("subagents", {})
-                allow_agents = subagents_config.get("allowAgents", [])
-                
-                # Check for wildcard
-                if "*" in allow_agents:
+                allow_agents_cfg = subagents_config.get("allowAgents", None)
+
+                if allow_agents_cfg is None:
+                    # No explicit allowlist → allow all (mirrors TS default)
                     allow_any = True
-                    # List all configured agents
-                    allow_agents = [
-                        agent_entry.get("id")
-                        for agent_entry in agents_list
-                        if agent_entry.get("id")
-                    ]
+                    allowed_ids: set[str] = set(all_agent_ids)
+                elif "*" in allow_agents_cfg:
+                    # Wildcard → allow all
+                    allow_any = True
+                    allowed_ids = set(all_agent_ids)
+                else:
+                    allowed_ids = set(allow_agents_cfg)
             else:
-                # Default: allow spawning all configured agents
+                # Agent not in list → allow all configured agents
                 allow_any = True
-                allow_agents = [
-                    agent_entry.get("id")
-                    for agent_entry in agents_list
-                    if agent_entry.get("id")
-                ]
-            
+                allowed_ids = set(all_agent_ids)
+
+            # Return full agent entries for allowed agents
+            allow_agents = [e for e in all_agents if e.get("id") in allowed_ids]
+
             result = {
                 "agents": allow_agents,
                 "allowAny": allow_any,

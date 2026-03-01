@@ -321,8 +321,9 @@ def build_agent_system_prompt(
     ))
 
     # ── 26. Runtime ──────────────────────────────────────────────────
+    # Pass {} when no runtime_info given so OS/arch/Python are auto-populated
     lines.extend(build_runtime_section(
-        runtime_info=runtime_info,
+        runtime_info=runtime_info if runtime_info is not None else {},
         is_minimal=is_minimal,
         reasoning_level=reasoning_level,
     ))
@@ -367,6 +368,7 @@ _BOOTSTRAP_FILENAMES = [
     DEFAULT_AGENTS_FILENAME,
     DEFAULT_SOUL_FILENAME,
     DEFAULT_TOOLS_FILENAME,
+    DEFAULT_BOOT_FILENAME,      # loaded separately from other templates (TS alignment)
     DEFAULT_IDENTITY_FILENAME,
     DEFAULT_USER_FILENAME,
     DEFAULT_HEARTBEAT_FILENAME,
@@ -449,21 +451,16 @@ def resolve_bootstrap_context_for_run(
             marker = f"\n\n... (truncated {len(content) - max_chars_per_file} chars) ...\n\n"
             content = head + marker + tail
 
-        # Total budget
+        # Total budget — stop loading entirely once exhausted (TS alignment)
+        if total_chars >= total_max_chars:
+            break
         if total_chars + len(content) > total_max_chars:
             remaining = total_max_chars - total_chars
-            if remaining <= 0:
+            # Stop loading if remaining budget is too small to be useful
+            # (less than 10% of the per-file limit → not worth partial-loading)
+            if remaining < max(200, max_chars_per_file // 10):
                 break
-            # Apply 70/20 strategy for total budget truncation too
-            if remaining > 100:  # Only use 70/20 if we have reasonable space
-                head_chars = int(remaining * 0.7)
-                tail_chars = int(remaining * 0.2)
-                head = content[:head_chars]
-                tail = content[-tail_chars:]
-                marker = f"\n\n... (truncated {len(content) - remaining} chars) ...\n\n"
-                content = head + marker + tail
-            else:
-                content = content[:remaining] + "\n…[truncated]"
+            content = content[:remaining] + "\n…[truncated]"
 
         files.append({"path": filename, "content": content})
         total_chars += len(content)
@@ -571,5 +568,27 @@ def format_skills_for_prompt(skills: list[dict]) -> str:
         lines.append("  </skill>")
 
     lines.append("</available_skills>")
-
     return "\n".join(lines)
+
+
+def load_bootstrap_files_legacy(
+    workspace_dir,
+    max_chars_per_file: int | None = None,
+    cfg=None,
+    session_key: str | None = None,
+    **kwargs,
+) -> list[dict]:
+    """Load bootstrap files and return as list of dicts (legacy/TS-compat format).
+
+    Kept for backwards compatibility with tests and external callers.
+    When ``session_key`` indicates a subagent session, only AGENTS.md and
+    TOOLS.md are returned (matching TS filterBootstrapFilesForSession).
+    """
+    workspace_path = Path(workspace_dir) if not isinstance(workspace_dir, Path) else workspace_dir
+    total_max_chars = kwargs.get("total_max_chars") or _DEFAULT_TOTAL_MAX_CHARS
+    return resolve_bootstrap_context_for_run(
+        workspace_path,
+        session_key=session_key,
+        max_chars_per_file=max_chars_per_file or _DEFAULT_MAX_CHARS_PER_FILE,
+        total_max_chars=total_max_chars,
+    )

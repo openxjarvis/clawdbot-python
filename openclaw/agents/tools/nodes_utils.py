@@ -17,6 +17,12 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Module-level alias for testability (allows patching in tests)
+try:
+    from openclaw.gateway.rpc_client import create_client
+except ImportError:
+    create_client = None  # type: ignore[assignment]
+
 
 # ---------------------------------------------------------------------------
 # Node matching helpers (mirrors src/shared/node-match.ts)
@@ -91,8 +97,11 @@ def resolve_node_id_from_candidates(nodes: list[dict[str, Any]], query: str) -> 
 
 async def _call_gateway(method: str, params: dict[str, Any]) -> Any:
     """Call gateway RPC, returns raw result."""
-    from openclaw.gateway.rpc_client import create_client
-    client = await create_client()
+    import openclaw.agents.tools.nodes_utils as _self  # noqa: PLC0415
+    _cc = _self.create_client
+    if _cc is None:
+        from openclaw.gateway.rpc_client import create_client as _cc  # noqa: PLC0415
+    client = await _cc()
     return await client.call(method, params)
 
 

@@ -233,6 +233,16 @@ class AgentToolResult(BaseModel, Generic[TDetails]):
     content: list[Content]
     details: TDetails
 
+    @property
+    def success(self) -> bool:
+        """True unless the content signals a tool error."""
+        for c in self.content:
+            if isinstance(c, dict) and c.get("type") == "tool_result":
+                return not c.get("is_error", False)
+            if hasattr(c, "type") and getattr(c, "type", None) == "tool_result":
+                return not getattr(c, "is_error", False)
+        return True
+
 
 class AgentToolUpdateCallback(Protocol):
     """Callback for streaming tool updates"""

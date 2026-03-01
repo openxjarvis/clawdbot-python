@@ -351,3 +351,20 @@ async def _retry_delivery(
     except Exception as e:
         logger.error(f"Failed to retry delivery {delivery.id}: {e}")
         fail_delivery(queue_dir, delivery.id, str(e))
+
+
+def ensure_delivery_queue_dirs(base_dir: Path | None = None) -> tuple[Path, Path]:
+    """Create the delivery queue directories (and other standard state dirs) if they do not exist.
+
+    Returns (queue_dir, failed_dir).
+    """
+    if base_dir is None:
+        base_dir = resolve_state_dir()
+    queue_dir = base_dir / DELIVERY_QUEUE_DIR
+    failed_dir = queue_dir / DELIVERY_QUEUE_FAILED_DIR
+    queue_dir.mkdir(parents=True, exist_ok=True)
+    failed_dir.mkdir(parents=True, exist_ok=True)
+    # Also ensure other standard top-level dirs (mirrors TS ensureStateDirs)
+    for extra_dir in ("credentials", "logs"):
+        (base_dir / extra_dir).mkdir(parents=True, exist_ok=True)
+    return queue_dir, failed_dir

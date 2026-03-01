@@ -19,6 +19,17 @@ logger = logging.getLogger(__name__)
 INTERNAL_MESSAGE_CHANNEL = "internal"
 
 
+async def deliver_outbound_payloads(**kwargs):
+    """Module-level wrapper — delegates to openclaw.infra.outbound.deliver.
+
+    Exposed here so tests can patch openclaw.auto_reply.reply.route_reply.deliver_outbound_payloads.
+    """
+    from openclaw.infra.outbound.deliver import (
+        deliver_outbound_payloads as _impl,
+    )
+    return await _impl(**kwargs)
+
+
 async def route_reply(
     *,
     payload: dict[str, Any],
@@ -122,11 +133,12 @@ async def route_reply(
     
     # Normalize channel ID
     try:
-        from openclaw.channels.plugins import normalize_channel_id
+        from openclaw.channels.plugins import normalize_channel_id  # noqa: PLC0415
         channel_id = normalize_channel_id(channel)
     except Exception:
-        channel_id = None
-    
+        from openclaw.utils.message_channel import normalize_message_channel  # noqa: PLC0415
+        channel_id = normalize_message_channel(channel) or channel
+
     if not channel_id:
         return {"ok": False, "error": f"Unknown channel: {channel}"}
     
@@ -143,9 +155,10 @@ async def route_reply(
         resolved_thread_id = None
     
     try:
-        # Deliver outbound payloads
-        from openclaw.infra.outbound.deliver import deliver_outbound_payloads
-        
+        # Use module-level deliver_outbound_payloads (allows test mocking via patch)
+        import openclaw.auto_reply.reply.route_reply as _self  # noqa: PLC0415
+        _deliver = _self.deliver_outbound_payloads
+
         mirror_config = None
         if (mirror is None or mirror) and session_key:
             mirror_config = {
@@ -155,7 +168,7 @@ async def route_reply(
                 "mediaUrls": media_urls,
             }
         
-        results = await deliver_outbound_payloads(
+        results = await _deliver(
             cfg=cfg,
             channel=channel_id,
             to=to,

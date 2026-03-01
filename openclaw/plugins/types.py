@@ -107,12 +107,27 @@ class PluginToolRegistration:
 
 @dataclass
 class PluginHookRegistration:
-    """Internal hook registered by a plugin."""
+    """Internal hook registered by a plugin.
+
+    Supports two calling conventions:
+    - Legacy:  PluginHookRegistration(plugin_id, events=[...], handler=fn, source="")
+    - New API: PluginHookRegistration(plugin_id, hook_name, handler, source, priority=0)
+    """
     plugin_id: str
-    events: list[str] = field(default_factory=list)   # Event keys like "command:new"
-    handler: Callable = field(default=lambda e: None)
-    entry: dict[str, Any] | None = None               # HookEntry metadata
+    hook_name: str = ""          # Single hook name (new API)
+    handler: Callable = field(default=lambda e, ctx=None: None)
     source: str = ""
+    priority: int = 0
+    # Legacy fields kept for backward compat
+    events: list[str] = field(default_factory=list)
+    entry: dict[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        # Sync events ↔ hook_name for cross-API compatibility
+        if self.hook_name and not self.events:
+            self.events = [self.hook_name]
+        elif self.events and not self.hook_name:
+            self.hook_name = self.events[0] if self.events else ""
 
 
 @dataclass

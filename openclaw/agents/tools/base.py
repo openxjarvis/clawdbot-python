@@ -416,12 +416,23 @@ class LegacyAgentTool:
     
     async def execute(
         self,
-        tool_call_id: str,
-        params: dict,
+        tool_call_id: str | dict,
+        params: dict | None = None,
         signal: asyncio.Event | None = None,
         on_update: Callable[[AgentToolResult], None] | None = None,
     ) -> AgentToolResult:
-        """Execute via _execute_impl"""
+        """Execute via _execute_impl.
+
+        When called as ``execute(params_dict)`` (legacy 1-arg form), the first
+        positional argument is treated as ``params`` and ``tool_call_id`` is
+        synthesised automatically.
+        """
+        # Handle legacy 1-arg form: execute(params_dict)
+        if isinstance(tool_call_id, dict) and params is None:
+            params = tool_call_id
+            tool_call_id = f"call_{id(params)}"
+        if params is None:
+            params = {}
         if hasattr(self, "_execute_impl"):
             result = await self._execute_impl(params)
             # Convert LegacyToolResult to AgentToolResult

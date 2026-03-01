@@ -12,13 +12,15 @@ from openclaw.agents.session import SessionManager, Session
 @pytest.fixture
 def temp_workspace(tmp_path):
     """Create a temporary workspace directory."""
-    return tmp_path / "workspace"
+    ws = tmp_path / "workspace"
+    ws.mkdir(parents=True, exist_ok=True)
+    return ws
 
 
 @pytest.fixture
-def session_manager(temp_workspace):
-    """Create a SessionManager instance."""
-    return SessionManager(workspace_dir=temp_workspace)
+def session_manager(tmp_path, temp_workspace):
+    """Create a SessionManager instance fully isolated in tmp_path."""
+    return SessionManager(workspace_dir=temp_workspace, base_dir=tmp_path)
 
 
 class TestSessionManagerCreation:
@@ -32,8 +34,8 @@ class TestSessionManagerCreation:
         assert isinstance(manager._sessions, dict)
     
     def test_sessions_directory_created(self, session_manager):
-        """Test that sessions directory is created."""
-        sessions_dir = session_manager.workspace_dir / ".sessions"
+        """Test that sessions directory is created (canonical path under base_dir)."""
+        sessions_dir = session_manager._sessions_dir
         assert sessions_dir.exists()
 
 
@@ -95,17 +97,17 @@ class TestListSessions:
         assert "session-2" in sessions
         assert "session-3" in sessions
     
-    def test_list_sessions_from_disk(self, temp_workspace):
+    def test_list_sessions_from_disk(self, tmp_path, temp_workspace):
         """Test listing sessions that exist on disk but not in cache."""
-        # Create sessions and save to disk
-        manager1 = SessionManager(workspace_dir=temp_workspace)
+        # Create sessions and save to disk (use same base_dir for isolation)
+        manager1 = SessionManager(workspace_dir=temp_workspace, base_dir=tmp_path)
         manager1.get_or_create("disk-session-1").add_user_message("Test")
         manager1.get_or_create("disk-session-2").add_user_message("Test")
-        
-        # Create new manager instance (empty cache)
-        manager2 = SessionManager(workspace_dir=temp_workspace)
+
+        # Create new manager instance (empty cache, same base_dir)
+        manager2 = SessionManager(workspace_dir=temp_workspace, base_dir=tmp_path)
         sessions = manager2.list_sessions()
-        
+
         assert len(sessions) >= 2
         assert "disk-session-1" in sessions
         assert "disk-session-2" in sessions
@@ -197,16 +199,16 @@ class TestConcurrency:
 class TestPersistenceAcrossManagers:
     """Test that sessions persist across SessionManager instances."""
     
-    def test_session_survives_manager_restart(self, temp_workspace):
+    def test_session_survives_manager_restart(self, tmp_path, temp_workspace):
         """Test that sessions persist when manager is recreated."""
         # Create manager and session
-        manager1 = SessionManager(workspace_dir=temp_workspace)
+        manager1 = SessionManager(workspace_dir=temp_workspace, base_dir=tmp_path)
         session1 = manager1.get_or_create("persistent")
         session1.add_user_message("Persistent message")
         session1.set_metadata("key", "value")
         
-        # Create new manager instance
-        manager2 = SessionManager(workspace_dir=temp_workspace)
+        # Create new manager instance (same base_dir for isolation)
+        manager2 = SessionManager(workspace_dir=temp_workspace, base_dir=tmp_path)
         session2 = manager2.get_or_create("persistent")
         
         # Should have loaded from disk
@@ -214,16 +216,16 @@ class TestPersistenceAcrossManagers:
         assert session2.messages[0].content == "Persistent message"
         assert session2.get_metadata("key") == "value"
     
-    def test_multiple_sessions_persist(self, temp_workspace):
+    def test_multiple_sessions_persist(self, tmp_path, temp_workspace):
         """Test that multiple sessions all persist."""
         # Create multiple sessions
-        manager1 = SessionManager(workspace_dir=temp_workspace)
+        manager1 = SessionManager(workspace_dir=temp_workspace, base_dir=tmp_path)
         for i in range(5):
             session = manager1.get_or_create(f"session-{i}")
             session.add_user_message(f"Message {i}")
-        
-        # Recreate manager
-        manager2 = SessionManager(workspace_dir=temp_workspace)
+
+        # Recreate manager (same base_dir for isolation)
+        manager2 = SessionManager(workspace_dir=temp_workspace, base_dir=tmp_path)
         
         # All should be loadable
         for i in range(5):

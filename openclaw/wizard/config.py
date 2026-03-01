@@ -79,8 +79,11 @@ def configure_telegram_enhanced() -> dict:
         "enabled": True,
         "bot_token": token,
         "dm_policy": dm_policy,
+        # TS defaults — align with openclaw TS openclaw.json
+        "group_policy": "allowlist",
+        "stream_mode": "partial",
     }
-    
+
     # Allowlist
     if dm_policy == "allowlist":
         print("\nEnter allowed Telegram user IDs (comma-separated)")
@@ -88,7 +91,7 @@ def configure_telegram_enhanced() -> dict:
         allow_from = input("Allowed user IDs: ").strip()
         if allow_from:
             config["allow_from"] = [x.strip() for x in allow_from.split(",")]
-    
+
     return config
 
 

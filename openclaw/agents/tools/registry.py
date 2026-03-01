@@ -69,6 +69,11 @@ class ToolRegistry:
         for tool in coding_tools:
             self._tools[tool.name] = tool
 
+        # Also register TS-compatible aliases (read_file, write_file, edit_file)
+        from .file_ops import ReadFileTool, WriteFileTool, EditFileTool  # noqa: PLC0415
+        for t in [ReadFileTool(), WriteFileTool(), EditFileTool()]:
+            self._tools[t.name] = t
+
         # Web tools
         self._tools[WebFetchTool().name] = WebFetchTool()
         self._tools[WebSearchTool().name] = WebSearchTool()
@@ -241,9 +246,11 @@ class ToolRegistry:
         
         elif profile == "coding":
             # Coding profile: file operations + bash + web
+            # Includes both TS-style names (read_file) and Python-style aliases (read)
             coding_names = {
-                "read_file", "write_file", "edit_file", "bash", 
-                "web_fetch", "web_search", "grep", "ls"
+                "read_file", "write_file", "edit_file", "bash",
+                "read", "write", "edit",
+                "web_fetch", "web_search", "grep", "ls",
             }
             return [tool for tool in self.list_tools() if tool.name in coding_names]
         

@@ -276,27 +276,79 @@ async def run_onboarding_wizard(
         print("Configuration not saved. Exiting...")
         return {"completed": False, "skipped": True, "reason": "User chose not to save"}
     
-    # Add TS-aligned configuration fields (wizard, messages, commands, hooks)
+    # Add TS-aligned configuration fields
     from datetime import datetime, timezone
-    from openclaw.config.schema import WizardConfig, MessagesConfig, CommandsConfig, HooksConfig, InternalHooksConfig
-    
+    from openclaw.config.schema import (
+        WizardConfig, MessagesConfig, CommandsConfig, HooksConfig,
+        InternalHooksConfig, CompactionConfig, SubagentsConfig,
+        AgentDefaults, AgentsConfig, GatewayTailscaleConfig, GatewayNodesConfig,
+        PluginsConfig, PluginEntryConfig,
+    )
+
+    # --- agents.defaults: compaction, maxConcurrent, subagents ---
+    if not claw_config.agents:
+        claw_config.agents = AgentsConfig()
+    if not claw_config.agents.defaults:
+        claw_config.agents.defaults = AgentDefaults()
+    _defs = claw_config.agents.defaults
+    if _defs.compaction is None:
+        _defs.compaction = CompactionConfig(mode="safeguard")
+    if _defs.maxConcurrent is None:
+        _defs.maxConcurrent = 4
+    if _defs.subagents is None:
+        _defs.subagents = SubagentsConfig(maxConcurrent=8)
+    elif _defs.subagents.maxConcurrent is None:
+        _defs.subagents.maxConcurrent = 8
+
+    # --- gateway: tailscale + nodes defaults ---
+    if not claw_config.gateway:
+        claw_config.gateway = GatewayConfig()
+    if claw_config.gateway.tailscale is None:
+        claw_config.gateway.tailscale = GatewayTailscaleConfig(mode="off", reset_on_exit=False)
+    if claw_config.gateway.nodes is None:
+        claw_config.gateway.nodes = GatewayNodesConfig(
+            deny_commands=[
+                "camera.snap", "camera.clip", "screen.record",
+                "calendar.add", "contacts.add", "reminders.add",
+            ]
+        )
+
+    # --- plugins.entries: mark telegram plugin enabled when configured ---
+    _has_telegram = bool(
+        claw_config.channels
+        and claw_config.channels.telegram
+        and claw_config.channels.telegram.enabled
+    )
+    if _has_telegram:
+        if claw_config.plugins is None:
+            claw_config.plugins = PluginsConfig()
+        if claw_config.plugins.entries is None:
+            claw_config.plugins.entries = {}
+        claw_config.plugins.entries["telegram"] = PluginEntryConfig(enabled=True)
+
+    # --- wizard: map 'quickstart' → 'local' to match TS lastRunMode values ---
+    _last_run_mode = "local" if mode == "quickstart" else mode
+
     if not claw_config.wizard:
         claw_config.wizard = WizardConfig(
             lastRunAt=datetime.now(timezone.utc).isoformat(),
             lastRunVersion="0.6.0",
             lastRunCommand="onboard",
-            lastRunMode=mode
+            lastRunMode=_last_run_mode,
         )
-    
+    else:
+        claw_config.wizard.last_run_at = datetime.now(timezone.utc).isoformat()
+        claw_config.wizard.last_run_command = "onboard"
+        claw_config.wizard.last_run_mode = _last_run_mode
+
     if not claw_config.messages:
         claw_config.messages = MessagesConfig(ackReactionScope="group-mentions")
-    
+
     if not claw_config.commands:
         claw_config.commands = CommandsConfig(native="auto", nativeSkills="auto")
-    
+
     if not claw_config.hooks:
         claw_config.hooks = HooksConfig(
-            enabled=True,
             internal=InternalHooksConfig(
                 enabled=True,
                 entries={
@@ -307,6 +359,11 @@ async def run_onboarding_wizard(
                 }
             )
         )
+    else:
+        # TS does not write top-level hooks.enabled — remove it from output by
+        # setting to None so exclude_none=True drops it during serialization.
+        # The internal hooks block is the authoritative enablement signal.
+        claw_config.hooks.enabled = None  # type: ignore[assignment]
     
     try:
         save_config(claw_config)

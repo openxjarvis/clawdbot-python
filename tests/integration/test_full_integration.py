@@ -237,7 +237,7 @@ class TestCompleteFlow:
         assert is_auth
         
         # 2. Session management
-        session_manager = SessionManager(tmp_path / "workspace", agent_id="main")
+        session_manager = SessionManager(tmp_path / "workspace", agent_id="main", base_dir=tmp_path)
         
         session = session_manager.get_or_create_session(
             channel="telegram",

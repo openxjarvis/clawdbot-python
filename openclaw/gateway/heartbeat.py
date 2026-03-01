@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -38,6 +38,19 @@ class ActiveHoursConfig:
     end: str = "24:00"        # HH:MM exclusive ("24:00" = end of day)
     timezone: str | None = None  # IANA tz or "user"/"local"; None = host tz
 
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, ActiveHoursConfig):
+            return self.start == other.start and self.end == other.end and self.timezone == other.timezone
+        if isinstance(other, (tuple, list)) and len(other) == 2:
+            # Compare as (start_hour, end_hour) integers
+            try:
+                s = int(self.start.split(":")[0])
+                e = int(self.end.split(":")[0])
+                return (s, e) == (int(other[0]), int(other[1]))
+            except (ValueError, IndexError):
+                pass
+        return NotImplemented
+
 
 @dataclass
 class HeartbeatVisibilityConfig:
@@ -48,54 +61,69 @@ class HeartbeatVisibilityConfig:
     use_indicator: bool = True  # Emit indicator events
 
 
-@dataclass
 class HeartbeatConfig:
     """Heartbeat configuration — mirrors TS HeartbeatConfig.
 
     Fields intentionally mirror the TS config schema to allow 1-to-1 mapping.
+    Accepts convenience kwargs ``enabled`` and ``interval_minutes`` in addition
+    to the canonical ``every`` interval string.
     """
 
-    # Interval string, e.g. "30m", "1h", "0m" (disabled).  Also accepts int minutes.
-    every: str = "30m"
+    def __init__(
+        self,
+        every: str = "30m",
+        interval_minutes: int | None = None,
+        enabled: bool | None = None,
+        model: str | None = None,
+        include_reasoning: bool = False,
+        target: str = "last",
+        to: str | None = None,
+        account_id: str | None = None,
+        prompt: str = DEFAULT_HEARTBEAT_PROMPT,
+        ack_max_chars: int = DEFAULT_ACK_MAX_CHARS,
+        session: str = "main",
+        suppress_tool_error_warnings: bool = False,
+        active_hours: "ActiveHoursConfig | tuple[int, int] | None" = None,
+        visibility: "HeartbeatVisibilityConfig | None" = None,
+    ) -> None:
+        # Coerce interval_minutes → every
+        if interval_minutes is not None:
+            self.every = f"{interval_minutes}m"
+        else:
+            self.every = every
+        self.model = model
+        self.include_reasoning = include_reasoning
+        self.target = target
+        self.to = to
+        self.account_id = account_id
+        self.prompt = prompt
+        self.ack_max_chars = ack_max_chars
+        self.session = session
+        self.suppress_tool_error_warnings = suppress_tool_error_warnings
+        self.visibility = visibility if visibility is not None else HeartbeatVisibilityConfig()
+        # Coerce tuple active_hours → ActiveHoursConfig
+        if isinstance(active_hours, tuple):
+            s_val, e_val = active_hours
+            def _int_to_hhmm(v: "int | str") -> str:
+                return f"{v:02d}:00" if isinstance(v, int) else str(v)
+            self.active_hours: "ActiveHoursConfig | None" = ActiveHoursConfig(
+                start=_int_to_hhmm(s_val), end=_int_to_hhmm(e_val)
+            )
+        else:
+            self.active_hours = active_hours
+        # Explicit enabled overrides computed value
+        self._enabled_explicit: bool | None = enabled
 
-    # Optional model override for heartbeat runs ("provider/model")
-    model: str | None = None
-
-    # Whether to also deliver a separate "Reasoning:" message when available
-    include_reasoning: bool = False
-
-    # Delivery target: "last" | "none" | channel id (e.g. "whatsapp", "telegram")
-    target: str = "last"
-
-    # Optional recipient override (E.164, Telegram chat-id, etc.)
-    to: str | None = None
-
-    # Optional account id for multi-account channels
-    account_id: str | None = None
-
-    # Custom prompt body (replaces default; sent verbatim)
-    prompt: str = DEFAULT_HEARTBEAT_PROMPT
-
-    # Max chars after HEARTBEAT_OK before it stops being treated as an ack
-    ack_max_chars: int = DEFAULT_ACK_MAX_CHARS
-
-    # Session key override ("main" = agent main session; or explicit key)
-    session: str = "main"
-
-    # Whether to suppress tool error warnings during heartbeat runs
-    suppress_tool_error_warnings: bool = False
-
-    # Active-hours restriction (None = always run)
-    active_hours: ActiveHoursConfig | None = None
-
-    # Per-channel visibility defaults
-    visibility: HeartbeatVisibilityConfig = field(default_factory=HeartbeatVisibilityConfig)
-
-    # Legacy compat aliases
     @property
     def enabled(self) -> bool:
-        """True unless interval is "0m" or "0"."""
+        """True unless interval is "0m"/"0" (disabled)."""
+        if self._enabled_explicit is not None:
+            return self._enabled_explicit
         return not self._is_zero_interval()
+
+    @enabled.setter
+    def enabled(self, value: bool | None) -> None:
+        self._enabled_explicit = value
 
     @property
     def interval_minutes(self) -> int:
@@ -104,6 +132,20 @@ class HeartbeatConfig:
 
     def _is_zero_interval(self) -> bool:
         return _parse_interval_minutes(self.every) == 0
+
+    def get_interval_minutes(self) -> int:
+        """Parsed interval in minutes (alias for interval_minutes property)."""
+        return self.interval_minutes
+
+    def __repr__(self) -> str:
+        return (
+            f"HeartbeatConfig(enabled={self.enabled!r}, every={self.every!r}, "
+            f"model={self.model!r}, include_reasoning={self.include_reasoning!r}, "
+            f"target={self.target!r}, to={self.to!r}, account_id={self.account_id!r}, "
+            f"prompt={self.prompt!r}, ack_max_chars={self.ack_max_chars!r}, "
+            f"session={self.session!r}, suppress_tool_error_warnings={self.suppress_tool_error_warnings!r}, "
+            f"active_hours={self.active_hours!r}, visibility={self.visibility!r})"
+        )
 
 
 def _parse_interval_minutes(every: str | int) -> int:

@@ -7,6 +7,12 @@ from .base import AgentTool, ToolResult
 
 logger = logging.getLogger(__name__)
 
+# Module-level alias for testability (tests can patch openclaw.agents.tools.nodes.create_client)
+try:
+    from openclaw.gateway.rpc_client import create_client
+except ImportError:
+    create_client = None  # type: ignore[assignment]
+
 
 class NodesTool(AgentTool):
     """Control connected devices (nodes) - camera, screen recording, location, notifications"""
@@ -127,8 +133,6 @@ class NodesTool(AgentTool):
         
         try:
             # Call gateway RPC
-            from openclaw.gateway.rpc_client import create_client
-            
             client = await create_client()
             result = await client.call("node.pair.pending", {})
             
@@ -170,8 +174,6 @@ class NodesTool(AgentTool):
         
         try:
             # Call gateway RPC
-            from openclaw.gateway.rpc_client import create_client
-            
             client = await create_client()
             result = await client.call("node.pair.approve", {"requestId": request_id})
             
@@ -206,8 +208,6 @@ class NodesTool(AgentTool):
         
         try:
             # Call gateway RPC
-            from openclaw.gateway.rpc_client import create_client
-            
             client = await create_client()
             result = await client.call("node.pair.reject", {"requestId": request_id})
             
@@ -255,8 +255,6 @@ class NodesTool(AgentTool):
         
         try:
             # Call gateway RPC
-            from openclaw.gateway.rpc_client import create_client
-            
             client = await create_client()
             result = await client.call("node.invoke", {
                 "nodeId": node_id,

@@ -63,38 +63,41 @@ class BootstrapFile(NamedTuple):
 def resolve_memory_bootstrap_entries(workspace_dir: Path) -> list[tuple[str, Path]]:
     """Resolve memory bootstrap files injected into the system prompt.
 
-    Aligned with TypeScript workspace.ts loadWorkspaceBootstrapFiles():
-    - Only MEMORY.md and memory.md (root-level) are auto-injected.
-    - Daily memory/*.md files are NOT auto-injected — they are accessed
-      on-demand via memory_search / memory_get tools to preserve context
-      budget.
+    Scans:
+    1. Root-level MEMORY.md / memory.md
+    2. All *.md files inside the memory/ subdirectory (mirrors TS workspace.ts)
 
-    Deduplicates symlinks and case-insensitive filesystem duplicates
-    (macOS/Windows).
+    Deduplicates symlinks and case-insensitive filesystem duplicates (macOS/Windows).
 
     Args:
         workspace_dir: Workspace directory
 
     Returns:
-        List of (filename, path) tuples for memory files found
+        List of (filename, path) tuples for memory files found, sorted alphabetically
     """
-    candidates = ["MEMORY.md", "memory.md"]
-    entries = []
+    raw_entries: list[tuple[str, Path]] = []
 
-    for filename in candidates:
+    # 1. Root-level MEMORY.md / memory.md
+    for filename in ("MEMORY.md", "memory.md"):
         path = workspace_dir / filename
         if path.exists():
-            entries.append((filename, path))
+            raw_entries.append((filename, path))
 
-    # If only one or no memory files found, return as-is
-    if len(entries) <= 1:
-        return entries
+    # 2. memory/ subdirectory — all *.md files (matches TS)
+    memory_dir = workspace_dir / "memory"
+    if memory_dir.is_dir():
+        for md_file in sorted(memory_dir.glob("*.md")):
+            if md_file.is_file():
+                raw_entries.append((f"memory/{md_file.name}", md_file))
 
-    # Deduplicate symlinks and case-insensitive duplicates
-    seen = set()
-    deduped = []
+    if not raw_entries:
+        return []
 
-    for filename, path in entries:
+    # Deduplicate symlinks and case-insensitive filesystem duplicates
+    seen: set[str] = set()
+    deduped: list[tuple[str, Path]] = []
+
+    for filename, path in raw_entries:
         try:
             real_path = path.resolve()
             real_path_lower = str(real_path).lower()
@@ -110,7 +113,7 @@ def resolve_memory_bootstrap_entries(workspace_dir: Path) -> list[tuple[str, Pat
                 f"Skipping duplicate memory file {filename} "
                 f"(duplicate or symlink to {real_path})"
             )
-    
+
     return deduped
 
 
@@ -152,6 +155,8 @@ def load_bootstrap_files(
         "HEARTBEAT.md",
         "BOOTSTRAP.md",
     ]
+    # Note: BOOT.md is loaded separately (not via this list) — it has special
+    # execution semantics distinct from the regular bootstrap context.
     
     results = []
     

@@ -55,6 +55,59 @@ def resolve_subagent_max_concurrent(cfg: dict[str, Any] | None) -> int:
     return DEFAULT_SUBAGENT_MAX_CONCURRENT
 
 
+# Default model aliases (mirrors TS config/defaults.ts)
+DEFAULT_MODEL_ALIASES: dict[str, str] = {
+    "opus": "claude-opus-4-5",
+    "sonnet": "claude-sonnet-4-5",
+    "haiku": "claude-haiku-3-5",
+    "gemini": "gemini-2.5-pro",
+    "gpt": "gpt-4o",
+    "o1": "o1",
+    "o3": "o3-mini",
+}
+
+
+def apply_session_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Apply default values to session configuration.
+
+    Mirrors TS applySessionDefaults() — always sets mainKey = "main".
+    """
+    session = dict(cfg.get("session") or {})
+    session["mainKey"] = "main"
+    return {**cfg, "session": session}
+
+
+def apply_logging_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Apply default values to logging configuration.
+
+    Mirrors TS applyLoggingDefaults() — redactSensitive defaults to "tools".
+    """
+    logging_cfg = dict(cfg.get("logging") or {})
+    logging_cfg.setdefault("redactSensitive", "tools")
+    return {**cfg, "logging": logging_cfg}
+
+
+def apply_compaction_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Apply default values to compaction configuration.
+
+    Mirrors TS applyCompactionDefaults() — mode defaults to "safeguard".
+    """
+    compaction = dict(cfg.get("compaction") or {})
+    compaction.setdefault("mode", "safeguard")
+    return {**cfg, "compaction": compaction}
+
+
+def apply_context_pruning_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Apply default values to contextPruning configuration.
+
+    Mirrors TS applyContextPruningDefaults() — mode="cache-ttl", ttl="1h".
+    """
+    pruning = dict(cfg.get("contextPruning") or {})
+    pruning.setdefault("mode", "cache-ttl")
+    pruning.setdefault("ttl", "1h")
+    return {**cfg, "contextPruning": pruning}
+
+
 def apply_agent_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
     """
     Apply default values to agent configuration
@@ -103,3 +156,19 @@ def apply_agent_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
             },
         },
     }
+
+
+def apply_all_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Apply all default values to config.
+
+    Mirrors TS applyAllDefaults() — chains all section defaults.
+    """
+    cfg = apply_agent_defaults(cfg)
+    cfg = apply_session_defaults(cfg)
+    if "logging" in cfg:
+        cfg = apply_logging_defaults(cfg)
+    if "compaction" in cfg:
+        cfg = apply_compaction_defaults(cfg)
+    if "contextPruning" in cfg:
+        cfg = apply_context_pruning_defaults(cfg)
+    return cfg

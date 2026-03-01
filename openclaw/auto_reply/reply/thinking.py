@@ -46,7 +46,7 @@ def is_binary_thinking_provider(provider: str | None) -> bool:
     return normalize_provider_id(provider) == "zai"
 
 
-def normalize_think_level(raw: str | None) -> ThinkLevel | None:
+def normalize_think_level(raw: str | None, default: ThinkLevel = "medium") -> ThinkLevel:
     """
     Normalize user-provided thinking level strings to canonical enum.
     
@@ -60,7 +60,7 @@ def normalize_think_level(raw: str | None) -> ThinkLevel | None:
         "off" -> "off"
     """
     if not raw:
-        return None
+        return default
     
     key = raw.strip().lower()
     collapsed = key.replace(" ", "").replace("_", "").replace("-", "")
@@ -88,8 +88,8 @@ def normalize_think_level(raw: str | None) -> ThinkLevel | None:
     
     if key in ("think",):
         return "minimal"
-    
-    return None
+
+    return default
 
 
 def supports_xhigh_thinking(provider: str | None, model: str | None) -> bool:
@@ -109,13 +109,27 @@ def supports_xhigh_thinking(provider: str | None, model: str | None) -> bool:
     return model_key in XHIGH_MODEL_IDS
 
 
-def list_thinking_levels(provider: str | None, model: str | None) -> list[ThinkLevel]:
+def list_thinking_levels(
+    provider: str | None = None,
+    model: str | None = None,
+    *,
+    is_binary_provider: bool | None = None,
+) -> list[ThinkLevel]:
     """
     List available thinking levels for provider/model.
-    
-    Mirrors TS listThinkingLevels from thinking.ts lines 89-95
+
+    Mirrors TS listThinkingLevels from thinking.ts lines 89-95.
+    ``is_binary_provider`` shortcut: True → ["off", "on"], False → full levels.
     """
-    levels: list[ThinkLevel] = ["off", "minimal", "low", "medium", "high"]
+    if is_binary_provider is True:
+        return ["off", "on"]
+    if is_binary_provider is False:
+        levels: list[ThinkLevel] = ["off", "minimal", "low", "medium", "high"]
+        return levels
+    # Normal path: derive from provider/model
+    if is_binary_thinking_provider(provider):
+        return ["off", "on"]
+    levels = ["off", "minimal", "low", "medium", "high"]
     if supports_xhigh_thinking(provider, model):
         levels.append("xhigh")
     return levels

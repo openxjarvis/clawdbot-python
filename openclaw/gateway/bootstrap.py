@@ -152,6 +152,14 @@ class GatewayBootstrap:
             _load_config = _self_module.load_config or (lambda p: {})
             self.config = _load_config(config_path)
             results["steps_completed"] += 1
+            # Initialise the config service singleton with the resolved config path so
+            # that gateway RPC methods (config.get / config.patch / config.save) can
+            # read and write the live config file.
+            try:
+                from openclaw.gateway.config_service import ConfigService, set_config_service
+                set_config_service(ConfigService(config_path_resolved))
+            except Exception as _cs_err:
+                logger.warning("Could not initialize config service: %s", _cs_err)
         except Exception as e:
             logger.error(f"Config load failed: {e}")
             results["errors"].append(f"config: {e}")
@@ -442,6 +450,10 @@ class GatewayBootstrap:
             
             self.skill_loader = SkillLoader(config=skill_config)
             loaded_skills = self.skill_loader.load_from_directory(bundled_skills_dir, source="bundled")
+            # Store loaded skills in the loader's skills dict so _log_startup and other
+            # consumers can access them via skill_loader.skills
+            for skill in loaded_skills:
+                self.skill_loader.skills[skill.name] = skill
             skill_count = len(loaded_skills)
             logger.info(f"Loaded {skill_count} skills from {bundled_skills_dir}")
         except Exception as e:
@@ -1045,15 +1057,23 @@ class GatewayBootstrap:
         logger.info(f"  Python: {platform.python_version()}")
         logger.info(f"  Port: {port}")
         try:
-            if self.config and not isinstance(self.config, dict):
+            # Show model info from runtime (includes fallbacks) if available, else from config
+            model_str = None
+            if self.runtime and hasattr(self.runtime, "model") and self.runtime.model:
+                fallbacks = getattr(self.runtime, "fallback_models", []) or []
+                if fallbacks:
+                    model_str = f"primary='{self.runtime.model}' fallbacks={fallbacks!r}"
+                else:
+                    model_str = self.runtime.model
+            elif self.config and not isinstance(self.config, dict):
                 if self.config.agents and self.config.agents.defaults:
-                    logger.info(f"  Model: {self.config.agents.defaults.model}")
+                    model_str = self.config.agents.defaults.model
             elif isinstance(self.config, dict):
-                model = (self.config.get("agent") or {}).get("model") or (
+                model_str = (self.config.get("agent") or {}).get("model") or (
                     (self.config.get("agents") or {}).get("defaults") or {}
                 ).get("model")
-                if model:
-                    logger.info(f"  Model: {model}")
+            if model_str:
+                logger.info(f"  Model: {model_str}")
         except Exception:
             pass
         if self.tool_registry:
