@@ -1,4 +1,4 @@
-# OpenXJarvis (openclaw-python)
+# Openclaw-Python （OpenXJarvis）
 
 > A Python implementation of [OpenClaw](https://github.com/openclaw/openclaw) — a self-hosted personal AI assistant you can run anywhere.
 
