@@ -14,6 +14,8 @@
 
 ---
 
+⚠️ **下个版本目标** 下个版本将增加对飞书支持。New version will add channel with Feishu。
+
 ## Quick Start
 
 **Prerequisites:** Python 3.11+ · [uv](https://docs.astral.sh/uv/) · a Telegram bot token · an LLM API key (Gemini / OpenAI / Claude)
