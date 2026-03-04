@@ -119,7 +119,17 @@ class WizardSession:
             ],
             default="google"
         ))
-        
+
+        # Ollama server URL — only shown when provider_select == "ollama"
+        self.steps.append(WizardStep(
+            id="ollama_base_url",
+            type=WizardStepType.TEXT,
+            title="Ollama Server URL",
+            message="Enter the URL where Ollama is running",
+            default="http://127.0.0.1:11434",
+            placeholder="http://127.0.0.1:11434",
+        ))
+
         # Gateway port
         self.steps.append(WizardStep(
             id="gateway_port",
@@ -147,25 +157,47 @@ class WizardSession:
             message="Your OpenClaw assistant is ready!"
         ))
     
+    def _should_skip_step(self, step: WizardStep) -> bool:
+        """Return True when a step should be auto-skipped based on prior answers.
+
+        ollama_base_url is only relevant when the user selected the "ollama" provider.
+        All other steps are shown unconditionally.
+        """
+        if step.id == "ollama_base_url":
+            return self.answers.get("provider_select") != "ollama"
+        return False
+
     def get_current_step(self) -> Optional[WizardStep]:
-        """Get the current step"""
-        if 0 <= self.current_step < len(self.steps):
-            return self.steps[self.current_step]
+        """Get the current step, skipping any steps that should be auto-skipped."""
+        while 0 <= self.current_step < len(self.steps):
+            step = self.steps[self.current_step]
+            if self._should_skip_step(step):
+                self.current_step += 1
+                continue
+            return step
         return None
-    
+
     def advance(self, answer: Optional[Any] = None) -> bool:
         """Advance to next step with optional answer"""
         current = self.get_current_step()
         if current and answer is not None:
             self.answers[current.id] = answer
-        
+
         self.current_step += 1
         self.updated_at = datetime.now()
-        
+
+        # Skip over any steps that should be auto-skipped
+        while self.current_step < len(self.steps):
+            next_step = self.steps[self.current_step]
+            if self._should_skip_step(next_step):
+                self.current_step += 1
+            else:
+                break
+
         if self.current_step >= len(self.steps):
             self.done = True
             return True
-        
+
         return False
     
     def get_answer(self, step_id: str) -> Optional[Any]:

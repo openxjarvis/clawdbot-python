@@ -169,11 +169,7 @@ def _fire_message_received_hooks(ctx: MsgContext, cfg: dict[str, Any]) -> None:
                 },
             )
             try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.ensure_future(coro)
-                else:
-                    loop.run_until_complete(coro)
+                asyncio.ensure_future(coro)
             except Exception:
                 pass
     except Exception:
@@ -242,11 +238,7 @@ def _fire_message_received_hooks(ctx: MsgContext, cfg: dict[str, Any]) -> None:
                 await trigger_internal_hook(hook_event)
             
             try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.ensure_future(_trigger())
-                else:
-                    loop.run_until_complete(_trigger())
+                asyncio.ensure_future(_trigger())
             except Exception:
                 pass
     except Exception:

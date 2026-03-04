@@ -8,6 +8,7 @@ All types are designed to match Pi Agent's TypeScript implementation.
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Literal, Protocol, TypeVar, Generic
@@ -104,7 +105,7 @@ class UserMessage(BaseModel):
     """User message"""
     role: Literal["user"] = "user"
     content: list[Content] | str
-    timestamp: int = Field(default_factory=lambda: int(asyncio.get_event_loop().time() * 1000))
+    timestamp: int = Field(default_factory=lambda: int(time.time() * 1000))
 
 
 class AssistantMessage(BaseModel):
@@ -123,7 +124,7 @@ class AssistantMessage(BaseModel):
     content: list[Content]  # TextContent | ImageContent | ThinkingContent | ToolCallContent
     stop_reason: StopReason = Field(default=StopReason.STOP, alias="stopReason")
     error_message: str | None = Field(default=None, alias="errorMessage")
-    timestamp: int = Field(default_factory=lambda: int(asyncio.get_event_loop().time() * 1000))
+    timestamp: int = Field(default_factory=lambda: int(time.time() * 1000))
     
     # Usage information (optional)
     usage: dict[str, Any] | None = None
@@ -144,7 +145,7 @@ class ToolResultMessage(BaseModel):
     content: list[Content]
     details: Any = None  # For UI/logging, not sent to LLM
     is_error: bool = Field(default=False, alias="isError")
-    timestamp: int = Field(default_factory=lambda: int(asyncio.get_event_loop().time() * 1000))
+    timestamp: int = Field(default_factory=lambda: int(time.time() * 1000))
 
 
 class BashExecutionMessage(BaseModel):
@@ -158,7 +159,7 @@ class BashExecutionMessage(BaseModel):
     command: str
     output: str
     exclude_from_context: bool = Field(default=False, alias="excludeFromContext")
-    timestamp: int = Field(default_factory=lambda: int(asyncio.get_event_loop().time() * 1000))
+    timestamp: int = Field(default_factory=lambda: int(time.time() * 1000))
 
 
 class CustomMessage(BaseModel):
@@ -172,7 +173,7 @@ class CustomMessage(BaseModel):
     content: str | list[Content]
     display: bool = True  # Whether to show in UI
     details: Any = None  # Additional data for UI/logging
-    timestamp: int = Field(default_factory=lambda: int(asyncio.get_event_loop().time() * 1000))
+    timestamp: int = Field(default_factory=lambda: int(time.time() * 1000))
 
 
 # Custom message types support (extensible via Protocol)

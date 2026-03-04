@@ -186,6 +186,90 @@ def format_memory_citations(
     return "\n".join(f"{r.text} [{r.path}]" for r in results)
 
 
+def apply_mmr(
+    results: List[SearchResult],
+    limit: int,
+    lambda_param: float = 0.7,
+) -> List[SearchResult]:
+    """Maximal Marginal Relevance (MMR) re-ranking for diversity.
+
+    Mirrors TS ``MemoryIndexManager`` MMR post-hybrid diversity re-ranking.
+
+    After hybrid scoring, MMR iteratively selects the next result that best
+    balances relevance (pre-computed ``score``) against redundancy with already
+    selected results:
+
+        mmr_score(d) = λ × relevance(d) - (1 - λ) × max_similarity(d, selected)
+
+    Similarity is estimated via token-level Jaccard overlap on the result text,
+    which is a reasonable proxy when raw embedding vectors are not available.
+
+    Args:
+        results:       Pre-scored candidate results (any order).
+        limit:         Maximum number of results to return.
+        lambda_param:  Relevance vs diversity trade-off (default 0.7).
+                       1.0 = pure relevance ranking, 0.0 = pure diversity.
+
+    Returns:
+        Re-ranked list of up to ``limit`` results.
+    """
+    if not results:
+        return results
+    limit = max(1, limit)
+    if len(results) <= limit:
+        return results
+
+    # Tokenise each result text into a frozenset of lower-cased tokens for fast
+    # Jaccard similarity computation.
+    def _tokenise(text: str) -> frozenset:
+        return frozenset(text.lower().split())
+
+    token_sets: list[frozenset] = [_tokenise(r.text) for r in results]
+
+    def _jaccard(a: frozenset, b: frozenset) -> float:
+        if not a and not b:
+            return 1.0
+        union = len(a | b)
+        return len(a & b) / union if union > 0 else 0.0
+
+    selected_indices: list[int] = []
+    remaining = list(range(len(results)))
+
+    # Seed with the highest-relevance candidate
+    best_seed = max(remaining, key=lambda i: results[i].score)
+    selected_indices.append(best_seed)
+    remaining.remove(best_seed)
+
+    while remaining and len(selected_indices) < limit:
+        best_idx: int | None = None
+        best_mmr: float = float("-inf")
+
+        for i in remaining:
+            rel = results[i].score
+            # Maximum similarity to any already-selected result
+            max_sim = max(
+                _jaccard(token_sets[i], token_sets[j]) for j in selected_indices
+            )
+            mmr = lambda_param * rel - (1.0 - lambda_param) * max_sim
+            if mmr > best_mmr:
+                best_mmr = mmr
+                best_idx = i
+
+        if best_idx is None:
+            break
+        selected_indices.append(best_idx)
+        remaining.remove(best_idx)
+
+    selected = [results[i] for i in selected_indices]
+    logger.debug(
+        "MMR re-ranked %d candidates → %d results (λ=%.2f)",
+        len(results),
+        len(selected),
+        lambda_param,
+    )
+    return selected
+
+
 def normalize_scores(results: List[SearchResult]) -> List[SearchResult]:
     """
     Normalize scores to 0-1 range

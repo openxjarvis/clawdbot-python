@@ -146,27 +146,57 @@ def parse_install_spec(spec: Any) -> SkillInstallSpec | None:
     )
 
 
+def _parse_bool(val: Any, default: bool) -> bool:
+    """Coerce *val* to bool exactly as TS parseFrontmatterBool() does.
+
+    Accepts ``True/False``, ``"true"/"yes"/"1"`` (case-insensitive).
+    """
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in ("true", "yes", "1")
+    if isinstance(val, (int, float)):
+        return bool(val)
+    return default
+
+
 def parse_invocation_policy(frontmatter: dict[str, Any]) -> SkillInvocationPolicy:
     """
-    Extract invocation policy from frontmatter (matches TS resolveSkillInvocationPolicy).
-    
+    Extract invocation policy from frontmatter.
+
+    Mirrors TS ``resolveSkillInvocationPolicy()`` which reads **flat top-level**
+    hyphenated keys:
+      - ``user-invocable``          (default: true)
+      - ``disable-model-invocation`` (default: false)
+
+    For backward compatibility the old nested ``openclaw.userInvocable`` /
+    ``openclaw.disableModelInvocation`` keys are also checked as a fallback.
+
     Args:
         frontmatter: Parsed frontmatter dictionary
-    
+
     Returns:
         SkillInvocationPolicy
     """
+    # TS canonical: flat top-level hyphenated keys
+    if "user-invocable" in frontmatter or "disable-model-invocation" in frontmatter:
+        return SkillInvocationPolicy(
+            user_invocable=_parse_bool(frontmatter.get("user-invocable", True), True),
+            disable_model_invocation=_parse_bool(
+                frontmatter.get("disable-model-invocation", False), False
+            ),
+        )
+
+    # Legacy / nested openclaw block (backward compat)
     openclaw = frontmatter.get("openclaw", {})
-    
     if not isinstance(openclaw, dict):
         return SkillInvocationPolicy()
-    
-    user_invocable = openclaw.get("userInvocable", True)
-    disable_model = openclaw.get("disableModelInvocation", False)
-    
+
     return SkillInvocationPolicy(
-        user_invocable=user_invocable,
-        disable_model_invocation=disable_model
+        user_invocable=_parse_bool(openclaw.get("userInvocable", True), True),
+        disable_model_invocation=_parse_bool(
+            openclaw.get("disableModelInvocation", False), False
+        ),
     )
 
 

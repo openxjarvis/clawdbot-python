@@ -4,7 +4,7 @@ from __future__ import annotations
 import builtins
 
 from pydantic import BaseModel, ConfigDict, Field
-from typing import Any
+from typing import Any, Literal
 
 
 class ModelConfig(BaseModel):
@@ -139,6 +139,7 @@ class AgentDefaults(BaseModel):
     workspace: str | None = Field(default=None)
     agentDir: str | None = Field(default=None)
     model: str | ModelConfig = Field(default="google/gemini-3-pro-preview")
+    models: dict[str, Any] | None = Field(default=None)
     tools: ToolsConfig | None = Field(default=None)
     compaction: CompactionConfig | None = Field(default=None)
     contextPruning: ContextPruningConfig | None = Field(default=None)
@@ -406,23 +407,41 @@ class ChannelConfig(BaseModel):
     botToken: str | None = Field(default=None, alias="bot_token")
     allowFrom: list[str] | None = Field(default=None, alias="allow_from")
     dmPolicy: str | None = Field(default=None, alias="dm_policy")
-    
+
     # Additional platform-specific fields
     token: str | None = Field(default=None)
     signingSecret: str | None = Field(default=None, alias="signing_secret")
     appId: str | None = Field(default=None, alias="app_id")
     appSecret: str | None = Field(default=None, alias="app_secret")
-    
-    model_config = {"populate_by_name": True}
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+
+class FeishuChannelConfig(BaseModel):
+    """Feishu / Lark channel configuration (mirrors TS FeishuConfigSchema)"""
+
+    enabled: bool = Field(default=True)
+    appId: str | None = Field(default=None)
+    appSecret: str | None = Field(default=None)
+    useWebSocket: bool = Field(default=True)
+    dmPolicy: str = Field(default="pairing")
+    webhookPath: str | None = Field(default=None)
+    allowFrom: list[str] | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
 
 
 class ChannelsConfig(BaseModel):
-    """Channels configuration"""
+    """Channels configuration (mirrors TS ChannelsSchema with .passthrough())"""
 
     telegram: TelegramChannelConfig | None = Field(default=None)
     whatsapp: ChannelConfig | None = Field(default=None)
     discord: ChannelConfig | None = Field(default=None)
     slack: ChannelConfig | None = Field(default=None)
+    feishu: FeishuChannelConfig | None = Field(default=None)
+
+    # Allow extension channels (matrix, zalo, msteams, etc.) — matches TS .passthrough()
+    model_config = ConfigDict(extra="allow")
 
 
 class SkillsConfig(BaseModel):
@@ -557,6 +576,40 @@ class EnvConfig(BaseModel):
         return result
 
 
+class SessionMaintenanceConfig(BaseModel):
+    """Session maintenance configuration — mirrors TS session.maintenance schema."""
+    model_config = ConfigDict(populate_by_name=True)
+
+    pruneAfter: str | None = Field(default=None)
+    pruneDays: int | None = Field(default=None)
+    maxEntries: int | None = Field(default=None)
+    rotateBytes: str | None = Field(default=None)
+    maxDiskBytes: str | None = Field(default=None)
+    highWaterBytes: str | None = Field(default=None)
+    resetArchiveRetention: str | None = Field(default=None)
+
+
+class SessionConfig(BaseModel):
+    """Session configuration — mirrors TS zod-schema.session.ts.
+
+    Replaces the previous ``dict[str, Any]`` field so that ``dmScope``,
+    ``identityLinks``, and ``maintenance`` are accessible as typed attributes
+    in ``resolve_agent_route()`` and elsewhere.
+    """
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+    dmScope: Literal["main", "per-peer", "per-channel-peer", "per-account-channel-peer"] = Field(
+        default="main"
+    )
+    identityLinks: dict[str, list[str]] | None = Field(default=None)
+    maintenance: SessionMaintenanceConfig = Field(default_factory=SessionMaintenanceConfig)
+    reset: str | None = Field(default=None)
+    idleMinutes: int | None = Field(default=None)
+    resetByType: dict[str, Any] | None = Field(default=None)
+    resetByChannel: dict[str, Any] | None = Field(default=None)
+    store: str | None = Field(default=None)
+
+
 class ClawdbotConfig(BaseModel):
     """Root configuration schema (aligned with TypeScript OpenClawConfig)"""
     
@@ -587,7 +640,7 @@ class ClawdbotConfig(BaseModel):
     messages: MessagesConfig | None = Field(default=None)
     commands: CommandsConfig | None = Field(default=None)
     approvals: dict[str, Any] | None = Field(default=None)
-    session: dict[str, Any] | None = Field(default=None)
+    session: SessionConfig = Field(default_factory=SessionConfig)
     web: dict[str, Any] | None = Field(default=None)
     cron: CronConfig | None = Field(default=None)
     hooks: HooksConfig | None = Field(default=None)

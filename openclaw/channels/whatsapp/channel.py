@@ -1,51 +1,45 @@
-"""WhatsApp channel implementation — aligned with TS whatsAppPlugin
+"""WhatsAppChannel — main channel plugin class.
 
-Aligns with TS loginWithQrStart / loginWithQrWait / heartbeatCheckReady.
-Supports two backends:
-  1. "web"  — uses whatsapp-web.py (Selenium-based, unofficial)
-  2. "business-api" — uses WhatsApp Business API (official HTTP)
+Integrates all WhatsApp sub-modules and implements the ChannelPlugin interface.
+Uses the Baileys Bridge (Node.js subprocess) for the personal-phone QR path.
+
+Mirrors TypeScript: extensions/whatsapp/src/channel.ts
 """
 from __future__ import annotations
 
-
-import asyncio
 import logging
-from datetime import UTC, datetime
-from enum import Enum
 from typing import Any
 
 from ..base import ChannelCapabilities, ChannelPlugin, InboundMessage
 
 logger = logging.getLogger(__name__)
 
-# Heartbeat check interval (seconds) — mirrors TS heartbeatInterval
-_HEARTBEAT_INTERVAL = 30.0
-
-
-class WhatsAppProvider(str, Enum):
-    WEB = "web"
-    BUSINESS_API = "business-api"
-
 
 class WhatsAppChannel(ChannelPlugin):
-    """WhatsApp channel — framework aligned with TS whatsAppPlugin
+    """
+    WhatsApp channel for openclaw-python.
 
-    Account fields (TS ResolvedWhatsAppAccount):
-        auth_dir   — directory to persist Baileys/web session (TS: authDir)
-        provider   — "web" | "business-api"
-        media_max_mb — max attachment size in MB
-        phone_number — E.164 phone for Business API
+    Supports:
+      - Personal-phone QR-code pairing via Baileys bridge (subprocess)
+      - DM + group messaging
+      - Multi-account configuration
+      - Media (images, video, audio, documents) with size optimization
+      - Emoji reactions (ack reaction + agent reactions)
+      - Native polls (up to 12 options)
+      - Markdown → WhatsApp format conversion
+      - DM pairing policy, group allowlist, group mention gating
+      - Message deduplication (memory + persistent)
+      - Configurable debouncing
+      - Read receipts (blue ticks)
+      - Text chunking (configurable length/newline mode)
 
-    QR login flow (mirrors TS):
-        1. call login_with_qr_start() -> returns QR data string
-        2. call login_with_qr_wait(qr) -> waits for scan
-        3. heartbeat_check_ready() -> checks auth + listener active
-
-    Note: Full "web" implementation requires whatsapp-web.py or a Baileys bridge.
-          "business-api" uses Meta's Cloud API (requires Meta approval).
+    Configuration (channels.whatsapp in openclaw.json):
+      dmPolicy, allowFrom, groupPolicy, groupAllowFrom, groups,
+      debounceMs, ackReaction, textChunkLimit, chunkMode, mediaMaxMb,
+      sendReadReceipts, selfChatMode, blockStreaming, ...
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.id = "whatsapp"
         self.label = "WhatsApp"
@@ -54,208 +48,71 @@ class WhatsAppChannel(ChannelPlugin):
             supports_media=True,
             supports_reactions=True,
             supports_threads=False,
-            supports_polls=False,
+            supports_polls=True,
+            supports_edit=False,
             supports_reply=True,
+            block_streaming=True,  # WhatsApp only receives final replies
         )
-        self._client: Any | None = None
-        # Account fields
-        self._provider: WhatsAppProvider = WhatsAppProvider.WEB
-        self._auth_dir: str = ".whatsapp-auth"
-        self._media_max_mb: int = 16
-        self._phone_number: str = ""
-        self._api_token: str = ""
-        self._api_base_url: str = "https://graph.facebook.com/v18.0"
-        # QR login state
-        self._qr_data: str | None = None
-        self._qr_event: asyncio.Event = asyncio.Event()
-        self._authenticated: bool = False
-        self._listener_active: bool = False
-        self._heartbeat_task: asyncio.Task | None = None
 
-    # -------------------------------------------------------------------------
+        from .monitor import WhatsAppMonitor
+        from .config import ResolvedWhatsAppAccount
+        from .outbound import WhatsAppOutboundAdapter
+
+        self._monitor: WhatsAppMonitor = WhatsAppMonitor()
+        self._accounts: list[ResolvedWhatsAppAccount] = []
+        self._default_outbound: WhatsAppOutboundAdapter | None = None
+        self._outbound_by_account: dict[str, WhatsAppOutboundAdapter] = {}
+
+    # ------------------------------------------------------------------
     # Lifecycle
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
-    async def start(self, config: dict[str, Any]) -> None:
-        """Start WhatsApp client — mirrors TS whatsAppPlugin.start()"""
-        provider_str = config.get("provider") or "web"
-        try:
-            self._provider = WhatsAppProvider(provider_str)
-        except ValueError:
-            logger.warning(f"[whatsapp] Unknown provider '{provider_str}', using 'web'")
-            self._provider = WhatsAppProvider.WEB
+    async def on_start(self, config: dict[str, Any]) -> None:
+        """Start the Baileys bridge and account monitors."""
+        from .config import parse_whatsapp_config
+        from .outbound import WhatsAppOutboundAdapter
 
-        self._auth_dir = config.get("authDir") or config.get("auth_dir") or ".whatsapp-auth"
-        self._media_max_mb = int(config.get("mediaMaxMb") or config.get("media_max_mb") or 16)
-        self._phone_number = config.get("phoneNumber") or config.get("phone_number") or ""
-        self._api_token = config.get("apiToken") or config.get("api_token") or ""
-        self._api_base_url = (
-            config.get("apiBaseUrl") or config.get("api_base_url")
-            or "https://graph.facebook.com/v18.0"
-        )
-
-        logger.info(f"[whatsapp] Starting channel (provider={self._provider.value})")
-
-        if self._provider == WhatsAppProvider.BUSINESS_API:
-            await self._start_business_api()
-        else:
-            await self._start_web()
-
-        self._running = True
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        logger.info("[whatsapp] Channel started")
-
-    async def _start_web(self) -> None:
-        """Initialize whatsapp-web.py client"""
-        try:
-            from webwhatsapi import WhatsAPIDriver  # type: ignore
-            logger.info("[whatsapp] Using whatsapp-web.py (web provider)")
-            # Actual initialization requires Selenium + browser
-            # This is a framework skeleton — full implementation needs webwhatsapi
-            self._authenticated = False
-            self._listener_active = False
-        except ImportError:
+        self._accounts = parse_whatsapp_config(config)
+        if not self._accounts:
             logger.warning(
-                "[whatsapp] whatsapp-web.py not installed. "
-                "Install with: pip install webwhatsapi  (requires Selenium + Chrome)"
+                "[whatsapp] No valid accounts configured. "
+                "Set channels.whatsapp.dmPolicy or accounts map."
             )
-            self._authenticated = False
-            self._listener_active = False
+            return
 
-    async def _start_business_api(self) -> None:
-        """Initialize WhatsApp Business Cloud API client"""
-        if not self._api_token:
-            logger.warning("[whatsapp] Business API token not set (config key: apiToken)")
-        # Business API is stateless HTTP — mark as authenticated if token present
-        self._authenticated = bool(self._api_token)
-        self._listener_active = False  # Requires webhook endpoint to be configured
+        if not self._message_handler:
+            raise RuntimeError("WhatsAppChannel: message handler not set before start()")
 
-    async def stop(self) -> None:
-        """Stop WhatsApp client"""
-        logger.info("[whatsapp] Stopping channel...")
-        self._running = False
-        if self._heartbeat_task:
-            self._heartbeat_task.cancel()
-            try:
-                await self._heartbeat_task
-            except asyncio.CancelledError:
-                pass
-        if self._client:
-            try:
-                if hasattr(self._client, "close"):
-                    await self._client.close()
-            except Exception:
-                pass
-        self._authenticated = False
-        self._listener_active = False
+        async def dispatch(msg: InboundMessage) -> None:
+            await self._handle_message(msg)
 
-    # -------------------------------------------------------------------------
-    # QR Login flow — mirrors TS loginWithQrStart / loginWithQrWait
-    # -------------------------------------------------------------------------
+        bridge_client = await self._monitor.start(self._accounts, dispatch)
 
-    async def login_with_qr_start(self) -> str:
-        """Start QR login flow — mirrors TS loginWithQrStart().
+        # Build per-account outbound adapters
+        for account in self._accounts:
+            adapter = WhatsAppOutboundAdapter(bridge_client, account)
+            self._outbound_by_account[account.account_id] = adapter
 
-        Returns the QR code data string for the caller to render.
-        """
-        logger.info("[whatsapp] Starting QR login flow")
-        self._qr_event.clear()
-        self._qr_data = None
+        if self._accounts:
+            default_account = self._accounts[0]
+            self._default_outbound = self._outbound_by_account.get(default_account.account_id)
 
-        if self._provider == WhatsAppProvider.WEB:
-            try:
-                qr_data = await self._generate_web_qr()
-                self._qr_data = qr_data
-                return qr_data
-            except Exception as e:
-                logger.error(f"[whatsapp] QR generation failed: {e}")
-                return "QR_CODE_UNAVAILABLE"
-        else:
-            logger.warning("[whatsapp] QR login not supported for business-api provider")
-            return "QR_NOT_SUPPORTED"
-
-    async def _generate_web_qr(self) -> str:
-        """Generate QR code via whatsapp-web.py — framework stub"""
-        # Actual implementation with webwhatsapi:
-        #   qr_code = self._client.get_qr()
-        #   return qr_code
-        logger.warning("[whatsapp] QR generation requires whatsapp-web.py + Selenium")
-        return "QR_CODE_PLACEHOLDER"
-
-    async def login_with_qr_wait(self, qr_data: str, timeout: float = 60.0) -> bool:
-        """Wait for QR code to be scanned — mirrors TS loginWithQrWait().
-
-        Returns True if authenticated, False on timeout.
-        """
-        logger.info(f"[whatsapp] Waiting for QR scan (timeout={timeout}s)")
-        try:
-            await asyncio.wait_for(self._qr_event.wait(), timeout=timeout)
-            return self._authenticated
-        except asyncio.TimeoutError:
-            logger.warning("[whatsapp] QR scan timed out")
-            return False
-
-    def on_qr_authenticated(self) -> None:
-        """Call this when QR authentication succeeds (from web driver callback)"""
-        logger.info("[whatsapp] QR authentication successful")
-        self._authenticated = True
-        self._qr_event.set()
-
-    # -------------------------------------------------------------------------
-    # Heartbeat — mirrors TS heartbeatCheckReady (three checks)
-    # -------------------------------------------------------------------------
-
-    async def heartbeat_check_ready(self) -> dict[str, bool]:
-        """Check channel readiness — mirrors TS heartbeatCheckReady three checks.
-
-        Returns dict with:
-            authenticated: bool   — auth credentials valid
-            listener_active: bool — message listener is running
-            ready: bool           — overall ready state
-        """
-        checks = {
-            "authenticated": self._authenticated,
-            "listener_active": self._listener_active,
-            "ready": self._authenticated and self._listener_active,
-        }
-
-        if self._provider == WhatsAppProvider.BUSINESS_API and self._api_token:
-            # For Business API: verify token via lightweight API call
-            try:
-                import aiohttp
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        f"{self._api_base_url}/me",
-                        headers={"Authorization": f"Bearer {self._api_token}"},
-                        timeout=aiohttp.ClientTimeout(total=5),
-                    ) as resp:
-                        checks["authenticated"] = resp.status == 200
-            except Exception:
-                checks["authenticated"] = False
-
-        checks["ready"] = checks["authenticated"] and (
-            checks["listener_active"] or self._provider == WhatsAppProvider.BUSINESS_API
+        logger.info(
+            "[whatsapp] Channel started with %d account(s): %s",
+            len(self._accounts),
+            [a.account_id for a in self._accounts],
         )
-        return checks
 
-    async def _heartbeat_loop(self) -> None:
-        """Periodic heartbeat check — mirrors TS heartbeat polling"""
-        while self._running:
-            try:
-                await asyncio.sleep(_HEARTBEAT_INTERVAL)
-                if not self._running:
-                    break
-                status = await self.heartbeat_check_ready()
-                if not status["ready"]:
-                    logger.warning(f"[whatsapp] Heartbeat check failed: {status}")
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.warning(f"[whatsapp] Heartbeat error: {e}")
+    async def on_stop(self) -> None:
+        """Stop the bridge and all account sessions."""
+        await self._monitor.stop()
+        self._default_outbound = None
+        self._outbound_by_account.clear()
+        logger.info("[whatsapp] Channel stopped")
 
-    # -------------------------------------------------------------------------
-    # Outbound
-    # -------------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Outbound (required abstract implementation)
+    # ------------------------------------------------------------------
 
     async def send_text(
         self,
@@ -263,54 +120,11 @@ class WhatsAppChannel(ChannelPlugin):
         text: str,
         reply_to: str | None = None,
     ) -> str:
-        """Send text message"""
-        if not self._running:
-            raise RuntimeError("WhatsApp channel not started")
-
-        if self._provider == WhatsAppProvider.BUSINESS_API:
-            return await self._send_business_api_text(target, text, reply_to)
-
-        # Web provider — framework stub
-        logger.warning(f"[whatsapp] send_text (web) not fully implemented: {target}")
-        return f"whatsapp-msg-{int(datetime.now(UTC).timestamp() * 1000)}"
-
-    async def _send_business_api_text(
-        self,
-        to: str,
-        text: str,
-        reply_to: str | None = None,
-    ) -> str:
-        """Send via WhatsApp Business Cloud API"""
-        if not self._api_token or not self._phone_number:
-            raise RuntimeError("WhatsApp Business API: apiToken and phoneNumber required")
-
-        payload: dict[str, Any] = {
-            "messaging_product": "whatsapp",
-            "to": to,
-            "type": "text",
-            "text": {"body": text},
-        }
-        if reply_to:
-            payload["context"] = {"message_id": reply_to}
-
-        try:
-            import aiohttp
-            url = f"{self._api_base_url}/{self._phone_number}/messages"
-            headers = {
-                "Authorization": f"Bearer {self._api_token}",
-                "Content-Type": "application/json",
-            }
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, headers=headers) as resp:
-                    resp.raise_for_status()
-                    data = await resp.json()
-                    messages = data.get("messages") or []
-                    if messages:
-                        return messages[0].get("id", "")
-                    return f"whatsapp-{int(datetime.now(UTC).timestamp() * 1000)}"
-        except Exception as e:
-            logger.error(f"[whatsapp] Business API send error: {e}", exc_info=True)
-            raise
+        """Send a text message to target (E.164 number or JID)."""
+        outbound = self._get_outbound(target)
+        result = await outbound.send_text(target, text, reply_to)
+        await self._track_send()
+        return result
 
     async def send_media(
         self,
@@ -319,55 +133,167 @@ class WhatsAppChannel(ChannelPlugin):
         media_type: str,
         caption: str | None = None,
     ) -> str:
-        """Send media message"""
-        if not self._running:
-            raise RuntimeError("WhatsApp channel not started")
+        """Send a media message to target."""
+        outbound = self._get_outbound(target)
+        result = await outbound.send_media(target, media_url, media_type, caption)
+        await self._track_send()
+        return result
 
-        if self._provider == WhatsAppProvider.BUSINESS_API:
-            return await self._send_business_api_media(target, media_url, media_type, caption)
-
-        logger.warning(f"[whatsapp] send_media (web) not fully implemented: {target}")
-        return f"whatsapp-media-{int(datetime.now(UTC).timestamp() * 1000)}"
-
-    async def _send_business_api_media(
+    async def send_reaction(
         self,
-        to: str,
-        media_url: str,
-        media_type: str,
-        caption: str | None = None,
+        target: str,
+        message_id: str,
+        emoji: str,
+        remove: bool = False,
+    ) -> None:
+        """Send or remove an emoji reaction."""
+        outbound = self._get_outbound(target)
+        await outbound.send_reaction(target, message_id, emoji, remove)
+
+    async def send_poll(
+        self,
+        target: str,
+        question: str,
+        options: list[str],
+        max_selections: int = 1,
     ) -> str:
-        """Send media via WhatsApp Business Cloud API"""
-        if not self._api_token or not self._phone_number:
-            raise RuntimeError("WhatsApp Business API: apiToken and phoneNumber required")
+        """Send a native WhatsApp poll."""
+        outbound = self._get_outbound(target)
+        return await outbound.send_poll(target, question, options, max_selections)
 
-        msg_type = "image" if media_type.startswith("image/") else (
-            "video" if media_type.startswith("video/") else (
-                "audio" if media_type.startswith("audio/") else "document"
-            )
-        )
+    # ------------------------------------------------------------------
+    # Health check
+    # ------------------------------------------------------------------
 
-        payload: dict[str, Any] = {
-            "messaging_product": "whatsapp",
-            "to": to,
-            "type": msg_type,
-            msg_type: {"link": media_url},
-        }
-        if caption and msg_type in ("image", "video", "document"):
-            payload[msg_type]["caption"] = caption
+    async def check_health(self) -> tuple[bool, str]:
+        if not self._running:
+            return False, "Channel not running"
+        if not self._monitor.is_running:
+            return False, "Monitor not running"
+        client = self._monitor.bridge_client
+        if client is None:
+            return False, "Bridge client not initialized"
+        bridge_ok = await client.health_check()
+        if not bridge_ok:
+            return False, "Bridge unreachable"
+        return True, "OK"
 
+    # ------------------------------------------------------------------
+    # QR login helpers (mirrors TS loginWithQrStart / loginWithQrWait)
+    # ------------------------------------------------------------------
+
+    async def get_qr(self, account_id: str = "default") -> dict[str, Any]:
+        """
+        Get QR code data URL for the specified account.
+        Returns {"qr": "<png-data-url>"} or {"status": "pending"} if not yet available.
+        """
+        client = self._monitor.bridge_client
+        if client is None:
+            return {"error": "Bridge not started"}
+        return await client.get_qr(account_id)
+
+    async def get_session_status(self, account_id: str = "default") -> dict[str, Any]:
+        """Return current session state for the account."""
+        client = self._monitor.bridge_client
+        if client is None:
+            return {"state": "not_started"}
         try:
-            import aiohttp
-            url = f"{self._api_base_url}/{self._phone_number}/messages"
-            headers = {
-                "Authorization": f"Bearer {self._api_token}",
-                "Content-Type": "application/json",
-            }
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload, headers=headers) as resp:
-                    resp.raise_for_status()
-                    data = await resp.json()
-                    messages = data.get("messages") or []
-                    return messages[0].get("id", "") if messages else ""
+            return await client.get_status(account_id)
         except Exception as e:
-            logger.error(f"[whatsapp] Business API media send error: {e}", exc_info=True)
-            raise
+            return {"state": "error", "error": str(e)}
+
+    async def logout(self, account_id: str = "default") -> None:
+        """Logout a session and clear its credentials."""
+        client = self._monitor.bridge_client
+        if client:
+            await client.logout(account_id)
+
+    # ------------------------------------------------------------------
+    # Agent tools
+    # ------------------------------------------------------------------
+
+    def agent_tools(self) -> list[dict]:
+        """Return agent tool descriptors for this channel.
+
+        Mirrors TS: agentTools: () => [createLoginTool()]
+        """
+        return [
+            {
+                "name": "whatsapp_login",
+                "description": (
+                    "Generate a WhatsApp QR code for linking, or wait for the scan to complete."
+                ),
+                "owner_only": True,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["start", "wait"],
+                        },
+                        "account_id": {"type": "string"},
+                        "timeout_ms": {"type": "number"},
+                        "force": {"type": "boolean"},
+                    },
+                    "required": ["action"],
+                },
+                "execute": self._execute_login_tool,
+            }
+        ]
+
+    async def _execute_login_tool(self, tool_call_id: str, args: dict) -> dict:
+        from .tools.whatsapp_login import run_whatsapp_login
+        return await run_whatsapp_login(args, self)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _get_outbound(self, target: str) -> "WhatsAppOutboundAdapter":  # type: ignore
+        """Select the correct outbound adapter for *target*.
+
+        Mirrors TypeScript resolveWhatsAppOutboundTarget: for each account,
+        check whether the target normalizes to an entry in that account's
+        allowFrom list; fall back to the default account.
+        """
+        if not self._outbound_by_account:
+            raise RuntimeError(
+                "WhatsAppChannel: no outbound adapter available (channel not started?)"
+            )
+
+        # Single-account fast path
+        if len(self._outbound_by_account) == 1:
+            return next(iter(self._outbound_by_account.values()))
+
+        # Multi-account: find the account whose allowFrom matches target
+        normalized_target = self._normalize_target(target)
+        for account in self._accounts:
+            allow_from = getattr(account, "allow_from", None) or []
+            normalized_allow = [self._normalize_target(str(e)) for e in allow_from]
+            if "*" in normalized_allow:
+                # Wildcard — this account accepts anything; check if it's the first match
+                pass
+            elif normalized_target and normalized_target in normalized_allow:
+                adapter = self._outbound_by_account.get(account.account_id)
+                if adapter:
+                    return adapter
+
+        # Fall back to default account
+        if self._default_outbound is None:
+            raise RuntimeError("WhatsAppChannel: no default outbound adapter")
+        return self._default_outbound
+
+    @staticmethod
+    def _normalize_target(target: str) -> str:
+        """Normalize a phone number or JID for comparison."""
+        t = target.strip()
+        # Strip @s.whatsapp.net suffix if present
+        if "@" in t:
+            t = t.split("@")[0]
+        # Remove leading +
+        if t.startswith("+"):
+            t = t[1:]
+        return t
+
+    def get_outbound_for_account(self, account_id: str) -> "WhatsAppOutboundAdapter | None":  # type: ignore
+        return self._outbound_by_account.get(account_id)

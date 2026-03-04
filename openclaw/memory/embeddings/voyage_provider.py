@@ -64,7 +64,7 @@ class VoyageEmbeddingProvider(EmbeddingProvider):
         import asyncio
 
         client = self._get_client()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         def _sync_embed():
             response = client.embed(texts, model=self.model)

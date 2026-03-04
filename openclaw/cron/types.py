@@ -74,6 +74,8 @@ class AgentTurnPayload:
     thinking: str | None = None
     timeout_seconds: int | None = None   # TS: timeoutSeconds
     allow_unsafe_external_content: bool = False  # TS: allowUnsafeExternalContent
+    fallbacks: list[str] | None = None   # TS: fallbacks — model fallback chain
+    light_context: bool = False          # TS: lightContext — skip heavy context loading
     # Legacy delivery hint fields (migrated to top-level delivery on normalize)
     deliver: bool | None = None
     channel: str | None = None
@@ -94,12 +96,38 @@ CronPayload = SystemEventPayload | AgentTurnPayload
 # ---------------------------------------------------------------------------
 
 @dataclass
+class CronFailureDestination:
+    """Failure-specific delivery destination (TS: failureDestination sub-object).
+
+    When set on a CronDelivery, failure alerts are routed here instead of the
+    main delivery target.
+    """
+    channel: str | None = None
+    to: str | None = None        # recipient id / chat id
+
+
+@dataclass
+class CronFailureAlert:
+    """Failure alert configuration (TS: CronFailureAlert).
+
+    After `after_n_errors` consecutive errors the service sends an alert
+    message via the failure_destination (or main delivery) channel,
+    rate-limited by `cooldown_ms`.
+    """
+    after_n_errors: int = 3              # TS: afterNErrors
+    cooldown_ms: int = 3_600_000         # TS: cooldownMs  (1 hour default)
+    message: str | None = None           # Optional custom alert message template
+
+
+@dataclass
 class CronDelivery:
     """Delivery configuration for isolated agent jobs (TS: CronDelivery)"""
     mode: Literal["none", "announce", "webhook"] = "announce"
-    channel: str | None = None  # ChannelId or "last"
-    to: str | None = None        # TS: to (was "target")
-    best_effort: bool = False    # TS: bestEffort
+    channel: str | None = None           # ChannelId or "last"
+    to: str | None = None                # TS: to (was "target")
+    best_effort: bool = False            # TS: bestEffort
+    account_id: str | None = None        # TS: accountId — preferred account for sending
+    failure_destination: CronFailureDestination | None = None  # TS: failureDestination
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +145,11 @@ class CronJobState:
     last_duration_ms: int | None = None   # TS: lastDurationMs
     consecutive_errors: int = 0           # TS: consecutiveErrors
     schedule_error_count: int | None = None  # TS: scheduleErrorCount
+    # Delivery tracking fields (TS: lastDeliveryStatus / lastDeliveryError / lastDelivered)
+    last_delivery_status: Literal["ok", "error", "skipped"] | None = None
+    last_delivery_error: str | None = None
+    last_delivered: int | None = None     # TS: lastDelivered (epoch ms of last successful delivery)
+    last_failure_alert_at_ms: int | None = None  # TS: lastFailureAlertAtMs — cooldown gate
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +265,9 @@ class CronJob:
     # Delivery (for isolated jobs)
     delivery: CronDelivery | None = None
 
+    # Failure alert (TS: failureAlert)
+    failure_alert: CronFailureAlert | None = None
+
     # State
     state: CronJobState = field(default_factory=CronJobState)
 
@@ -289,6 +325,10 @@ class CronJob:
                 p["timeout_seconds"] = self.payload.timeout_seconds
             if self.payload.allow_unsafe_external_content:
                 p["allow_unsafe_external_content"] = self.payload.allow_unsafe_external_content
+            if self.payload.fallbacks:
+                p["fallbacks"] = list(self.payload.fallbacks)
+            if self.payload.light_context:
+                p["light_context"] = self.payload.light_context
             result["payload"] = p
 
         # Delivery
@@ -300,7 +340,26 @@ class CronJob:
                 d["to"] = self.delivery.to
             if self.delivery.best_effort:
                 d["best_effort"] = self.delivery.best_effort
+            if self.delivery.account_id:
+                d["account_id"] = self.delivery.account_id
+            if self.delivery.failure_destination:
+                fd: dict[str, Any] = {}
+                if self.delivery.failure_destination.channel:
+                    fd["channel"] = self.delivery.failure_destination.channel
+                if self.delivery.failure_destination.to:
+                    fd["to"] = self.delivery.failure_destination.to
+                if fd:
+                    d["failure_destination"] = fd
             result["delivery"] = d
+
+        # Failure alert
+        if self.failure_alert:
+            fa: dict[str, Any] = {"after_n_errors": self.failure_alert.after_n_errors}
+            if self.failure_alert.cooldown_ms != 3_600_000:
+                fa["cooldown_ms"] = self.failure_alert.cooldown_ms
+            if self.failure_alert.message:
+                fa["message"] = self.failure_alert.message
+            result["failure_alert"] = fa
 
         # State
         state_dict: dict[str, Any] = {}
@@ -320,6 +379,14 @@ class CronJob:
             state_dict["consecutive_errors"] = self.state.consecutive_errors
         if self.state.schedule_error_count is not None:
             state_dict["schedule_error_count"] = self.state.schedule_error_count
+        if self.state.last_delivery_status is not None:
+            state_dict["last_delivery_status"] = self.state.last_delivery_status
+        if self.state.last_delivery_error is not None:
+            state_dict["last_delivery_error"] = self.state.last_delivery_error
+        if self.state.last_delivered is not None:
+            state_dict["last_delivered"] = self.state.last_delivered
+        if self.state.last_failure_alert_at_ms is not None:
+            state_dict["last_failure_alert_at_ms"] = self.state.last_failure_alert_at_ms
         result["state"] = state_dict
 
         return result
@@ -392,6 +459,10 @@ class CronJob:
                 or payload_data.get("prompt")
                 or ""
             )
+            raw_fallbacks = payload_data.get("fallbacks") or payload_data.get("modelFallbacks")
+            fallbacks: list[str] | None = None
+            if isinstance(raw_fallbacks, list) and raw_fallbacks:
+                fallbacks = [str(f) for f in raw_fallbacks if f]
             payload = AgentTurnPayload(
                 message=msg,
                 kind="agentTurn",
@@ -402,6 +473,11 @@ class CronJob:
                     payload_data.get("allow_unsafe_external_content")
                     or payload_data.get("allowUnsafeExternalContent")
                 ),
+                fallbacks=fallbacks,
+                light_context=bool(
+                    payload_data.get("light_context")
+                    or payload_data.get("lightContext")
+                ),
             )
         else:
             payload = SystemEventPayload(text="", kind="systemEvent")
@@ -410,11 +486,38 @@ class CronJob:
         delivery: CronDelivery | None = None
         if "delivery" in data and isinstance(data["delivery"], dict):
             dd = data["delivery"]
+            fd_raw = dd.get("failure_destination") or dd.get("failureDestination")
+            failure_dest: CronFailureDestination | None = None
+            if isinstance(fd_raw, dict):
+                failure_dest = CronFailureDestination(
+                    channel=fd_raw.get("channel"),
+                    to=fd_raw.get("to"),
+                )
             delivery = CronDelivery(
                 mode=dd.get("mode", "announce"),
                 channel=dd.get("channel"),
                 to=dd.get("to") or dd.get("target"),
                 best_effort=bool(dd.get("best_effort") or dd.get("bestEffort")),
+                account_id=dd.get("account_id") or dd.get("accountId"),
+                failure_destination=failure_dest,
+            )
+
+        # Parse failure_alert
+        failure_alert: CronFailureAlert | None = None
+        fa_raw = data.get("failure_alert") or data.get("failureAlert")
+        if isinstance(fa_raw, dict):
+            failure_alert = CronFailureAlert(
+                after_n_errors=int(
+                    fa_raw.get("after_n_errors")
+                    or fa_raw.get("afterNErrors")
+                    or 3
+                ),
+                cooldown_ms=int(
+                    fa_raw.get("cooldown_ms")
+                    or fa_raw.get("cooldownMs")
+                    or 3_600_000
+                ),
+                message=fa_raw.get("message"),
             )
 
         # Parse state
@@ -435,6 +538,13 @@ class CronJob:
                 state_data.get("schedule_error_count")
                 or state_data.get("scheduleErrorCount")
             ),
+            last_delivery_status=state_data.get("last_delivery_status") or state_data.get("lastDeliveryStatus"),
+            last_delivery_error=state_data.get("last_delivery_error") or state_data.get("lastDeliveryError"),
+            last_delivered=state_data.get("last_delivered") or state_data.get("lastDelivered"),
+            last_failure_alert_at_ms=(
+                state_data.get("last_failure_alert_at_ms")
+                or state_data.get("lastFailureAlertAtMs")
+            ),
         )
 
         now_ms = int(datetime.now().timestamp() * 1000)
@@ -451,6 +561,7 @@ class CronJob:
             wake_mode=data.get("wake_mode") or data.get("wakeMode") or "next-heartbeat",
             payload=payload,
             delivery=delivery,
+            failure_alert=failure_alert,
             state=state,
             created_at_ms=int(data.get("created_at_ms") or data.get("createdAtMs") or now_ms),
             updated_at_ms=int(data.get("updated_at_ms") or data.get("updatedAtMs") or now_ms),

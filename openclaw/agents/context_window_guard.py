@@ -29,6 +29,16 @@ class ContextWindowGuardResult(ContextWindowInfo):
     should_block: bool
 
 
+def _normalize_positive_int(value: Any) -> int | None:
+    """Return the floor of a positive finite number, or None."""
+    if not isinstance(value, (int, float)):
+        return None
+    if value != value or value == float("inf") or value == float("-inf"):
+        return None
+    v = int(value)
+    return v if v > 0 else None
+
+
 def resolve_context_window_info(
     cfg: dict[str, Any] | None,
     provider: str,
@@ -36,30 +46,36 @@ def resolve_context_window_info(
     model_context_window: int | None,
     default_tokens: int,
 ) -> ContextWindowInfo:
-    """
-    Resolve context window size from multiple sources with priority.
-    
+    """Resolve context window size from multiple sources.
+
     Mirrors TypeScript resolveContextWindowInfo().
-    
-    Priority order:
-    1. cfg.models.providers.{provider}.models[].contextWindow
-    2. model_context_window (from model metadata)
-    3. cfg.agents.defaults.contextTokens (as upper limit)
-    4. default_tokens
-    
+
+    Resolution order:
+    1. ``cfg.models.providers.{provider}.models[].contextWindow``
+    2. ``model_context_window`` (from model metadata)
+    3. ``default_tokens`` (fallback)
+
+    Then, ``cfg.agents.defaults.contextTokens`` is applied as a
+    **post-resolution upper cap**: if it is lower than the resolved
+    value, it replaces it.  This matches the TS behaviour where
+    ``agentContextTokens`` is not a priority-3 fallback but a cap.
+
     Args:
         cfg: OpenClaw configuration dict
         provider: Model provider name (e.g., "google", "anthropic")
         model_id: Model identifier
         model_context_window: Context window from model metadata
         default_tokens: Default fallback value
-        
+
     Returns:
         ContextWindowInfo with tokens and source
     """
-    # Priority 1: Check cfg.models.providers.{provider}.models[].contextWindow
+    import re as _re
+
+    # Priority 1: cfg.models.providers.{provider}.models[].contextWindow
+    from_models_config: int | None = None
     if cfg:
-        models_config = cfg.get("models") or {}
+        models_config = cfg.get("models") if isinstance(cfg, dict) else {}
         if not isinstance(models_config, dict):
             models_config = {}
         providers_config = models_config.get("providers") or {}
@@ -69,61 +85,42 @@ def resolve_context_window_info(
         if not isinstance(provider_config, dict):
             provider_config = {}
         models_list = provider_config.get("models") or []
-        if not isinstance(models_list, list):
-            models_list = []
-        
-        for model_entry in models_list:
-            if not isinstance(model_entry, dict):
-                continue
-            
-            # Match by id or idPattern
-            entry_id = model_entry.get("id")
-            entry_pattern = model_entry.get("idPattern")
-            
-            is_match = False
-            if entry_id and entry_id == model_id:
-                is_match = True
-            elif entry_pattern:
-                # Simple pattern matching (could use regex if needed)
-                import re
-                try:
-                    if re.search(entry_pattern, model_id):
-                        is_match = True
-                except Exception:
-                    pass
-            
-            if is_match:
-                ctx_window = model_entry.get("contextWindow")
-                if isinstance(ctx_window, int) and ctx_window > 0:
-                    return ContextWindowInfo(
-                        tokens=ctx_window,
-                        source="modelsConfig"
-                    )
-    
-    # Priority 2: Use model_context_window from model metadata
-    if model_context_window and isinstance(model_context_window, int) and model_context_window > 0:
-        return ContextWindowInfo(
-            tokens=model_context_window,
-            source="model"
-        )
-    
-    # Priority 3: Check cfg.agents.defaults.contextTokens (as upper limit)
+        if isinstance(models_list, list):
+            for model_entry in models_list:
+                if not isinstance(model_entry, dict):
+                    continue
+                entry_id = model_entry.get("id")
+                if entry_id == model_id:
+                    from_models_config = _normalize_positive_int(model_entry.get("contextWindow"))
+                    if from_models_config:
+                        break
+
+    # Priority 2: model_context_window
+    from_model = _normalize_positive_int(model_context_window)
+
+    # Determine base info (before cap)
+    if from_models_config:
+        base_info = ContextWindowInfo(tokens=from_models_config, source="modelsConfig")
+    elif from_model:
+        base_info = ContextWindowInfo(tokens=from_model, source="model")
+    else:
+        base_info = ContextWindowInfo(tokens=max(1, int(default_tokens)), source="default")
+
+    # Post-resolution upper cap: cfg.agents.defaults.contextTokens
+    cap_tokens: int | None = None
     if cfg:
-        agents_config = cfg.get("agents", {})
-        defaults = agents_config.get("defaults", {})
-        context_tokens = defaults.get("contextTokens")
-        
-        if isinstance(context_tokens, int) and context_tokens > 0:
-            return ContextWindowInfo(
-                tokens=context_tokens,
-                source="agentContextTokens"
-            )
-    
-    # Priority 4: Use default_tokens
-    return ContextWindowInfo(
-        tokens=default_tokens,
-        source="default"
-    )
+        agents_config = cfg.get("agents", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(agents_config, dict):
+            agents_config = {}
+        defaults = agents_config.get("defaults", {}) if isinstance(agents_config, dict) else {}
+        if not isinstance(defaults, dict):
+            defaults = {}
+        cap_tokens = _normalize_positive_int(defaults.get("contextTokens"))
+
+    if cap_tokens and cap_tokens < base_info.tokens:
+        return ContextWindowInfo(tokens=cap_tokens, source="agentContextTokens")
+
+    return base_info
 
 
 def evaluate_context_window_guard(
@@ -144,11 +141,15 @@ def evaluate_context_window_guard(
     Returns:
         ContextWindowGuardResult with evaluation flags
     """
-    should_block = info.tokens < hard_min_tokens
-    should_warn = info.tokens < warn_below_tokens
-    
+    warn_below = max(1, int(warn_below_tokens))
+    hard_min = max(1, int(hard_min_tokens))
+    tokens = max(0, int(info.tokens))
+    # tokens > 0 guard: mirrors TS behaviour — 0 means "unknown", not "blocked"
+    should_block = tokens > 0 and tokens < hard_min
+    should_warn = tokens > 0 and tokens < warn_below
+
     return ContextWindowGuardResult(
-        tokens=info.tokens,
+        tokens=tokens,
         source=info.source,
         should_warn=should_warn,
         should_block=should_block,

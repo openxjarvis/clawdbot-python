@@ -285,6 +285,10 @@ def resolve_failover_reason_from_error(err: Any) -> FailoverReason | None:
         return FailoverReason.AUTH
     if status == 408:
         return FailoverReason.TIMEOUT
+    if status in (502, 503, 504):
+        return FailoverReason.TIMEOUT
+    if status == 529:
+        return FailoverReason.RATE_LIMIT
     if status == 400:
         return FailoverReason.FORMAT
 

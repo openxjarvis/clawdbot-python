@@ -21,6 +21,20 @@ WARNING_THRESHOLD = 10
 CRITICAL_THRESHOLD = 20
 GLOBAL_CIRCUIT_BREAKER_THRESHOLD = 30
 
+# Default config — enabled=False mirrors TS DEFAULT_LOOP_DETECTION_CONFIG.enabled
+DEFAULT_LOOP_DETECTION_CONFIG: dict[str, Any] = {
+    "enabled": False,
+    "historySize": TOOL_CALL_HISTORY_SIZE,
+    "warningThreshold": WARNING_THRESHOLD,
+    "criticalThreshold": CRITICAL_THRESHOLD,
+    "globalCircuitBreakerThreshold": GLOBAL_CIRCUIT_BREAKER_THRESHOLD,
+    "detectors": {
+        "genericRepeat": True,
+        "knownPollNoProgress": True,
+        "pingPong": True,
+    },
+}
+
 
 @dataclass
 class LoopDetectionResult:
@@ -241,6 +255,11 @@ def detect_tool_call_loop(
     - Critical-level detections always block (no shown_warnings deduplication)
     - Warning-level detections use bucket throttling (emit once per 10-call increment)
     """
+    # enabled=False is the default — mirrors TS where loop detection is opt-in
+    enabled = config.get("enabled", DEFAULT_LOOP_DETECTION_CONFIG["enabled"]) if config else DEFAULT_LOOP_DETECTION_CONFIG["enabled"]
+    if not enabled:
+        return LoopDetectionResult(stuck=False)
+
     if not state or not state.tool_call_history:
         return LoopDetectionResult(stuck=False)
 

@@ -45,6 +45,10 @@ PluginHookName = Literal[
     "before_message_write",
     "session_start",
     "session_end",
+    "subagent_spawning",
+    "subagent_delivery_target",
+    "subagent_spawned",
+    "subagent_ended",
     "gateway_start",
     "gateway_stop",
 ]
@@ -68,6 +72,10 @@ PLUGIN_HOOK_NAMES: frozenset[str] = frozenset([
     "before_message_write",
     "session_start",
     "session_end",
+    "subagent_spawning",
+    "subagent_delivery_target",
+    "subagent_spawned",
+    "subagent_ended",
     "gateway_start",
     "gateway_stop",
 ])
@@ -648,6 +656,92 @@ class PluginHookGatewayStopEvent:
 
 
 # =============================================================================
+# Subagent Hook Types (mirrors TS PluginHookSubagentContext)
+# =============================================================================
+
+@dataclass
+class PluginHookSubagentContext:
+    """Context passed to subagent lifecycle hooks. Mirrors TS PluginHookSubagentContext."""
+    agent_id: str | None = None
+    session_key: str | None = None
+    parent_agent_id: str | None = None
+    parent_session_key: str | None = None
+    label: str | None = None
+    task: str | None = None
+
+
+@dataclass
+class PluginHookSubagentSpawningEvent:
+    """Event for subagent_spawning hook — fired before a subagent is created.
+    Mirrors TS PluginHookSubagentSpawningEvent.
+    """
+    task: str = ""
+    label: str | None = None
+    agent_id: str | None = None
+    model: str | None = None
+
+
+@dataclass
+class PluginHookSubagentSpawningResult:
+    """Result of subagent_spawning hook (modifying, serial).
+    Mirrors TS PluginHookSubagentSpawningResult.
+
+    Handlers may return:
+    - status="ok": spawn proceeds normally
+    - status="error": spawn is blocked with the given error message
+    - thread_binding_ready=True: signals the thread binding is prepared
+    """
+    status: str = "ok"              # "ok" | "error"
+    error: str | None = None        # Error message when status="error"
+    thread_binding_ready: bool = False
+
+
+@dataclass
+class PluginHookSubagentDeliveryTargetEvent:
+    """Event for subagent_delivery_target hook — fired to determine message delivery origin.
+    Mirrors TS PluginHookSubagentDeliveryTargetEvent.
+    """
+    task: str = ""
+    label: str | None = None
+    agent_id: str | None = None
+    session_key: str | None = None
+
+
+@dataclass
+class PluginHookSubagentDeliveryTargetResult:
+    """Result of subagent_delivery_target hook (modifying, serial).
+    Mirrors TS PluginHookSubagentDeliveryTargetResult.
+
+    Handlers may return an origin dict that overrides the default delivery target.
+    """
+    origin: dict[str, Any] | None = None
+
+
+@dataclass
+class PluginHookSubagentSpawnedEvent:
+    """Event for subagent_spawned hook — fired after a subagent was successfully created.
+    Mirrors TS PluginHookSubagentSpawnedEvent. (void, parallel)
+    """
+    session_key: str = ""
+    agent_id: str | None = None
+    label: str | None = None
+    task: str = ""
+
+
+@dataclass
+class PluginHookSubagentEndedEvent:
+    """Event for subagent_ended hook — fired after a subagent run completes.
+    Mirrors TS PluginHookSubagentEndedEvent. (void, parallel)
+    """
+    session_key: str = ""
+    agent_id: str | None = None
+    label: str | None = None
+    success: bool = True
+    error: str | None = None
+    duration_ms: int | None = None
+
+
+# =============================================================================
 # Additional types expected by __init__.py and other existing modules
 # =============================================================================
 
@@ -777,6 +871,14 @@ __all__ = [
     "PluginHookSessionEndEvent",
     "PluginHookGatewayStartEvent",
     "PluginHookGatewayStopEvent",
+    # Subagent hook types
+    "PluginHookSubagentContext",
+    "PluginHookSubagentSpawningEvent",
+    "PluginHookSubagentSpawningResult",
+    "PluginHookSubagentDeliveryTargetEvent",
+    "PluginHookSubagentDeliveryTargetResult",
+    "PluginHookSubagentSpawnedEvent",
+    "PluginHookSubagentEndedEvent",
     # Backward-compat types
     "OpenClawPluginDefinition",
     "OpenClawPluginHookOptions",

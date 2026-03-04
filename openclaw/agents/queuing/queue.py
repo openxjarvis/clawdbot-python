@@ -27,6 +27,20 @@ DropPolicy = Literal["old", "new", "summarize"]
 DEFAULT_WARN_AFTER_MS: int = 2_000
 
 
+class CommandLaneClearedError(RuntimeError):
+    """Raised on queued tasks when their lane is cleared.
+
+    Mirrors TS ``CommandLaneClearedError`` from process/command-queue.ts.
+    Callers that fire-and-forget enqueued tasks can catch this specific type
+    to avoid unhandled-rejection noise.
+    """
+
+    def __init__(self, lane: str | None = None) -> None:
+        msg = f'Command lane "{lane}" cleared' if lane else "Command lane cleared"
+        super().__init__(msg)
+        self.lane = lane
+
+
 class GatewayDrainingError(RuntimeError):
     """Raised when the gateway is draining and rejecting new enqueues."""
 
@@ -294,6 +308,39 @@ class QueueManager:
             await lane.stop()
             del self._session_lanes[session_id]
             logger.debug(f"Cleaned up lane for session: {session_id}")
+
+    def clear_command_lane(self, lane: str | CommandLane | None = None) -> int:
+        """Drain all queued (not-yet-started) tasks from a lane and reject them.
+
+        Mirrors TS ``clearCommandLane(lane?)`` from process/command-queue.ts.
+
+        Args:
+            lane: A ``CommandLane`` enum value, a string lane key, or ``None``
+                  to default to ``CommandLane.MAIN``.
+
+        Returns:
+            Number of entries that were drained.
+        """
+        if lane is None:
+            lane = CommandLane.MAIN
+
+        if isinstance(lane, CommandLane):
+            cleaned = lane.value
+            lane_instance = self._fixed_lanes.get(lane)
+        else:
+            cleaned = (lane or "").strip() or CommandLane.MAIN.value
+            # Check fixed lanes by value, then session lanes by key
+            lane_instance = next(
+                (l for l in self._fixed_lanes.values() if l.name == cleaned), None
+            ) or self._session_lanes.get(cleaned)
+
+        if lane_instance is None:
+            return 0
+
+        error = CommandLaneClearedError(cleaned)
+        removed = lane_instance.clear(error)
+        logger.debug("clear_command_lane: drained %d entries from lane %s", removed, cleaned)
+        return removed
 
     def reset_all_lanes(self) -> None:
         """Reset all lane runtime state to idle.

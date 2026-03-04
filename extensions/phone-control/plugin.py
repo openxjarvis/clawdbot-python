@@ -185,7 +185,7 @@ def _patch_config_node_lists(
 async def _write_config(cfg_dict: dict) -> None:
     try:
         from openclaw.config.loader import write_config_file
-        await asyncio.get_event_loop().run_in_executor(None, write_config_file, cfg_dict)
+        await asyncio.get_running_loop().run_in_executor(None, write_config_file, cfg_dict)
     except Exception:
         try:
             from openclaw.gateway.config_service import write_config

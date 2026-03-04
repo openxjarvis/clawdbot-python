@@ -255,11 +255,48 @@ class TelegramChannel(ChannelPlugin):
 
         # Initialize chat command system
         self._command_parser = ChatCommandParser()
-        # Note: command_executor will be initialized once we have session_manager
-        # This would typically be set via set_message_handler or similar
 
-        # Create application
-        self._app = Application.builder().token(self._bot_token).build()
+        # Store runtime config values for send_text path
+        self._text_chunk_limit: int = config.get("textChunkLimit") or 4096
+        self._chunk_mode: str = config.get("chunkMode") or "smart"
+        self._response_prefix: str = config.get("responsePrefix") or ""
+        self._link_preview: bool = bool(config.get("linkPreview", True))
+        self._media_max_mb: int = config.get("mediaMaxMb") or 50
+        self._history_limit: int = config.get("historyLimit") or 100
+        self._dm_history_limit: int = config.get("dmHistoryLimit") or 50
+        self._streaming_enabled: bool = bool(config.get("streaming", False))
+        self._reply_to_mode: str = config.get("replyToMode") or "first"
+
+        # Build Application — wire proxy and network timeouts
+        builder = Application.builder().token(self._bot_token)
+        from .network_config import resolve_telegram_proxy
+        proxy_url = resolve_telegram_proxy(config)
+        if proxy_url:
+            try:
+                from telegram.request import HTTPXRequest
+                _req = HTTPXRequest(proxy=proxy_url)
+                builder = builder.request(_req).get_updates_request(_req)
+                logger.info("Telegram proxy configured: %s", proxy_url)
+            except Exception as proxy_err:
+                logger.warning("Failed to configure Telegram proxy (%s): %s", proxy_url, proxy_err)
+
+        network_cfg = config.get("network") or {}
+        connect_timeout = float(network_cfg.get("connectTimeout") or 10)
+        read_timeout = float(network_cfg.get("readTimeout") or 30)
+        write_timeout = float(network_cfg.get("writeTimeout") or 30)
+        pool_timeout = float(network_cfg.get("poolTimeout") or 10)
+        try:
+            builder = (
+                builder
+                .connect_timeout(connect_timeout)
+                .read_timeout(read_timeout)
+                .write_timeout(write_timeout)
+                .pool_timeout(pool_timeout)
+            )
+        except Exception:
+            pass  # Older PTB versions may not support all timeout setters
+
+        self._app = builder.build()
 
         # Register i18n language switching handlers
         register_lang_handlers(self._app)
@@ -359,10 +396,33 @@ class TelegramChannel(ChannelPlugin):
         if saved_offset is not None:
             logger.info("Resuming from persisted update offset %d", saved_offset)
 
-        await self._app.updater.start_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=False,  # We already dropped via delete_webhook
-        )
+        # Webhook vs polling mode (mirrors TS: webhookUrl → start_webhook)
+        webhook_url = config.get("webhookUrl") or config.get("webhook_url")
+        webhook_port = int(config.get("webhookPort") or config.get("webhook_port") or 8443)
+        self._webhook_mode = bool(webhook_url)
+
+        if webhook_url:
+            logger.info("Telegram channel starting in WEBHOOK mode: %s", webhook_url)
+            try:
+                await self._app.updater.start_webhook(
+                    listen="0.0.0.0",
+                    port=webhook_port,
+                    url_path=self._bot_token,
+                    webhook_url=f"{webhook_url.rstrip('/')}/{self._bot_token}",
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=False,
+                )
+            except Exception as wh_err:
+                logger.error("Failed to start webhook, falling back to polling: %s", wh_err)
+                await self._app.updater.start_polling(
+                    allowed_updates=Update.ALL_TYPES,
+                    drop_pending_updates=False,
+                )
+        else:
+            await self._app.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=False,  # We already dropped via delete_webhook
+            )
 
         self._running = True
         self._conflict_backoff = _POLL_BACKOFF_INITIAL
@@ -418,10 +478,12 @@ class TelegramChannel(ChannelPlugin):
             self._schedule_polling_restart(reason="conflict")
 
         elif _is_recoverable_network_error(exc):
-            # Network errors are transient — force a polling restart
-            # (mirrors TS unhandled-rejection handler for network errors)
-            logger.warning("Telegram recoverable network error — scheduling restart: %s", exc)
-            self._schedule_polling_restart(reason="network")
+            # PTB's network_retry_loop already handles NetworkError/TimedOut by
+            # retrying internally.  Scheduling a restart here would stop an
+            # actively-retrying updater and trigger the initialize() lifecycle,
+            # causing the "Updater was not initialized" error during outages.
+            # Mirror TS behaviour: log and let PTB's built-in retry loop recover.
+            logger.debug("Telegram recoverable network error (PTB retry loop active): %s", exc)
 
         elif isinstance(exc, tg_err.TimedOut):
             logger.debug("Telegram request timed out (auto-retry by PTB): %s", exc)
@@ -487,6 +549,9 @@ class TelegramChannel(ChannelPlugin):
                 logger.debug("Updater stop during restart (%s): %s", reason, stop_exc)
 
             try:
+                # PTB v20+ lifecycle: stop() transitions Updater to STOPPED state.
+                # initialize() must be called to return to IDLE before start_polling().
+                await self._app.updater.initialize()
                 await self._app.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=False,
@@ -523,22 +588,31 @@ class TelegramChannel(ChannelPlugin):
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                failures += 1
-                logger.warning(
-                    "Telegram health check failed (%d/%d): %s",
-                    failures,
-                    _HEALTH_MAX_FAILURES,
-                    exc,
-                )
-                if failures >= _HEALTH_MAX_FAILURES:
-                    logger.error(
-                        "Telegram health check failed %d times — forcing polling restart",
-                        failures,
+                if _is_recoverable_network_error(exc):
+                    # Network outage: PTB's retry loop is already handling this.
+                    # Don't count against the failure threshold — health restarts
+                    # are only for cases where the bot is stuck despite connectivity.
+                    logger.debug(
+                        "Telegram health check: network unavailable (PTB retry loop active): %s",
+                        exc,
                     )
-                    failures = 0
-                    self._schedule_polling_restart(reason="health-check-failure")
+                else:
+                    failures += 1
+                    logger.warning(
+                        "Telegram health check failed (%d/%d): %s",
+                        failures,
+                        _HEALTH_MAX_FAILURES,
+                        exc,
+                    )
+                    if failures >= _HEALTH_MAX_FAILURES:
+                        logger.error(
+                            "Telegram health check failed %d times — forcing polling restart",
+                            failures,
+                        )
+                        failures = 0
+                        self._schedule_polling_restart(reason="health-check-failure")
 
-    async def send_typing(self, target: str) -> None:
+    async def send_typing(self, target: str, message_id: str | None = None) -> None:
         """Send a 'typing…' chat action to show the bot is processing."""
         if not self._app:
             return
@@ -599,11 +673,7 @@ class TelegramChannel(ChannelPlugin):
                 await trigger_internal_hook(hook_event)
 
             try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.ensure_future(_trigger())
-                else:
-                    loop.run_until_complete(_trigger())
+                asyncio.ensure_future(_trigger())
             except Exception:
                 pass
         except Exception:
@@ -1095,6 +1165,12 @@ class TelegramChannel(ChannelPlugin):
             file_id = message.document.file_id
             file_name = message.document.file_name or f"document_{message.message_id}"
             mime_type = message.document.mime_type or "application/octet-stream"
+        elif getattr(message, "video_note", None):
+            # video_note = circular video message (Telegram Video Messages feature)
+            media_type = "video_note"
+            file_id = message.video_note.file_id
+            file_name = f"video_note_{message.message_id}.mp4"
+            mime_type = "video/mp4"
         elif message.sticker:
             # Skip animated/video stickers; accept static WebP only
             if not (message.sticker.is_animated or message.sticker.is_video):
@@ -1160,6 +1236,13 @@ class TelegramChannel(ChannelPlugin):
                     sender_username=sender.username,
                 )
 
+            # Fetch reply-target media — mirrors TS resolveReplyMedia()
+            reply_attachments: list[dict] = []
+            if message.reply_to_message:
+                reply_attachments = await self._fetch_reply_target_media(
+                    message.reply_to_message, context
+                )
+
             # Determine chat type
             chat_type = "direct"
             if chat.type in ("group", "supergroup"):
@@ -1180,6 +1263,7 @@ class TelegramChannel(ChannelPlugin):
                 text=text,
                 timestamp=message.date.isoformat() if message.date else datetime.now(UTC).isoformat(),
                 reply_to=str(message.reply_to_message.message_id) if message.reply_to_message else None,
+                account_id=self._account_id or None,
                 metadata={
                     "username": sender.username,
                     "chat_title": chat.title,
@@ -1190,7 +1274,7 @@ class TelegramChannel(ChannelPlugin):
                     "mime_type": mime_type,
                     "caption": caption,
                 },
-                attachments=[attachment],
+                attachments=[attachment] + reply_attachments,
             )
 
             await self._handle_message(inbound)
@@ -1238,33 +1322,7 @@ class TelegramChannel(ChannelPlugin):
         is_group = chat.type in ["group", "supergroup"]
         is_dm = not is_group
 
-        # DM Access Control - Check dm_policy for direct messages
-        if is_dm and self._config:
-            dm_policy = self._config.get("dmPolicy") or self._config.get("dm_policy") or "pairing"
-
-            # Handle disabled DM
-            if dm_policy == "disabled":
-                logger.info(f"DM from {sender.id} blocked by dm_policy=disabled")
-                return
-
-            # Handle pairing and allowlist modes
-            if dm_policy in ["pairing", "allowlist"]:
-                # Check if sender is allowed
-                is_allowed = await self._check_sender_allowed(
-                    sender_id=str(sender.id),
-                    username=sender.username,
-                    dm_policy=dm_policy
-                )
-
-                if not is_allowed:
-                    # For pairing mode, create pairing request
-                    if dm_policy == "pairing":
-                        await self._handle_pairing_request(sender, chat, context)
-                    else:
-                        # For allowlist mode, just ignore
-                        logger.info(f"DM from {sender.id} blocked by dm_policy={dm_policy}")
-                    return
-
+        # DM / group access control is handled inside _process_normal_text_message
         # Process as normal message
         await self._process_normal_text_message(message, update, context)
 
@@ -1547,37 +1605,30 @@ class TelegramChannel(ChannelPlugin):
         )
 
     async def _handle_model_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /model command - show model selection"""
-        current_model = self._config.get("model", "google/gemini-3-pro-preview") if self._config else "unknown"
-
-        keyboard = [
-            [InlineKeyboardButton("🌟 Gemini Pro (Current)", callback_data="model_gemini")],
-            [InlineKeyboardButton("🧠 Claude Sonnet", callback_data="model_claude")],
-            [InlineKeyboardButton("⚡ GPT-4", callback_data="model_gpt4")],
-            [InlineKeyboardButton("🔥 GPT-4 Turbo", callback_data="model_gpt4turbo")],
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
+        """Handle /model command — paginated model picker."""
+        keyboard, header = self._build_model_picker_keyboard(page=0)
         await update.message.reply_text(
-            f"🤖 *Select AI Model*\n\n"
-            f"Current Model: `{current_model}`\n\n"
-            f"Choose the model to use:",
+            header,
             parse_mode="Markdown",
-            reply_markup=reply_markup
+            reply_markup=InlineKeyboardMarkup(keyboard),
         )
 
     async def _handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle callback queries from inline keyboards"""
+        """Handle callback queries from inline keyboards.
+
+        Mirrors TS bot-handlers.ts handleCallbackQuery():
+        - Well-known data prefixes handled directly
+        - Unknown callbacks passed as synthetic text messages to the agent
+        """
         from telegram.error import BadRequest
 
         query = update.callback_query
         await query.answer()
 
-        data = query.data
-        logger.info(f"Callback query: {data}")
+        data = query.data or ""
+        logger.info("Callback query: %s", data)
 
         if data == "new_confirm":
-            # Clear conversation history (implement this in session manager)
             try:
                 await query.edit_message_text(
                     "✅ *New Conversation Started*\n\n"
@@ -1585,10 +1636,7 @@ class TelegramChannel(ChannelPlugin):
                     parse_mode="Markdown"
                 )
             except BadRequest as e:
-                if "Message is not modified" in str(e):
-                    # Message content is identical, silently ignore
-                    logger.debug(f"Message already shows correct state for {data}")
-                else:
+                if "Message is not modified" not in str(e):
                     raise
 
         elif data == "new_cancel":
@@ -1598,100 +1646,337 @@ class TelegramChannel(ChannelPlugin):
                     parse_mode="Markdown"
                 )
             except BadRequest as e:
-                if "Message is not modified" in str(e):
-                    logger.debug(f"Message already shows correct state for {data}")
-                else:
+                if "Message is not modified" not in str(e):
+                    raise
+
+        elif data.startswith("model_select:"):
+            # Paginated model selection — model_select:<model_id>
+            model_id = data[len("model_select:"):]
+            if self._config:
+                self._config["model"] = model_id
+            try:
+                await query.edit_message_text(
+                    f"✅ *Model Switched*\n\nNow using: `{model_id}`\n\n_New messages will use this model_",
+                    parse_mode="Markdown"
+                )
+            except BadRequest as e:
+                if "Message is not modified" not in str(e):
+                    raise
+
+        elif data.startswith("model_page:"):
+            # Pagination for model picker — model_page:<page_number>
+            try:
+                page = int(data[len("model_page:"):])
+            except ValueError:
+                page = 0
+            keyboard, header = self._build_model_picker_keyboard(page=page)
+            try:
+                await query.edit_message_text(
+                    header,
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
+            except BadRequest as e:
+                if "Message is not modified" not in str(e):
                     raise
 
         elif data.startswith("model_"):
-            model_name = data.replace("model_", "")
+            # Legacy: model_<short_key>
+            model_name = data[len("model_"):]
             model_map = {
                 "gemini": ("google/gemini-3-pro-preview", "Gemini Pro"),
                 "claude": ("claude-3-5-sonnet-20241022", "Claude 3.5 Sonnet"),
                 "gpt4": ("gpt-4", "GPT-4"),
                 "gpt4turbo": ("gpt-4-turbo", "GPT-4 Turbo"),
             }
-
             if model_name in model_map:
                 model_id, display_name = model_map[model_name]
-                # Update config (this would need to be persisted)
                 if self._config:
                     self._config["model"] = model_id
-
                 try:
                     await query.edit_message_text(
-                        f"✅ *Model Switched*\n\n"
-                        f"Now using: {display_name}\n"
-                        f"Model ID: `{model_id}`\n\n"
-                        f"_New messages will use this model_",
-                        parse_mode="Markdown"
+                        f"✅ *Model Switched*\n\nNow using: {display_name}\nModel ID: `{model_id}`\n\n_New messages will use this model_",
+                        parse_mode="Markdown",
                     )
                 except BadRequest as e:
-                    if "Message is not modified" in str(e):
-                        logger.debug(f"Message already shows correct state for model {model_name}")
-                    else:
+                    if "Message is not modified" not in str(e):
                         raise
+
+        else:
+            # Unknown callback_data — pass as synthetic text message to the agent
+            # Mirrors TS: any unhandled callbackData forwarded as user message
+            if query.message and query.from_user:
+                chat = query.message.chat
+                sender = query.from_user
+                is_group = chat.type in ("group", "supergroup")
+                chat_type = "group" if is_group else "direct"
+
+                inbound = InboundMessage(
+                    channel_id=self.id,
+                    message_id=f"cbq_{query.id}",
+                    sender_id=str(sender.id),
+                    sender_name=sender.full_name or sender.username or str(sender.id),
+                    chat_id=str(chat.id),
+                    chat_type=chat_type,
+                    text=data,
+                    timestamp=datetime.now(UTC).isoformat(),
+                    account_id=self._account_id or None,
+                    metadata={
+                        "username": sender.username,
+                        "event_type": "callback_query",
+                        "callback_query_id": query.id,
+                        "inline_message_id": getattr(query, "inline_message_id", None),
+                    },
+                )
+                await self._handle_message(inbound)
+
+    def _build_model_picker_keyboard(self, page: int = 0) -> tuple[list, str]:
+        """Build paginated model picker inline keyboard.
+
+        Returns (keyboard_rows, header_text).
+        Mirrors TS buildModelPickerKeyboard().
+        """
+        _PAGE_SIZE = 5
+
+        available_models: list[tuple[str, str]] = []
+        try:
+            from openclaw.agents.registry import list_available_models  # type: ignore
+            raw = list_available_models()
+            available_models = [(m.get("id", ""), m.get("label", m.get("id", ""))) for m in raw if m.get("id")]
+        except Exception:
+            pass
+
+        if not available_models:
+            # Fallback to hardcoded list
+            available_models = [
+                ("google/gemini-3-pro-preview", "Gemini Pro"),
+                ("claude-3-5-sonnet-20241022", "Claude 3.5 Sonnet"),
+                ("gpt-4", "GPT-4"),
+                ("gpt-4-turbo", "GPT-4 Turbo"),
+                ("gpt-4o", "GPT-4o"),
+            ]
+
+        total = len(available_models)
+        total_pages = max(1, (total + _PAGE_SIZE - 1) // _PAGE_SIZE)
+        page = max(0, min(page, total_pages - 1))
+        start = page * _PAGE_SIZE
+        page_models = available_models[start : start + _PAGE_SIZE]
+
+        current_model = (self._config or {}).get("model", "")
+        keyboard: list[list[InlineKeyboardButton]] = []
+        for model_id, label in page_models:
+            marker = "✅ " if model_id == current_model else ""
+            keyboard.append([InlineKeyboardButton(f"{marker}{label}", callback_data=f"model_select:{model_id}")])
+
+        nav_row: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("◀ Prev", callback_data=f"model_page:{page - 1}"))
+        if page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton("Next ▶", callback_data=f"model_page:{page + 1}"))
+        if nav_row:
+            keyboard.append(nav_row)
+
+        header = f"🤖 *Select AI Model* (page {page + 1}/{total_pages})\n\nCurrent: `{current_model}`"
+        return keyboard, header
 
     async def _check_sender_allowed(
         self,
         sender_id: str,
         username: str | None,
-        dm_policy: str
+        dm_policy: str,
+        allow_from_override: list | None = None,
     ) -> bool:
         """Check if sender is allowed based on dm_policy and allowFrom.
-        
+
+        Mirrors TS checkTelegramSenderAllowed():
+        - strips telegram:/tg: prefixes via normalizer before comparing
+        - merges config allowFrom with pairing-store approved senders
+
         Args:
             sender_id: Telegram user ID
             username: Telegram username (without @)
             dm_policy: DM policy (pairing, allowlist, open)
-            
+            allow_from_override: Optional list override (e.g. per-group allowFrom)
+
         Returns:
             True if sender is allowed
         """
-        # For open policy with wildcard, allow all
-        if dm_policy == "open":
-            allow_from = self._config.get("allowFrom") or self._config.get("allow_from") or []
-            if "*" in allow_from:
-                return True
+        from .allow_from import (
+            is_numeric_telegram_user_id,
+            normalize_telegram_allow_from_entry,
+        )
 
-        # Get allowFrom from config
-        allow_from_config = self._config.get("allowFrom") or self._config.get("allow_from") or []
+        if allow_from_override is not None:
+            raw_list = allow_from_override
+        else:
+            # For open policy with wildcard, allow all
+            if dm_policy == "open":
+                allow_from = self._config.get("allowFrom") or self._config.get("allow_from") or []
+                normalized = [normalize_telegram_allow_from_entry(e) for e in allow_from]
+                if "*" in normalized:
+                    return True
 
-        # Get allowFrom from pairing store
-        try:
-            from ...pairing.pairing_store import read_channel_allow_from_store
-            # Pass account_id to read both account-scoped and legacy allowFrom lists
-            allow_from_store = read_channel_allow_from_store("telegram", self._account_id)
-        except Exception as e:
-            logger.warning(f"Failed to read pairing store: {e}")
-            allow_from_store = []
+            # Get allowFrom from config
+            allow_from_config = self._config.get("allowFrom") or self._config.get("allow_from") or []
 
-        # Merge both lists
-        effective_allow_from = list(set(allow_from_config + allow_from_store))
+            # Get allowFrom from pairing store
+            try:
+                from ...pairing.pairing_store import read_channel_allow_from_store
+                allow_from_store = read_channel_allow_from_store("telegram", self._account_id)
+            except Exception as e:
+                logger.warning("Failed to read pairing store: %s", e)
+                allow_from_store = []
+
+            raw_list = allow_from_config + allow_from_store
+
+        # Normalize all entries (strips telegram:/tg: prefixes)
+        normalized = [normalize_telegram_allow_from_entry(e) for e in raw_list]
 
         # Check wildcard
-        if "*" in effective_allow_from:
+        if "*" in normalized:
             return True
 
         # Check if empty and not in pairing mode
-        if not effective_allow_from and dm_policy == "allowlist":
+        if not normalized and dm_policy == "allowlist":
             return False
 
-        # Check sender ID match
-        if sender_id in effective_allow_from:
+        # Check sender ID match (numeric IDs match directly)
+        if sender_id in normalized:
             return True
 
-        # Check username match (case-insensitive)
+        # Check username match (case-insensitive, with/without @ prefix)
         if username:
             username_lower = username.lower()
-            username_with_at = f"@{username_lower}"
-
-            for allowed in effective_allow_from:
-                allowed_lower = allowed.lower()
-                if allowed_lower == username_lower or allowed_lower == username_with_at:
+            for entry in normalized:
+                entry_lower = entry.lower()
+                if entry_lower == username_lower or entry_lower == f"@{username_lower}":
                     return True
 
         return False
+
+    def _resolve_group_config(self, chat_id: str) -> dict:
+        """Return per-group config override block (may be empty dict).
+
+        Mirrors TS resolveGroupConfig(): looks up config.groups[chatId].
+        """
+        if not self._config:
+            return {}
+        groups_config = self._config.get("groups") or {}
+        return groups_config.get(str(chat_id)) or groups_config.get(chat_id) or {}
+
+    def _message_mentions_bot(self, message: Any) -> bool:
+        """Return True if the message @-mentions the bot.
+
+        Mirrors TS requiresMentionCheck().
+        """
+        if not self._app:
+            return False
+        try:
+            bot_username = self._app.bot.username or ""
+        except Exception:
+            bot_username = ""
+
+        text = message.text or getattr(message, "caption", None) or ""
+        if bot_username and f"@{bot_username}" in text:
+            return True
+
+        entities = list(getattr(message, "entities", None) or []) + list(
+            getattr(message, "caption_entities", None) or []
+        )
+        for entity in entities:
+            if entity.type == "mention":
+                mention = text[entity.offset : entity.offset + entity.length]
+                if mention.lstrip("@").lower() == bot_username.lower():
+                    return True
+            elif entity.type == "text_mention":
+                user = getattr(entity, "user", None)
+                if user:
+                    try:
+                        if user.id == self._app.bot.id:
+                            return True
+                    except Exception:
+                        pass
+        return False
+
+    async def _check_group_message_allowed(
+        self, message: Any, chat: Any, sender: Any
+    ) -> bool:
+        """Apply group-level access-control logic.
+
+        Mirrors TS groupPolicy / requireMention / groupAllowFrom gating.
+        Returns True when the message should be forwarded to the agent.
+        """
+        if not self._config:
+            return True
+
+        chat_id = str(chat.id)
+        group_cfg = self._resolve_group_config(chat_id)
+
+        # Resolve effective policy (per-group override → account default → "open")
+        group_policy = (
+            group_cfg.get("groupPolicy")
+            or self._config.get("groupPolicy")
+            or "open"
+        )
+
+        if group_policy == "disabled":
+            logger.debug("Group %s blocked by groupPolicy=disabled", chat_id)
+            return False
+
+        if group_policy == "allowlist":
+            # Chat itself must be in groupAllowFrom
+            group_allow_from_raw = self._config.get("groupAllowFrom") or []
+            from .allow_from import normalize_telegram_allow_from_entry
+            group_allow_from = [normalize_telegram_allow_from_entry(e) for e in group_allow_from_raw]
+            if "*" not in group_allow_from and chat_id not in group_allow_from:
+                logger.debug("Group %s not in groupAllowFrom allowlist", chat_id)
+                return False
+
+        # Per-group sender allowFrom (overrides account-level allowFrom for groups)
+        group_sender_allow_from = group_cfg.get("allowFrom")
+        if group_sender_allow_from is not None:
+            sender_ok = await self._check_sender_allowed(
+                sender_id=str(sender.id),
+                username=getattr(sender, "username", None),
+                dm_policy="allowlist",
+                allow_from_override=group_sender_allow_from,
+            )
+            if not sender_ok:
+                logger.debug(
+                    "Group %s: sender %s blocked by group allowFrom", chat_id, sender.id
+                )
+                return False
+
+        # requireMention (per-group overrides account level)
+        require_mention = group_cfg.get(
+            "requireMention",
+            self._config.get("requireMention", False),
+        )
+        if require_mention:
+            if not self._message_mentions_bot(message):
+                logger.debug(
+                    "Group %s: ignored — bot not mentioned (requireMention=true)", chat_id
+                )
+                return False
+
+        return True
+
+    async def _send_ack_reaction(self, chat_id: int | str, message_id: int, emoji: str = "👀") -> None:
+        """Send an ack reaction to indicate the bot is processing.
+
+        Mirrors TS sendAckReaction().
+        """
+        if not self._app:
+            return
+        try:
+            from telegram import ReactionTypeEmoji
+            await self._app.bot.set_message_reaction(
+                chat_id=chat_id,
+                message_id=message_id,
+                reaction=[ReactionTypeEmoji(emoji=emoji)],
+            )
+        except Exception as exc:
+            logger.debug("Failed to send ack reaction: %s", exc)
 
     async def _handle_pairing_request(
         self,
@@ -1921,6 +2206,7 @@ class TelegramChannel(ChannelPlugin):
                         chat_type="group" if is_group else "direct",
                         text=text,
                         timestamp=datetime.now(UTC).isoformat(),
+                        account_id=self._account_id or None,
                         metadata={
                             "event_type": "reaction",
                             "emoji": emoji,
@@ -1935,6 +2221,67 @@ class TelegramChannel(ChannelPlugin):
 
             except Exception as exc:
                 logger.error("Failed to handle reaction event: %s", exc, exc_info=True)
+
+    async def _fetch_reply_target_media(
+        self,
+        reply_msg: Any,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> list[dict]:
+        """Download media from a replied-to message and return as attachments.
+
+        Mirrors TS resolveReplyMedia() in bot-handlers.ts.
+        Returns a list (possibly empty) of attachment dicts.
+        """
+        import base64
+
+        def _make_attachment(file_bytes: bytes, mime_type: str, file_name: str) -> dict:
+            b64 = base64.b64encode(file_bytes).decode()
+            is_image = mime_type.startswith("image/")
+            attach_type = "image" if is_image else "file"
+            return {
+                "type": attach_type,
+                "mimeType": mime_type,
+                "content": b64,
+                "filename": file_name,
+                "size": len(file_bytes),
+                "isReplyMedia": True,
+            }
+
+        try:
+            file_id: str | None = None
+            mime_type = "application/octet-stream"
+            file_name = "reply_media"
+
+            if reply_msg.photo:
+                file_id = reply_msg.photo[-1].file_id
+                mime_type = "image/jpeg"
+                file_name = f"reply_photo_{reply_msg.message_id}.jpg"
+            elif reply_msg.video:
+                file_id = reply_msg.video.file_id
+                mime_type = reply_msg.video.mime_type or "video/mp4"
+                file_name = reply_msg.video.file_name or f"reply_video_{reply_msg.message_id}.mp4"
+            elif reply_msg.audio:
+                file_id = reply_msg.audio.file_id
+                mime_type = reply_msg.audio.mime_type or "audio/mpeg"
+                file_name = reply_msg.audio.file_name or f"reply_audio_{reply_msg.message_id}.mp3"
+            elif reply_msg.voice:
+                file_id = reply_msg.voice.file_id
+                mime_type = reply_msg.voice.mime_type or "audio/ogg"
+                file_name = f"reply_voice_{reply_msg.message_id}.ogg"
+            elif reply_msg.document:
+                file_id = reply_msg.document.file_id
+                mime_type = reply_msg.document.mime_type or "application/octet-stream"
+                file_name = reply_msg.document.file_name or f"reply_doc_{reply_msg.message_id}"
+
+            if not file_id:
+                return []
+
+            tg_file = await context.bot.get_file(file_id)
+            data = await tg_file.download_as_bytearray()
+            return [_make_attachment(bytes(data), mime_type, file_name)]
+        except Exception as exc:
+            logger.debug("Failed to fetch reply-target media: %s", exc)
+            return []
 
     async def _buffer_media_group(
         self,
@@ -2106,6 +2453,7 @@ class TelegramChannel(ChannelPlugin):
                 text=text,
                 timestamp=primary_message.date.isoformat() if primary_message.date else datetime.now(UTC).isoformat(),
                 reply_to=str(primary_message.reply_to_message.message_id) if primary_message.reply_to_message else None,
+                account_id=self._account_id or None,
                 metadata={
                     "username": sender.username,
                     "chat_title": chat.title,
@@ -2295,6 +2643,23 @@ class TelegramChannel(ChannelPlugin):
                         logger.info(f"DM from {sender.id} blocked by dm_policy={dm_policy}")
                     return
 
+        # Group Access Control — mirrors TS groupPolicy gating
+        if is_group and self._config:
+            if not await self._check_group_message_allowed(message, chat, sender):
+                return
+
+        # Ack reaction — send 👀 while processing (mirrors TS ackReaction/ackReactionScope)
+        if self._config:
+            ack_reaction_scope = self._config.get("ackReactionScope") or self._config.get("ackReaction")
+            ack_emoji = self._config.get("ackReactionEmoji") or "👀"
+            should_ack = (
+                ack_reaction_scope == "all"
+                or (ack_reaction_scope == "dm" and is_dm)
+                or (ack_reaction_scope in ("group", "groups") and is_group)
+            )
+            if should_ack:
+                asyncio.create_task(self._send_ack_reaction(chat.id, message.message_id, ack_emoji))
+
         # Check for chat commands
         if self._command_parser:
             command = self._command_parser.parse(message.text)
@@ -2336,6 +2701,7 @@ class TelegramChannel(ChannelPlugin):
             text=message.text,
             timestamp=message.date.isoformat() if message.date else datetime.now(UTC).isoformat(),
             reply_to=str(message.reply_to_message.message_id) if message.reply_to_message else None,
+            account_id=self._account_id or None,
             metadata={
                 "username": sender.username,
                 "chat_title": chat.title,

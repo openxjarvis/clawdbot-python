@@ -19,21 +19,21 @@ from .connection import (
 from .registry import ChannelRegistry, get_channel, get_channel_registry, register_channel
 from .webchat import WebChatChannel
 
-# Import channel implementations conditionally
+try:
+    from .telegram import EnhancedTelegramChannel, TelegramChannel
+except ImportError:
+    EnhancedTelegramChannel = None
+    TelegramChannel = None
+
 try:
     from .discord import DiscordChannel
 except ImportError:
     DiscordChannel = None
 
 try:
-    from .slack import SlackChannel  
+    from .slack import SlackChannel
 except ImportError:
     SlackChannel = None
-
-try:
-    from .telegram import TelegramChannel
-except ImportError:
-    TelegramChannel = None
 
 __all__ = [
     # Base classes
@@ -57,9 +57,10 @@ __all__ = [
     "WebChatChannel",
 ]
 
-# Add optional channels to __all__ if they loaded
 if TelegramChannel:
     __all__.append("TelegramChannel")
+if EnhancedTelegramChannel:
+    __all__.append("EnhancedTelegramChannel")
 if DiscordChannel:
     __all__.append("DiscordChannel")
 if SlackChannel:

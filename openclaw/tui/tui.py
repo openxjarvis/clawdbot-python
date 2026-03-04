@@ -454,7 +454,7 @@ class TUI:
     async def _readline_async(self) -> str | None:
         sys.stdout.write(f"\n{_bold('>')}\u00a0")
         sys.stdout.flush()
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             line = await loop.run_in_executor(None, sys.stdin.readline)
             return line.rstrip("\n") if line else None

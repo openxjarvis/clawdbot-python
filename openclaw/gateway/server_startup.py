@@ -225,7 +225,8 @@ async def start_gateway_sidecars(params: dict) -> dict:
         logger.error(f"Canvas Host Server failed to start: {e}")
     
     # 6. Trigger gateway:startup hook event
-    if cfg.get("hooks", {}).get("internal", {}).get("enabled"):
+    # Use `or {}` to handle cfg["hooks"] = None (Pydantic model_dump includes None values)
+    if (cfg.get("hooks") or {}).get("internal", {}).get("enabled"):
         # Small delay to let services fully initialize
         async def trigger_startup_hook():
             await asyncio.sleep(0.25)

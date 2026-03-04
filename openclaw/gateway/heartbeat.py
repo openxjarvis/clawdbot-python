@@ -85,6 +85,8 @@ class HeartbeatConfig:
         suppress_tool_error_warnings: bool = False,
         active_hours: "ActiveHoursConfig | tuple[int, int] | None" = None,
         visibility: "HeartbeatVisibilityConfig | None" = None,
+        response_prefix: str | None = None,  # Prepended to non-HEARTBEAT_OK messages
+        workspace_dir: str | None = None,  # For HEARTBEAT.md empty check
     ) -> None:
         # Coerce interval_minutes → every
         if interval_minutes is not None:
@@ -111,6 +113,8 @@ class HeartbeatConfig:
             )
         else:
             self.active_hours = active_hours
+        self.response_prefix = response_prefix
+        self.workspace_dir = workspace_dir
         # Explicit enabled overrides computed value
         self._enabled_explicit: bool | None = enabled
 
@@ -217,6 +221,100 @@ def strip_heartbeat_ok(text: str) -> str:
     return stripped
 
 
+def is_heartbeat_content_effectively_empty(content: str | None) -> bool:
+    """Return True when a HEARTBEAT.md file has no actionable content.
+
+    Strips frontmatter-style lines, blank lines, markdown headers, and
+    empty list items.  Mirrors TS isHeartbeatContentEffectivelyEmpty().
+    """
+    if content is None:
+        return False
+    if not isinstance(content, str):
+        return False
+    import re as _re
+    _HEADER_RE = _re.compile(r"^#+(\s|$)")
+    _EMPTY_LIST_RE = _re.compile(r"^[-*+]\s*(\[[\sXx]?\]\s*)?$")
+    for line in content.split("\n"):
+        trimmed = line.strip()
+        if not trimmed:
+            continue
+        if _HEADER_RE.match(trimmed):
+            continue
+        if _EMPTY_LIST_RE.match(trimmed):
+            continue
+        return False  # Found actionable content
+    return True
+
+
+def build_exec_event_prompt(deliver_to_user: bool = True) -> str:
+    """Build the LLM prompt for an exec-event triggered heartbeat.
+
+    Mirrors TS buildExecEventPrompt().
+    """
+    if not deliver_to_user:
+        return (
+            "An async command you ran earlier has completed. "
+            "The result is shown in the system messages above. "
+            "Handle the result internally. Do not relay it to the user unless explicitly requested."
+        )
+    return (
+        "An async command you ran earlier has completed. "
+        "The result is shown in the system messages above. "
+        "Please relay the command output to the user in a helpful way. "
+        "If the command succeeded, share the relevant output. "
+        "If it failed, explain what went wrong."
+    )
+
+
+def build_cron_event_prompt(
+    pending_events: list[str],
+    deliver_to_user: bool = True,
+) -> str:
+    """Build the LLM prompt for a cron-triggered heartbeat.
+
+    Mirrors TS buildCronEventPrompt().
+    """
+    event_text = "\n".join(pending_events).strip()
+    if not event_text:
+        if not deliver_to_user:
+            return (
+                "A scheduled cron event was triggered, but no event content was found. "
+                "Handle this internally and reply HEARTBEAT_OK when nothing needs user-facing follow-up."
+            )
+        return "A scheduled cron event was triggered, but no event content was found. Reply HEARTBEAT_OK."
+    if not deliver_to_user:
+        return (
+            "A scheduled reminder has been triggered. The reminder content is:\n\n"
+            + event_text
+            + "\n\nHandle this reminder internally. Do not relay it to the user unless explicitly requested."
+        )
+    return (
+        "A scheduled reminder has been triggered. The reminder content is:\n\n"
+        + event_text
+        + "\n\nPlease relay this reminder to the user in a helpful and friendly way."
+    )
+
+
+async def prune_heartbeat_transcript(
+    transcript_path: str | None,
+    pre_heartbeat_size: int | None,
+) -> None:
+    """Truncate transcript file back to its pre-heartbeat size on HEARTBEAT_OK.
+
+    Mirrors TS pruneHeartbeatTranscript().
+    """
+    import os
+    if not transcript_path or pre_heartbeat_size is None or pre_heartbeat_size < 0:
+        return
+    try:
+        current_size = os.path.getsize(transcript_path)
+        if current_size > pre_heartbeat_size:
+            with open(transcript_path, "r+b") as fh:
+                fh.truncate(pre_heartbeat_size)
+    except OSError:
+        pass
+
+
 def _parse_hhmm(hhmm: str) -> tuple[int, int]:
     """Parse "HH:MM" or "24:00" → (hours, minutes)."""
     parts = hhmm.split(":")
@@ -225,24 +323,56 @@ def _parse_hhmm(hhmm: str) -> tuple[int, int]:
     return int(parts[0]), 0
 
 
+def _resolve_active_hours_timezone(raw: str | None) -> str | None:
+    """Resolve active-hours timezone string to a valid IANA tz or None (local).
+
+    Mirrors TS resolveActiveHoursTimezone().
+    """
+    trimmed = (raw or "").strip()
+    if not trimmed or trimmed == "local":
+        return None  # Use local time
+    if trimmed == "user":
+        # TODO: resolve from config.agents.defaults.userTimezone; fall back to local
+        return None
+    # Validate as IANA timezone
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(trimmed)
+        return trimmed
+    except Exception:
+        return None  # Fall back to local time on invalid IANA string
+
+
 def _in_active_hours(cfg: ActiveHoursConfig) -> bool:
-    """Return True if now is within the configured active hours window."""
-    now = datetime.now()
-    # TODO: full IANA timezone support; currently uses local time only
-    h, m = now.hour, now.minute
-    current_mins = h * 60 + m
+    """Return True if now is within the configured active hours window.
+
+    Supports IANA timezone strings via the ``timezone`` field on
+    ``ActiveHoursConfig``.  Mirrors TS isWithinActiveHours().
+    """
+    tz_name = _resolve_active_hours_timezone(cfg.timezone)
+    if tz_name:
+        try:
+            from zoneinfo import ZoneInfo
+            import datetime as _dt
+            now_local = _dt.datetime.now(ZoneInfo(tz_name))
+        except Exception:
+            now_local = datetime.now()
+    else:
+        now_local = datetime.now()
+
+    current_mins = now_local.hour * 60 + now_local.minute
     start_h, start_m = _parse_hhmm(cfg.start)
     end_h, end_m = _parse_hhmm(cfg.end)
     start_mins = start_h * 60 + start_m
-    # "24:00" is handled as 24*60 = 1440
-    end_mins = end_h * 60 + end_m
+    end_mins = end_h * 60 + end_m  # "24:00" → 1440
 
-    if start_mins <= end_mins:
-        # Normal range
+    if start_mins == end_mins:
+        return False  # Zero-width window — always outside
+
+    if start_mins < end_mins:
         return start_mins <= current_mins < end_mins
-    else:
-        # Wraps midnight
-        return current_mins >= start_mins or current_mins < end_mins
+    # Wraps midnight
+    return current_mins >= start_mins or current_mins < end_mins
 
 
 class HeartbeatManager:
@@ -328,9 +458,54 @@ class HeartbeatManager:
             return False
         return True
 
+    async def _check_heartbeat_md(self) -> bool:
+        """Return True if execution should proceed (HEARTBEAT.md exists and is not empty).
+
+        Missing HEARTBEAT.md is treated as non-empty (proceed).
+        Effectively-empty HEARTBEAT.md causes skip.
+        Mirrors TS preflight HEARTBEAT.md gate.
+        """
+        import os
+        workspace = self._config.workspace_dir
+        if not workspace:
+            return True  # No workspace configured — skip file gate
+        heartbeat_path = os.path.join(workspace, "HEARTBEAT.md")
+        try:
+            with open(heartbeat_path, "r", encoding="utf-8") as fh:
+                content = fh.read()
+            if is_heartbeat_content_effectively_empty(content):
+                logger.info("HEARTBEAT.md is effectively empty — skipping heartbeat")
+                return False
+        except FileNotFoundError:
+            pass  # Missing file is intentional in some setups; proceed
+        except Exception as exc:
+            logger.debug("HEARTBEAT.md read error: %s", exc)
+        return True
+
     async def _execute_heartbeat(self) -> None:
         """Execute heartbeat agent turn and handle HEARTBEAT_OK contract."""
         logger.info("Executing heartbeat turn (session=%s)", self._session_key)
+
+        # HEARTBEAT.md empty check (mirrors TS preflight gate)
+        if not await self._check_heartbeat_md():
+            return
+
+        # Capture transcript state for pruning on HEARTBEAT_OK
+        transcript_path: str | None = None
+        pre_heartbeat_size: int | None = None
+        try:
+            import os
+            workspace = self._config.workspace_dir
+            if workspace:
+                # Best-effort: look for a JSONL transcript for this session
+                # (simple heuristic; full TS implementation queries session store)
+                candidate = os.path.join(workspace, ".openclaw", "sessions", "main.jsonl")
+                if os.path.isfile(candidate):
+                    transcript_path = candidate
+                    pre_heartbeat_size = os.path.getsize(candidate)
+        except Exception:
+            pass
+
         try:
             content_parts: list[str] = []
             async for event in self._agent_runtime.run_turn(
@@ -348,19 +523,39 @@ class HeartbeatManager:
                     logger.debug("Heartbeat agent turn complete")
 
             full_text = "".join(content_parts).strip()
-            is_ok = _is_heartbeat_ok(full_text, self._config.ack_max_chars)
+
+            # Strip leading responsePrefix before HEARTBEAT_OK check (mirrors TS)
+            response_prefix = (self._config.response_prefix or "").strip()
+            if response_prefix and full_text.startswith(response_prefix):
+                after_prefix = full_text[len(response_prefix):].lstrip()
+                check_text = after_prefix
+            else:
+                check_text = full_text
+
+            is_ok = _is_heartbeat_ok(check_text, self._config.ack_max_chars)
             vis = self._config.visibility
 
             if is_ok:
+                # Prune transcript on HEARTBEAT_OK (mirrors TS pruneHeartbeatTranscript)
+                await prune_heartbeat_transcript(transcript_path, pre_heartbeat_size)
+
+                heartbeat_ok_text = (
+                    f"{response_prefix} HEARTBEAT_OK" if response_prefix else "HEARTBEAT_OK"
+                )
                 if vis.show_ok:
+                    payload = strip_heartbeat_ok(check_text)
                     logger.info("Heartbeat OK (delivering ack)")
-                    await self._deliver(strip_heartbeat_ok(full_text) or "HEARTBEAT_OK")
+                    await self._deliver(payload or heartbeat_ok_text)
                 else:
                     logger.debug("Heartbeat OK — suppressed (show_ok=False)")
             else:
+                # Prepend responsePrefix to alert messages (mirrors TS)
+                deliver_text = full_text
+                if response_prefix and deliver_text and not deliver_text.startswith(response_prefix):
+                    deliver_text = f"{response_prefix} {deliver_text}"
                 if vis.show_alerts:
                     logger.info("Heartbeat alert — delivering")
-                    await self._deliver(full_text)
+                    await self._deliver(deliver_text)
                 else:
                     logger.debug("Heartbeat alert suppressed (show_alerts=False)")
 
@@ -481,4 +676,8 @@ __all__ = [
     "strip_heartbeat_ok",
     "_is_heartbeat_ok",
     "_parse_interval_minutes",
+    "is_heartbeat_content_effectively_empty",
+    "build_exec_event_prompt",
+    "build_cron_event_prompt",
+    "prune_heartbeat_transcript",
 ]

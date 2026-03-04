@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import secrets
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -15,9 +16,12 @@ from typing import Optional
 from ..agents.model_catalog import load_model_catalog, ModelCatalogEntry
 from ..agents.agent_paths import resolve_openclaw_agent_dir
 from ..config.loader import load_config, save_config
-from ..config.schema import ClawdbotConfig, AgentConfig, GatewayConfig, ChannelsConfig, AuthConfig
+from ..config.schema import (
+    ClawdbotConfig, AgentConfig, GatewayConfig, ChannelsConfig, AuthConfig, ModelsConfig,
+    TelegramChannelConfig, ChannelConfig, FeishuChannelConfig,
+)
 from .auth import configure_auth, check_env_api_key
-from .config import configure_telegram_enhanced, configure_discord_enhanced, configure_agent
+from .config import configure_telegram_enhanced, configure_discord_enhanced, configure_feishu_enhanced, configure_whatsapp_enhanced, configure_agent
 from .onboard_hooks import setup_hooks
 from .onboard_skills import setup_skills
 from .onboard_finalize import finalize_onboarding
@@ -162,7 +166,39 @@ async def run_onboarding_wizard(
             model_value.get("primary", "") if isinstance(model_value, dict) else str(model_value)
         )
         claw_config.agent.model = primary_str
-        # Store auth in environment variables (handled by configure_auth)
+
+        # Write models.providers block for Ollama and Custom providers
+        _provider_name = provider_config.get("provider")
+        if _provider_name == "ollama":
+            if not claw_config.models:
+                claw_config.models = ModelsConfig()
+            claw_config.models.providers = claw_config.models.providers or {}
+            claw_config.models.providers["ollama"] = {
+                "baseUrl": provider_config["base_url"],
+                "api": "ollama",
+                "apiKey": provider_config.get("api_key", "ollama-local"),
+                "models": provider_config.get("discovered_models", []),
+            }
+        elif _provider_name not in ("anthropic", "openai", "gemini", None):
+            # Custom provider: write models.providers.<id>
+            pid = _provider_name
+            if not claw_config.models:
+                claw_config.models = ModelsConfig()
+            claw_config.models.providers = claw_config.models.providers or {}
+            provider_entry: dict = {
+                "baseUrl": provider_config["base_url"],
+                "api": provider_config.get("api", "openai-completions"),
+                "models": [provider_config["model_definition"]],
+            }
+            if provider_config.get("api_key"):
+                provider_entry["apiKey"] = provider_config["api_key"]
+            claw_config.models.providers[pid] = provider_entry
+            # Write alias to agents.defaults.models if provided
+            if provider_config.get("alias"):
+                alias_ref = provider_config["model"]  # "<pid>/<model_id>"
+                if not claw_config.agents.defaults.models:
+                    claw_config.agents.defaults.models = {}
+                claw_config.agents.defaults.models[alias_ref] = {"alias": provider_config["alias"]}
     
     # Step 5: Agent configuration
     if mode == "advanced":
@@ -202,9 +238,25 @@ async def run_onboarding_wizard(
         if not claw_config.channels:
             claw_config.channels = ChannelsConfig()
         if "telegram" in channels_config:
-            claw_config.channels.telegram = channels_config["telegram"]
+            tg = channels_config["telegram"]
+            claw_config.channels.telegram = (
+                TelegramChannelConfig.model_validate(tg) if isinstance(tg, dict) else tg
+            )
         if "discord" in channels_config:
-            claw_config.channels.discord = channels_config["discord"]
+            dc = channels_config["discord"]
+            claw_config.channels.discord = (
+                ChannelConfig.model_validate(dc) if isinstance(dc, dict) else dc
+            )
+        if "whatsapp" in channels_config:
+            wa = channels_config["whatsapp"]
+            claw_config.channels.whatsapp = (
+                ChannelConfig.model_validate(wa) if isinstance(wa, dict) else wa
+            )
+        if "feishu" in channels_config:
+            fs = channels_config["feishu"]
+            claw_config.channels.feishu = (
+                FeishuChannelConfig.model_validate(fs) if isinstance(fs, dict) else fs
+            )
     
     # Step 7.5: Collect user information for workspace
     user_info = {}
@@ -882,6 +934,302 @@ async def _pick_model(provider: str, exclude: list[str] | None = None) -> str | 
     return options[0][0]
 
 
+async def _configure_ollama() -> dict:
+    """Configure native Ollama provider.
+
+    Prompts for the Ollama server URL, performs live /api/tags discovery,
+    lets the user pick (or type) a model, and optionally collects an API key
+    for secured Ollama instances.
+
+    Returns a dict compatible with the models.providers.ollama config block.
+    Mirrors the Ollama runtime discovery in TS models-config.providers.ts
+    (discoverOllamaModels / buildOllamaProvider).
+    """
+    import httpx
+
+    # --- 1. Prompt base URL ---
+    raw_url = input("\nOllama server URL [http://127.0.0.1:11434]: ").strip()
+    base_url = raw_url.rstrip("/").rstrip("/v1").rstrip("/") if raw_url else "http://127.0.0.1:11434"
+    # Ensure no /v1 suffix (native Ollama API lives at /api/*, not /v1/*)
+    if base_url.endswith("/v1"):
+        base_url = base_url[:-3]
+
+    # --- 2. Connectivity check + model discovery via GET /api/tags ---
+    discovered_models: list[dict] = []
+    model_names: list[str] = []
+
+    print(f"\nConnecting to Ollama at {base_url} ...")
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{base_url}/api/tags")
+            resp.raise_for_status()
+            data = resp.json()
+            raw_models = data.get("models", [])
+
+            for m in raw_models[:200]:  # cap at 200 (OLLAMA_SHOW_MAX_MODELS)
+                model_name: str = m.get("name") or m.get("model") or ""
+                if not model_name:
+                    continue
+                model_id = model_name
+                display = model_name
+                is_reasoning = any(kw in model_name.lower() for kw in ("r1", "reasoning"))
+
+                # Query /api/show for context window (best-effort)
+                ctx_window = 65536
+                try:
+                    show_resp = await client.post(
+                        f"{base_url}/api/show",
+                        json={"name": model_name},
+                        timeout=5.0,
+                    )
+                    if show_resp.status_code == 200:
+                        show_data = show_resp.json()
+                        modelfile = show_data.get("modelfile") or show_data.get("parameters") or ""
+                        import re
+                        m_ctx = re.search(r"(?i)num_ctx\s+(\d+)", modelfile)
+                        if not m_ctx:
+                            params_str = str(show_data.get("details") or show_data.get("model_info") or "")
+                            m_ctx = re.search(r"(?i)num_ctx[\"':\s]+(\d+)", params_str)
+                        if m_ctx:
+                            ctx_window = int(m_ctx.group(1))
+                except Exception:
+                    pass
+
+                discovered_models.append({
+                    "id": model_id,
+                    "name": display,
+                    "contextWindow": ctx_window,
+                    "maxTokens": 8192,
+                    "reasoning": is_reasoning,
+                    "input": ["text"],
+                    "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                })
+                model_names.append(model_name)
+
+        if discovered_models:
+            print(f"  Found {len(discovered_models)} model(s):")
+            for i, m in enumerate(discovered_models, 1):
+                ctx_k = m["contextWindow"] // 1024
+                default_tag = "  <- default" if i == 1 else ""
+                print(f"    {i}. {m['name']}  (ctx {ctx_k}k){default_tag}")
+        else:
+            print("  Connected but no models found. Make sure you have pulled at least one model.")
+            print("  Hint: ollama pull llama3")
+
+    except Exception as e:
+        print(f"  Could not reach Ollama: {e}")
+        print("  Make sure Ollama is running: ollama serve")
+
+    # --- 3. Model selection ---
+    model_id: str
+    if discovered_models:
+        raw = input(f"\nSelect model [1]: ").strip()
+        if not raw:
+            model_id = discovered_models[0]["id"]
+        else:
+            try:
+                idx = int(raw) - 1
+                if 0 <= idx < len(discovered_models):
+                    model_id = discovered_models[idx]["id"]
+                else:
+                    model_id = discovered_models[0]["id"]
+            except ValueError:
+                # User typed a name directly
+                model_id = raw
+    else:
+        raw = input("Enter model name (e.g. llama3, mistral): ").strip()
+        model_id = raw if raw else "llama3"
+        discovered_models = [{
+            "id": model_id,
+            "name": model_id,
+            "contextWindow": 65536,
+            "maxTokens": 8192,
+            "reasoning": False,
+            "input": ["text"],
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+        }]
+
+    # --- 4. Optional API key (for secured Ollama instances) ---
+    raw_key = input("\nAPI Key [leave blank if not secured]: ").strip()
+    api_key = raw_key if raw_key else "ollama-local"
+
+    return {
+        "provider": "ollama",
+        "model": f"ollama/{model_id}",
+        "base_url": base_url,
+        "api_key": api_key,
+        "discovered_models": discovered_models,
+    }
+
+
+def _derive_custom_provider_id(base_url: str) -> str:
+    """Derive a provider ID from a base URL, e.g. http://127.0.0.1:11434/v1 → custom-127-0-0-1-11434.
+    Mirrors resolveCustomProviderId logic in TS onboard-custom.ts.
+    """
+    try:
+        parsed = urllib.parse.urlparse(base_url)
+        netloc = parsed.netloc  # e.g. "127.0.0.1:11434"
+        safe = netloc.replace(".", "-").replace(":", "-")
+        return f"custom-{safe}"
+    except Exception:
+        return "custom-provider"
+
+
+async def _configure_custom_provider() -> dict:
+    """Configure a custom OpenAI/Anthropic-compatible endpoint.
+
+    Mirrors TS promptCustomApiConfig() in src/commands/onboard-custom.ts:
+    URL prompt → compatibility select → model ID prompt → verify loop →
+    endpoint ID prompt → alias prompt.
+
+    Returns a dict containing all fields needed to write models.providers.<id>.
+    """
+    import httpx
+
+    _DEFAULT_URL = "http://127.0.0.1:11434/v1"
+
+    # --- 1. API Base URL ---
+    while True:
+        raw_url = input(f"\nAPI Base URL [{_DEFAULT_URL}]: ").strip()
+        base_url = raw_url if raw_url else _DEFAULT_URL
+        base_url = base_url.rstrip("/")
+        try:
+            parsed = urllib.parse.urlparse(base_url)
+            if not parsed.scheme or not parsed.netloc:
+                raise ValueError("Invalid URL")
+            break
+        except Exception:
+            print("  Invalid URL. Please enter a full URL including scheme, e.g. http://127.0.0.1:11434/v1")
+
+    # Optional API key
+    raw_key = input("API Key (leave blank if not required): ").strip()
+    api_key: Optional[str] = raw_key if raw_key else None
+
+    # --- 2. Compatibility ---
+    print("\nEndpoint compatibility:")
+    print("  1. OpenAI-compatible  (uses /chat/completions)")
+    print("  2. Anthropic-compatible  (uses /messages)")
+    print("  3. Unknown — detect automatically")
+    compat_choice = input("\nSelect [1]: ").strip() or "1"
+    compat_map = {"1": "openai", "2": "anthropic", "3": "unknown"}
+    compatibility = compat_map.get(compat_choice, "openai")  # "openai" | "anthropic" | "unknown"
+
+    # --- 3. Model ID ---
+    while True:
+        model_id = input('\nModel ID (e.g. llama3, claude-3-7-sonnet): ').strip()
+        if model_id:
+            break
+        print("  Model ID is required.")
+
+    # --- 4. Verify loop ---
+    _OPENAI_PAYLOAD = lambda mid: {
+        "model": mid,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1,
+    }
+    _ANTHROPIC_PAYLOAD = lambda mid: {
+        "model": mid,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1,
+    }
+
+    resolved_compat = compatibility  # may change after auto-detect
+    while True:
+        print(f"\nVerifying endpoint {base_url} with model {model_id} ...")
+        verify_ok = False
+        detected_compat = resolved_compat
+
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                headers: dict = {}
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+
+                if resolved_compat in ("openai", "unknown"):
+                    try:
+                        r = await client.post(
+                            f"{base_url}/chat/completions",
+                            json=_OPENAI_PAYLOAD(model_id),
+                            headers=headers,
+                        )
+                        if r.status_code < 500:
+                            verify_ok = True
+                            detected_compat = "openai"
+                    except Exception:
+                        pass
+
+                if not verify_ok and resolved_compat in ("anthropic", "unknown"):
+                    try:
+                        r = await client.post(
+                            f"{base_url}/messages",
+                            json=_ANTHROPIC_PAYLOAD(model_id),
+                            headers=headers,
+                        )
+                        if r.status_code < 500:
+                            verify_ok = True
+                            detected_compat = "anthropic"
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            print(f"  Connection failed: {e}")
+
+        if verify_ok:
+            resolved_compat = detected_compat
+            api_field = "openai-completions" if resolved_compat == "openai" else "anthropic"
+            print(f"  Endpoint verified ({api_field})")
+            break
+        else:
+            print("  Could not verify endpoint.")
+            print("\nWhat would you like to change?")
+            print("  1. Change base URL")
+            print("  2. Change model")
+            print("  3. Change base URL and model")
+            print("  4. Skip verification (use as-is)")
+            fix_choice = input("Select [4]: ").strip() or "4"
+
+            if fix_choice == "1" or fix_choice == "3":
+                raw_url = input(f"New base URL [{base_url}]: ").strip()
+                if raw_url:
+                    base_url = raw_url.rstrip("/")
+            if fix_choice == "2" or fix_choice == "3":
+                new_model = input(f"New model ID [{model_id}]: ").strip()
+                if new_model:
+                    model_id = new_model
+            if fix_choice == "4":
+                api_field = "openai-completions" if resolved_compat in ("openai", "unknown") else "anthropic"
+                break
+
+    # --- 5. Endpoint ID ---
+    default_pid = _derive_custom_provider_id(base_url)
+    raw_pid = input(f"\nEndpoint ID [{default_pid}]: ").strip()
+    provider_id = raw_pid if raw_pid else default_pid
+
+    # --- 6. Model alias ---
+    raw_alias = input('Model alias (optional, e.g. local, ollama): ').strip()
+    alias: Optional[str] = raw_alias if raw_alias else None
+
+    model_definition = {
+        "id": model_id,
+        "name": f"{model_id} (Custom Provider)",
+        "contextWindow": 8192,
+        "maxTokens": 4096,
+        "input": ["text"],
+        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+        "reasoning": False,
+    }
+
+    return {
+        "provider": provider_id,
+        "model": f"{provider_id}/{model_id}",
+        "base_url": base_url,
+        "api": api_field,
+        "api_key": api_key,
+        "alias": alias,
+        "model_definition": model_definition,
+    }
+
+
 async def _configure_provider(mode: str) -> Optional[dict]:
     """Configure LLM provider"""
     print("\n" + "-" * 80)
@@ -908,6 +1256,7 @@ async def _configure_provider(mode: str) -> Optional[dict]:
     print("  2. OpenAI (GPT-4)")
     print("  3. Google (Gemini)")
     print("  4. Ollama (Local)")
+    print("  5. Custom Provider (OpenAI/Anthropic compatible)")
 
     choice = input("\nSelect provider [1]: ").strip()
 
@@ -916,24 +1265,29 @@ async def _configure_provider(mode: str) -> Optional[dict]:
         "2": "openai",
         "3": "gemini",
         "4": "ollama",
+        "5": "custom",
     }
     provider = provider_map.get(choice, "anthropic")
 
-    # Configure auth (skips if Ollama)
-    if provider != "ollama":
+    if provider == "ollama":
+        return await _configure_ollama()
+    elif provider == "custom":
+        return await _configure_custom_provider()
+    else:
+        # Cloud providers: configure auth (API key)
         try:
-            auth_result = configure_auth(provider)
+            configure_auth(provider)
             print(f"\n✓ {provider.title()} configured")
         except Exception as e:
             print(f"\n✗ Failed to configure {provider}: {e}")
             return None
 
-    # Select primary model
-    print(f"\nSelect primary model for {provider.title()}:")
-    primary = await _pick_model(provider) or _PROVIDER_MODELS.get(provider, [("",)])[0][0]
+        # Select primary model
+        print(f"\nSelect primary model for {provider.title()}:")
+        primary = await _pick_model(provider) or _PROVIDER_MODELS.get(provider, [("",)])[0][0]
 
-    model_value = await _ask_fallbacks(provider, primary)
-    return {"provider": provider, "model": model_value}
+        model_value = await _ask_fallbacks(provider, primary)
+        return {"provider": provider, "model": model_value}
 
 
 async def _ask_fallbacks(provider: str, primary: str) -> str | dict:
@@ -1043,9 +1397,11 @@ async def _configure_channels(mode: str) -> Optional[dict]:
     print("\nWhich channels would you like to configure?")
     print("  1. Telegram")
     print("  2. Discord")
-    print("  3. Skip")
+    print("  3. Feishu / Lark")
+    print("  4. WhatsApp")
+    print("  5. Skip")
     
-    choice = input("\nSelect channel [3]: ").strip()
+    choice = input("\nSelect channel [5]: ").strip()
     
     if choice == "1":
         print("\n" + "~" * 60)
@@ -1061,6 +1417,20 @@ async def _configure_channels(mode: str) -> Optional[dict]:
         discord_config = configure_discord_enhanced()
         if discord_config:
             channels_config["discord"] = discord_config
+    elif choice == "3":
+        print("\n" + "~" * 60)
+        print("Configuring Feishu / Lark")
+        print("~" * 60)
+        feishu_config = configure_feishu_enhanced()
+        if feishu_config:
+            channels_config["feishu"] = feishu_config
+    elif choice == "4":
+        print("\n" + "~" * 60)
+        print("Configuring WhatsApp")
+        print("~" * 60)
+        whatsapp_config = configure_whatsapp_enhanced()
+        if whatsapp_config:
+            channels_config["whatsapp"] = whatsapp_config
     
     return channels_config if channels_config else None
 

@@ -151,6 +151,7 @@ class InboundMessage(BaseModel):
     text: str
     timestamp: str
     reply_to: str | None = None
+    account_id: str | None = None  # channel account ID (e.g. Telegram bot alias, Feishu appId)
     metadata: dict[str, Any] = {}
     attachments: list[ChatAttachment] = []
 
@@ -439,7 +440,12 @@ class ChannelPlugin(ABC):
         pass
 
     async def send_media(
-        self, target: str, media_url: str, media_type: str, caption: str | None = None
+        self,
+        target: str,
+        media_url: str,
+        media_type: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
     ) -> str:
         """Send media message. Returns message ID."""
         raise NotImplementedError("Media not supported by this channel")

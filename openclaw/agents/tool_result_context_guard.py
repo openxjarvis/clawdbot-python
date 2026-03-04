@@ -228,62 +228,163 @@ def enforce_tool_result_context_budget(
                             break
 
 
+class _GuardedHistory:
+    """
+    A list-like proxy that intercepts appends and enforces tool-result size
+    limits before items reach the conversation history.
+
+    Mirrors the TS ``installToolResultContextGuard`` pattern which hooks into
+    ``agent.transformContext`` — here we wrap the list object itself so any
+    ``append`` / ``extend`` is intercepted regardless of how the SDK calls it.
+    """
+
+    def __init__(
+        self,
+        backing: list,
+        context_budget_chars: int,
+        max_single_chars: int,
+    ) -> None:
+        object.__setattr__(self, "_backing", backing)
+        object.__setattr__(self, "_context_budget_chars", context_budget_chars)
+        object.__setattr__(self, "_max_single_chars", max_single_chars)
+
+    # --- list interface delegation ----------------------------------------
+
+    def __getitem__(self, idx: Any) -> Any:
+        return self._backing[idx]
+
+    def __setitem__(self, idx: Any, val: Any) -> None:
+        self._backing[idx] = val
+
+    def __delitem__(self, idx: Any) -> None:
+        del self._backing[idx]
+
+    def __len__(self) -> int:
+        return len(self._backing)
+
+    def __iter__(self):
+        return iter(self._backing)
+
+    def __contains__(self, item: Any) -> bool:
+        return item in self._backing
+
+    def __eq__(self, other: Any) -> bool:
+        if isinstance(other, _GuardedHistory):
+            return self._backing == other._backing
+        return self._backing == other
+
+    def __ne__(self, other: Any) -> bool:
+        return not self.__eq__(other)
+
+    def _guard_message(self, msg: Any) -> Any:
+        """Cap single tool-result messages before they enter history."""
+        if not isinstance(msg, dict):
+            return msg
+        role = msg.get("role")
+        # Handle both OpenAI-style {"role":"tool"} and Anthropic-style content blocks
+        if role == "tool" or role == "toolResult":
+            return truncate_tool_result_to_chars(msg, self._max_single_chars)
+        # Also check user messages with embedded tool_result content blocks
+        if role == "user":
+            content = msg.get("content")
+            if isinstance(content, list):
+                new_blocks = []
+                changed = False
+                for blk in content:
+                    if isinstance(blk, dict) and blk.get("type") == "tool_result":
+                        capped = truncate_tool_result_to_chars(blk, self._max_single_chars)
+                        if capped is not blk:
+                            changed = True
+                        new_blocks.append(capped)
+                    else:
+                        new_blocks.append(blk)
+                if changed:
+                    import copy as _copy
+                    msg = _copy.copy(msg)
+                    msg["content"] = new_blocks
+        return msg
+
+    def append(self, item: Any) -> None:
+        self._backing.append(self._guard_message(item))
+        # After append, enforce overall budget (compact oldest if over limit)
+        enforce_tool_result_context_budget(
+            self._backing,
+            self._context_budget_chars,
+            self._max_single_chars,
+        )
+
+    def extend(self, items: Any) -> None:
+        for item in items:
+            self.append(item)
+
+    def insert(self, idx: int, item: Any) -> None:
+        self._backing.insert(idx, self._guard_message(item))
+
+    def pop(self, idx: int = -1) -> Any:
+        return self._backing.pop(idx)
+
+    def clear(self) -> None:
+        self._backing.clear()
+
+    def copy(self) -> list:
+        return list(self._backing)
+
+    # Needed so list() conversion works
+    def __repr__(self) -> str:
+        return repr(self._backing)
+
+
 def install_tool_result_context_guard(
     agent: Any,
     context_window_tokens: int,
-) -> callable:
+) -> "callable":
     """
-    Install tool result context guard on an agent.
-    
-    Mirrors TypeScript installToolResultContextGuard().
-    
-    This intercepts tool results and enforces size limits before they
-    are added to conversation history.
-    
-    Args:
-        agent: Agent instance to protect
-        context_window_tokens: Context window size in tokens
-        
-    Returns:
-        Cleanup function to remove the guard
+    Install a tool-result size guard on *agent*.
+
+    Replaces ``agent._conversation_history`` with a ``_GuardedHistory`` proxy
+    that intercepts every ``append`` / ``extend`` call and:
+
+    1. Caps individual tool results to ``SINGLE_TOOL_RESULT_CONTEXT_SHARE`` of
+       the context window before they are stored.
+    2. After each append, runs ``enforce_tool_result_context_budget`` to
+       compact old tool results if the total history budget is exceeded.
+
+    This mirrors TypeScript ``installToolResultContextGuard`` which hooks into
+    ``agent.transformContext``.
+
+    Returns a cleanup callable that restores the original list object.
     """
-    # Calculate budgets based on context window
     context_budget_tokens = int(context_window_tokens * CONTEXT_INPUT_HEADROOM_RATIO)
     context_budget_chars = context_budget_tokens * TOOL_RESULT_CHARS_PER_TOKEN_ESTIMATE
-    
-    max_single_tool_result_tokens = int(context_window_tokens * SINGLE_TOOL_RESULT_CONTEXT_SHARE)
-    max_single_tool_result_chars = max_single_tool_result_tokens * TOOL_RESULT_CHARS_PER_TOKEN_ESTIMATE
-    
+
+    max_single_tokens = int(context_window_tokens * SINGLE_TOOL_RESULT_CONTEXT_SHARE)
+    max_single_chars = max_single_tokens * TOOL_RESULT_CHARS_PER_TOKEN_ESTIMATE
+
     logger.debug(
-        f"Tool Result Context Guard installed: "
-        f"budget={context_budget_tokens} tokens, "
-        f"max_single={max_single_tool_result_tokens} tokens"
+        "Tool Result Context Guard: budget=%d tokens, max_single=%d tokens",
+        context_budget_tokens,
+        max_single_tokens,
     )
-    
-    # Original method reference
-    if hasattr(agent, '_conversation_history'):
-        original_history = agent._conversation_history
-        
-        def guarded_access():
-            """Guarded access that enforces budget."""
-            if isinstance(original_history, list):
-                enforce_tool_result_context_budget(
-                    messages=original_history,
-                    context_budget_chars=context_budget_chars,
-                    max_single_tool_result_chars=max_single_tool_result_chars,
-                )
-            return original_history
-        
-        # Intercept history access (this is a simplified approach)
-        # In practice, we'd need to hook into the agent's tool result handler
-        
-        def cleanup():
-            """Cleanup function to restore original behavior."""
-            pass
-        
-        return cleanup
-    
-    return lambda: None
+
+    if not hasattr(agent, "_conversation_history"):
+        logger.debug("Tool Result Context Guard: agent has no _conversation_history, skipping")
+        return lambda: None
+
+    original_history: list = agent._conversation_history
+
+    guarded = _GuardedHistory(
+        backing=original_history,
+        context_budget_chars=context_budget_chars,
+        max_single_chars=max_single_chars,
+    )
+    agent._conversation_history = guarded
+
+    def cleanup() -> None:
+        """Restore the original backing list."""
+        if hasattr(agent, "_conversation_history") and agent._conversation_history is guarded:
+            agent._conversation_history = original_history
+
+    return cleanup
 
 
 def get_tool_result_chars(msg: dict[str, Any]) -> int:

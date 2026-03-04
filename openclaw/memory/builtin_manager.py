@@ -1,14 +1,24 @@
-"""Built-in memory manager using SQLite + Vector + FTS."""
+"""Built-in memory manager using SQLite + Vector + FTS.
+
+Exposes a ``search(query, opts)`` adapter so it can be used as a drop-in
+replacement for ``SimpleMemorySearchManager`` via ``get_memory_search_manager()``.
+"""
 import hashlib
 import logging
 import sqlite3
 import struct
+import time
 from pathlib import Path
-from typing import Optional, List
+from typing import Any, Optional, List
 
-from .types import MemorySearchResult, MemorySource
+from .types import (
+    MemoryEmbeddingProbeResult,
+    MemoryProviderStatus,
+    MemorySearchResult,
+    MemorySource,
+)
 from .embeddings import EmbeddingProvider, OpenAIEmbeddingProvider
-from .hybrid import merge_hybrid_results, normalize_scores, SearchResult
+from .hybrid import apply_mmr, merge_hybrid_results, normalize_scores, SearchResult
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +34,11 @@ class BuiltinMemoryManager:
     ):
         self.agent_id = agent_id
         self.workspace_dir = workspace_dir
-        
+        # Resolved provider name (string) for status reporting
+        self._embedding_provider_name: str = (
+            embedding_provider if isinstance(embedding_provider, str) else "custom"
+        ) if embedding_provider else "openai"
+
         # Initialize embedding provider
         if isinstance(embedding_provider, EmbeddingProvider):
             self.embedder = embedding_provider
@@ -263,7 +277,7 @@ class BuiltinMemoryManager:
                     chunk['start_line'],
                     chunk['end_line'],
                     self._hash_content(chunk['text']),
-                    self.embedding_provider,
+                    self._embedding_provider_name,
                     chunk['text'],
                     now
                 ])
@@ -354,6 +368,64 @@ class BuiltinMemoryManager:
         if self.db:
             self.db.close()
             self.db = None
+
+    # ------------------------------------------------------------------
+    # Compatibility interface — matches SimpleMemorySearchManager API so
+    # BuiltinMemoryManager can be returned by get_memory_search_manager()
+    # and used transparently by agents/tools/memory.py.
+    # ------------------------------------------------------------------
+
+    async def search(  # type: ignore[override]
+        self,
+        query: str,
+        opts: dict[str, Any] | None = None,
+    ) -> list[MemorySearchResult]:
+        """Dict-opts adapter — delegates to hybrid or FTS search.
+
+        Accepts the same ``search(query, opts)`` signature as
+        ``SimpleMemorySearchManager`` so this class is a drop-in replacement.
+        """
+        opts = opts or {}
+        limit = int(opts.get("maxResults", opts.get("limit", 10)))
+        include_sessions = bool(opts.get("includeSessions") or opts.get("include_sessions"))
+
+        sources: list[MemorySource] | None = None
+        if include_sessions:
+            sources = [MemorySource.MEMORY, MemorySource.SESSIONS]
+
+        return await self._hybrid_search(query, limit, sources)
+
+    def status(self) -> "MemoryProviderStatus":
+        """Return provider status (matches SimpleMemorySearchManager.status())."""
+        chunk_count = 0
+        if self.db:
+            try:
+                chunk_count = self.db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+            except Exception:
+                pass
+        return MemoryProviderStatus(
+            backend="builtin",
+            provider=f"vector+fts5-sqlite ({self._embedding_provider_name})",
+            files=0,
+            chunks=chunk_count,
+            workspace_dir=str(self.workspace_dir),
+            fts={"enabled": True, "available": True},
+            sources=[MemorySource.MEMORY],
+        )
+
+    async def probe_embedding_availability(self) -> "MemoryEmbeddingProbeResult":
+        """Probe whether the embedding provider is reachable."""
+        try:
+            test = await self.embedder.embed_text("test")
+            if test and len(test) > 0:
+                return MemoryEmbeddingProbeResult(ok=True)
+            return MemoryEmbeddingProbeResult(ok=False, error="Empty embedding returned")
+        except Exception as exc:
+            return MemoryEmbeddingProbeResult(ok=False, error=str(exc))
+
+    async def probe_vector_availability(self) -> bool:
+        """Return True — BuiltinMemoryManager always has vector support."""
+        return True
 
     async def _vector_search(
         self,
@@ -498,10 +570,13 @@ class BuiltinMemoryManager:
         vector_sr = normalize_scores(vector_sr)
         fts_sr = normalize_scores(fts_sr)
         
-        # Merge
+        # Merge via weighted hybrid scoring
         text_weight = 1.0 - vector_weight
         merged = merge_hybrid_results(vector_sr, fts_sr, vector_weight, text_weight)
-        
+
+        # Apply MMR re-ranking for diversity (mirrors TS MemoryIndexManager)
+        merged = apply_mmr(merged, limit=limit * 2)
+
         # Convert back to MemorySearchResult
         results = []
         for sr in merged[:limit]:

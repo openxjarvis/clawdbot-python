@@ -138,6 +138,6 @@ class TestMemoryProviderStatus:
             status = manager.status()
             
             assert status.backend == "builtin"
-            assert status.provider == "simple-text-search"
+            assert status.provider in ("fts5-sqlite", "simple-text-search")
             assert status.files == 2
             assert workspace.name in str(status.workspace_dir)

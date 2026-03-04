@@ -364,6 +364,8 @@ class CronService:
         cron_config: Optional[Dict[str, Any]] = None,
         default_agent_id: Optional[str] = None,
         lane_manager: Optional[Any] = None,  # QueueManager for lane-based execution
+        # Failure alert callback: async fn(job, consecutive_errors, last_error) -> bool
+        send_failure_alert: Optional[Callable[..., Awaitable[bool]]] = None,
         # Legacy callback names (backward compat)
         on_system_event: Optional[Callable[..., Any]] = None,
         on_isolated_agent: Optional[Callable[..., Awaitable[Dict[str, Any]]]] = None,
@@ -390,6 +392,7 @@ class CronService:
         self.cron_config = cron_config or {}
         self.default_agent_id = default_agent_id or "default"
         self.lane_manager = lane_manager
+        self.send_failure_alert = send_failure_alert
 
         # Store path for per-store-path locking (aligned with TS)
         self._store_path = str(store_path) if store_path else ""
@@ -804,6 +807,12 @@ class CronService:
             self._emit_job_finished(job, r, started_at)
             self._append_run_log(job, r)
 
+            # Failure alert subsystem (Gap 3): fire after N consecutive errors
+            if status == "error" and job.failure_alert and self.send_failure_alert:
+                asyncio.create_task(
+                    self._maybe_send_failure_alert(job, error)
+                )
+
             if should_delete and job.id in self.jobs:
                 del self.jobs[job.id]
                 self._emit(jobId=job.id, action="removed")
@@ -1050,6 +1059,49 @@ class CronService:
     # Emit / log helpers
     # ------------------------------------------------------------------
 
+    async def _maybe_send_failure_alert(self, job: CronJob, last_error: str | None) -> None:
+        """Fire failure alert if threshold and cooldown conditions are met.
+
+        Mirrors TS cron/service.ts failure alert logic.
+        Checks consecutive_errors >= failure_alert.after_n_errors and
+        enforces cooldown via last_failure_alert_at_ms.
+        """
+        import time as _time
+        fa = job.failure_alert
+        if not fa or not self.send_failure_alert:
+            return
+
+        consecutive = job.state.consecutive_errors or 0
+        if consecutive < fa.after_n_errors:
+            return
+
+        now_ms = int(_time.time() * 1000)
+        last_alert = job.state.last_failure_alert_at_ms or 0
+        if now_ms - last_alert < fa.cooldown_ms:
+            logger.debug(
+                "cron: failure alert suppressed for job %r (cooldown %dms remaining)",
+                job.id,
+                fa.cooldown_ms - (now_ms - last_alert),
+            )
+            return
+
+        logger.info(
+            "cron: sending failure alert for job %r (consecutiveErrors=%d)",
+            job.id, consecutive,
+        )
+        try:
+            ok = await self.send_failure_alert(job, consecutive, last_error)
+            if ok:
+                # Update cooldown gate under lock so it persists
+                job.state.last_failure_alert_at_ms = now_ms
+                if self._store:
+                    try:
+                        self._store.save(list(self.jobs.values()))
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.error("cron: failure alert send error for job %r: %s", job.id, e)
+
     def _emit_job_finished(
         self,
         job: CronJob,
@@ -1159,6 +1211,12 @@ def _apply_job_patch(job: CronJob, patch: Dict[str, Any]) -> None:
         elif kind == "agentTurn":
             msg = p.get("message") or p.get("prompt") or ""
             existing = job.payload if isinstance(job.payload, AgentTurnPayload) else None
+            raw_fallbacks = p.get("fallbacks") or p.get("modelFallbacks")
+            new_fallbacks: list[str] | None = None
+            if isinstance(raw_fallbacks, list) and raw_fallbacks:
+                new_fallbacks = [str(f) for f in raw_fallbacks if f]
+            elif existing:
+                new_fallbacks = existing.fallbacks
             job.payload = AgentTurnPayload(
                 message=msg or (existing.message if existing else ""),
                 kind="agentTurn",
@@ -1174,6 +1232,12 @@ def _apply_job_patch(job: CronJob, patch: Dict[str, Any]) -> None:
                     or p.get("allowUnsafeExternalContent")
                     or (existing.allow_unsafe_external_content if existing else False)
                 ),
+                fallbacks=new_fallbacks,
+                light_context=bool(
+                    p.get("light_context")
+                    or p.get("lightContext")
+                    or (existing.light_context if existing else False)
+                ),
             )
 
     # Delivery patch
@@ -1183,6 +1247,17 @@ def _apply_job_patch(job: CronJob, patch: Dict[str, Any]) -> None:
             job.delivery = None
         else:
             existing_d = job.delivery
+            # Parse failure_destination from patch
+            fd_raw = d.get("failure_destination") or d.get("failureDestination")
+            failure_dest = None
+            if isinstance(fd_raw, dict):
+                from openclaw.cron.types import CronFailureDestination
+                failure_dest = CronFailureDestination(
+                    channel=fd_raw.get("channel"),
+                    to=fd_raw.get("to"),
+                )
+            elif existing_d:
+                failure_dest = existing_d.failure_destination
             job.delivery = CronDelivery(
                 mode=d.get("mode", existing_d.mode if existing_d else "announce"),
                 channel=d.get("channel", existing_d.channel if existing_d else None),
@@ -1191,6 +1266,31 @@ def _apply_job_patch(job: CronJob, patch: Dict[str, Any]) -> None:
                     d.get("best_effort", d.get("bestEffort",
                         existing_d.best_effort if existing_d else False))
                 ),
+                account_id=(
+                    d.get("account_id") or d.get("accountId")
+                    or (existing_d.account_id if existing_d else None)
+                ),
+                failure_destination=failure_dest,
+            )
+
+    # Failure alert patch
+    if "failure_alert" in patch or "failureAlert" in patch:
+        fa_raw = patch.get("failure_alert") or patch.get("failureAlert")
+        if fa_raw is None:
+            job.failure_alert = None
+        elif isinstance(fa_raw, dict):
+            from openclaw.cron.types import CronFailureAlert
+            existing_fa = job.failure_alert
+            job.failure_alert = CronFailureAlert(
+                after_n_errors=int(
+                    fa_raw.get("after_n_errors") or fa_raw.get("afterNErrors")
+                    or (existing_fa.after_n_errors if existing_fa else 3)
+                ),
+                cooldown_ms=int(
+                    fa_raw.get("cooldown_ms") or fa_raw.get("cooldownMs")
+                    or (existing_fa.cooldown_ms if existing_fa else 3_600_000)
+                ),
+                message=fa_raw.get("message", existing_fa.message if existing_fa else None),
             )
 
 

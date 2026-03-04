@@ -332,7 +332,7 @@ class UnifiedBrowserTool(AgentTool):
         from openclaw.config.loader import load_config
 
         cfg = load_config(as_dict=True) or {}
-        policy = cfg.get("gateway", {}).get("nodes", {}).get("browser", {})
+        policy = cfg.get("gateway", {}).get("nodes", {}).get("browser") or {}
         mode = policy.get("mode", "auto")
 
         if mode == "off":

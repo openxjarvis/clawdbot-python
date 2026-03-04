@@ -116,7 +116,7 @@ async def ensure_browser_control_service() -> None:
             except ImportError as exc:
                 raise RuntimeError(f"browser module not available: {exc}") from exc
 
-        _browser_control_ready = asyncio.ensure_future(_start())
+        _browser_control_ready = asyncio.create_task(_start())
 
     await _browser_control_ready
 

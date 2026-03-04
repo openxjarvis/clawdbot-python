@@ -145,10 +145,31 @@ class SessionsListMethod:
         """
         agent_id = params.get("agentId", "main")
         store_path = get_default_store_path(agent_id)
-        
+
         try:
             store = load_session_store(str(store_path))
-            
+
+            # Multi-agent store merge: when no explicit agentId is specified,
+            # merge sessions from peer agent stores into the result set so the
+            # client sees all agents' sessions (mirrors TS sessions.list behaviour).
+            if not params.get("agentId"):
+                try:
+                    import os as _os
+                    from openclaw.agents.session_entry import get_sessions_base_dir
+                    base_dir = get_sessions_base_dir()
+                    if base_dir and base_dir.exists():
+                        for peer_dir in base_dir.iterdir():
+                            if not peer_dir.is_dir() or peer_dir.name == agent_id:
+                                continue
+                            peer_store_path = peer_dir / "sessions.json"
+                            if peer_store_path.exists():
+                                peer_store = load_session_store(str(peer_store_path))
+                                for k, v in peer_store.items():
+                                    if k not in store:
+                                        store[k] = v
+                except Exception as merge_exc:
+                    logger.debug("Multi-agent store merge skipped: %s", merge_exc)
+
             opts = SessionsListOptions(
                 agent_id=params.get("agentId"),
                 spawned_by=params.get("spawnedBy"),
@@ -502,17 +523,15 @@ class SessionsResetMethod:
                 store[target.canonical_key] = reset_entry
                 return
             
-            # Preserve configuration fields from existing session
+            # Preserve only the fields that survive a reset — mirrors TS sessions.reset.
+            # providerOverride, modelOverride, deliveryContext, displayName are intentionally
+            # cleared on reset (per-conversation state that should not carry over).
             preserved = {
                 "thinking_level": entry.thinkingLevel,
                 "verbose_level": entry.verboseLevel,
                 "reasoning_level": entry.reasoningLevel,
                 "elevated_level": entry.elevatedLevel,
                 "label": entry.label,
-                "display_name": entry.displayName,
-                "provider_override": entry.providerOverride,
-                "model_override": entry.modelOverride,
-                "exec_host": entry.execHost,
                 "exec_security": entry.execSecurity,
                 "exec_ask": entry.execAsk,
                 "exec_node": entry.execNode,
@@ -520,7 +539,6 @@ class SessionsResetMethod:
                 "group_activation": entry.groupActivation,
                 "response_usage": entry.responseUsage,
                 "origin": entry.origin,
-                "delivery_context": entry.deliveryContext,
             }
             
             # Create new entry with reset fields
@@ -572,6 +590,29 @@ class SessionsResetMethod:
             except Exception as e:
                 logger.warning(f"Failed to delete transcript for {target.canonical_key}: {e}")
         
+        # Fire lifecycle hooks — mirrors TS triggerInternalHook("session:reset") chain
+        try:
+            from openclaw.hooks.internal_hooks import trigger_internal_hook, InternalHookEvent
+            await trigger_internal_hook(InternalHookEvent(
+                type="session",
+                action="reset",
+                session_key=target.canonical_key,
+                context={
+                    "oldSessionId": old_session_id,
+                    "newSessionId": new_session_id,
+                    "key": target.canonical_key,
+                },
+            ))
+        except Exception as hook_exc:
+            logger.debug("session:reset hook error: %s", hook_exc)
+
+        # Unbind thread bindings for the old session key
+        try:
+            from openclaw.channels.thread_bindings import unbind_thread_bindings_by_session_key
+            await unbind_thread_bindings_by_session_key(target.canonical_key)
+        except Exception:
+            pass
+
         # Return updated entry shape (TS-compatible sessions.reset payload)
         updated_store = load_session_store(target.store_path)
         updated_entry = updated_store.get(target.canonical_key)
@@ -605,19 +646,28 @@ class SessionsDeleteMethod:
     async def execute(self, connection: Any, params: dict[str, Any]) -> dict[str, Any]:
         """
         Execute sessions.delete
-        
+
         Params:
         - key: Session key (required)
-        - archiveTranscript: Archive before deleting (default: true)
-        
+        - deleteTranscript: Delete transcript permanently (default: false) — TS canonical name.
+          Also accepts legacy ``archiveTranscript`` (inverted semantics: true=archive/keep).
+
         Returns:
         - { ok: true, deleted: bool }
         """
         key = params.get("key")
         if not key:
             raise ValueError("key is required")
-        
-        archive_transcript = params.get("archiveTranscript", True)
+
+        # TS uses deleteTranscript: true → permanently delete the JSONL file.
+        # Legacy Python used archiveTranscript: true → rename (archive) before deleting.
+        # Support both: prefer the TS canonical param.
+        if "deleteTranscript" in params:
+            # TS: deleteTranscript=true means actually delete; false means keep
+            archive_transcript = not bool(params.get("deleteTranscript", False))
+        else:
+            # Legacy Python param
+            archive_transcript = params.get("archiveTranscript", True)
         
         target = resolve_gateway_session_store_target(key)
         
@@ -647,9 +697,28 @@ class SessionsDeleteMethod:
         def mutator(store_dict: Dict[str, SessionEntry]) -> None:
             if target.canonical_key in store_dict:
                 del store_dict[target.canonical_key]
-        
+
         update_session_store(target.store_path, mutator)
-        
+
+        # Fire lifecycle hooks — mirrors TS triggerInternalHook("session:delete") chain
+        try:
+            from openclaw.hooks.internal_hooks import trigger_internal_hook, InternalHookEvent
+            await trigger_internal_hook(InternalHookEvent(
+                type="session",
+                action="delete",
+                session_key=target.canonical_key,
+                context={"sessionId": old_session_id, "key": target.canonical_key},
+            ))
+        except Exception as hook_exc:
+            logger.debug("session:delete hook error: %s", hook_exc)
+
+        # Unbind thread bindings for the deleted session key
+        try:
+            from openclaw.channels.thread_bindings import unbind_thread_bindings_by_session_key
+            await unbind_thread_bindings_by_session_key(target.canonical_key)
+        except Exception:
+            pass
+
         return {"ok": True, "key": target.canonical_key, "deleted": True, "archived": archived}
     
     def get_schema(self) -> dict[str, Any]:

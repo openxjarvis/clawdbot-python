@@ -132,9 +132,8 @@ class NodeManager:
         )
         self.pending_pairs[request.request_id] = request
         logger.info(f"Node pairing requested: {node_id}")
-        
-        # TODO: Broadcast node.pair.requested event
-        
+        # node.pair.requested event is broadcast by the gateway handler (handle_node_pair_request)
+        # which has access to the gateway broadcast function.
         return request
     
     def approve_pairing(self, request_or_node_id: str) -> Optional[str]:
@@ -166,9 +165,8 @@ class NodeManager:
         self.pending_pairs.pop(request.request_id, None)
         
         logger.info(f"Node pairing approved: {request.node_id}")
-        
-        # TODO: Broadcast node.pair.resolved event
-        
+        # node.pair.resolved event is broadcast by the gateway handler (handle_node_pair_approve)
+        # which has access to the gateway broadcast function.
         return token
     
     def reject_pairing(self, request_or_node_id: str, reason: Optional[str] = None):
@@ -192,8 +190,8 @@ class NodeManager:
         self.pending_pairs.pop(request.request_id, None)
         
         logger.info(f"Node pairing rejected: {request.node_id}, reason: {reason}")
-        
-        # TODO: Broadcast node.pair.rejected event
+        # node.pair.resolved (decision="rejected") event is broadcast by the gateway handler
+        # (handle_node_pair_reject) which has access to the gateway broadcast function.
     
     def list_nodes(self) -> List[Dict[str, Any]]:
         """

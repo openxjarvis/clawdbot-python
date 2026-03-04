@@ -274,7 +274,7 @@ class ChannelManager:
 
         # Register channel classes
         manager.register("telegram", EnhancedTelegramChannel)
-        manager.register("discord", EnhancedDiscordChannel)
+        manager.register("discord", DiscordChannel)
 
         # Configure channels
         manager.configure("telegram", {
@@ -350,6 +350,10 @@ class ChannelManager:
 
         # Running state
         self._running = False
+
+        # Per-agent SessionManager registry — mirrors TS per-agent session stores.
+        # Key: agent_id (normalised). Created lazily via get_session_manager().
+        self._session_managers: dict[str, Any] = {}
 
         logger.info("ChannelManager initialized")
 
@@ -898,6 +902,62 @@ class ChannelManager:
             return env.agent_runtime
         return self.default_runtime
 
+    def get_runtime_for_agent(self, agent_id: str) -> AgentRuntime | None:
+        """Return the AgentRuntime for a specific agent_id.
+
+        Checks ``_runtime_envs`` for a channel-env keyed by agent_id first,
+        then falls back to the default runtime.  This mirrors TS
+        ``getChannelRuntime(agentId)`` used after ``resolveAgentRoute``.
+        """
+        env = self._runtime_envs.get(agent_id)
+        if env and env.agent_runtime:
+            return env.agent_runtime
+        return self.default_runtime
+
+    def get_session_manager(self, agent_id: str) -> Any:
+        """Return (and lazily create) the per-agent SessionManager.
+
+        Mirrors TS per-agent session store isolation: each agentId has its own
+        sessions.json at ``~/.openclaw/agents/<agentId>/sessions/``.
+
+        Falls back to the default ``self.session_manager`` if it was provided
+        for the same agent_id; creates a fresh one otherwise.
+        """
+        from openclaw.routing.session_key import normalize_agent_id as _norm_agent
+
+        norm = _norm_agent(agent_id)
+
+        # Return cached instance
+        if norm in self._session_managers:
+            return self._session_managers[norm]
+
+        # Re-use the injected default session_manager if it matches
+        if (
+            self.session_manager is not None
+            and getattr(self.session_manager, "agent_id", None) == norm
+        ):
+            self._session_managers[norm] = self.session_manager
+            return self.session_manager
+
+        # Create a new one with workspace resolved per-agent (mirrors resolveAgentWorkspaceDir)
+        try:
+            from openclaw.agents.session import SessionManager
+            from openclaw.agents.agent_scope import resolve_agent_workspace_dir
+            from openclaw.config.loader import load_config as _lc
+            cfg = _lc()
+            workspace = resolve_agent_workspace_dir(cfg, norm)
+            sm = SessionManager(workspace_dir=workspace, agent_id=norm)
+            self._session_managers[norm] = sm
+            logger.info("Created SessionManager for agent_id=%s workspace=%s", norm, workspace)
+            return sm
+        except Exception as exc:
+            logger.warning(
+                "Failed to create SessionManager for agent_id=%s, falling back to default: %s",
+                norm,
+                exc,
+            )
+            return self.session_manager
+
     def list_channels(self) -> list[str]:
         """List all registered channel IDs"""
         all_ids = set(self._channel_classes.keys())
@@ -1113,12 +1173,6 @@ class ChannelManager:
                 await env.custom_message_handler(message)
                 return
 
-            # Get runtime
-            runtime = self.get_runtime(channel_id)
-            if not runtime:
-                logger.error(f"No AgentRuntime available for channel: {channel_id}")
-                return
-
             # Get channel for sending response
             channel = self._channels.get(channel_id)
             if not channel:
@@ -1134,22 +1188,80 @@ class ChannelManager:
                     finalize_inbound_context,
                 )
 
-                # Build proper session key (align with TypeScript format)
-                from openclaw.routing.session_key import build_agent_peer_session_key
+                # ----------------------------------------------------------------
+                # Routing: resolve agent + session key via bindings (mirrors TS
+                # resolveAgentRoute called from every channel handler).
+                # ----------------------------------------------------------------
+                from openclaw.routing.resolve_route import resolve_agent_route
+                from openclaw.routing.session_key import resolve_thread_session_keys
+                from openclaw.config.loader import load_config as _load_cfg
 
-                # Determine peer_kind based on chat_type
-                peer_kind = "dm" if message.chat_type == "dm" else message.chat_type or "dm"
+                _cfg = _load_cfg()
 
-                # Build session key: agent:main:telegram:dm:8366053063
-                session_key = build_agent_peer_session_key(
-                    agent_id=self.session_manager.agent_id if self.session_manager else "main",
-                    channel=channel_id,
-                    peer_kind=peer_kind,
-                    peer_id=str(message.chat_id),
-                    dm_scope="per-channel-peer"  # Each channel+peer gets own session
+                # Normalise peer_kind — TS uses "direct" / "group" / "channel"
+                peer_kind = (
+                    "group" if message.chat_type in ("group", "channel")
+                    else "direct"
                 )
 
-                logger.info(f"[{channel_id}] Built session key: {session_key}")
+                _route = resolve_agent_route(
+                    cfg=_cfg,
+                    channel=channel_id,
+                    account_id=message.account_id,
+                    peer={"kind": peer_kind, "id": str(message.chat_id)},
+                )
+                agent_id = _route.agent_id
+                session_key = _route.session_key
+                main_session_key = _route.main_session_key
+
+                # Fail-closed guard (mirrors TS): if this is a named (non-default)
+                # account and no binding matched, drop rather than using default agent.
+                # "default" account always passes — only explicitly-named accounts
+                # (e.g. "bot-2", a second bot token) are dropped when they have no binding.
+                if (
+                    message.account_id
+                    and message.account_id != "default"
+                    and _route.matched_by == "default"
+                ):
+                    _default_acct = getattr(
+                        getattr(_cfg, "agents", None), "defaults", None
+                    )
+                    _default_acct_id = (
+                        getattr(_default_acct, "accountId", None) if _default_acct else None
+                    ) or ""
+                    if message.account_id != _default_acct_id:
+                        logger.debug(
+                            "[%s] dropping message: named account '%s' has no binding (matched_by=default)",
+                            channel_id,
+                            message.account_id,
+                        )
+                        return
+
+                # Thread suffix: apply when the message is inside a topic/thread.
+                # Feishu: feishu_root_id indicates a topic thread.
+                # Telegram: a thread_id meta key (set by forum topic routing).
+                _meta = message.metadata or {}
+                _thread_id = (
+                    _meta.get("thread_id")
+                    or _meta.get("feishu_root_id")
+                    or None
+                )
+                if _thread_id:
+                    thread_keys = resolve_thread_session_keys(
+                        base_session_key=session_key,
+                        thread_id=str(_thread_id),
+                    )
+                    session_key = thread_keys.get("session_key", session_key)
+
+                # Use per-agent runtime (falls back to default if no binding override)
+                runtime = self.get_runtime_for_agent(agent_id)
+                if not runtime:
+                    runtime = self.get_runtime(channel_id)
+                if not runtime:
+                    logger.error("No AgentRuntime available for channel=%s agent=%s", channel_id, agent_id)
+                    return
+
+                logger.info("[%s] Built session key: %s (agent=%s, matched_by=%s)", channel_id, session_key, agent_id, _route.matched_by)
 
                 # Propagate command metadata from InboundMessage (set by command_dispatcher.py)
                 _meta = message.metadata or {}
@@ -1193,12 +1305,13 @@ class ChannelManager:
 
                 logger.debug(f"[{channel_id}] Context finalized: BodyForAgent length={len(ctx.BodyForAgent or '')}, ChatType={ctx.ChatType}")
 
-                # Get or create session using session key (will query store for UUID)
+                # Get or create session using per-agent SessionManager
                 session = None
                 session_workspace: str | None = None
                 workspace_root: str | None = str(Path.home() / ".openclaw" / "workspace")
-                if self.session_manager:
-                    session = self.session_manager.get_or_create_session_by_key(session_key)
+                _session_mgr = self.get_session_manager(agent_id)
+                if _session_mgr:
+                    session = _session_mgr.get_or_create_session_by_key(session_key)
                     logger.info(f"[{channel_id}] Session created/retrieved: key={session_key}, uuid={session.session_id}")
 
                     # Resolve session workspace for file generation
@@ -1211,6 +1324,26 @@ class ChannelManager:
                     workspace_root = str(_workspace_root)
                     logger.info(f"[{channel_id}] Session workspace: {session_workspace}")
 
+                    # Record inbound session metadata (mirrors TS recordSessionMetaFromInbound).
+                    # Uses preserve-activity semantics: does NOT refresh updatedAt so that
+                    # idle-reset logic continues to track actual agent-turn timestamps.
+                    try:
+                        _session_mgr.update_session_meta_preserve_activity(session_key, {
+                            "lastChannel": channel_id,
+                            "chatType": message.chat_type,
+                        })
+                        # updateLastRoute: write delivery context to mainSessionKey for DMs
+                        # so that outbound reply routing can always find the right target
+                        # even when dmScope != "main" (mirrors TS updateLastRoute).
+                        if message.chat_type == "direct" and main_session_key != session_key:
+                            _session_mgr.update_session_meta_preserve_activity(main_session_key, {
+                                "lastChannel": channel_id,
+                                "lastTo": str(message.chat_id),
+                                "lastAccountId": message.account_id,
+                            })
+                    except Exception as _meta_err:
+                        logger.debug("[%s] Failed to record session metadata: %s", channel_id, _meta_err)
+
                 # Use BodyForAgent (properly formatted with sender metadata for groups)
                 message_text = ctx.BodyForAgent or ctx.Body
 
@@ -1220,14 +1353,33 @@ class ChannelManager:
 
                 # Wire up typing indicator (mirrors TS bot-message-dispatch.ts)
                 _typing_target = str(message.chat_id)
+                _typing_message_id: str | None = getattr(message, "message_id", None)
+
                 async def _send_typing() -> None:
                     if hasattr(channel, "send_typing"):
                         try:
-                            await channel.send_typing(_typing_target)
+                            await channel.send_typing(
+                                _typing_target, message_id=_typing_message_id
+                            )
                         except Exception:
                             pass
 
-                typing_ctrl = create_typing_controller(on_reply_start=_send_typing)
+                async def _stop_typing() -> None:
+                    if hasattr(channel, "stop_typing"):
+                        try:
+                            await channel.stop_typing(
+                                _typing_target, message_id=_typing_message_id
+                            )
+                        except Exception:
+                            pass
+
+                def _on_typing_cleanup() -> None:
+                    asyncio.ensure_future(_stop_typing())
+
+                typing_ctrl = create_typing_controller(
+                    on_reply_start=_send_typing,
+                    on_cleanup=_on_typing_cleanup,
+                )
                 await typing_ctrl.on_reply_start()
                 await typing_ctrl.start_typing_loop()
 
@@ -1315,9 +1467,9 @@ class ChannelManager:
                 # Resolve queue settings from session entry
                 from openclaw.auto_reply.reply.queue import QueueSettings
                 _queue_settings = QueueSettings()
-                if self.session_manager:
+                if _session_mgr:
                     try:
-                        _entry = self.session_manager.get_session_entry(session_key)
+                        _entry = _session_mgr.get_session_entry(session_key)
                         if _entry and hasattr(_entry, "queueMode") and _entry.queueMode:
                             _queue_settings.mode = _entry.queueMode
                     except Exception:
@@ -1352,7 +1504,7 @@ class ChannelManager:
                 # run_prepared_reply handles steer/queue/run logic and will
                 # call typing_ctrl.mark_run_complete() / mark_dispatch_idle()
                 # on its own when the turn finishes.
-                asyncio.ensure_future(run_prepared_reply(reply_ctx))
+                asyncio.create_task(run_prepared_reply(reply_ctx))
 
             except Exception as e:
                 try:
@@ -1391,7 +1543,6 @@ def discover_channel_plugins() -> dict[str, type[ChannelPlugin]]:
     """
     from ..channels import (
         DiscordChannel,
-        EnhancedDiscordChannel,
         EnhancedTelegramChannel,
         SlackChannel,
         TelegramChannel,
@@ -1406,7 +1557,6 @@ def discover_channel_plugins() -> dict[str, type[ChannelPlugin]]:
         ("telegram", TelegramChannel),
         ("telegram-enhanced", EnhancedTelegramChannel),
         ("discord", DiscordChannel),
-        ("discord-enhanced", EnhancedDiscordChannel),
         ("slack", SlackChannel),
         ("webchat", WebChatChannel),
     ]

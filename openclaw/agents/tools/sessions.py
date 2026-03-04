@@ -359,6 +359,51 @@ class SessionsSpawnTool(AgentTool):
             except (TypeError, ValueError):
                 run_timeout_seconds = None
 
+        # Resolve hook_runner from gateway or agent runtime
+        hook_runner = None
+        if self.gateway is not None:
+            hook_runner = getattr(self.gateway, "_hook_runner", None)
+        if hook_runner is None and self.session_manager is not None:
+            hook_runner = getattr(self.session_manager, "_hook_runner", None)
+
+        # Parent context for hooks
+        parent_agent_id = agent_id
+        parent_session_key: str | None = None
+        if self.session_manager is not None and hasattr(self.session_manager, "current_session_key"):
+            parent_session_key = self.session_manager.current_session_key
+
+        spawning_event = {
+            "task": task.strip(),
+            "label": label or None,
+            "agent_id": agent_id,
+            "model": model,
+        }
+        spawning_ctx = {
+            "agent_id": agent_id,
+            "parent_agent_id": parent_agent_id,
+            "parent_session_key": parent_session_key,
+        }
+
+        # Fire subagent_spawning hook (modifying — can block spawn)
+        if hook_runner is not None and hook_runner.has_hooks("subagent_spawning"):
+            try:
+                spawning_result = await hook_runner.run_subagent_spawning(spawning_event, spawning_ctx)
+                if isinstance(spawning_result, dict) and spawning_result.get("status") == "error":
+                    error_msg = spawning_result.get("error") or "Subagent spawn blocked by plugin"
+                    return ToolResult(success=False, content="", error=error_msg)
+            except Exception as hook_exc:
+                logger.warning("subagent_spawning hook error: %s", hook_exc)
+
+        # Fire subagent_delivery_target hook (modifying — can override delivery origin)
+        delivery_origin: dict | None = None
+        if hook_runner is not None and hook_runner.has_hooks("subagent_delivery_target"):
+            try:
+                delivery_result = await hook_runner.run_subagent_delivery_target(spawning_event, spawning_ctx)
+                if isinstance(delivery_result, dict):
+                    delivery_origin = delivery_result.get("origin")
+            except Exception as hook_exc:
+                logger.warning("subagent_delivery_target hook error: %s", hook_exc)
+
         try:
             import time
             session_id = (
@@ -378,9 +423,26 @@ class SessionsSpawnTool(AgentTool):
                         thinking=thinking,
                         run_timeout_seconds=run_timeout_seconds,
                         cleanup=cleanup,
+                        delivery_origin=delivery_origin,
                     )
                     if isinstance(result, dict):
                         session_key = result.get("sessionKey") or result.get("session_key") or session_id
+
+                        # Fire subagent_spawned hook (void, parallel)
+                        if hook_runner is not None and hook_runner.has_hooks("subagent_spawned"):
+                            try:
+                                await hook_runner.run_subagent_spawned(
+                                    {
+                                        "session_key": session_key,
+                                        "agent_id": agent_id,
+                                        "label": label or None,
+                                        "task": task.strip(),
+                                    },
+                                    spawning_ctx,
+                                )
+                            except Exception as hook_exc:
+                                logger.warning("subagent_spawned hook error: %s", hook_exc)
+
                         return ToolResult(
                             success=True,
                             content=f"Spawned subagent session '{session_key}'. Task: {task.strip()[:120]}",
@@ -390,6 +452,22 @@ class SessionsSpawnTool(AgentTool):
             if self.session_manager is not None:
                 session = self.session_manager.get_session(session_id)
                 session.add_user_message(task.strip())
+
+                # Fire subagent_spawned hook (void, parallel)
+                if hook_runner is not None and hook_runner.has_hooks("subagent_spawned"):
+                    try:
+                        await hook_runner.run_subagent_spawned(
+                            {
+                                "session_key": session_id,
+                                "agent_id": agent_id,
+                                "label": label or None,
+                                "task": task.strip(),
+                            },
+                            spawning_ctx,
+                        )
+                    except Exception as hook_exc:
+                        logger.warning("subagent_spawned hook error: %s", hook_exc)
+
                 return ToolResult(
                     success=True,
                     content=f"Spawned session '{session_id}'",

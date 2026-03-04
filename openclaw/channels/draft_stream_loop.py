@@ -20,7 +20,7 @@ class DraftStreamLoop:
     def update(self, text: str) -> None:
         self._pending_text = text
         if self._timer is None and not self._in_flight:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             self._timer = loop.call_later(
                 self._throttle_ms / 1000.0,
                 lambda: asyncio.ensure_future(self._do_flush()),
@@ -48,7 +48,7 @@ class DraftStreamLoop:
                 return
 
             self._pending_text = ""
-            task = asyncio.ensure_future(self._send_or_edit(text))
+            task = asyncio.create_task(self._send_or_edit(text))
             self._in_flight = task
             try:
                 sent = await task
@@ -62,7 +62,7 @@ class DraftStreamLoop:
                 self._pending_text = text
                 return
 
-            self._last_sent_at = asyncio.get_event_loop().time() * 1000
+            self._last_sent_at = asyncio.get_running_loop().time() * 1000
             if not self._pending_text:
                 return
 

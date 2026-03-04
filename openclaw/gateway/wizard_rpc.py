@@ -4,7 +4,7 @@ import logging
 from typing import Any, Optional
 from ..wizard.session import WizardSession
 from ..config.loader import save_config
-from ..config.schema import ClawdbotConfig
+from ..config.schema import ClawdbotConfig, ModelsConfig
 
 logger = logging.getLogger(__name__)
 
@@ -228,7 +228,20 @@ class WizardRPCHandler:
             
             model = model_map.get(provider, "google/gemini-3-pro-preview")
             config.agents.defaults.model = model
-            
+
+            # Write models.providers block for Ollama
+            if provider == "ollama":
+                ollama_base_url = session.get_answer("ollama_base_url") or "http://127.0.0.1:11434"
+                if not config.models:
+                    config.models = ModelsConfig()
+                config.models.providers = config.models.providers or {}
+                config.models.providers["ollama"] = {
+                    "baseUrl": ollama_base_url,
+                    "api": "ollama",
+                    "apiKey": "ollama-local",
+                    "models": [],  # auto-discovered at runtime by models_config.py
+                }
+
             # Gateway configuration
             config.gateway.port = gateway_port
             config.gateway.mode = session.mode or "local"

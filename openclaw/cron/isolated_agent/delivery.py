@@ -105,8 +105,11 @@ async def resolve_delivery_target(
             channel=requested_channel,
             to=explicit_to,
             mode="explicit",
+            # Honor explicit account_id from delivery config (Gap 1 fix)
+            account_id=getattr(delivery, "account_id", None) or None,
         )
-        _try_resolve_account_id(target, cfg=cfg, agent_id=agent_id)
+        if not target.account_id:
+            _try_resolve_account_id(target, cfg=cfg, agent_id=agent_id)
         logger.info("cron delivery: explicit target %s", target)
         return target
 
@@ -130,7 +133,12 @@ async def resolve_delivery_target(
             allow_mismatched_last_to=(requested_channel == "last"),
         )
         if resolved.channel and (resolved.to or requested_channel == "last"):
-            _try_resolve_account_id(resolved, cfg=cfg, agent_id=agent_id)
+            # Honor explicit account_id from delivery config first (Gap 1 fix)
+            explicit_account_id = getattr(delivery, "account_id", None) or None
+            if explicit_account_id:
+                resolved.account_id = explicit_account_id
+            else:
+                _try_resolve_account_id(resolved, cfg=cfg, agent_id=agent_id)
             _try_validate_outbound(resolved, cfg=cfg)
             logger.info("cron delivery: session-store target %s", resolved)
             return resolved
@@ -325,6 +333,7 @@ async def deliver_result(
     *,
     cfg: Any = None,
     agent_id: str | None = None,
+    is_failure_alert: bool = False,
 ) -> bool:
     """Deliver isolated agent result to channel.
 
@@ -336,10 +345,13 @@ async def deliver_result(
         session_history: Optional session history for "last" channel resolution.
         cfg: OpenClaw config (for session-store lookup).
         agent_id: Agent identifier.
+        is_failure_alert: If True, route to failure_destination if configured.
 
     Returns:
         True if delivery succeeded or was not needed.
     """
+    import time as _time
+
     # Resolve channel registry from channel manager if provided
     if get_channel_manager is not None and channel_registry is None:
         try:
@@ -358,10 +370,26 @@ async def deliver_result(
         logger.info("cron delivery: agent already sent via messaging tool")
         return True
 
-    # Resolve target
-    target = await resolve_delivery_target(
-        job, session_history, cfg=cfg, agent_id=agent_id
-    )
+    # Webhook delivery mode (Gap 5: implement HTTP POST)
+    if job.delivery.mode == "webhook" and job.delivery.to:
+        return await _deliver_via_webhook(job, result)
+
+    # Failure alert routing: use failure_destination if set (Gap 4)
+    if is_failure_alert and job.delivery.failure_destination:
+        fd = job.delivery.failure_destination
+        target = DeliveryTarget(
+            channel=fd.channel or DEFAULT_CHAT_CHANNEL,
+            to=fd.to,
+            mode="explicit",
+            account_id=getattr(job.delivery, "account_id", None) or None,
+        )
+        if not target.account_id:
+            _try_resolve_account_id(target, cfg=cfg, agent_id=agent_id)
+    else:
+        # Resolve target via normal resolution
+        target = await resolve_delivery_target(
+            job, session_history, cfg=cfg, agent_id=agent_id
+        )
 
     if not target.to:
         if target.error:
@@ -371,12 +399,17 @@ async def deliver_result(
         delivery_obj = job.delivery
         if getattr(delivery_obj, "best_effort", False):
             logger.warning("cron delivery: %s (best effort)", msg)
+            _update_delivery_state(job, status="skipped", now_ms=int(_time.time() * 1000))
             return True
         logger.error("cron delivery: %s", msg)
+        _update_delivery_state(job, status="error", error=msg, now_ms=int(_time.time() * 1000))
         return False
 
     if not channel_registry:
         logger.error("cron delivery: no channel registry available")
+        _update_delivery_state(
+            job, status="error", error="no channel registry", now_ms=int(_time.time() * 1000)
+        )
         return False
 
     channel = channel_registry.get(target.channel)
@@ -385,41 +418,110 @@ async def deliver_result(
         error_msg = f"channel '{target.channel}' not found"
         if getattr(job.delivery, "best_effort", False):
             logger.warning("cron delivery: %s (best effort)", error_msg)
+            _update_delivery_state(job, status="skipped", now_ms=int(_time.time() * 1000))
             return True
         logger.error("cron delivery: %s", error_msg)
+        _update_delivery_state(
+            job, status="error", error=error_msg, now_ms=int(_time.time() * 1000)
+        )
         return False
 
     if not channel.is_running():
         error_msg = f"channel '{target.channel}' is not running"
         if getattr(job.delivery, "best_effort", False):
             logger.warning("cron delivery: %s (best effort)", error_msg)
+            _update_delivery_state(job, status="skipped", now_ms=int(_time.time() * 1000))
             return True
         logger.error("cron delivery: %s", error_msg)
+        _update_delivery_state(
+            job, status="error", error=error_msg, now_ms=int(_time.time() * 1000)
+        )
         return False
 
     # Prepare message
-    if not result.get("success") and result.get("error"):
-        error = result.get("error", "Unknown error")
-        message = f"\u26a0\ufe0f Cron job '{job.name}' failed:\n\n{error}"
-    else:
-        summary = result.get("summary", "") or result.get("full_response", "")
-        if not summary:
-            logger.warning("cron delivery: no content to deliver")
-            return True
-        message = f"\U0001f916 **{job.name}**\n\n{summary}"
+    message = format_delivery_message(job, result)
 
+    now_ms = int(_time.time() * 1000)
     try:
         logger.info("cron delivery: sending to %s:%s", target.channel, target.to)
         await channel.send_text(target.to, message)
         logger.info("cron delivery: succeeded")
+        _update_delivery_state(job, status="ok", now_ms=now_ms)
         return True
     except Exception as e:
         error_msg = f"delivery failed: {e}"
         if getattr(job.delivery, "best_effort", False):
             logger.warning("cron delivery: %s (best effort)", error_msg, exc_info=True)
+            _update_delivery_state(job, status="skipped", now_ms=now_ms)
             return True
         logger.error("cron delivery: %s", error_msg, exc_info=True)
+        _update_delivery_state(job, status="error", error=error_msg, now_ms=now_ms)
         return False
+
+
+async def _deliver_via_webhook(job: "CronJob", result: dict[str, Any]) -> bool:
+    """Deliver cron job result via HTTP POST webhook (Gap 5).
+
+    Mirrors TS deliverOutboundPayloads webhook branch.
+    POSTs a JSON payload to delivery.to URL.
+    """
+    import json
+    try:
+        import aiohttp
+    except ImportError:
+        logger.error("cron delivery: aiohttp not installed, cannot use webhook delivery")
+        return False
+
+    url = job.delivery.to if job.delivery else None  # type: ignore[union-attr]
+    if not url:
+        logger.error("cron delivery: webhook mode requires delivery.to URL")
+        return False
+
+    payload = {
+        "jobId": job.id,
+        "jobName": job.name,
+        "status": result.get("status", "ok"),
+        "summary": result.get("summary"),
+        "error": result.get("error"),
+        "sessionKey": result.get("session_key") or result.get("sessionKey"),
+        "model": result.get("model"),
+        "provider": result.get("provider"),
+    }
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            ) as resp:
+                if resp.status < 400:
+                    logger.info("cron delivery: webhook POST %s → %d", url, resp.status)
+                    return True
+                body = await resp.text()
+                logger.error(
+                    "cron delivery: webhook POST %s failed: %d %s", url, resp.status, body[:200]
+                )
+                return False
+    except Exception as e:
+        logger.error("cron delivery: webhook POST %s error: %s", url, e)
+        return False
+
+
+def _update_delivery_state(
+    job: "CronJob",
+    status: str,
+    error: str | None = None,
+    now_ms: int | None = None,
+) -> None:
+    """Update job state delivery tracking fields after a delivery attempt."""
+    import time as _time
+    ts = now_ms if now_ms is not None else int(_time.time() * 1000)
+    job.state.last_delivery_status = status  # type: ignore[assignment]
+    job.state.last_delivery_error = error
+    if status == "ok":
+        job.state.last_delivered = ts
 
 
 def format_delivery_message(job: "CronJob", result: dict[str, Any]) -> str:

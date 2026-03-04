@@ -152,6 +152,32 @@ class Lane:
             self.active -= 1
             self.queue.task_done()
 
+    def clear(self, error: Exception) -> int:
+        """Drain all pending queued entries and reject their futures.
+
+        Mirrors TS ``clearCommandLane()`` — does NOT cancel active tasks,
+        only drains the not-yet-started items from the queue.
+
+        Args:
+            error: Exception to set on every pending future.
+
+        Returns:
+            Number of entries that were drained.
+        """
+        removed = 0
+        while not self.queue.empty():
+            try:
+                item = self.queue.get_nowait()
+                # item = (task, future, task_id, generation)
+                if isinstance(item, tuple) and len(item) >= 2:
+                    fut = item[1]
+                    if isinstance(fut, asyncio.Future) and not fut.done():
+                        fut.set_exception(error)
+                removed += 1
+            except asyncio.QueueEmpty:
+                break
+        return removed
+
     async def stop(self) -> None:
         """Stop the worker"""
         self._running = False

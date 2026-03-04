@@ -63,7 +63,7 @@ async def stream_proxy(
         # Yield error event
         yield {
             "type": "error",
-            "timestamp": asyncio.get_event_loop().time(),
+            "timestamp": asyncio.get_running_loop().time(),
             "payload": {
                 "error": str(e),
                 "error_type": type(e).__name__
@@ -251,7 +251,7 @@ async def proxy_with_buffer(
         logger.error(f"Error in buffered stream proxy: {e}", exc_info=True)
         yield {
             "type": "error",
-            "timestamp": asyncio.get_event_loop().time(),
+            "timestamp": asyncio.get_running_loop().time(),
             "payload": {
                 "error": str(e),
                 "error_type": type(e).__name__

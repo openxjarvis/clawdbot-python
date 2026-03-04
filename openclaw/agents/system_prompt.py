@@ -388,11 +388,17 @@ def resolve_bootstrap_context_for_run(
     max_chars_per_file: int = _DEFAULT_MAX_CHARS_PER_FILE,
     total_max_chars: int = _DEFAULT_TOTAL_MAX_CHARS,
     hook_overrides: dict[str, str] | None = None,
+    run_kind: str = "default",
 ) -> list[dict]:
     """
     Load bootstrap files for a run, applying session filtering and size limits.
 
-    Matches TypeScript resolveBootstrapContextForRun().
+    Matches TypeScript resolveBootstrapContextForRun() + applyContextModeFilter().
+
+    run_kind controls which files are loaded (mirrors TS contextMode logic):
+    - "default"   → full context (all bootstrap files)
+    - "heartbeat" → lightweight: only HEARTBEAT.md (+ hook overrides)
+    - "cron"      → lightweight: empty context (no bootstrap files)
 
     Subagent sessions (spawn_depth > 0) only get AGENTS.md + TOOLS.md.
     Hook overrides (from plugins) can inject or replace file content.
@@ -403,12 +409,32 @@ def resolve_bootstrap_context_for_run(
         max_chars_per_file: Per-file character limit.
         total_max_chars: Total accumulated character limit.
         hook_overrides: Dict of filename → replacement content from plugins.
+        run_kind: "default" | "heartbeat" | "cron".
 
     Returns:
         List of dicts with {"path": str, "content": str}.
     """
     from openclaw.agents.system_prompt_bootstrap import resolve_memory_bootstrap_entries
-    
+
+    # Cron runs get no bootstrap context at all (lightweight mode)
+    if run_kind == "cron":
+        return []
+
+    # Heartbeat runs only get HEARTBEAT.md
+    if run_kind == "heartbeat":
+        heartbeat_file = "HEARTBEAT.md"
+        if hook_overrides and heartbeat_file in hook_overrides:
+            content = hook_overrides[heartbeat_file]
+        else:
+            path = workspace_dir / heartbeat_file
+            if not path.exists():
+                return []
+            try:
+                content = path.read_text(encoding="utf-8")
+            except Exception:
+                return []
+        return [{"path": heartbeat_file, "content": content}]
+
     # Subagent filter: only AGENTS.md + TOOLS.md for sub-sessions
     # Matches TS workspace.ts#L470-478 (filterBootstrapFilesForSession)
     is_subagent = session_key and (":sub:" in session_key or ":spawn:" in session_key)
@@ -482,15 +508,32 @@ def build_embedded_system_prompt(
     extra_system_prompt: str | None = None,
     max_chars_per_file: int = _DEFAULT_MAX_CHARS_PER_FILE,
     total_max_chars: int = _DEFAULT_TOTAL_MAX_CHARS,
+    # --- All params from build_agent_system_prompt (previously dropped) ---
+    heartbeat_prompt: str | None = None,
+    sandbox_info: dict | None = None,
+    exec_config: dict | None = None,
+    owner_numbers: list[str] | None = None,
+    workspace_notes: list[str] | None = None,
+    memory_citations_mode: Literal["on", "off"] = "on",
+    model_alias_lines: list[str] | None = None,
+    tts_hint: str | None = None,
+    reaction_guidance: dict | None = None,
+    reasoning_level: str = "off",
+    reasoning_hint: str | None = None,
+    message_tool_hints: list[str] | None = None,
+    message_channel_options: str = "telegram|discord|slack|signal",
+    has_gateway: bool = True,
+    run_kind: str = "default",
 ) -> str:
     """
     Per-session dynamic system prompt builder.
 
     Matches TypeScript buildEmbeddedSystemPrompt():
     1. resolveBootstrapContextForRun() → load AGENTS.md, SOUL.md, etc.
+       (respects run_kind so heartbeat/cron runs get lightweight context)
     2. applyBootstrapHookOverrides() (passed as hook_overrides)
     3. buildWorkspaceSkillSnapshot() → already done in skills param
-    4. buildAgentSystemPrompt() with all params
+    4. buildAgentSystemPrompt() with ALL params threaded through
 
     Args:
         workspace_dir: Agent workspace directory.
@@ -506,6 +549,21 @@ def build_embedded_system_prompt(
         extra_system_prompt: Injected extra context.
         max_chars_per_file: Per-file size limit.
         total_max_chars: Total bootstrap context size limit.
+        heartbeat_prompt: Heartbeat section content.
+        sandbox_info: Sandbox configuration dict.
+        exec_config: Exec security configuration.
+        owner_numbers: Owner phone numbers.
+        workspace_notes: Additional workspace notes.
+        memory_citations_mode: Memory citations mode.
+        model_alias_lines: Model alias section lines.
+        tts_hint: TTS hint text.
+        reaction_guidance: Reaction guidance dict.
+        reasoning_level: Reasoning level ("off", "on", "stream").
+        reasoning_hint: Reasoning format hint.
+        message_tool_hints: Extra hints for message tool.
+        message_channel_options: Channel option string for message tool.
+        has_gateway: Whether gateway tool is available.
+        run_kind: "default" | "heartbeat" | "cron" — controls bootstrap filtering.
 
     Returns:
         Assembled system prompt string.
@@ -516,6 +574,7 @@ def build_embedded_system_prompt(
         max_chars_per_file=max_chars_per_file,
         total_max_chars=total_max_chars,
         hook_overrides=hook_overrides,
+        run_kind=run_kind,
     )
 
     # Format skills into prompt text if provided
@@ -529,10 +588,24 @@ def build_embedded_system_prompt(
         tool_summaries=tool_summaries,
         context_files=context_files,
         skills_prompt=skills_prompt_text,
+        heartbeat_prompt=heartbeat_prompt,
+        sandbox_info=sandbox_info,
+        exec_config=exec_config,
         user_timezone=user_timezone,
-        runtime_info=runtime_info,
-        prompt_mode=prompt_mode,
+        owner_numbers=owner_numbers,
         extra_system_prompt=extra_system_prompt,
+        workspace_notes=workspace_notes,
+        memory_citations_mode=memory_citations_mode,
+        model_alias_lines=model_alias_lines,
+        tts_hint=tts_hint,
+        reaction_guidance=reaction_guidance,
+        reasoning_level=reasoning_level,
+        reasoning_hint=reasoning_hint,
+        message_tool_hints=message_tool_hints,
+        message_channel_options=message_channel_options,
+        has_gateway=has_gateway,
+        prompt_mode=prompt_mode,
+        runtime_info=runtime_info,
     )
 
 

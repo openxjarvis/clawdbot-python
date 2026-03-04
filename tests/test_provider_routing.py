@@ -246,8 +246,9 @@ class TestModelsConfigEnvVarDiscovery:
                                   "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY")}
         with patch.dict(os.environ, clean_env, clear=True):
             implicit = _resolve_implicit_providers("/tmp/test", {})
-        # Should still have ollama (no auth required)
-        assert "ollama" in implicit
+        # Ollama is discovered async; _resolve_implicit_providers adds a
+        # _ollama_pending placeholder that is resolved in ensure_openclaw_models_json.
+        assert "ollama" in implicit or "_ollama_pending" in implicit
         # Should not have API-key-based providers
         for p in ("xai", "deepseek", "zai", "groq", "mistral"):
             assert p not in implicit

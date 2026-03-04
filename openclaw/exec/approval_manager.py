@@ -81,11 +81,20 @@ class ExecApprovalManager:
         )
         
         self.pending_approvals[approval_id] = request
-        
+
         logger.info(f"Approval requested: {approval_id} for command: {command}")
-        
-        # TODO: Broadcast exec.approval.requested event
-        
+
+        # Broadcast exec.approval.requested to all WebSocket clients
+        try:
+            from openclaw.gateway.events import broadcast as _broadcast
+            _broadcast("exec.approval.requested", {
+                "id": approval_id,
+                "command": command,
+                "context": context or {},
+            })
+        except Exception:
+            pass
+
         return approval_id
     
     def approve(
@@ -120,12 +129,21 @@ class ExecApprovalManager:
         del self.pending_approvals[approval_id]
         
         logger.info(f"Approval granted: {approval_id} by {approved_by}")
-        
+
         # Trigger callbacks
         self._trigger_callbacks(request, True)
-        
-        # TODO: Broadcast exec.approval.resolved event
-        
+
+        # Broadcast exec.approval.resolved
+        try:
+            from openclaw.gateway.events import broadcast as _broadcast
+            _broadcast("exec.approval.resolved", {
+                "id": approval_id,
+                "status": "approved",
+                "approvedBy": approved_by,
+            })
+        except Exception:
+            pass
+
         return True
     
     def reject(
@@ -160,12 +178,21 @@ class ExecApprovalManager:
         del self.pending_approvals[approval_id]
         
         logger.info(f"Approval rejected: {approval_id} by {rejected_by}")
-        
+
         # Trigger callbacks
         self._trigger_callbacks(request, False)
-        
-        # TODO: Broadcast exec.approval.resolved event
-        
+
+        # Broadcast exec.approval.resolved
+        try:
+            from openclaw.gateway.events import broadcast as _broadcast
+            _broadcast("exec.approval.resolved", {
+                "id": approval_id,
+                "status": "rejected",
+                "rejectedBy": rejected_by,
+            })
+        except Exception:
+            pass
+
         return True
     
     def list_pending(self) -> List[Dict[str, Any]]:

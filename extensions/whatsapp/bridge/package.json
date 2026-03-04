@@ -1,0 +1,27 @@
+{
+  "name": "openclaw-whatsapp-bridge",
+  "version": "1.0.0",
+  "description": "Baileys WebSocket bridge for openclaw-python WhatsApp channel",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "start": "node --loader ts-node/esm src/server.ts",
+    "dev": "tsx src/server.ts",
+    "build": "tsc",
+    "start:dist": "node dist/server.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.16",
+    "express": "^4.21.2",
+    "jimp": "^1.6.0",
+    "pino": "^9.6.0",
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.1",
+    "@types/node": "^22.15.3",
+    "@types/qrcode": "^1.5.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.8.3"
+  }
+}

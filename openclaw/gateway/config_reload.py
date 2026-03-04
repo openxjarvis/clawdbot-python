@@ -72,6 +72,7 @@ class ConfigReloader:
         self._observer = None
         self._debounce_task: Optional[asyncio.Task] = None
         self._last_mtime: float = 0.0
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -84,6 +85,7 @@ class ConfigReloader:
             return
 
         logger.info(f"Starting config reloader: path={self.config_path} mode={self.mode}")
+        self._loop = asyncio.get_running_loop()
         self._last_mtime = self._get_mtime()
         self._start_watchdog()
 
@@ -143,8 +145,8 @@ class ConfigReloader:
     def _schedule_debounced(self) -> None:
         """Schedule a debounced reload (called from watchdog thread)."""
         try:
-            loop = asyncio.get_event_loop()
-            loop.call_soon_threadsafe(self._enqueue_reload)
+            if self._loop is not None:
+                self._loop.call_soon_threadsafe(self._enqueue_reload)
         except RuntimeError:
             pass
 

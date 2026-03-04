@@ -69,24 +69,26 @@ def test_tool_message_name_preservation():
         session_file = session._session_file
         print(f"✅ 保存到: {session_file}")
         
-        # 读取文件内容
+        # 读取文件内容 (JSONL format)
         if session_file.exists():
             with open(session_file, 'r') as f:
-                data = json.load(f)
-                print(f"✅ 文件内容:")
-                print(f"  - messages count: {len(data.get('messages', []))}")
-                if data.get('messages'):
-                    last_msg = data['messages'][-1]
-                    print(f"  - 最后一条消息:")
-                    print(f"    - role: {last_msg.get('role')}")
-                    print(f"    - name: {last_msg.get('name')}")
-                    print(f"    - tool_call_id: {last_msg.get('tool_call_id')}")
-                    
-                    if last_msg.get('name') == 'bash':
-                        print("✅ PASS: name 字段正确保存到磁盘")
-                    else:
-                        print(f"❌ FAIL: name 字段在磁盘上丢失，expected 'bash', got '{last_msg.get('name')}'")
-                        assert False, f"Name field lost on disk, expected 'bash', got '{last_msg.get('name')}'"
+                lines = [l.strip() for l in f if l.strip()]
+            messages = [json.loads(l).get('message') for l in lines if json.loads(l).get('type') == 'message']
+            print(f"✅ 文件内容:")
+            print(f"  - messages count: {len(messages)}")
+            if messages:
+                last_msg = messages[-1]
+                print(f"  - 最后一条消息:")
+                print(f"    - role: {last_msg.get('role') if last_msg else None}")
+                print(f"    - name: {last_msg.get('name') if last_msg else None}")
+                print(f"    - tool_call_id: {last_msg.get('tool_call_id') if last_msg else None}")
+                
+                if last_msg and last_msg.get('name') == 'bash':
+                    print("✅ PASS: name 字段正确保存到磁盘")
+                else:
+                    actual = last_msg.get('name') if last_msg else None
+                    print(f"❌ FAIL: name 字段在磁盘上丢失，expected 'bash', got '{actual}'")
+                    assert False, f"Name field lost on disk, expected 'bash', got '{actual}'"
         else:
             print(f"❌ FAIL: 会话文件不存在")
             assert False, "Session file does not exist"

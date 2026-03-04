@@ -4,13 +4,21 @@ Aligned with TypeScript openclaw/src/agents/models-config.ts.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 logger = logging.getLogger(__name__)
+
+_OLLAMA_SHOW_CONCURRENCY = 8
+_OLLAMA_SHOW_MAX_MODELS = 200
+_OLLAMA_DEFAULT_CONTEXT_WINDOW = 128000
+_OLLAMA_DEFAULT_MAX_TOKENS = 8192
 
 _DEFAULT_MODE = "merge"
 
@@ -74,6 +82,120 @@ def merge_providers(
 # Implicit provider discovery (Python equivalent of models-config.providers.ts)
 # ---------------------------------------------------------------------------
 
+def _resolve_ollama_api_base(configured_base_url: str | None) -> str:
+    """Derive the native Ollama API base URL by stripping /v1 if present.
+
+    Mirrors resolveOllamaApiBase() in models-config.providers.ts.
+    """
+    base = configured_base_url or "http://localhost:11434"
+    base = base.rstrip("/")
+    if base.lower().endswith("/v1"):
+        base = base[:-3]
+    return base
+
+
+async def _query_ollama_context_window(
+    api_base: str,
+    model_name: str,
+    client: httpx.AsyncClient,
+) -> int | None:
+    """Query /api/show for a model's context window size.
+
+    Mirrors queryOllamaContextWindow() in models-config.providers.ts.
+    """
+    try:
+        resp = await client.post(
+            f"{api_base}/api/show",
+            json={"name": model_name},
+            timeout=3.0,
+        )
+        if not resp.is_success:
+            return None
+        data: dict[str, Any] = resp.json()
+        model_info: dict[str, Any] = data.get("model_info") or {}
+        for key, value in model_info.items():
+            if key.endswith(".context_length") and isinstance(value, (int, float)):
+                ctx = int(value)
+                if ctx > 0:
+                    return ctx
+        return None
+    except Exception:
+        return None
+
+
+async def _discover_ollama_models(
+    base_url: str | None = None,
+    quiet: bool = False,
+) -> list[dict[str, Any]]:
+    """Discover locally installed Ollama models via /api/tags + /api/show.
+
+    Mirrors discoverOllamaModels() in models-config.providers.ts:
+      - GET /api/tags to list installed models (5s timeout)
+      - POST /api/show for up to OLLAMA_SHOW_MAX_MODELS models,
+        8 at a time concurrently, to discover context window size
+      - Sets reasoning=True for models whose name contains 'r1' or 'reasoning'
+
+    Returns list of model dicts suitable for the models.json format.
+    """
+    api_base = _resolve_ollama_api_base(base_url)
+    discovered: list[dict[str, Any]] = []
+
+    async with httpx.AsyncClient() as client:
+        # GET /api/tags
+        try:
+            resp = await client.get(f"{api_base}/api/tags", timeout=5.0)
+            if not resp.is_success:
+                if not quiet:
+                    logger.warning("Failed to discover Ollama models: HTTP %s", resp.status_code)
+                return []
+            data: dict[str, Any] = resp.json()
+        except Exception as exc:
+            if not quiet:
+                logger.warning("Failed to discover Ollama models: %s", exc)
+            return []
+
+        raw_models: list[dict[str, Any]] = data.get("models") or []
+        if not raw_models:
+            logger.debug("No Ollama models found on local instance")
+            return []
+
+        models_to_inspect = raw_models[:_OLLAMA_SHOW_MAX_MODELS]
+        if len(models_to_inspect) < len(raw_models) and not quiet:
+            logger.warning(
+                "Capping Ollama /api/show inspection to %d models (received %d)",
+                _OLLAMA_SHOW_MAX_MODELS,
+                len(raw_models),
+            )
+
+        # Batch POST /api/show — OLLAMA_SHOW_CONCURRENCY at a time
+        for i in range(0, len(models_to_inspect), _OLLAMA_SHOW_CONCURRENCY):
+            batch = models_to_inspect[i : i + _OLLAMA_SHOW_CONCURRENCY]
+
+            async def _show_one(model_info: dict[str, Any]) -> dict[str, Any]:
+                model_id: str = model_info.get("name") or ""
+                if not model_id:
+                    return {}
+                ctx_window = await _query_ollama_context_window(api_base, model_id, client)
+                is_reasoning = (
+                    "r1" in model_id.lower() or "reasoning" in model_id.lower()
+                )
+                return {
+                    "id": model_id,
+                    "name": model_id,
+                    "reasoning": is_reasoning,
+                    "input": ["text"],
+                    "contextWindow": ctx_window if ctx_window else _OLLAMA_DEFAULT_CONTEXT_WINDOW,
+                    "maxTokens": _OLLAMA_DEFAULT_MAX_TOKENS,
+                }
+
+            batch_results = await asyncio.gather(*[_show_one(m) for m in batch])
+            for entry in batch_results:
+                if entry.get("id"):
+                    discovered.append(entry)
+
+    return discovered
+
+
 def _resolve_implicit_providers(
     agent_dir: str,
     explicit_providers: dict[str, Any],
@@ -126,12 +248,15 @@ def _resolve_implicit_providers(
                 ],
             }
 
-    # Ollama (no auth required, local endpoint)
+    # Ollama placeholder — baseUrl only; models are discovered async in
+    # ensure_openclaw_models_json() and the entry is REMOVED if nothing is found.
+    # Mirrors TS: only include ollama when models found OR OLLAMA_API_KEY set.
     if not explicit_providers.get("ollama"):
         ollama_base = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
-        implicit["ollama"] = {
-            "baseUrl": ollama_base,
-            "models": [],  # Populated at runtime by Ollama client
+        implicit["_ollama_pending"] = {
+            "baseUrl": _resolve_ollama_api_base(ollama_base),
+            "api": "ollama",
+            "models": [],
         }
 
     # ── OpenAI-compatible providers — mirrors TS register-builtins.ts ──
@@ -309,6 +434,67 @@ def _normalize_providers(
 # Main entry point — mirrors TS ensureOpenClawModelsJson
 # ---------------------------------------------------------------------------
 
+def _merge_with_existing_provider_secrets(
+    next_providers: dict[str, Any],
+    existing_providers: dict[str, Any],
+) -> dict[str, Any]:
+    """Merge new provider configs with existing, preserving apiKey/baseUrl from existing.
+
+    Mirrors TS mergeWithExistingProviderSecrets() — when regenerating models.json in
+    'merge' mode, user-set API keys and baseUrls stored in the file are not overwritten.
+    """
+    merged: dict[str, Any] = {}
+    # Start with all existing providers
+    for key, entry in existing_providers.items():
+        merged[key] = entry
+    # For each new provider, merge preserving secrets from existing
+    for key, new_entry in next_providers.items():
+        existing = existing_providers.get(key)
+        if existing is None:
+            merged[key] = new_entry
+            continue
+        preserved: dict[str, Any] = {}
+        if isinstance(existing.get("apiKey"), str) and existing["apiKey"]:
+            preserved["apiKey"] = existing["apiKey"]
+        if isinstance(existing.get("baseUrl"), str) and existing["baseUrl"]:
+            preserved["baseUrl"] = existing["baseUrl"]
+        merged[key] = {**new_entry, **preserved}
+    return merged
+
+
+async def _resolve_providers_for_mode(
+    mode: str,
+    target_path: Path,
+    providers: dict[str, Any],
+) -> dict[str, Any]:
+    """Apply 'merge' mode logic — preserve secrets from existing models.json.
+
+    Mirrors TS resolveProvidersForMode().
+    """
+    if mode != "merge":
+        return providers
+    try:
+        with open(target_path, encoding="utf-8") as fh:
+            existing = json.load(fh)
+        if not isinstance(existing, dict) or not isinstance(existing.get("providers"), dict):
+            return providers
+        existing_providers: dict[str, Any] = existing["providers"]
+        return _merge_with_existing_provider_secrets(
+            next_providers=providers,
+            existing_providers=existing_providers,
+        )
+    except Exception:
+        return providers
+
+
+async def _read_raw_file(path: Path) -> str:
+    """Read a file as raw text, returning '' on any error. Mirrors TS readRawFile()."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except Exception:
+        return ""
+
+
 async def ensure_openclaw_models_json(
     config: Any = None,
     agent_dir_override: str | None = None,
@@ -340,6 +526,61 @@ async def ensure_openclaw_models_json(
         explicit_providers = models_section.get("providers") or {}
 
     implicit_providers = _resolve_implicit_providers(agent_dir, explicit_providers)
+
+    # ── Ollama model discovery (async) — mirrors TS discoverOllamaModels gate ─
+    # TS only adds ollama provider when: models found OR OLLAMA_API_KEY set OR
+    # explicit config has apiKey. This prevents an empty entry from cluttering the
+    # catalog when Ollama is not running.
+    ollama_api_key = os.environ.get("OLLAMA_API_KEY", "").strip()
+    explicit_ollama = explicit_providers.get("ollama") or {}
+    explicit_ollama_api_key = explicit_ollama.get("apiKey", "")
+    has_explicit_ollama_models = (
+        isinstance(explicit_ollama.get("models"), list)
+        and len(explicit_ollama["models"]) > 0
+    )
+
+    # Remove the placeholder added above so we can decide whether to keep it
+    implicit_providers.pop("_ollama_pending", None)
+
+    ollama_base = (
+        _resolve_ollama_api_base(explicit_ollama.get("baseUrl"))
+        if explicit_ollama.get("baseUrl")
+        else _resolve_ollama_api_base(os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434"))
+    )
+
+    # Normalise the explicit_providers["ollama"] baseUrl right away so that
+    # merge_providers never overwrites the resolved URL with a raw /v1-suffixed one.
+    if explicit_providers.get("ollama") and isinstance(explicit_providers["ollama"], dict):
+        explicit_providers["ollama"] = {
+            **explicit_providers["ollama"],
+            "baseUrl": ollama_base,
+        }
+
+    if has_explicit_ollama_models:
+        # Explicit models configured — skip discovery; set api field.
+        implicit_providers["ollama"] = {
+            **explicit_ollama,
+            "baseUrl": ollama_base,
+            "api": explicit_ollama.get("api") or "ollama",
+        }
+        if ollama_api_key or explicit_ollama_api_key:
+            implicit_providers["ollama"]["apiKey"] = ollama_api_key or explicit_ollama_api_key
+    else:
+        # Auto-discovery (quiet=True when user has not explicitly configured Ollama)
+        quiet = not (ollama_api_key or explicit_ollama)
+        ollama_models = await _discover_ollama_models(ollama_base, quiet=quiet)
+
+        # Gate: only include if models found OR API key present OR explicit apiKey
+        if ollama_models or ollama_api_key or explicit_ollama_api_key:
+            implicit_providers["ollama"] = {
+                "baseUrl": ollama_base,
+                "api": "ollama",
+                "models": ollama_models,
+            }
+            api_key = ollama_api_key or explicit_ollama_api_key
+            if api_key:
+                implicit_providers["ollama"]["apiKey"] = api_key
+
     providers = merge_providers(implicit_providers, explicit_providers)
 
     # Bedrock: check for AWS credentials (simplified — TS does full SDK discovery)
@@ -359,28 +600,16 @@ async def ensure_openclaw_models_json(
         mode = models_section.get("mode") or _DEFAULT_MODE
 
     target_path = Path(agent_dir) / "models.json"
-    merged_providers = providers
-
-    if mode == "merge" and target_path.exists():
-        try:
-            with open(target_path, encoding="utf-8") as fh:
-                existing = json.load(fh)
-            if (
-                isinstance(existing, dict)
-                and isinstance(existing.get("providers"), dict)
-            ):
-                existing_providers: dict[str, Any] = existing["providers"]
-                merged_providers = {**existing_providers, **providers}
-        except Exception:
-            pass
+    merged_providers = await _resolve_providers_for_mode(
+        mode=mode,
+        target_path=target_path,
+        providers=providers,
+    )
 
     normalized = _normalize_providers(merged_providers, agent_dir)
     next_content = json.dumps({"providers": normalized}, indent=2) + "\n"
 
-    try:
-        existing_raw = target_path.read_text(encoding="utf-8")
-    except Exception:
-        existing_raw = ""
+    existing_raw = await _read_raw_file(target_path)
 
     if existing_raw == next_content:
         return {"agent_dir": agent_dir, "wrote": False}
@@ -631,6 +860,8 @@ __all__ = [
     "build_qianfan_provider",
     "build_synthetic_provider",
     "build_huggingface_provider",
+    "_discover_ollama_models",
+    "_resolve_ollama_api_base",
     "MINIMAX_BASE_URL",
     "QIANFAN_BASE_URL",
     "SYNTHETIC_BASE_URL",

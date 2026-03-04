@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import platform
-import subprocess
 from datetime import UTC, datetime
 from typing import Any
 
@@ -48,14 +47,18 @@ class iMessageChannel(ChannelPlugin):
         logger.info("Starting iMessage channel...")
 
         try:
-            result = subprocess.run(
-                ["osascript", "-e", 'tell application "Messages" to get name'],
-                capture_output=True,
-                text=True,
-                timeout=5,
+            proc = await asyncio.create_subprocess_exec(
+                "osascript", "-e", 'tell application "Messages" to get name',
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
+            try:
+                _stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=5)
+            except asyncio.TimeoutError:
+                proc.kill()
+                raise RuntimeError("Messages.app not responding")
 
-            if result.returncode != 0:
+            if proc.returncode != 0:
                 raise RuntimeError("Cannot access Messages.app")
 
             logger.info("Messages.app accessible")
@@ -65,8 +68,6 @@ class iMessageChannel(ChannelPlugin):
             await self._start_monitor()
             logger.info("iMessage channel started")
 
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("Messages.app not responding")
         except FileNotFoundError:
             raise RuntimeError("osascript not found (macOS required)")
         except Exception as e:
@@ -185,16 +186,23 @@ class iMessageChannel(ChannelPlugin):
             end tell
             """
 
-            result = subprocess.run(
-                ["osascript", "-e", script], capture_output=True, text=True, timeout=10
+            proc = await asyncio.create_subprocess_exec(
+                "osascript", "-e", script,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
+            try:
+                _stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+            except asyncio.TimeoutError:
+                proc.kill()
+                raise RuntimeError("osascript timed out sending iMessage")
 
-            if result.returncode == 0:
+            if proc.returncode == 0:
                 message_id = f"imsg-{int(datetime.now(UTC).timestamp() * 1000)}"
                 logger.info(f"Sent iMessage to {target}")
                 return message_id
             else:
-                error = result.stderr or "Unknown error"
+                error = (_stderr or b"").decode(errors="replace") or "Unknown error"
                 raise RuntimeError(f"Failed to send message: {error}")
 
         except Exception as e:

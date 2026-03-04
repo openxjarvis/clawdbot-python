@@ -30,6 +30,7 @@ import json
 import logging
 import secrets
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -62,6 +63,9 @@ from ..config import ClawdbotConfig
 from ..events import Event
 from .channel_manager import ChannelManager, discover_channel_plugins
 from .handlers import get_method_handler
+from .node_registry import NodeRegistry
+from .node_subscriptions import NodeSubscriptionManager
+from .node_events import NodeEventHandler
 from .protocol import ErrorShape, EventFrame, RequestFrame, ResponseFrame
 from .protocol.frames import ConnectRequest, HelloResponse
 
@@ -90,6 +94,10 @@ class GatewayConnection:
         self.auth_context = AuthContext(role="operator", scopes=set())
         self.nonce: Optional[str] = None
         self.connect_challenge_sent = False
+        # Per-connection UUID — used to track node registrations
+        self.conn_id: str = str(uuid.uuid4())
+        # Set to the node_id when this connection is a node (role="node")
+        self.node_id: str | None = None
 
     async def send_response(
         self, request_id: str | int, payload: Any = None, error: ErrorShape | None = None
@@ -362,6 +370,45 @@ class GatewayConnection:
                 device_id=device_identity.id if device_identity else None
             )
 
+            # Register node connection in NodeRegistry when role == "node"
+            if role == "node" and self.gateway is not None:
+                client_dict = connect_req.client or {}
+                if isinstance(client_dict, dict):
+                    node_id = (
+                        client_dict.get("instanceId")
+                        or client_dict.get("id")
+                        or (device_identity.id if device_identity else None)
+                        or self.conn_id
+                    )
+                else:
+                    node_id = getattr(client_dict, "instanceId", None) or getattr(client_dict, "id", None) or self.conn_id
+
+                device_id = (device_identity.id if device_identity else None) or node_id
+                capabilities = list(connect_req.caps or [])
+                commands = list(connect_req.commands or [])
+                platform = client_dict.get("platform") if isinstance(client_dict, dict) else None
+                display_name = client_dict.get("displayName") if isinstance(client_dict, dict) else None
+
+                self.node_id = node_id
+                self.gateway.node_registry.register_node(
+                    node_id=node_id,
+                    conn_id=self.conn_id,
+                    device_id=device_id,
+                    capabilities=capabilities,
+                    metadata={
+                        "displayName": display_name,
+                        "platform": platform,
+                        "commands": commands,
+                        "pathEnv": connect_req.pathEnv if hasattr(connect_req, "pathEnv") else None,
+                        "remoteIp": self.remote_addr.split(":")[0] if self.remote_addr else None,
+                    },
+                    send_event=self.send_event,
+                )
+                logger.info(
+                    f"Node registered: id={node_id!r} device={device_id!r} "
+                    f"caps={capabilities} conn={self.conn_id!r}"
+                )
+
             # Send hello response
             hello = HelloResponse(
                 protocol=negotiated_protocol,
@@ -377,8 +424,8 @@ class GatewayConnection:
                     "channels": True,
                     "tools": True,
                     "cron": True,
-                    "nodes": False,  # Not yet implemented
-                    "devices": False,  # Not yet implemented
+                    "nodes": True,
+                    "devices": True,
                 },
                 snapshot={
                     "sessions": [],
@@ -483,6 +530,25 @@ class GatewayServer:
             system_prompt=self.system_prompt,
         )
 
+        # Create NodeRegistry + supporting managers (mirrors TS gateway/node-registry.ts)
+        self.node_registry = NodeRegistry()
+        self.node_subscription_manager = NodeSubscriptionManager(
+            get_node_send_fn=lambda node_id: (
+                self.node_registry.get_node(node_id)._send_event
+                if self.node_registry.get_node(node_id) is not None
+                else None
+            )
+        )
+        self.node_event_handler = NodeEventHandler(
+            node_registry=self.node_registry,
+            subscription_manager=self.node_subscription_manager,
+            session_manager=session_manager,
+            agent_runtime=agent_runtime,
+        )
+        # Wire subscription manager into registry for cleanup on disconnect
+        self.node_registry.set_subscription_manager(self.node_subscription_manager)
+        self.node_registry.set_event_handler(self.node_event_handler)
+
         # Register global handler instances so gateway handlers can access runtime
         from openclaw.gateway.handlers import set_global_instances
         from openclaw.agents.tools.registry import ToolRegistry
@@ -497,6 +563,8 @@ class GatewayServer:
             tool_registry=tool_registry,
             channel_registry=self.channel_manager,
             agent_runtime=agent_runtime,
+            node_registry=self.node_registry,
+            node_event_handler=self.node_event_handler,
         )
 
         # Register as observer if agent_runtime provided
@@ -577,7 +645,17 @@ class GatewayServer:
 
         try:
             logger.info(f"New WebSocket connection from {remote_addr}")
-            
+
+            # Broadcast presence: new peer joined
+            try:
+                await self.broadcast_event("presence", {
+                    "event": "join",
+                    "connections": len(self.connections),
+                    "ts": int(time.time() * 1000),
+                })
+            except Exception:
+                pass
+
             # Send connect challenge immediately
             connection.nonce = secrets.token_urlsafe(32)
             connection.connect_challenge_sent = True
@@ -598,7 +676,20 @@ class GatewayServer:
             logger.error(f"Connection error: {e}", exc_info=True)
         finally:
             self.connections.discard(connection)
+            # Unregister node on disconnect
+            if connection.node_id is not None:
+                self.node_registry.unregister_node(connection.node_id)
+                logger.info(f"Node unregistered on disconnect: id={connection.node_id!r}")
             logger.info(f"Connection closed: {remote_addr}")
+            # Broadcast presence: peer left
+            try:
+                await self.broadcast_event("presence", {
+                    "event": "leave",
+                    "connections": len(self.connections),
+                    "ts": int(time.time() * 1000),
+                })
+            except Exception:
+                pass
         
         return ws
 
@@ -1002,6 +1093,24 @@ class GatewayServer:
             app.router.add_get('/ws', self.handle_websocket)
         
         logger.info(f"Routes registered: WebSocket on / and /ws, Control UI: {ui_enabled}")
+
+        # Start periodic tick broadcaster (mirrors TS gateway tick heartbeat)
+        TICK_INTERVAL_S = 5.0
+        async def _tick_loop() -> None:
+            while self.running:
+                try:
+                    await asyncio.sleep(TICK_INTERVAL_S)
+                    if not self.running:
+                        break
+                    ts = int(time.time() * 1000)
+                    await self.broadcast_event("tick", {"ts": ts})
+                except asyncio.CancelledError:
+                    break
+                except Exception as exc:
+                    logger.debug("tick broadcast error: %s", exc)
+
+        self._tick_task = asyncio.create_task(_tick_loop())
+        logger.debug("Tick broadcaster started (interval=%.1fs)", TICK_INTERVAL_S)
 
         # Start all enabled channels
         if start_channels:

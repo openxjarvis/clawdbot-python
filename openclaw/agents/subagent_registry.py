@@ -28,6 +28,11 @@ MAX_ANNOUNCE_RETRY_DELAY_MS = 8_000
 MAX_ANNOUNCE_RETRY_COUNT = 3
 ANNOUNCE_EXPIRY_MS = 5 * 60_000  # 5 min
 
+SUBAGENT_ENDED_REASON_COMPLETE = "complete"
+SUBAGENT_ENDED_REASON_ERROR = "error"
+SUBAGENT_ENDED_REASON_TIMEOUT = "timeout"
+SUBAGENT_ENDED_REASON_KILLED = "killed"
+
 
 @dataclass
 class SubagentRunRecord:
@@ -50,10 +55,12 @@ class SubagentRunRecord:
     archive_at_ms: int | None = None
     cleanup_completed_at: int | None = None
     cleanup_handled: bool = False
-    suppress_announce_reason: str | None = None  # NEW: "steer-restart" or "killed"
-    expects_completion_message: bool = False  # NEW: Whether to announce on completion
-    announce_retry_count: int = 0  # NEW: Number of announce retry attempts
-    last_announce_retry_at: int | None = None  # NEW: Timestamp of last retry
+    suppress_announce_reason: str | None = None  # "steer-restart" or "killed"
+    expects_completion_message: bool = False  # Whether to announce on completion
+    announce_retry_count: int = 0  # Number of announce retry attempts
+    last_announce_retry_at: int | None = None  # Timestamp of last retry
+    ended_reason: str | None = None  # TS: endedReason typed field
+    spawn_mode: str = "run"  # TS: spawnMode on run record ("run" | "session")
     
     def to_dict(self) -> dict[str, Any]:
         """Convert to dict for serialization"""
@@ -71,7 +78,7 @@ class SubagentRegistry:
     - Persistence across Gateway restarts
     """
     
-    def __init__(self, config: dict[str, Any] | None = None):
+    def __init__(self, config: dict[str, Any] | None = None, hook_runner: Any | None = None):
         self._runs: dict[str, SubagentRunRecord] = {}
         self._resumed_runs: set[str] = set()
         self._restore_attempted = False
@@ -81,6 +88,12 @@ class SubagentRegistry:
         self._lifecycle_listener_installed = False
         # Pending lifecycle errors with grace period (mirrors TS schedulePendingLifecycleError)
         self._pending_lifecycle_errors: dict[str, asyncio.TimerHandle | asyncio.Task] = {}
+        # Optional hook runner for subagent lifecycle hooks
+        self._hook_runner: Any | None = hook_runner
+
+    def set_hook_runner(self, hook_runner: Any) -> None:
+        """Wire in a PluginHookRunner to fire subagent lifecycle hooks."""
+        self._hook_runner = hook_runner
     
     def _resolve_archive_after_ms(self) -> int | None:
         """
@@ -115,10 +128,11 @@ class SubagentRegistry:
         model: str | None = None,
         run_timeout_seconds: int | None = None,
         expects_completion_message: bool = False,
+        spawn_mode: str = "run",
     ) -> SubagentRunRecord:
         """
-        Register a new subagent run
-        
+        Register a new subagent run.
+
         Args:
             child_session_key: Session key of child agent
             requester_session_key: Session key of requester
@@ -127,17 +141,23 @@ class SubagentRegistry:
             requester_display_key: Display key for requester
             cleanup: "delete" or "keep" session after completion
             label: Optional label
-            
+            spawn_mode: Spawn mode ("run" | "session")
+
         Returns:
             Created SubagentRunRecord
         """
         run_id = str(uuid.uuid4())
         now_ms = int(time.time() * 1000)
-        
-        # Calculate archive time (aligned with TS)
+
+        # Calculate archive time (aligned with TS); session mode runs never archive
         archive_after_ms = self._resolve_archive_after_ms()
-        archive_at_ms = (now_ms + archive_after_ms) if archive_after_ms else None
-        
+        spawn_mode = "session" if spawn_mode == "session" else "run"
+        archive_at_ms = (
+            None
+            if spawn_mode == "session"
+            else (now_ms + archive_after_ms) if archive_after_ms else None
+        )
+
         record = SubagentRunRecord(
             run_id=run_id,
             child_session_key=child_session_key,
@@ -150,6 +170,7 @@ class SubagentRegistry:
             model=model,
             run_timeout_seconds=run_timeout_seconds,
             expects_completion_message=expects_completion_message,
+            spawn_mode=spawn_mode,
             created_at=now_ms,
             started_at=now_ms,
             archive_at_ms=archive_at_ms,
@@ -315,38 +336,92 @@ class SubagentRegistry:
     def mark_subagent_ended(
         self,
         run_id: str,
-        outcome: dict[str, Any] | None = None
+        outcome: dict[str, Any] | None = None,
+        ended_reason: str | None = None,
     ):
         """
-        Mark subagent as ended
-        
+        Mark subagent as ended.
+
         Args:
             run_id: Run ID
             outcome: Outcome information
+            ended_reason: Typed ended reason (complete/error/timeout/killed)
         """
         entry = self._runs.get(run_id)
         if not entry:
             return
-        
-        entry.ended_at = int(time.time() * 1000)
+
+        now_ms = int(time.time() * 1000)
+        entry.ended_at = now_ms
         entry.outcome = outcome
+        if ended_reason:
+            entry.ended_reason = ended_reason
+        elif outcome:
+            # Infer from outcome dict
+            status = outcome.get("status")
+            if status == "ok":
+                entry.ended_reason = SUBAGENT_ENDED_REASON_COMPLETE
+            elif status == "error":
+                entry.ended_reason = SUBAGENT_ENDED_REASON_ERROR
+            elif status == "timeout":
+                entry.ended_reason = SUBAGENT_ENDED_REASON_TIMEOUT
         self._persist()
-        
+
         # Notify waiters
         if run_id in self._event_listeners:
             for event in self._event_listeners[run_id]:
                 event.set()
             del self._event_listeners[run_id]
-        
-        logger.info(f"Subagent run {run_id} ended")
+
+        logger.info("Subagent run %s ended (reason=%s)", run_id, entry.ended_reason)
+
+        # Fire subagent_ended hook (void, parallel) — mirrors TS subagent_ended hook
+        if self._hook_runner is not None and self._hook_runner.has_hooks("subagent_ended"):
+            _hook_runner = self._hook_runner
+            _entry = entry
+            _outcome = outcome
+
+            async def _fire_subagent_ended() -> None:
+                try:
+                    success = (_outcome or {}).get("status") not in ("error", "timeout")
+                    error_msg = (_outcome or {}).get("error") if not success else None
+                    duration_ms = (
+                        (_entry.ended_at - _entry.started_at)
+                        if _entry.ended_at and _entry.started_at
+                        else None
+                    )
+                    await _hook_runner.run_subagent_ended(
+                        {
+                            "session_key": _entry.child_session_key,
+                            "agent_id": None,
+                            "label": _entry.label,
+                            "success": bool(success),
+                            "error": error_msg,
+                            "duration_ms": duration_ms,
+                        },
+                        {
+                            "session_key": _entry.child_session_key,
+                            "parent_session_key": _entry.requester_session_key,
+                        },
+                    )
+                except Exception as hook_exc:
+                    logger.warning("subagent_ended hook error: %s", hook_exc)
+
+            try:
+                asyncio.get_running_loop().create_task(_fire_subagent_ended())
+            except RuntimeError:
+                # No running event loop — skip hook (happens in sync test contexts)
+                pass
     
     def mark_cleanup_completed(self, run_id: str):
-        """Mark cleanup as completed"""
+        """Mark cleanup as completed and retry any deferred sibling announces."""
         entry = self._runs.get(run_id)
         if entry:
             entry.cleanup_completed_at = int(time.time() * 1000)
             entry.cleanup_handled = True
             self._persist()
+            # Unblock deferred sibling announces (mirrors TS retryDeferredCompletedAnnounces)
+            self._retry_deferred_completed_announces(exclude_run_id=run_id)
     
     async def _trigger_announce_and_cleanup(self, entry: SubagentRunRecord):
         """
@@ -440,23 +515,91 @@ class SubagentRegistry:
         except Exception as e:
             logger.error(f"Failed to persist subagent registry: {e}")
     
+    def _reconcile_orphaned_run(
+        self,
+        run_id: str,
+        entry: SubagentRunRecord,
+        reason: str,
+        source: str = "restore",
+    ) -> bool:
+        """Mark a run as orphaned and remove it from the registry.
+
+        Mirrors TS reconcileOrphanedRun().
+        """
+        now_ms = int(time.time() * 1000)
+        changed = False
+        if entry.ended_at is None:
+            entry.ended_at = now_ms
+            changed = True
+        orphan_outcome: dict[str, Any] = {
+            "status": "error",
+            "error": f"orphaned subagent run ({reason})",
+        }
+        if entry.outcome != orphan_outcome:
+            entry.outcome = orphan_outcome
+            changed = True
+        if entry.ended_reason != SUBAGENT_ENDED_REASON_ERROR:
+            entry.ended_reason = SUBAGENT_ENDED_REASON_ERROR
+            changed = True
+        if not entry.cleanup_handled:
+            entry.cleanup_handled = True
+            changed = True
+        if entry.cleanup_completed_at is None:
+            entry.cleanup_completed_at = now_ms
+            changed = True
+        removed = self._runs.pop(run_id, None) is not None
+        self._resumed_runs.discard(run_id)
+        if removed or changed:
+            logger.warning(
+                "Subagent orphan run pruned source=%s run=%s child=%s reason=%s",
+                source,
+                run_id,
+                entry.child_session_key,
+                reason,
+            )
+            return True
+        return False
+
+    def _reconcile_orphaned_restored_runs(self) -> bool:
+        """Reconcile all restored runs that no longer have a matching session.
+
+        Mirrors TS reconcileOrphanedRestoredRuns(). Only runs that already
+        ended (ended_at set) and have no live session are pruned — active
+        runs are left untouched so normal lifecycle handling can proceed.
+        """
+        changed = False
+        for run_id, entry in list(self._runs.items()):
+            # Only prune runs that ended; active runs are handled by resume
+            if entry.ended_at is None:
+                continue
+            if entry.cleanup_completed_at is not None:
+                continue
+            child_key = (entry.child_session_key or "").strip()
+            if not child_key:
+                if self._reconcile_orphaned_run(run_id, entry, "missing-session-entry", "restore"):
+                    changed = True
+        return changed
+
     def restore_once(self):
         """Restore registry from disk (once)"""
         if self._restore_attempted:
             return
-        
+
         self._restore_attempted = True
-        
+
         try:
             restored = load_subagent_registry_from_disk()
             if restored:
                 self._runs = restored
-                logger.info(f"Restored {len(restored)} subagent runs from disk")
-                
+                logger.info("Restored %d subagent runs from disk", len(restored))
+
+                # Reconcile orphaned runs before resuming
+                self._reconcile_orphaned_restored_runs()
+
                 # Resume incomplete runs
                 self._resume_incomplete_runs()
         except Exception as e:
-            logger.error(f"Failed to restore subagent registry: {e}")
+            logger.error("Failed to restore subagent registry: %s", e)
     
     def _resume_incomplete_runs(self):
         """Resume incomplete runs after restart"""
@@ -670,6 +813,137 @@ class SubagentRegistry:
         task = asyncio.create_task(self._sweep_loop(), name="subagent-registry-sweeper")
         logger.debug("Subagent registry sweeper started")
         return task
+
+    # ------------------------------------------------------------------
+    # Recursive descendant tracking (BFS) — mirrors TS registry-queries
+    # ------------------------------------------------------------------
+
+    def _for_each_descendant_run(
+        self,
+        root_session_key: str,
+        visitor: Any,
+    ) -> bool:
+        """BFS over all descendant runs starting from root_session_key."""
+        root = root_session_key.strip()
+        if not root:
+            return False
+        pending = [root]
+        visited: set[str] = {root}
+        idx = 0
+        while idx < len(pending):
+            requester = pending[idx]
+            idx += 1
+            for run_id, entry in self._runs.items():
+                if entry.requester_session_key != requester:
+                    continue
+                visitor(run_id, entry)
+                child_key = entry.child_session_key.strip()
+                if child_key and child_key not in visited:
+                    visited.add(child_key)
+                    pending.append(child_key)
+        return True
+
+    def count_active_descendant_runs(self, root_session_key: str) -> int:
+        """Count active (not ended) descendant runs recursively via BFS.
+
+        Mirrors TS countActiveDescendantRunsFromRuns().
+        """
+        count = 0
+
+        def _visit(_run_id: str, entry: SubagentRunRecord) -> None:
+            nonlocal count
+            if entry.ended_at is None:
+                count += 1
+
+        if not self._for_each_descendant_run(root_session_key, _visit):
+            return 0
+        return count
+
+    def list_descendant_runs(self, root_session_key: str) -> list[SubagentRunRecord]:
+        """List all descendant runs recursively via BFS.
+
+        Mirrors TS listDescendantRunsForRequesterFromRuns().
+        """
+        descendants: list[SubagentRunRecord] = []
+
+        def _visit(_run_id: str, entry: SubagentRunRecord) -> None:
+            descendants.append(entry)
+
+        if not self._for_each_descendant_run(root_session_key, _visit):
+            return []
+        return descendants
+
+    # ------------------------------------------------------------------
+    # clearSubagentRunSteerRestart — mirrors TS clearSubagentRunSteerRestart()
+    # ------------------------------------------------------------------
+
+    def clear_subagent_run_steer_restart(self, run_id: str) -> bool:
+        """Clear the steer-restart suppression flag on a run.
+
+        If the run already ended while suppressed, resumes cleanup so
+        completion output is not lost.
+        Mirrors TS clearSubagentRunSteerRestart().
+        """
+        key = run_id.strip()
+        if not key:
+            return False
+        entry = self._runs.get(key)
+        if not entry:
+            return False
+        if entry.suppress_announce_reason != "steer-restart":
+            return True
+        entry.suppress_announce_reason = None
+        self._persist()
+        # Resume if run already ended while suppression was active
+        self._resumed_runs.discard(key)
+        if entry.ended_at is not None and not entry.cleanup_completed_at:
+            asyncio.create_task(self._trigger_announce_and_cleanup(entry))
+        return True
+
+    # ------------------------------------------------------------------
+    # retryDeferredCompletedAnnounces — mirrors TS retryDeferredCompletedAnnounces()
+    # ------------------------------------------------------------------
+
+    _ANNOUNCE_EXPIRY_MS: int = 30 * 60 * 1000  # 30 minutes
+
+    def _retry_deferred_completed_announces(self, exclude_run_id: str | None = None) -> None:
+        """Retry announces for runs that ended but haven't been cleaned up yet.
+
+        Called after cleanup completes for a run, to unblock any deferred
+        sibling announces.  Mirrors TS retryDeferredCompletedAnnounces().
+        """
+        now_ms = int(time.time() * 1000)
+        for run_id, entry in list(self._runs.items()):
+            if exclude_run_id and run_id == exclude_run_id:
+                continue
+            if entry.ended_at is None:
+                continue
+            if entry.cleanup_completed_at or entry.cleanup_handled:
+                continue
+            if entry.suppress_announce_reason == "steer-restart":
+                continue
+            # Expire stale non-completion announces
+            ended_ago = now_ms - (entry.ended_at or now_ms)
+            if not entry.expects_completion_message and ended_ago > self._ANNOUNCE_EXPIRY_MS:
+                logger.debug("Subagent announce expiry give-up: run=%s", run_id)
+                entry.cleanup_completed_at = now_ms
+                self._persist()
+                continue
+            self._resumed_runs.discard(run_id)
+            asyncio.create_task(self._trigger_announce_and_cleanup(entry))
+
+    # ------------------------------------------------------------------
+    # releaseSubagentRun — mirrors TS releaseSubagentRun()
+    # ------------------------------------------------------------------
+
+    def release_subagent_run(self, run_id: str) -> None:
+        """Remove a run from the registry and persist.
+
+        Mirrors TS releaseSubagentRun().
+        """
+        if self._runs.pop(run_id, None) is not None:
+            self._persist()
+            logger.debug("Released subagent run %s", run_id)
 
 
 # Global registry instance

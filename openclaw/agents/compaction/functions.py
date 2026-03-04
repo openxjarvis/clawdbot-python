@@ -28,12 +28,35 @@ BASE_CHUNK_RATIO = 0.4
 MIN_CHUNK_RATIO = 0.15
 SAFETY_MARGIN = 1.2  # 20% buffer for estimate_tokens inaccuracy
 
+# Token estimation: 4 chars per token (matches TS CHARS_PER_TOKEN_ESTIMATE=4)
+CHARS_PER_TOKEN_ESTIMATE = 4
+
+# Overhead reserved for compaction system prompts / preamble
+SUMMARIZATION_OVERHEAD_TOKENS = 4096
+
+# Identifier preservation instruction — injected into every summarization prompt
+# mirrors TS IDENTIFIER_PRESERVATION_INSTRUCTIONS from compaction.ts
+IDENTIFIER_PRESERVATION_INSTRUCTIONS = (
+    "Preserve all opaque identifiers exactly as written (no shortening or reconstruction), "
+    "including UUIDs, hashes, IDs, tokens, API keys, hostnames, IPs, ports, URLs, and file names."
+)
+
 _DEFAULT_SUMMARY_FALLBACK = "No prior history."
 _DEFAULT_PARTS = 2
-_MERGE_SUMMARIES_INSTRUCTIONS = (
-    "Merge these partial summaries into a single cohesive summary. Preserve decisions,"
-    " TODOs, open questions, and any constraints."
-)
+_MERGE_SUMMARIES_INSTRUCTIONS = "\n".join([
+    "Merge these partial summaries into a single cohesive summary.",
+    "",
+    "MUST PRESERVE:",
+    "- Active tasks and their current status (in-progress, blocked, pending)",
+    "- Batch operation progress (e.g., '5/17 items completed')",
+    "- The last thing the user requested and what was being done about it",
+    "- Decisions made and their rationale",
+    "- TODOs, open questions, and constraints",
+    "- Any commitments or follow-ups promised",
+    "",
+    "PRIORITIZE recent context over older history. The agent needs to know",
+    "what it was doing, not just what was discussed.",
+])
 
 
 # ---------------------------------------------------------------------------
@@ -41,17 +64,20 @@ _MERGE_SUMMARIES_INSTRUCTIONS = (
 # ---------------------------------------------------------------------------
 
 def _estimate_single_message_tokens(msg: dict[str, Any]) -> int:
-    """Estimate tokens for a single message using char-count heuristic."""
+    """Estimate tokens for a single message using char-count heuristic.
+
+    Uses CHARS_PER_TOKEN_ESTIMATE=4 to match TS exactly.
+    """
     # 4 token overhead per message (matches pi-mono)
     total = 4
     content = msg.get("content", "")
     if isinstance(content, str):
-        total += max(1, int(len(content) / 3.5 * 1.1))
+        total += max(1, len(content) // CHARS_PER_TOKEN_ESTIMATE)
     elif isinstance(content, list):
         for block in content:
             if isinstance(block, dict):
                 text = block.get("text") or block.get("content") or ""
-                total += max(0, int(len(str(text)) / 3.5 * 1.1))
+                total += max(0, len(str(text)) // CHARS_PER_TOKEN_ESTIMATE)
     return total
 
 
@@ -297,7 +323,8 @@ async def _generate_summary_via_llm(
 
     system_prompt = (
         "You are a concise summariser. Produce a clear, factual summary of the conversation "
-        "history preserving all key decisions, TODOs, open questions, and constraints."
+        "history preserving all key decisions, TODOs, open questions, and constraints.\n\n"
+        + IDENTIFIER_PRESERVATION_INSTRUCTIONS
     )
     user_prompt = "\n".join(prompt_parts)
 
@@ -320,7 +347,7 @@ async def _generate_summary_via_llm(
             import google.generativeai as genai
             genai.configure(api_key=api_key)
             gmodel = genai.GenerativeModel(model_id, system_instruction=system_prompt)
-            result = await asyncio.get_event_loop().run_in_executor(
+            result = await asyncio.get_running_loop().run_in_executor(
                 None,
                 lambda: gmodel.generate_content(user_prompt),
             )

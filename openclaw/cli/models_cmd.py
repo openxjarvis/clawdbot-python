@@ -626,11 +626,36 @@ def auth_setup_token(
 
 @auth_app.command("paste-token")
 def auth_paste_token(
-    provider: Optional[str] = typer.Option(None, "--provider", help="Provider id"),
-    profile_id: Optional[str] = typer.Option(None, "--profile-id", help="Auth profile id"),
+    provider: Optional[str] = typer.Option(None, "--provider", help="Provider id (e.g. google, anthropic, openai)"),
+    profile_id: Optional[str] = typer.Option(None, "--profile-id", help="Auth profile id (default: <provider>:default)"),
+    key: Optional[str] = typer.Option(None, "--key", help="API key (if omitted, prompted interactively)"),
 ):
-    """Paste a token into auth-profiles.json"""
-    console.print("[yellow]⚠[/yellow]  Token paste not yet implemented")
+    """Paste an API key into auth-profiles.json"""
+    from ..config.auth_profiles import set_api_key, resolve_auth_store_path
+
+    if not provider:
+        provider = typer.prompt("Provider (e.g. google, anthropic, openai, openrouter)")
+    provider = provider.strip().lower()
+
+    if not key:
+        import sys
+        if sys.stdin.isatty():
+            key = typer.prompt(f"Paste {provider} API key", hide_input=True)
+        else:
+            key = sys.stdin.readline().strip()
+
+    if not key:
+        console.print("[red]✗[/red]  No key provided — aborted")
+        raise typer.Exit(1)
+
+    pid = profile_id or f"{provider}:default"
+    try:
+        set_api_key(provider, key, profile_id=pid)
+        path = resolve_auth_store_path()
+        console.print(f"[green]✓[/green]  Saved [bold]{pid}[/bold] → {path}")
+    except Exception as exc:
+        console.print(f"[red]✗[/red]  Failed to save key: {exc}")
+        raise typer.Exit(1)
 
 
 @auth_app.command("login-github-copilot")

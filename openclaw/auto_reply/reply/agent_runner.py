@@ -145,7 +145,7 @@ async def run_prepared_reply(ctx: ReplyContext) -> None:
         return
 
     # action == "run-now": fire and forget
-    asyncio.ensure_future(_run_agent_now(ctx))
+    asyncio.create_task(_run_agent_now(ctx))
 
 
 async def _run_agent_now(ctx: ReplyContext) -> None:
@@ -279,10 +279,15 @@ def _resolve_media_path(raw_url: str, session_workspace: str | None = None) -> s
     if p.is_absolute() and p.exists():
         return str(p)
 
-    # Search local roots by filename (mirrors TS local-roots fallback)
-    filename = p.name
     for root in _get_local_media_roots(session_workspace):
-        candidate = root / filename
+        # Try full relative path first (e.g. "presentations/file.pptx" under workspace)
+        if not p.is_absolute():
+            candidate = root / p
+            if candidate.exists():
+                logger.debug("Resolved media %r → %s", raw_url, candidate)
+                return str(candidate)
+        # Fall back to filename-only search (mirrors TS local-roots fallback)
+        candidate = root / p.name
         if candidate.exists():
             logger.debug("Resolved media %r → %s", raw_url, candidate)
             return str(candidate)

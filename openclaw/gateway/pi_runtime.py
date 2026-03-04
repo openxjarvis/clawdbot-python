@@ -591,7 +591,7 @@ class PiAgentRuntime:
         This prevents injecting synthetic tool-result events while a tool call
         is still in-flight, which would cause "missing tool result" errors.
         """
-        deadline = asyncio.get_event_loop().time() + timeout
+        deadline = asyncio.get_running_loop().time() + timeout
         while True:
             # Check known idle indicators on pi_session
             is_idle = False
@@ -608,7 +608,7 @@ class PiAgentRuntime:
             if is_idle:
                 return True
 
-            remaining = deadline - asyncio.get_event_loop().time()
+            remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 return False
 
@@ -894,6 +894,8 @@ class PiAgentRuntime:
         auth_profile_ids = self._resolve_auth_profile_candidates(provider_hint)
         max_retry = self._resolve_max_retry_iterations(len(auth_profile_ids))
         overflow_compaction_attempts = 0
+        # Mirrors TS toolResultTruncationAttempted — truncation is tried at most once
+        _tool_result_truncation_attempted = False
         current_profile_idx = 0
         current_think_level: str | None = None  # set on fallback
 
@@ -1164,16 +1166,19 @@ class PiAgentRuntime:
                     
                             context_window = guard_result.tokens
                     
-                            # Log warnings if needed
+                            # Act on guard result — mirrors TS behaviour where should_block
+                            # raises an error and should_warn emits a user-visible warning
                             if guard_result.should_block:
-                                logger.error(
-                                    f"Context window too small: {context_window} tokens < 16K "
-                                    f"(source: {guard_result.source})"
+                                err_msg = (
+                                    f"Context window critically small ({context_window} tokens). "
+                                    "Cannot run agent safely. Increase context window or compact session."
                                 )
+                                logger.error(err_msg)
+                                raise RuntimeError(err_msg)
                             elif guard_result.should_warn:
                                 logger.warning(
                                     f"Context window is small: {context_window} tokens < 32K "
-                                    f"(source: {guard_result.source})"
+                                    f"(source: {guard_result.source}). Consider compacting the session."
                                 )
                             else:
                                 logger.debug(f"Context window: {context_window} tokens (source: {guard_result.source})")
@@ -1185,54 +1190,37 @@ class PiAgentRuntime:
                             try:
                                 if hasattr(_pi_session, '_conversation_history'):
                                     # Phase 5: Apply context pruning before token estimation
+                                    # Uses context_pruning.py (TS-aligned defaults: softTrimRatio=0.3,
+                                    # hardClearRatio=0.5, minPrunableToolChars=50_000)
                                     try:
-                                        from openclaw.agents.context_pruning.pruner import prune_context_messages
-                                        from openclaw.agents.context_pruning.cache_ttl import read_last_cache_ttl_timestamp
-                                
-                                        # Get context pruning settings from config (ensure config is not None)
+                                        from openclaw.agents.context_pruning import apply_context_pruning
+
+                                        # Get context pruning settings from config
                                         agents_config = (self.config or {}).get('agents', {})
                                         defaults = agents_config.get('defaults', {})
                                         pruning_config = defaults.get('contextPruning', {})
-                                
-                                        context_pruning_settings = {
-                                            'mode': pruning_config.get('mode', 'off'),
-                                            'ttl': pruning_config.get('ttl', '5m'),
-                                            'softTrimRatio': pruning_config.get('softTrimRatio', 0.3),
-                                            'hardClearRatio': pruning_config.get('hardClearRatio', 0.5),
-                                            'keepLastAssistants': pruning_config.get('keepLastAssistants', 3),
-                                            'softTrim': pruning_config.get('softTrim', {
-                                                'maxChars': 4000,
-                                                'headChars': 1500,
-                                                'tailChars': 1500,
-                                            }),
-                                            'hardClear': pruning_config.get('hardClear', {
-                                                'enabled': True,
-                                                'placeholder': '[Old tool result content cleared]',
-                                            }),
-                                            'tools': pruning_config.get('tools', {
-                                                'prunable': ['Read', 'Grep', 'Shell'],
-                                            }),
-                                            'minPrunableToolChars': pruning_config.get('minPrunableToolChars', 50000),
-                                        }
-                                
+
                                         # Get last cache touch timestamp for TTL mode
-                                        last_cache_touch = None
-                                        if hasattr(self, 'session_manager') and self.session_manager:
-                                            last_cache_touch = read_last_cache_ttl_timestamp(self.session_manager)
-                                
+                                        last_cache_touch_ms: int | None = None
+                                        if hasattr(self, '_last_cache_touch_ms'):
+                                            last_cache_touch_ms = self._last_cache_touch_ms
+
                                         original_len = len(_pi_session._conversation_history)
-                                        pruned_history = prune_context_messages(
+                                        pruned_history, new_touch_ms = apply_context_pruning(
                                             messages=_pi_session._conversation_history,
-                                            settings=context_pruning_settings,
-                                            ctx={'model': {'contextWindow': context_window}},
-                                            last_cache_touch_at=last_cache_touch,
+                                            context_tokens=context_window,
+                                            pruning_config=pruning_config,
+                                            last_cache_touch_ms=last_cache_touch_ms,
                                         )
-                                
-                                        if pruned_history != _pi_session._conversation_history:
+
+                                        if pruned_history is not _pi_session._conversation_history:
                                             _pi_session._conversation_history = pruned_history
-                                            logger.debug(f"Context pruning applied: {original_len} messages processed")
+                                            logger.debug(f"Context pruning applied: {original_len} → {len(pruned_history)} messages")
                                         else:
                                             logger.debug("Context pruning: no changes needed")
+
+                                        if new_touch_ms is not None:
+                                            self._last_cache_touch_ms = new_touch_ms
                                     except Exception as prune_exc:
                                         logger.debug(f"Context pruning skipped: {prune_exc}")
                             
@@ -1521,11 +1509,13 @@ class PiAgentRuntime:
                                 continue
                         except Exception as compact_exc:
                             logger.warning("Retry compaction failed: %s", compact_exc)
-                    # Compaction exhausted — try truncation
-                    if pi_session_for_compact:
+                    # Compaction exhausted — try tool-result truncation exactly once
+                    # (mirrors TS toolResultTruncationAttempted guard)
+                    if pi_session_for_compact and not _tool_result_truncation_attempted:
+                        _tool_result_truncation_attempted = True
                         truncated = await self._truncate_oversized_tool_results(session_id, pi_session_for_compact)
                         if truncated:
-                            logger.info("Truncated oversized results, retrying turn")
+                            logger.info("Truncated oversized tool results, retrying turn")
                             continue
 
                 # No retry condition met — exit

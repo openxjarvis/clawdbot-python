@@ -228,18 +228,55 @@ def resolve_subagent_tool_policy(
                     if hasattr(tools_policy, "allow"):
                         configured_allow = tools_policy.allow
     
+    # Also check alsoAllow in configured policy
+    configured_also_allow: list[str] | None = None
+    if cfg:
+        if hasattr(cfg, "tools"):
+            tools_cfg = cfg.tools
+            if hasattr(tools_cfg, "subagents"):
+                subagents_tools = tools_cfg.subagents
+                if hasattr(subagents_tools, "tools"):
+                    tools_policy = subagents_tools.tools
+                    if isinstance(tools_policy, dict):
+                        configured_also_allow = tools_policy.get("alsoAllow") or tools_policy.get("also_allow")
+                    elif hasattr(tools_policy, "alsoAllow"):
+                        configured_also_allow = tools_policy.alsoAllow
+                    elif hasattr(tools_policy, "also_allow"):
+                        configured_also_allow = tools_policy.also_allow
+
     # Effective depth (default to 1)
     effective_depth = depth if isinstance(depth, int) and depth >= 0 else 1
-    
+
     # Build base deny list
     base_deny = resolve_subagent_deny_list(effective_depth, max_spawn_depth)
-    
-    # Merge with configured deny list
-    deny = [*base_deny, *(configured_deny if isinstance(configured_deny, list) else [])]
-    
-    # Allow list (if configured)
-    allow = configured_allow if isinstance(configured_allow, list) else None
-    
+
+    # Tools explicitly allowed override base deny list
+    explicit_allow: set[str] = set()
+    for source in [configured_allow, configured_also_allow]:
+        if isinstance(source, list):
+            for t in source:
+                explicit_allow.add(normalize_tool_name(t))
+
+    deny = [
+        t for t in base_deny
+        if normalize_tool_name(t) not in explicit_allow
+    ] + (configured_deny if isinstance(configured_deny, list) else [])
+
+    # Merge allow + alsoAllow (mirrors TS mergedAllow)
+    ca_is_list = isinstance(configured_allow, list)
+    caa_is_list = isinstance(configured_also_allow, list)
+    if ca_is_list and caa_is_list:
+        allow: list[str] | None = list({
+            *configured_allow,
+            *configured_also_allow,
+        })
+    elif ca_is_list:
+        allow = configured_allow
+    elif caa_is_list:
+        allow = configured_also_allow
+    else:
+        allow = None
+
     return {
         "allow": allow,
         "deny": deny,
@@ -359,19 +396,293 @@ _PROFILE_TOOLS: dict[str, list[str] | None] = {
 }
 
 
+def _normalize_provider_key(value: str) -> str:
+    return value.strip().lower()
+
+
+def _pick_sandbox_tool_policy(tools_cfg: Any) -> dict[str, Any] | None:
+    """Extract the effective allow/deny/profile/alsoAllow dict from a tools config block."""
+    if tools_cfg is None:
+        return None
+    if isinstance(tools_cfg, dict):
+        out: dict[str, Any] = {}
+        for key in ("allow", "deny", "profile", "alsoAllow", "also_allow"):
+            val = tools_cfg.get(key)
+            if val is not None:
+                out[key.replace("alsoAllow", "also_allow")] = val
+        return out if out else None
+    for attr in ("allow", "deny", "profile", "alsoAllow", "also_allow"):
+        if hasattr(tools_cfg, attr):
+            break
+    else:
+        return None
+    out = {}
+    for attr in ("allow", "deny", "profile"):
+        val = getattr(tools_cfg, attr, None)
+        if val is not None:
+            out[attr] = val
+    for attr in ("alsoAllow", "also_allow"):
+        val = getattr(tools_cfg, attr, None)
+        if val is not None:
+            out["also_allow"] = val
+            break
+    return out if out else None
+
+
+def _resolve_provider_tool_policy(
+    by_provider: Any,
+    model_provider: str | None,
+    model_id: str | None,
+) -> dict[str, Any] | None:
+    """Resolve provider/model-id compound key from ``byProvider`` config block.
+
+    Mirrors TS ``resolveProviderToolPolicy()``.
+    Lookup order: ``provider/modelId`` compound key → bare ``provider`` key.
+    """
+    if not model_provider or not by_provider:
+        return None
+    lookup: dict[str, Any] = {}
+    if isinstance(by_provider, dict):
+        for key, val in by_provider.items():
+            normalized = _normalize_provider_key(key)
+            if normalized:
+                lookup[normalized] = val
+    if not lookup:
+        return None
+    normalized_provider = _normalize_provider_key(model_provider)
+    raw_model_id = (model_id or "").strip().lower()
+    full_model_id: str | None = None
+    if raw_model_id:
+        full_model_id = (
+            raw_model_id
+            if "/" in raw_model_id
+            else f"{normalized_provider}/{raw_model_id}"
+        )
+    candidates = [c for c in [full_model_id, normalized_provider] if c]
+    for key in candidates:
+        if key in lookup:
+            return lookup[key]
+    return None
+
+
+def resolve_effective_tool_policy(
+    config: Any = None,
+    session_key: str | None = None,
+    agent_id: str | None = None,
+    model_provider: str | None = None,
+    model_id: str | None = None,
+) -> dict[str, Any]:
+    """Resolve the 4-layer effective tool policy for a session/agent/model combination.
+
+    Layers (mirrors TS ``resolveEffectiveToolPolicy()``):
+    1. Global tools policy
+    2. Global per-provider policy (keyed by provider/modelId)
+    3. Agent tools policy
+    4. Agent per-provider policy
+
+    Returns a dict with:
+    - ``agent_id``
+    - ``global_policy``
+    - ``global_provider_policy``
+    - ``agent_policy``
+    - ``agent_provider_policy``
+    - ``profile``
+    - ``provider_profile``
+    - ``profile_also_allow``
+    - ``provider_profile_also_allow``
+    """
+    from openclaw.routing.session_key import normalize_agent_id, parse_agent_session_key
+
+    effective_agent_id: str | None = None
+    if isinstance(agent_id, str) and agent_id.strip():
+        effective_agent_id = normalize_agent_id(agent_id)
+    elif session_key:
+        parsed = parse_agent_session_key(session_key) or {}
+        raw = parsed.get("agent_id") if isinstance(parsed, dict) else None
+        if raw:
+            effective_agent_id = normalize_agent_id(raw)
+
+    agent_tools_cfg: Any = None
+    global_tools_cfg: Any = None
+
+    if config is not None:
+        # Resolve global tools config
+        global_tools_cfg = (
+            config.get("tools") if isinstance(config, dict) else getattr(config, "tools", None)
+        )
+        # Resolve agent tools config
+        if effective_agent_id:
+            try:
+                from openclaw.agents.agent_scope import resolve_agent_config
+                agent_cfg = resolve_agent_config(config, effective_agent_id)
+                agent_tools_cfg = (
+                    agent_cfg.get("tools")
+                    if isinstance(agent_cfg, dict)
+                    else getattr(agent_cfg, "tools", None)
+                ) if agent_cfg else None
+            except Exception:
+                pass
+
+    global_policy = _pick_sandbox_tool_policy(global_tools_cfg)
+    agent_policy = _pick_sandbox_tool_policy(agent_tools_cfg)
+
+    # Per-provider policies
+    global_by_provider = (
+        global_tools_cfg.get("byProvider")
+        if isinstance(global_tools_cfg, dict)
+        else getattr(global_tools_cfg, "byProvider", None)
+    ) if global_tools_cfg is not None else None
+    agent_by_provider = (
+        agent_tools_cfg.get("byProvider")
+        if isinstance(agent_tools_cfg, dict)
+        else getattr(agent_tools_cfg, "byProvider", None)
+    ) if agent_tools_cfg is not None else None
+
+    global_provider_raw = _resolve_provider_tool_policy(global_by_provider, model_provider, model_id)
+    agent_provider_raw = _resolve_provider_tool_policy(agent_by_provider, model_provider, model_id)
+    global_provider_policy = _pick_sandbox_tool_policy(global_provider_raw)
+    agent_provider_policy = _pick_sandbox_tool_policy(agent_provider_raw)
+
+    # Profile: agent takes precedence over global
+    profile: str | None = None
+    for src in [agent_policy, global_policy]:
+        if src and src.get("profile"):
+            profile = src["profile"]
+            break
+
+    provider_profile: str | None = None
+    for src in [agent_provider_policy, global_provider_policy]:
+        if src and src.get("profile"):
+            provider_profile = src["profile"]
+            break
+
+    # alsoAllow: agent takes precedence over global
+    profile_also_allow: list[str] | None = None
+    for src in [agent_policy, global_policy]:
+        if src:
+            aa = src.get("also_allow")
+            if isinstance(aa, list) and aa:
+                profile_also_allow = aa
+                break
+
+    provider_profile_also_allow: list[str] | None = None
+    for src in [agent_provider_policy, global_provider_policy]:
+        if src:
+            aa = src.get("also_allow")
+            if isinstance(aa, list) and aa:
+                provider_profile_also_allow = aa
+                break
+
+    return {
+        "agent_id": effective_agent_id,
+        "global_policy": global_policy,
+        "global_provider_policy": global_provider_policy,
+        "agent_policy": agent_policy,
+        "agent_provider_policy": agent_provider_policy,
+        "profile": profile,
+        "provider_profile": provider_profile,
+        "profile_also_allow": profile_also_allow,
+        "provider_profile_also_allow": provider_profile_also_allow,
+    }
+
+
+def _resolve_group_context_from_session_key(session_key: str | None) -> dict[str, str | None]:
+    """Extract channel and groupId from a session key.
+
+    Mirrors TS ``resolveGroupContextFromSessionKey()``.
+    """
+    raw = (session_key or "").strip()
+    if not raw:
+        return {"channel": None, "group_id": None}
+    parts = [p for p in raw.split(":") if p]
+    body = parts[2:] if len(parts) >= 2 and parts[0] == "agent" else parts
+    if body and body[0] == "subagent":
+        body = body[1:]
+    if len(body) < 3:
+        return {"channel": None, "group_id": None}
+    channel = body[0].strip().lower()
+    kind = body[1]
+    if kind not in ("group", "channel"):
+        return {"channel": None, "group_id": None}
+    group_id = ":".join(body[2:]).strip()
+    return {"channel": channel, "group_id": group_id or None}
+
+
+def resolve_group_tool_policy(
+    config: Any = None,
+    session_key: str | None = None,
+    spawned_by: str | None = None,
+    message_provider: str | None = None,
+    group_id: str | None = None,
+    group_channel: str | None = None,
+    group_space: str | None = None,
+    account_id: str | None = None,
+    sender_id: str | None = None,
+    sender_name: str | None = None,
+    sender_username: str | None = None,
+    sender_e164: str | None = None,
+) -> dict[str, Any] | None:
+    """Resolve tool policy for a group/channel context.
+
+    Mirrors TS ``resolveGroupToolPolicy()``.
+    Queries the channel dock's ``resolveToolPolicy`` hook if available;
+    falls back to ``None`` (no restriction) when the hook is absent.
+    """
+    if config is None:
+        return None
+
+    session_ctx = _resolve_group_context_from_session_key(session_key)
+    spawned_ctx = _resolve_group_context_from_session_key(spawned_by)
+
+    effective_group_id = group_id or session_ctx.get("group_id") or spawned_ctx.get("group_id")
+    if not effective_group_id:
+        return None
+
+    channel_raw = message_provider or session_ctx.get("channel") or spawned_ctx.get("channel")
+    if not channel_raw:
+        return None
+    channel = channel_raw.strip().lower()
+
+    # Try to resolve via channel dock
+    try:
+        from openclaw.channels.dock import get_channel_dock
+        dock = get_channel_dock(channel)
+        groups = getattr(dock, "groups", None) if dock else None
+        resolve_fn = getattr(groups, "resolve_tool_policy", None) if groups else None
+        if callable(resolve_fn):
+            policy = resolve_fn(
+                cfg=config,
+                group_id=effective_group_id,
+                group_channel=group_channel,
+                group_space=group_space,
+                account_id=account_id,
+                sender_id=sender_id,
+                sender_name=sender_name,
+                sender_username=sender_username,
+                sender_e164=sender_e164,
+            )
+            return _pick_sandbox_tool_policy(policy)
+    except Exception:
+        pass
+
+    return None
+
+
 class ToolPolicy:
-    """Structured tool policy with profile, allow/deny lists and per-provider overrides."""
+    """Structured tool policy with profile, allow/deny/alsoAllow lists and per-provider overrides."""
 
     def __init__(
         self,
         profile: str = "default",
         allow: list[str] | None = None,
         deny: list[str] | None = None,
+        also_allow: list[str] | None = None,
         by_provider: dict[str, "ToolPolicy"] | None = None,
     ) -> None:
         self.profile = profile
         self.allow = allow
         self.deny = deny
+        self.also_allow = also_allow  # alsoAllow: extends profile without replacing allow
         self.by_provider = by_provider or {}
 
 

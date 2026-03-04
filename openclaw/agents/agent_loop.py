@@ -12,10 +12,22 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
+
+# ── Loop safety constants (mirrors TS run.ts) ────────────────────────────────
+MAX_OUTER_TURNS: int = 20          # hard ceiling on follow-up iterations
+MAX_OVERFLOW_COMPACTION_ATTEMPTS: int = 3  # max compaction passes on overflow
+
+# ── LLM retry constants (mirrors TS retryAsync) ──────────────────────────────
+_RETRY_MAX_ATTEMPTS: int = 3
+_RETRY_BASE_DELAY_MS: float = 300.0    # 300 ms
+_RETRY_MAX_DELAY_MS: float = 30_000.0  # 30 s
+_RETRY_JITTER_FACTOR: float = 0.2
+_RATE_LIMIT_STATUS_CODES = frozenset({429, 529})
 
 from .abort import AbortController, AbortError, AbortSignal
 from .events import (
@@ -81,6 +93,7 @@ class AgentOptions:
     transform_context: Callable[[list[AgentMessage]], Awaitable[list[AgentMessage]] | list[AgentMessage]] | None = None
     steering_mode: Literal["all", "one-at-a-time"] = "one-at-a-time"
     follow_up_mode: Literal["all", "one-at-a-time"] = "one-at-a-time"
+    max_turns: int = MAX_OUTER_TURNS  # hard ceiling on outer-loop iterations
 
 
 def default_convert_to_llm(messages: list[AgentMessage]) -> list[LLMMessage]:
@@ -171,6 +184,70 @@ class AgentState:
     def signal(self) -> AbortSignal:
         """Get abort signal"""
         return self.abort_controller.signal
+
+
+def _is_rate_limit_error(exc: BaseException) -> bool:
+    """Return True if *exc* looks like a rate-limit / transient API error."""
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if isinstance(status, int) and status in _RATE_LIMIT_STATUS_CODES:
+        return True
+    msg = str(exc).lower()
+    return any(kw in msg for kw in ("rate limit", "too many requests", "overloaded"))
+
+
+async def _stream_with_retry(
+    provider: "LLMProvider",
+    llm_messages: list["LLMMessage"],
+    model: str,
+    tool_definitions: list[dict],
+) -> "AsyncIterator[Any]":
+    """
+    Collect one complete streaming response from *provider* with exponential
+    back-off retry on transient / rate-limit errors.
+
+    Mirrors TS ``retryAsync()`` (3 attempts, 300 ms – 30 s, 20 % jitter).
+
+    Returns an async iterable of LLMResponse objects.
+    """
+    last_exc: BaseException | None = None
+    for attempt in range(_RETRY_MAX_ATTEMPTS):
+        try:
+            # Collect the async generator into a list so we can return it
+            # without the generator being exhausted by the retry logic.
+            # For most providers the stream is lazy, so we must drive it here.
+            results: list[Any] = []
+            async for chunk in provider.stream(
+                messages=llm_messages,
+                model=model,
+                tools=tool_definitions,
+            ):
+                results.append(chunk)
+
+            async def _replay() -> "AsyncIterator[Any]":
+                for item in results:
+                    yield item
+
+            return _replay()
+        except Exception as exc:
+            last_exc = exc
+            is_retriable = _is_rate_limit_error(exc)
+            if not is_retriable or attempt >= _RETRY_MAX_ATTEMPTS - 1:
+                raise
+            # Exponential back-off with jitter
+            raw_delay = _RETRY_BASE_DELAY_MS * (2 ** attempt)
+            delay_ms = min(raw_delay, _RETRY_MAX_DELAY_MS)
+            jitter = delay_ms * _RETRY_JITTER_FACTOR * (random.random() * 2 - 1)
+            wait_sec = (delay_ms + jitter) / 1000.0
+            logger.warning(
+                "LLM stream error (attempt %d/%d), retrying in %.1f s: %s",
+                attempt + 1,
+                _RETRY_MAX_ATTEMPTS,
+                wait_sec,
+                exc,
+            )
+            await asyncio.sleep(wait_sec)
+
+    raise last_exc  # type: ignore[misc]
 
 
 class AgentLoop:
@@ -271,16 +348,29 @@ class AgentLoop:
     async def run_loop(self) -> None:
         """
         Main execution loop with double-loop architecture - aligned with pi-mono
-        
-        Outer loop: Continues when follow-up messages arrive
-        Inner loop: Process tool calls and steering messages
+
+        Outer loop: Continues when follow-up messages arrive (bounded by max_turns).
+        Inner loop: Process tool calls and steering messages.
         """
         first_turn = True
+        outer_turn_count = 0
+        max_turns = self.options.max_turns
+
         # Check for steering messages at start (user may have typed while waiting)
         pending_messages: list[AgentMessage] = await self._get_steering_messages()
-        
+
         # Outer loop: continues when queued follow-up messages arrive after agent would stop
         while True:
+            # Hard ceiling on outer-loop iterations (mirrors TS MAX_RUN_LOOP_ITERATIONS)
+            if outer_turn_count >= max_turns:
+                logger.warning(
+                    "Agent loop reached max_turns limit (%d). Stopping to prevent infinite loop.",
+                    max_turns,
+                )
+                break
+
+            outer_turn_count += 1
+
             # Check for abort signal
             try:
                 self.state.signal.throw_if_aborted()
@@ -395,33 +485,40 @@ class AgentLoop:
             messages = self.state.messages
             if self.options.transform_context:
                 # Note: transform_context should work on AgentMessage[], not LLMMessage[]
-                # This is a signature change from current implementation
                 if asyncio.iscoroutinefunction(self.options.transform_context):
                     messages = await self.options.transform_context(messages)
                 else:
-                    # Fallback for sync transform (backward compat)
                     messages = self.options.transform_context(messages)
-            
+
             # Step 2: Convert to LLM-compatible messages SECOND (AgentMessage[] → LLMMessage[])
             convert_fn = self.options.convert_to_llm or default_convert_to_llm
             llm_messages = convert_fn(messages)
-            
-            # Stream from provider
-            async for response in self.provider.stream(
-                messages=llm_messages,
+
+            tool_definitions = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": (
+                            tool.get_schema()
+                            if callable(getattr(tool, "get_schema", None))
+                            else getattr(tool, "parameters", {})
+                        ),
+                    },
+                }
+                for tool in self.tools.values()
+            ]
+
+            # Stream from provider with retry + exponential back-off (mirrors TS retryAsync)
+            stream_iter = await _stream_with_retry(
+                self.provider,
+                llm_messages=llm_messages,
                 model=self.state.model,
-                tools=[
-                    {
-                        "type": "function",
-                        "function": {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "parameters": (tool.get_schema() if callable(getattr(tool, "get_schema", None)) else getattr(tool, "parameters", {}))
-                        }
-                    }
-                    for tool in self.tools.values()
-                ]
-            ):
+                tool_definitions=tool_definitions,
+            )
+
+            async for response in stream_iter:
                 # Handle LLMResponse objects from providers
                 event_type = response.type
                 
@@ -614,8 +711,20 @@ class AgentLoop:
             steering = await self._get_steering_messages()
             if steering:
                 logger.info(f"Steering detected after tool {tool_name}, skipping remaining tools")
+                # Insert synthetic tool_result placeholders for ALL remaining (not-yet-executed)
+                # tools so the conversation history keeps every tool_use paired with a
+                # tool_result — the Anthropic API rejects messages if any tool_use is
+                # unmatched.  Mirrors TS skipToolCall().
+                executed_ids = {r.tool_call_id for r in tool_results}
+                for remaining_call in tool_calls:
+                    if remaining_call["id"] not in executed_ids:
+                        tool_results.append(AgentMessage(
+                            role="toolResult",
+                            tool_call_id=remaining_call["id"],
+                            content="Skipped due to queued user message.",
+                        ))
                 return tool_results, steering
-        
+
         return tool_results, None
     
     async def _get_steering_messages(self) -> list[AgentMessage]:

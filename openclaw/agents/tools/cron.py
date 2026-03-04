@@ -137,20 +137,96 @@ Actions:
                         },
                         "payload": {
                             "type": "object",
+                            "description": "Payload for the cron job (systemEvent or agentTurn)",
                             "properties": {
-                                "kind": {"type": "string", "enum": ["systemEvent", "agentTurn"]},
-                                "text": {"type": "string"},
-                                "prompt": {"type": "string"},
-                                "model": {"type": "string"},
+                                "kind": {
+                                    "type": "string",
+                                    "enum": ["systemEvent", "agentTurn"],
+                                    "description": "systemEvent=heartbeat wakeup, agentTurn=isolated session",
+                                },
+                                "text": {
+                                    "type": "string",
+                                    "description": "Text for systemEvent kind",
+                                },
+                                "prompt": {
+                                    "type": "string",
+                                    "description": "Message for agentTurn kind (alias for message)",
+                                },
+                                "message": {
+                                    "type": "string",
+                                    "description": "Message prompt for agentTurn kind",
+                                },
+                                "model": {
+                                    "type": "string",
+                                    "description": "Model override for agentTurn",
+                                },
+                                "fallbacks": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "Model fallback chain for agentTurn (tried in order if primary fails)",
+                                },
+                                "timeoutSeconds": {
+                                    "type": "integer",
+                                    "description": "Per-turn timeout in seconds for agentTurn (default: no limit)",
+                                },
+                                "lightContext": {
+                                    "type": "boolean",
+                                    "description": "Skip heavy context loading for agentTurn (faster, less context)",
+                                },
                             },
                             "required": ["kind"],
                         },
                         "delivery": {
                             "type": "object",
+                            "description": "Delivery config for isolated agentTurn jobs",
                             "properties": {
-                                "channel": {"type": "string"},
-                                "target": {"type": "string"},
-                                "best_effort": {"type": "boolean"},
+                                "mode": {
+                                    "type": "string",
+                                    "enum": ["announce", "none", "webhook"],
+                                    "description": "announce=send to channel, none=no delivery, webhook=HTTP POST",
+                                },
+                                "channel": {
+                                    "type": "string",
+                                    "description": "Channel to deliver to (e.g. 'telegram', 'feishu', 'last'=last-used)",
+                                },
+                                "to": {
+                                    "type": "string",
+                                    "description": "Recipient chat ID / user ID (required unless mode=none or channel=last)",
+                                },
+                                "accountId": {
+                                    "type": "string",
+                                    "description": "Specific bot account to send from (for multi-account setups)",
+                                },
+                                "best_effort": {
+                                    "type": "boolean",
+                                    "description": "If true, delivery failures are warnings not errors",
+                                },
+                                "failureDestination": {
+                                    "type": "object",
+                                    "description": "Override delivery target for failure alerts only",
+                                    "properties": {
+                                        "channel": {"type": "string"},
+                                        "to": {"type": "string"},
+                                    },
+                                },
+                            },
+                        },
+                        "failureAlert": {
+                            "type": "object",
+                            "description": "Send an alert after N consecutive errors",
+                            "properties": {
+                                "afterNErrors": {
+                                    "type": "integer",
+                                    "description": "Number of consecutive errors before alerting (default: 3)",
+                                },
+                                "cooldownMs": {
+                                    "type": "integer",
+                                    "description": "Minimum ms between alerts (default: 3600000 = 1 hour)",
+                                },
+                                "message": {
+                                    "type": "string",
+                                    "description": "Custom alert message template",
+                                },
                             },
                         },
                     },
@@ -278,12 +354,10 @@ Actions:
         """Add new cron job (matches TypeScript add with normalization)."""
         from openclaw.cron.types import (
             AgentTurnPayload,
-            AtSchedule,
             CronDelivery,
+            CronFailureAlert,
+            CronFailureDestination,
             CronJob,
-            CronSchedule,
-            EverySchedule,
-            SystemEventPayload,
         )
 
         job_id = f"cron-{uuid.uuid4().hex[:8]}"
@@ -311,30 +385,50 @@ Actions:
             if delivery_config is None:
                 delivery_config = {}
             channel = delivery_config.get("channel", "")
-            target = delivery_config.get("target", "")
+            target = delivery_config.get("to") or delivery_config.get("target", "")
             if not channel and self._current_chat_info:
                 channel = self._current_chat_info.get("channel", "")
             if not target and self._current_chat_info:
                 target = self._current_chat_info.get("chat_id", "")
             if channel:
                 delivery = CronDelivery(
+                    mode=delivery_config.get("mode", "announce"),
                     channel=channel,
-                    target=target or None,
+                    to=target or None,
                     best_effort=delivery_config.get("best_effort", delivery_config.get("bestEffort", False)),
+                    account_id=delivery_config.get("accountId") or delivery_config.get("account_id"),
+                    failure_destination=_parse_failure_destination(
+                        delivery_config.get("failureDestination") or delivery_config.get("failure_destination")
+                    ),
                 )
         elif delivery_config:
             channel = delivery_config.get("channel", "")
-            target = delivery_config.get("target")
+            target = delivery_config.get("to") or delivery_config.get("target")
             if not channel and self._current_chat_info:
                 channel = self._current_chat_info.get("channel", "")
             if not target and self._current_chat_info:
                 target = self._current_chat_info.get("chat_id")
             if channel:
                 delivery = CronDelivery(
+                    mode=delivery_config.get("mode", "announce"),
                     channel=channel,
-                    target=target,
+                    to=target,
                     best_effort=delivery_config.get("best_effort", delivery_config.get("bestEffort", False)),
+                    account_id=delivery_config.get("accountId") or delivery_config.get("account_id"),
+                    failure_destination=_parse_failure_destination(
+                        delivery_config.get("failureDestination") or delivery_config.get("failure_destination")
+                    ),
                 )
+
+        # --- Failure alert ---
+        failure_alert: CronFailureAlert | None = None
+        fa_config = job_config.get("failureAlert") or job_config.get("failure_alert")
+        if isinstance(fa_config, dict):
+            failure_alert = CronFailureAlert(
+                after_n_errors=int(fa_config.get("afterNErrors") or fa_config.get("after_n_errors") or 3),
+                cooldown_ms=int(fa_config.get("cooldownMs") or fa_config.get("cooldown_ms") or 3_600_000),
+                message=fa_config.get("message"),
+            )
 
         # --- Wake mode ---
         wake_mode = job_config.get("wakeMode", job_config.get("wake_mode", "next-heartbeat"))
@@ -350,6 +444,7 @@ Actions:
             wake_mode=wake_mode,
             payload=payload,
             delivery=delivery,
+            failure_alert=failure_alert,
         )
 
         added_job = await self._cron_service.add_job(job)
@@ -359,9 +454,12 @@ Actions:
         text += f"  Schedule: {self._format_schedule(job_config.get('schedule', {}))}\n"
         text += f"  Type: {'Isolated Agent' if session_target == 'isolated' else 'System Event'}"
         if delivery:
-            text += f"\n  Delivery: {delivery.channel}"
-            if delivery.target:
-                text += f" -> {delivery.target}"
+            mode_str = f" [{delivery.mode}]" if delivery.mode != "announce" else ""
+            text += f"\n  Delivery: {delivery.channel}{mode_str}"
+            if delivery.to:
+                text += f" -> {delivery.to}"
+        if failure_alert:
+            text += f"\n  Failure alert: after {failure_alert.after_n_errors} errors"
 
         return _ok(text)
 
@@ -522,8 +620,31 @@ def _normalize_payload(config: dict[str, Any]):
     if kind == "systemEvent":
         return SystemEventPayload(text=config.get("text", ""))
     elif kind == "agentTurn":
+        raw_fallbacks = config.get("fallbacks") or config.get("modelFallbacks")
+        fallbacks: list[str] | None = None
+        if isinstance(raw_fallbacks, list) and raw_fallbacks:
+            fallbacks = [str(f) for f in raw_fallbacks if f]
         return AgentTurnPayload(
             message=config.get("message", config.get("prompt", "")),
             model=config.get("model"),
+            timeout_seconds=(
+                int(config["timeoutSeconds"]) if "timeoutSeconds" in config
+                else int(config["timeout_seconds"]) if "timeout_seconds" in config
+                else None
+            ),
+            fallbacks=fallbacks,
+            light_context=bool(config.get("lightContext") or config.get("light_context")),
         )
+    return None
+
+
+def _parse_failure_destination(raw: Any) -> "CronFailureDestination | None":
+    """Parse failure_destination dict to CronFailureDestination."""
+    if not isinstance(raw, dict):
+        return None
+    from openclaw.cron.types import CronFailureDestination
+    channel = raw.get("channel")
+    to = raw.get("to")
+    if channel or to:
+        return CronFailureDestination(channel=channel, to=to)
     return None

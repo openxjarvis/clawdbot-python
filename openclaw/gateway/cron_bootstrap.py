@@ -173,6 +173,7 @@ async def build_gateway_cron_service(
                 # Model selection chain: mirrors TS runCronIsolatedAgentTurn
                 # Priority: hooks.gmail.model > job.payload.model > session override > default
                 # ----------------------------------------------------------
+                job_payload = getattr(job, "payload", None)
                 model_override: str | None = None
 
                 # 1. hooks.gmail.model override for Gmail hook sessions
@@ -187,7 +188,7 @@ async def build_gateway_cron_service(
 
                 # 2. Job payload model override (agentTurn.model)
                 if model_override is None:
-                    payload_model = getattr(getattr(job, "payload", None), "model", None)
+                    payload_model = getattr(job_payload, "model", None)
                     if payload_model and isinstance(payload_model, str) and payload_model.strip():
                         model_override = payload_model.strip()
 
@@ -202,6 +203,12 @@ async def build_gateway_cron_service(
                     except Exception:
                         pass
 
+                # payload.fallbacks — model fallback chain (Gap 6)
+                payload_fallbacks: list[str] | None = getattr(job_payload, "fallbacks", None)
+
+                # payload.timeout_seconds — per-job agent turn timeout (Gap 6)
+                payload_timeout: int | None = getattr(job_payload, "timeout_seconds", None)
+
                 response_text = ""
                 run_kwargs: dict[str, Any] = {
                     "tools": tools,
@@ -209,13 +216,25 @@ async def build_gateway_cron_service(
                 }
                 if model_override:
                     run_kwargs["model_override"] = model_override
+                if payload_fallbacks:
+                    run_kwargs["model_fallbacks"] = payload_fallbacks
 
-                async for event in runtime.run_turn(session, message, **run_kwargs):
-                    evt_type = getattr(event, "type", "")
-                    if evt_type in ("text", "text_delta"):
-                        data = getattr(event, "data", {}) or {}
-                        chunk = data.get("text") or data.get("delta") or ""
-                        response_text += str(chunk) if chunk else ""
+                async def _collect_response() -> str:
+                    text = ""
+                    async for event in runtime.run_turn(session, message, **run_kwargs):
+                        evt_type = getattr(event, "type", "")
+                        if evt_type in ("text", "text_delta"):
+                            data = getattr(event, "data", {}) or {}
+                            chunk = data.get("text") or data.get("delta") or ""
+                            text += str(chunk) if chunk else ""
+                    return text
+
+                if payload_timeout and payload_timeout > 0:
+                    response_text = await asyncio.wait_for(
+                        _collect_response(), timeout=float(payload_timeout)
+                    )
+                else:
+                    response_text = await _collect_response()
 
                 # Collect basic telemetry if runtime exposes it
                 used_model: str | None = None
@@ -306,6 +325,59 @@ async def build_gateway_cron_service(
             logger.error(f"Error handling cron event: {e}", exc_info=True)
 
     # ------------------------------------------------------------------
+    # Callback: send_failure_alert
+    # Wires CronService failure-alert subsystem to the channel manager.
+    # Mirrors TS cron/service.ts failure alert delivery.
+    # ------------------------------------------------------------------
+    async def send_failure_alert(
+        job: "CronJob",
+        consecutive_errors: int,
+        last_error: str | None,
+    ) -> bool:
+        """Send failure alert after N consecutive errors.
+
+        Delivers via failure_destination (if set) or normal delivery channel.
+        """
+        from ..cron.isolated_agent.delivery import deliver_result
+        fa = job.failure_alert
+        if not fa:
+            return False
+
+        # Build alert text
+        alert_text = fa.message or (
+            f"⚠️ Cron job **{job.name}** has failed {consecutive_errors} times in a row.\n\n"
+            f"Last error: {last_error or 'unknown'}"
+        )
+
+        # Create synthetic result for delivery
+        alert_result = {
+            "status": "error",
+            "error": last_error,
+            "summary": alert_text,
+        }
+
+        try:
+            cm = deps.get_channel_manager()
+            channel_registry = cm._channels if cm and hasattr(cm, "_channels") else None
+            ok = await deliver_result(
+                job=job,
+                result=alert_result,
+                channel_registry=channel_registry,
+                cfg=config,
+                agent_id=job.agent_id,
+                is_failure_alert=True,
+            )
+            if ok:
+                logger.info(
+                    "cron: failure alert sent for job %r (consecutiveErrors=%d)",
+                    job.id, consecutive_errors,
+                )
+            return ok
+        except Exception as e:
+            logger.error("cron: send_failure_alert error for job %r: %s", job.id, e)
+            return False
+
+    # ------------------------------------------------------------------
     # Create service
     # ------------------------------------------------------------------
     service = CronService(
@@ -317,6 +389,7 @@ async def build_gateway_cron_service(
         run_heartbeat_once=run_heartbeat_once,
         run_isolated_agent_job=run_isolated_agent,
         on_event=on_event,
+        send_failure_alert=send_failure_alert,
     )
 
     # Load jobs
@@ -433,7 +506,7 @@ async def _run_heartbeat_async(
 
     # -- Deliver via active channels (e.g., Telegram) --
     if response_text:
-        asyncio.ensure_future(
+        asyncio.create_task(
             _deliver_via_channels(session_key, response_text, cm)
         )
 
@@ -518,84 +591,141 @@ async def _deliver_via_channels(
         if media_result.media_urls:
             all_media.extend(media_result.media_urls)
 
-        for ch_id in running:
+        # Mirrors TS resolveSessionDeliveryTarget: use last-used channel from session.
+        # Find sessions belonging to this agent and extract their channel+chat_id.
+        delivery_targets = _extract_delivery_targets(all_session_keys, agent_part, running)
+
+        for ch_id, chat_id in delivery_targets:
             channel = cm.get_channel(ch_id)
             if not channel:
                 continue
-            for sk in all_session_keys:
-                if agent_part and agent_part in sk and "telegram" in sk:
-                    chat_id = _extract_telegram_chat_id(sk)
-                    if not chat_id:
+
+            # Send text (without MEDIA: lines)
+            if display_text:
+                try:
+                    await channel.send_text(target=chat_id, text=display_text)
+                    logger.info(f"cron: delivered text to {ch_id} chat_id={chat_id}")
+                except Exception as e:
+                    logger.warning(f"cron: send_text failed {ch_id} chat_id={chat_id}: {e}")
+
+            # Send media files extracted from MEDIA: tokens
+            for media_url in all_media:
+                try:
+                    resolved_url = _resolve_media_url(media_url, _cron_workspace)
+                    if resolved_url is None:
                         continue
-
-                    # Send text (without MEDIA: lines)
-                    if display_text:
-                        try:
-                            await channel.send_text(target=chat_id, text=display_text)
-                            logger.info(f"cron: delivered text to telegram chat_id={chat_id}")
-                        except Exception as e:
-                            logger.warning(f"cron: send_text failed chat_id={chat_id}: {e}")
-
-                    # Send media files extracted from MEDIA: tokens
-                    for media_url in all_media:
-                        try:
-                            # Resolve relative paths against known workspace locations
-                            resolved_url = media_url
-                            if not media_url.startswith(("http://", "https://", "file://", "/")):
-                                # Search order:
-                                # 1. cron session workspace
-                                # 2. all agent workspaces under ~/.openclaw/workspace/
-                                #    (covers files made in Telegram / other sessions)
-                                # 3. CWD
-                                # 4. home dir
-                                search_dirs = []
-                                if _cron_workspace:
-                                    search_dirs.append(Path(_cron_workspace))
-                                _oc_workspace_root = Path.home() / ".openclaw" / "workspace"
-                                if _oc_workspace_root.is_dir():
-                                    try:
-                                        for _ws_dir in sorted(
-                                            _oc_workspace_root.iterdir(),
-                                            key=lambda p: p.stat().st_mtime,
-                                            reverse=True,  # newest workspaces first
-                                        ):
-                                            if _ws_dir.is_dir() and _ws_dir not in search_dirs:
-                                                search_dirs.append(_ws_dir)
-                                    except Exception:
-                                        pass
-                                search_dirs.append(Path.cwd())
-                                search_dirs.append(Path.home())
-                                for search_dir in search_dirs:
-                                    candidate = search_dir / media_url
-                                    if candidate.exists():
-                                        resolved_url = str(candidate)
-                                        logger.info(f"cron: resolved relative path '{media_url}' -> {resolved_url}")
-                                        break
-                                else:
-                                    # Not found anywhere — skip gracefully
-                                    logger.warning(
-                                        f"cron: media file '{media_url}' not found in any workspace, skipping"
-                                    )
-                                    continue
-
-                            mime = detect_mime(resolved_url)
-                            kind = media_kind_from_mime(mime)
-                            media_type = kind.value if kind != MediaKind.UNKNOWN else "document"
-                            await channel.send_media(
-                                target=chat_id,
-                                media_url=resolved_url,
-                                media_type=media_type,
-                            )
-                            logger.info(
-                                f"cron: delivered media {Path(resolved_url).name} "
-                                f"(type={media_type}) to chat_id={chat_id}"
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                f"cron: failed to send media {media_url} to chat_id={chat_id}: {e}"
-                            )
+                    mime = detect_mime(resolved_url)
+                    kind = media_kind_from_mime(mime)
+                    media_type = kind.value if kind != MediaKind.UNKNOWN else "document"
+                    await channel.send_media(
+                        target=chat_id,
+                        media_url=resolved_url,
+                        media_type=media_type,
+                    )
+                    logger.info(
+                        f"cron: delivered media {Path(resolved_url).name} "
+                        f"(type={media_type}) to {ch_id} chat_id={chat_id}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"cron: failed to send media {media_url} to {ch_id} chat_id={chat_id}: {e}"
+                    )
     except Exception as e:
         logger.debug(f"cron: _deliver_via_channels error: {e}")
+
+
+def _extract_delivery_targets(
+    all_session_keys: list[str],
+    agent_part: str | None,
+    running_channel_ids: list[str],
+) -> list[tuple[str, str]]:
+    """
+    Extract (channel_id, chat_id) delivery pairs from session keys.
+
+    Mirrors TS resolveSessionDeliveryTarget("last") — finds all active
+    channel sessions for this agent and returns the channel + recipient.
+
+    Session key format: agent:<agent>:<channel>:<kind>:<peer_id>
+    Supports: telegram, feishu, discord, whatsapp, slack, line, imessage
+    """
+    # Channel id → last segment extractor (peer_id position is always last)
+    _KNOWN_CHANNELS = {
+        "telegram", "feishu", "discord", "whatsapp", "slack",
+        "line", "imessage", "lark",
+    }
+    targets: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    for sk in all_session_keys:
+        parts = sk.split(":")
+        # Expect: agent:<agent>:<channel>:<kind>:<peer_id>
+        if len(parts) < 5 or parts[0] != "agent":
+            continue
+        sk_agent = parts[1]
+        sk_channel = parts[2]
+        sk_peer = parts[-1]
+
+        if agent_part and sk_agent != agent_part:
+            continue
+        if sk_channel not in _KNOWN_CHANNELS:
+            continue
+        if sk_channel not in running_channel_ids:
+            continue
+        if not sk_peer:
+            continue
+
+        key = (sk_channel, sk_peer)
+        if key not in seen:
+            seen.add(key)
+            targets.append(key)
+
+    return targets
+
+
+def _resolve_media_url(media_url: str, cron_workspace: str | None) -> str | None:
+    """
+    Resolve a possibly-relative media URL to an absolute path.
+
+    Returns the resolved path string, or None if the file is not found.
+    """
+    from pathlib import Path
+
+    if media_url.startswith(("http://", "https://", "file://", "/")):
+        return media_url
+
+    search_dirs: list[Path] = []
+    if cron_workspace:
+        search_dirs.append(Path(cron_workspace))
+    _oc_workspace_root = Path.home() / ".openclaw" / "workspace"
+    if _oc_workspace_root.is_dir():
+        try:
+            for _ws_dir in sorted(
+                _oc_workspace_root.iterdir(),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            ):
+                if _ws_dir.is_dir() and _ws_dir not in search_dirs:
+                    search_dirs.append(_ws_dir)
+        except Exception:
+            pass
+    search_dirs.append(Path.cwd())
+    search_dirs.append(Path.home())
+
+    p = Path(media_url)
+    for search_dir in search_dirs:
+        # Try full relative path (e.g. presentations/file.pptx)
+        candidate = search_dir / p
+        if candidate.exists():
+            logger.info("cron: resolved relative path '%s' -> %s", media_url, candidate)
+            return str(candidate)
+        # Fall back to filename only
+        candidate = search_dir / p.name
+        if candidate.exists():
+            logger.info("cron: resolved filename '%s' -> %s", media_url, candidate)
+            return str(candidate)
+
+    logger.warning("cron: media file '%s' not found in any workspace, skipping", media_url)
+    return None
 
 
 def _extract_agent_part(session_key: str) -> str | None:
@@ -605,14 +735,6 @@ def _extract_agent_part(session_key: str) -> str | None:
         return parts[1]
     return session_key  # Use as-is for simple keys like "main"
 
-
-def _extract_telegram_chat_id(session_key: str) -> str | None:
-    """Extract Telegram chat_id from session key like 'agent:main:telegram:direct:8366053063'."""
-    parts = session_key.split(":")
-    # Format: agent:<agent>:telegram:direct:<chat_id> or agent:<agent>:telegram:group:<chat_id>
-    if len(parts) >= 5 and "telegram" in parts:
-        return parts[-1]
-    return None
 
 
 def _list_all_session_keys(cm: Any) -> list[str]:

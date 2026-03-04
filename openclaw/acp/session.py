@@ -35,6 +35,9 @@ class AcpSessionStore:
     def get_session(self, session_id: str) -> AcpSession | None:
         return self._sessions.get(session_id)
 
+    def has_session(self, session_id: str) -> bool:
+        return session_id in self._sessions
+
     def get_session_by_run_id(self, run_id: str) -> AcpSession | None:
         sid = self._run_to_session.get(run_id)
         return self._sessions.get(sid) if sid else None

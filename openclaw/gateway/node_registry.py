@@ -241,7 +241,7 @@ class NodeRegistry:
                 error={"code": "UNAVAILABLE", "message": f"failed to send invoke: {exc}"},
             )
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         future: asyncio.Future[NodeInvokeResult] = loop.create_future()
 
         def _on_timeout() -> None:

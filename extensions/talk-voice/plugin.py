@@ -73,7 +73,7 @@ async def _list_voices(api_key: str) -> list[dict]:
             voices = data.get("voices") if isinstance(data, dict) else None
             return voices if isinstance(voices, list) else []
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _fetch)
 
 
@@ -134,7 +134,7 @@ def _config_to_dict(cfg) -> dict:
 async def _write_config(cfg_dict: dict) -> None:
     try:
         from openclaw.config.loader import write_config_file
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, write_config_file, cfg_dict)
     except Exception:
         pass

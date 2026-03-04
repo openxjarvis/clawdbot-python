@@ -2,7 +2,7 @@
 
 Python equivalent of TypeScript src/plugins/hooks.ts createHookRunner().
 
-Provides typed execution of all 20 plugin lifecycle hooks with:
+Provides typed execution of all 24 plugin lifecycle hooks with:
 - Priority ordering (higher priority runs first)
 - Parallel execution for void hooks (asyncio.gather)
 - Sequential execution for modifying hooks (result merging)
@@ -246,6 +246,26 @@ class PluginHookRunner:
             "block_reason": nxt.get("block_reason") or acc.get("block_reason"),
         }
 
+    @staticmethod
+    def _merge_subagent_spawning(acc: dict | None, nxt: dict) -> dict:
+        """Merge subagent_spawning results. Error status wins; first non-default fields win."""
+        acc = acc or {}
+        # "error" status wins over "ok"
+        status = "error" if (nxt.get("status") == "error" or acc.get("status") == "error") else "ok"
+        return {
+            "status": status,
+            "error": nxt.get("error") or acc.get("error"),
+            "thread_binding_ready": nxt.get("thread_binding_ready") or acc.get("thread_binding_ready", False),
+        }
+
+    @staticmethod
+    def _merge_subagent_delivery_target(acc: dict | None, nxt: dict) -> dict:
+        """Merge subagent_delivery_target results. First non-None origin wins."""
+        acc = acc or {}
+        return {
+            "origin": nxt.get("origin") or acc.get("origin"),
+        }
+
     # =========================================================================
     # Agent Hooks
     # =========================================================================
@@ -384,6 +404,48 @@ class PluginHookRunner:
     async def run_gateway_stop(self, event: dict[str, Any], ctx: dict[str, Any]) -> None:
         """Run gateway_stop (parallel)."""
         await self._run_void_hook("gateway_stop", event, ctx)
+
+    # =========================================================================
+    # Subagent Hooks (mirrors TS PluginHookHandlerMap subagent entries)
+    # =========================================================================
+
+    async def run_subagent_spawning(
+        self, event: dict[str, Any], ctx: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Run subagent_spawning — modifying (sequential).
+
+        Allows plugins to block or modify subagent spawn.
+        Returns merged result with 'status' ("ok"|"error") and optional 'thread_binding_ready'.
+        """
+        return await self._run_modifying_hook(
+            "subagent_spawning",
+            event,
+            ctx,
+            merge_fn=self._merge_subagent_spawning,
+        )
+
+    async def run_subagent_delivery_target(
+        self, event: dict[str, Any], ctx: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Run subagent_delivery_target — modifying (sequential).
+
+        Allows plugins to override the delivery target origin for the subagent.
+        Returns merged result with optional 'origin' dict.
+        """
+        return await self._run_modifying_hook(
+            "subagent_delivery_target",
+            event,
+            ctx,
+            merge_fn=self._merge_subagent_delivery_target,
+        )
+
+    async def run_subagent_spawned(self, event: dict[str, Any], ctx: dict[str, Any]) -> None:
+        """Run subagent_spawned — void (parallel). Fired after subagent successfully created."""
+        await self._run_void_hook("subagent_spawned", event, ctx)
+
+    async def run_subagent_ended(self, event: dict[str, Any], ctx: dict[str, Any]) -> None:
+        """Run subagent_ended — void (parallel). Fired after subagent run completes."""
+        await self._run_void_hook("subagent_ended", event, ctx)
 
     # =========================================================================
     # Utility

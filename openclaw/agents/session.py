@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
+import uuid as _uuid_module
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -29,19 +31,29 @@ SESSION_STORE_CACHE_TTL = 45.0
 
 
 class Message(BaseModel):
-    """A single message in a conversation"""
+    """A single message in a conversation.
+
+    ``content`` accepts either a plain string or a list of typed content blocks
+    (text, tool_use, tool_result, image) exactly as the Anthropic / OpenAI APIs
+    return them.  This mirrors the TS ``Message.content: ContentBlock[]`` union.
+    """
+
+    model_config = {"arbitrary_types_allowed": True}
 
     role: str  # "user", "assistant", "system", "tool"
-    content: str
-    timestamp: str = Field(default_factory=lambda: datetime.utcnow().isoformat())
+    content: str | list[Any]  # str OR list of content blocks
+    timestamp: str = Field(default_factory=lambda: datetime.now(UTC).isoformat())
     tool_calls: list[dict[str, Any]] | None = None
     tool_call_id: str | None = None
     name: str | None = None  # For tool results
     images: list[str] | None = None  # Image URLs or paths
+    # JSONL DAG fields — set by Session._save()
+    id: str | None = None          # Entry UUID (full v4)
+    parent_id: str | None = None   # Previous entry UUID (for compaction DAG)
 
     def to_api_format(self) -> dict[str, Any]:
         """Convert to API format for LLM calls"""
-        msg = {"role": self.role, "content": self.content}
+        msg: dict[str, Any] = {"role": self.role, "content": self.content}
 
         if self.tool_calls:
             msg["tool_calls"] = self.tool_calls
@@ -114,6 +126,8 @@ class Session(BaseModel):
 
     # Private override for sessions directory (used for workspace-scoped sessions)
     _sessions_dir_override: Path | None = PrivateAttr(default=None)
+    # Thread-safe write lock for sync _save() calls
+    _write_lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
 
     model_config = {"arbitrary_types_allowed": True}
 
@@ -162,9 +176,9 @@ class Session(BaseModel):
         
         # Create sessions directory
         self._sessions_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Load existing session if exists
-        if self._session_file.exists() and not self.messages:
+
+        # Load from JSONL (v3) or legacy .json if present
+        if (self._session_file.exists() or self._session_file_legacy.exists()) and not self.messages:
             self._load()
 
     @property
@@ -207,14 +221,15 @@ class Session(BaseModel):
 
     @property
     def _session_file(self) -> Path:
-        """
-        Get session file path using UUID.
-        
-        Format: ~/.openclaw/agents/{agentId}/sessions/{uuid}.json
-        """
+        """Session JSONL transcript path.  Extension is ``.jsonl`` (v3 format)."""
+        return self._sessions_dir / f"{self.session_id}.jsonl"
+
+    @property
+    def _session_file_legacy(self) -> Path:
+        """Old ``.json`` path for backward-compat migration check."""
         return self._sessions_dir / f"{self.session_id}.json"
 
-    def add_message(self, role: str, content: str, **kwargs) -> Message:
+    def add_message(self, role: str, content: str | list[Any], **kwargs) -> Message:
         """Add a message to the session"""
         msg = Message(role=role, content=content, **kwargs)
         self.messages.append(msg)
@@ -255,68 +270,282 @@ class Session(BaseModel):
         return [msg.to_api_format() for msg in messages]
 
     def clear(self) -> None:
-        """Clear all messages"""
+        """Clear all messages and rewrite the JSONL file with an empty header."""
         self.messages = []
-        self.updated_at = datetime.utcnow().isoformat()
-        self._save()
+        self.updated_at = datetime.now(UTC).isoformat()
+        try:
+            with self._write_lock:
+                # Truncate and rewrite — JSONL is append-only so we must rewrite
+                header: dict[str, Any] = {
+                    "type": "session",
+                    "version": 3,
+                    "id": self.session_id,
+                    "timestamp": self.created_at,
+                }
+                if self.workspace_dir:
+                    header["cwd"] = str(self.workspace_dir)
+                self._session_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(self._session_file, "w", encoding="utf-8") as f:
+                    f.write(json.dumps(header, default=str) + "\n")
+        except Exception as e:
+            logger.error("Failed to clear session %s: %s", self.session_id, e)
 
     def set_metadata(self, key: str, value: Any) -> None:
         """Set metadata value"""
         self.metadata[key] = value
-        self._save()
+        self._save_metadata()
 
     def get_metadata(self, key: str, default: Any = None) -> Any:
         """Get metadata value"""
         return self.metadata.get(key, default)
 
-    def _save(self) -> None:
-        """Save session to disk"""
-        try:
-            def _msg_to_dict(msg: Any) -> dict:
-                if isinstance(msg, dict):
-                    return msg
-                return msg.model_dump()
+    # ── Append-only JSONL persistence (v3 format, mirrors TS session-manager.ts) ─────
 
-            data = {
-                "session_id": self.session_id,
-                "session_key": self.session_key,
-                "agent_id": self.agent_id,
-                "messages": [_msg_to_dict(msg) for msg in self.messages],
-                "metadata": self.metadata,
-                "created_at": self.created_at,
-                "updated_at": self.updated_at,
+    def _save_metadata(self) -> None:
+        """Append a metadata snapshot entry to the JSONL transcript."""
+        try:
+            self._ensure_session_header()
+            entry: dict[str, Any] = {
+                "type": "metadata",
+                "id": str(_uuid_module.uuid4()),
+                "timestamp": datetime.now(UTC).isoformat(),
+                "data": self.metadata,
             }
-            with open(self._session_file, "w") as f:
-                json.dump(data, f, indent=2, default=str)
+            with self._write_lock:
+                with open(self._session_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry, default=str) + "\n")
         except Exception as e:
-            logger.error(f"Failed to save session: {e}")
+            logger.error("Failed to save metadata for session %s: %s", self.session_id, e)
+
+    def _ensure_session_header(self) -> None:
+        """Write v3 session header if the JSONL file does not exist yet."""
+        if self._session_file.exists():
+            return
+        header: dict[str, Any] = {
+            "type": "session",
+            "version": 3,
+            "id": self.session_id,
+            "timestamp": self.created_at,
+        }
+        if self.workspace_dir:
+            header["cwd"] = str(self.workspace_dir)
+        if self.session_key:
+            header["sessionKey"] = self.session_key
+        if self.agent_id:
+            header["agentId"] = self.agent_id
+        try:
+            self._session_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self._session_file, "w", encoding="utf-8") as f:
+                f.write(json.dumps(header, default=str) + "\n")
+        except Exception as exc:
+            logger.error("Failed to write session header: %s", exc)
+
+    def _read_last_entry_id(self) -> str | None:
+        """Return the ``id`` field of the last JSONL line (for parentId chain)."""
+        if not self._session_file.exists():
+            return None
+        try:
+            buf = b""
+            with open(self._session_file, "rb") as f:
+                f.seek(0, 2)
+                pos = f.tell()
+                while pos > 0:
+                    read_size = min(512, pos)
+                    pos -= read_size
+                    f.seek(pos)
+                    chunk = f.read(read_size)
+                    buf = chunk + buf
+                    lines = buf.split(b"\n")
+                    for line in reversed(lines):
+                        stripped = line.strip()
+                        if stripped:
+                            entry = json.loads(stripped.decode("utf-8", errors="replace"))
+                            return entry.get("id")
+        except Exception:
+            pass
+        return None
+
+    def _save(self) -> None:
+        """
+        Append the most recently added message to the JSONL transcript.
+
+        On first call (file doesn't exist) a v3 session header line is written
+        first.  Each message entry carries a full UUIDv4 ``id`` and a
+        ``parentId`` pointing to the previous entry, forming a DAG that the
+        compaction algorithm traverses — mirrors TS session-manager.ts.
+
+        A SessionWriteLock is acquired before any write to prevent concurrent
+        corruption.
+        """
+        try:
+            self._ensure_session_header()
+
+            # Determine which message to persist (only the last one, newly added)
+            if not self.messages:
+                return
+            msg = self.messages[-1]
+            msg_dict = msg.model_dump() if hasattr(msg, "model_dump") else dict(msg) if isinstance(msg, dict) else {}
+
+            entry_id = str(_uuid_module.uuid4())
+            parent_id = self._read_last_entry_id()
+
+            entry: dict[str, Any] = {
+                "type": "message",
+                "id": entry_id,
+                "timestamp": datetime.now(UTC).isoformat(),
+                "message": msg_dict,
+            }
+            if parent_id:
+                entry["parentId"] = parent_id
+
+            with self._write_lock:
+                with open(self._session_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(entry, default=str) + "\n")
+
+            # Stamp the message with its DAG ids so callers can read them back
+            if hasattr(msg, "__dict__"):
+                try:
+                    object.__setattr__(msg, "id", entry_id)
+                    if parent_id:
+                        object.__setattr__(msg, "parent_id", parent_id)
+                except Exception:
+                    pass
+
+            self.updated_at = datetime.now(UTC).isoformat()
+        except Exception as e:
+            logger.error("Failed to append message to session %s: %s", self.session_id, e)
+
+    def _save_all(self) -> None:
+        """Rewrite the entire JSONL file with the header and all current messages.
+
+        Use this when the history has been replaced en-masse (e.g. via the
+        history setter or save_session).  Incremental callers should use
+        _save() instead to avoid O(n) rewrites on every message.
+        """
+        try:
+            header: dict[str, Any] = {
+                "type": "session",
+                "version": 3,
+                "id": self.session_id,
+                "timestamp": self.created_at,
+            }
+            if self.workspace_dir:
+                header["cwd"] = str(self.workspace_dir)
+            if self.session_key:
+                header["sessionKey"] = self.session_key
+            if self.agent_id:
+                header["agentId"] = self.agent_id
+
+            lines: list[str] = [json.dumps(header, default=str)]
+            prev_id: str | None = None
+            for msg in self.messages:
+                msg_dict = msg.model_dump() if hasattr(msg, "model_dump") else dict(msg) if isinstance(msg, dict) else {}
+                entry_id = str(_uuid_module.uuid4())
+                entry: dict[str, Any] = {
+                    "type": "message",
+                    "id": entry_id,
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "message": msg_dict,
+                }
+                if prev_id:
+                    entry["parentId"] = prev_id
+                lines.append(json.dumps(entry, default=str))
+                prev_id = entry_id
+
+            if self.metadata:
+                meta_entry: dict[str, Any] = {
+                    "type": "metadata",
+                    "id": str(_uuid_module.uuid4()),
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "data": self.metadata,
+                }
+                lines.append(json.dumps(meta_entry, default=str))
+
+            with self._write_lock:
+                self._session_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(self._session_file, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines) + "\n")
+
+            self.updated_at = datetime.now(UTC).isoformat()
+        except Exception as e:
+            logger.error("Failed to save_all session %s: %s", self.session_id, e)
 
     def _load(self) -> None:
-        """Load session from disk"""
-        try:
-            with open(self._session_file) as f:
-                data = json.load(f)
+        """
+        Load session state from the JSONL transcript.
 
-            loaded_msgs = []
-            for m in data.get("messages", []):
-                if isinstance(m, dict):
-                    try:
-                        loaded_msgs.append(Message(**m))
-                    except Exception:
+        Handles both new JSONL (v3) files and legacy JSON files for migration.
+        """
+        # Migration: old .json file without a .jsonl counterpart
+        legacy = self._session_file_legacy
+        if not self._session_file.exists() and legacy.exists():
+            try:
+                with open(legacy) as f:
+                    data = json.load(f)
+                loaded_msgs = []
+                for m in data.get("messages", []):
+                    if isinstance(m, dict):
+                        try:
+                            loaded_msgs.append(Message(**m))
+                        except Exception:
+                            loaded_msgs.append(m)
+                    else:
                         loaded_msgs.append(m)
-                else:
-                    loaded_msgs.append(m)
+                self.messages = loaded_msgs  # type: ignore[assignment]
+                self.metadata = data.get("metadata", {})
+                self.created_at = data.get("created_at", self.created_at)
+                self.updated_at = data.get("updated_at", self.updated_at)
+                if data.get("session_key") and not self.session_key:
+                    self.session_key = data["session_key"]
+                if data.get("agent_id") and not self.agent_id:
+                    self.agent_id = data["agent_id"]
+            except Exception as e:
+                logger.error("Failed to load legacy session %s: %s", self.session_id, e)
+            return
+
+        # JSONL path
+        if not self._session_file.exists():
+            return
+        try:
+            loaded_msgs: list[Message] = []
+            with open(self._session_file, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    entry = json.loads(line)
+                    entry_type = entry.get("type")
+                    if entry_type == "session":
+                        # Header — restore cwd / session_key / agent_id if present
+                        if entry.get("cwd") and self.workspace_dir == Path.home() / ".openclaw" / "workspace":
+                            self.workspace_dir = Path(entry["cwd"])
+                        if entry.get("sessionKey") and not self.session_key:
+                            self.session_key = entry["sessionKey"]
+                        if entry.get("agentId") and not self.agent_id:
+                            self.agent_id = entry["agentId"]
+                    elif entry_type == "metadata":
+                        # Metadata snapshot — merge into current metadata
+                        data = entry.get("data")
+                        if isinstance(data, dict):
+                            self.metadata.update(data)
+                    elif entry_type == "message":
+                        msg_data = entry.get("message")
+                        if isinstance(msg_data, dict):
+                            try:
+                                msg = Message(**msg_data)
+                            except Exception:
+                                msg = msg_data  # type: ignore[assignment]
+                            # Restore DAG ids
+                            if isinstance(msg, Message):
+                                try:
+                                    msg.id = entry.get("id")
+                                    msg.parent_id = entry.get("parentId")
+                                except Exception:
+                                    pass
+                            loaded_msgs.append(msg)
             self.messages = loaded_msgs  # type: ignore[assignment]
-            self.metadata = data.get("metadata", {})
-            self.created_at = data.get("created_at", self.created_at)
-            self.updated_at = data.get("updated_at", self.updated_at)
-            # Restore fields that _save now persists
-            if data.get("session_key") and not self.session_key:
-                self.session_key = data["session_key"]
-            if data.get("agent_id") and not self.agent_id:
-                self.agent_id = data["agent_id"]
         except Exception as e:
-            logger.error(f"Failed to load session: {e}")
+            logger.error("Failed to load JSONL session %s: %s", self.session_id, e)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary"""
@@ -727,11 +956,8 @@ class SessionManager:
         return session
 
     def save_session(self, session: "Session") -> None:
-        """Persist a session to disk.
-
-        Convenience wrapper used by external code and tests.
-        """
-        session._save()
+        """Persist a session to disk (full rewrite — ensures all messages are written)."""
+        session._save_all()
 
     def get_or_create(self, session_id: str | None = None, session_key: str | None = None) -> "Session":
         """
@@ -810,8 +1036,10 @@ class SessionManager:
                 return s
 
         # 3. Try loading from disk by session_id stem (loads prior messages)
-        candidate_file = self._sessions_dir / f"{session_id}.json"
-        if candidate_file.exists():
+        # Check .jsonl first (new format), then .json (legacy)
+        candidate_file_jsonl = self._sessions_dir / f"{session_id}.jsonl"
+        candidate_file_json = self._sessions_dir / f"{session_id}.json"
+        if candidate_file_jsonl.exists() or candidate_file_json.exists():
             session = Session(
                 session_id,
                 self.workspace_dir,
@@ -820,16 +1048,19 @@ class SessionManager:
             self._sessions[session_id] = session
             return session
 
-        # 4. Scan disk files and match by session_key field
+        # 4. Scan disk files and match by session_key field (header line of JSONL or JSON)
         if self._sessions_dir.exists():
-            for f in self._sessions_dir.glob("*.json"):
+            for f in list(self._sessions_dir.glob("*.jsonl")) + list(self._sessions_dir.glob("*.json")):
                 if f.name in ("session_map.json", "sessions.json"):
                     continue
                 try:
                     import json as _json
-                    data = _json.loads(f.read_text())
-                    if data.get("session_key") == session_id:
-                        loaded_id = data.get("session_id", f.stem)
+                    first_line = f.read_text().splitlines()[0] if f.suffix == ".jsonl" else f.read_text()
+                    data = _json.loads(first_line)
+                    # JSONL header uses "sessionKey"; legacy JSON uses "session_key"
+                    key_val = data.get("sessionKey") or data.get("session_key")
+                    if key_val == session_id:
+                        loaded_id = data.get("id") or data.get("session_id") or f.stem
                         session = Session(
                             loaded_id,
                             self.workspace_dir,
@@ -860,16 +1091,16 @@ class SessionManager:
             Sorted list of session keys.
         """
         disk_sessions: set[str] = set()
-        # Scan canonical sessions dir (agent-key sessions)
+        # Scan canonical sessions dir (agent-key sessions) — both .jsonl and .json
         if self._sessions_dir.exists():
-            for f in self._sessions_dir.glob("*.json"):
+            for f in list(self._sessions_dir.glob("*.jsonl")) + list(self._sessions_dir.glob("*.json")):
                 if f.name not in ("session_map.json", "sessions.json"):
                     disk_sessions.add(f.stem)
 
         # Also scan workspace_dir/.sessions (simple/workspace-scoped sessions)
         legacy_dir = self.workspace_dir / ".sessions"
         if legacy_dir.exists() and legacy_dir != self._sessions_dir:
-            for f in legacy_dir.glob("*.json"):
+            for f in list(legacy_dir.glob("*.jsonl")) + list(legacy_dir.glob("*.json")):
                 if f.name not in ("session_map.json", "sessions.json"):
                     disk_sessions.add(f.stem)
 
@@ -924,16 +1155,17 @@ class SessionManager:
             logger.info(f"Removed {len(keys_to_remove)} session key(s) for {session_id}")
 
         # Remove from disk (new canonical path + legacy workspace path)
+        # Check both .jsonl (new) and .json (legacy)
         deleted = False
-        session_file = self._sessions_dir / f"{session_id}.json"
-        if session_file.exists():
-            session_file.unlink()
-            deleted = True
-
-        legacy_file = self.workspace_dir / ".sessions" / f"{session_id}.json"
-        if legacy_file.exists():
-            legacy_file.unlink()
-            deleted = True
+        for ext in (".jsonl", ".json"):
+            session_file = self._sessions_dir / f"{session_id}{ext}"
+            if session_file.exists():
+                session_file.unlink()
+                deleted = True
+            legacy_file = self.workspace_dir / ".sessions" / f"{session_id}{ext}"
+            if legacy_file.exists():
+                legacy_file.unlink()
+                deleted = True
 
         return deleted
 
@@ -972,3 +1204,79 @@ class SessionManager:
                 pass
 
         return deleted
+
+    # ------------------------------------------------------------------
+    # SessionEntry access methods (mirrors TS sessionStore.get/patch)
+    # ------------------------------------------------------------------
+
+    def get_session_entry(self, session_key: str) -> "SessionEntry | None":
+        """Return the ``SessionEntry`` for a session key (or None if absent).
+
+        Mirrors TS ``sessionStore.get(sessionKey)``.
+        """
+        from openclaw.agents.session_entry import SessionEntry as _SE  # noqa: F401
+        store = self._get_session_store()
+        return store.get(session_key)
+
+    def get_entry_by_session_key(self, session_key: str) -> "SessionEntry | None":
+        """Alias for ``get_session_entry`` — used by channel_manager routing."""
+        return self.get_session_entry(session_key)
+
+    def get_entry_by_id(self, session_id: str) -> "SessionEntry | None":
+        """Find a ``SessionEntry`` by UUID ``session_id``.
+
+        Mirrors TS ``findSessionEntryById(store, sessionId)``.
+        """
+        store = self._get_session_store()
+        for entry in store.values():
+            if entry.sessionId == session_id:
+                return entry
+        return None
+
+    async def save_entry(self, entry: "SessionEntry") -> None:  # type: ignore[override]
+        """Persist an updated ``SessionEntry`` back to the session store.
+
+        Locates the entry by ``sessionId``, replaces it, and saves to disk.
+        Mirrors TS ``updateSessionStore(storePath, sessionKey, patch)``.
+        """
+        store = self._get_session_store()
+        # Find the key(s) that match this entry's sessionId
+        matching_keys = [k for k, e in store.items() if e.sessionId == entry.sessionId]
+        if not matching_keys:
+            logger.warning("save_entry: no session key found for sessionId=%s", entry.sessionId)
+            return
+        for key in matching_keys:
+            store.set(key, entry)
+        self._session_store = store
+        self._save_session_store(store)
+
+    def update_session_meta_preserve_activity(
+        self, session_key: str, patch: "dict[str, Any]"
+    ) -> None:
+        """Merge metadata fields into a ``SessionEntry`` WITHOUT touching ``updatedAt``.
+
+        Mirrors TS ``mergeSessionEntryPreserveActivity`` — inbound metadata
+        (lastChannel, lastTo, etc.) must not refresh ``updatedAt`` because
+        idle-reset logic depends on that timestamp tracking actual agent turns.
+
+        If no entry exists yet for the key, one is created (upsert).
+        """
+        import time as _time
+        from openclaw.agents.session_entry import merge_session_entry
+
+        store = self._get_session_store()
+        existing = store.get(session_key)
+        if existing is None:
+            # Auto-create a bare entry for the key so metadata has somewhere to live
+            from openclaw.agents.session_entry import SessionEntry as _SE
+            import uuid as _uuid
+            existing = _SE(sessionId=str(_uuid.uuid4()))
+
+        # Merge the patch, preserving the original updatedAt
+        original_updated_at = existing.updatedAt
+        updated = merge_session_entry(existing, patch)
+        updated.updatedAt = original_updated_at  # restore — mirrors preserveActivity
+
+        store.set(session_key, updated)
+        self._session_store = store
+        self._save_session_store(store)

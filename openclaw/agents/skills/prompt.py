@@ -45,11 +45,18 @@ def format_skills_for_prompt(
     skill_items = []
     for entry in skill_entries:
         skill = entry.skill
-        
-        # Skip skills that are disabled for model invocation
-        if skill.disable_model_invocation:
+
+        # Skip skills that are disabled for model invocation.
+        # Read from the entry's invocation policy (not directly from Skill dataclass).
+        disable_model = (
+            entry.invocation.disable_model_invocation
+            if entry.invocation is not None
+            else False
+        )
+        if disable_model:
             continue
-        
+
+        # skill.file_path is a property alias for skill.location (TS: skill.filePath)
         skill_item = f"""  <skill>
     <name>{_escape_xml(skill.name)}</name>
     <description>{_escape_xml(skill.description)}</description>

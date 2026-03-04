@@ -191,7 +191,7 @@ class BrowserController:
         page = self._get_page(page_id)
         
         if path is None:
-            path = f"/tmp/screenshot-{asyncio.get_event_loop().time()}.png"
+            path = f"/tmp/screenshot-{asyncio.get_running_loop().time()}.png"
         
         await page.screenshot(path=path, full_page=full_page)
         

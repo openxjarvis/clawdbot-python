@@ -26,6 +26,7 @@ class ModelCatalogEntry:
     context_window: int | None = None
     reasoning: bool | None = None
     input: list[str] | None = None  # e.g. ["text", "image"]
+    api: str | None = None  # Provider API type: "ollama", "openai-completions", etc.
 
 
 # ---------------------------------------------------------------------------
@@ -79,16 +80,29 @@ def _read_models_json_directly(agent_dir: str) -> list[ModelCatalogEntry]:
     except Exception:
         return []
 
-    # models.json may be a list or {"providers": {provider: [models]}}
+    # models.json may be a list or {"providers": {provider: {api: ..., models: [...]}}}
     entries: list[dict[str, Any]] = []
     if isinstance(raw, list):
         entries = raw
     elif isinstance(raw, dict):
         providers = raw.get("providers") or {}
-        for provider_id, provider_models in (providers.items() if isinstance(providers, dict) else []):
-            for model_entry in (provider_models if isinstance(provider_models, list) else []):
+        for provider_id, provider_config in (providers.items() if isinstance(providers, dict) else []):
+            # provider_config can be a list (legacy) or a dict with "models" key
+            if isinstance(provider_config, list):
+                provider_models = provider_config
+                provider_api = None
+            elif isinstance(provider_config, dict):
+                provider_models = provider_config.get("models") or []
+                provider_api = provider_config.get("api")
+            else:
+                continue
+            for model_entry in provider_models:
                 if isinstance(model_entry, dict):
-                    entries.append({**model_entry, "provider": provider_id})
+                    entries.append({
+                        **model_entry,
+                        "provider": provider_id,
+                        "_provider_api": provider_api,
+                    })
 
     results: list[ModelCatalogEntry] = []
     for entry in entries:
@@ -105,6 +119,8 @@ def _read_models_json_directly(agent_dir: str) -> list[ModelCatalogEntry]:
         reasoning = bool(reasoning) if isinstance(reasoning, bool) else None
         inp = entry.get("input")
         input_types = list(inp) if isinstance(inp, list) else None
+        # Preserve provider-level api type — model-level "api" takes precedence
+        api_type = entry.get("api") or entry.get("_provider_api") or None
         results.append(ModelCatalogEntry(
             id=mid,
             name=name,
@@ -112,6 +128,7 @@ def _read_models_json_directly(agent_dir: str) -> list[ModelCatalogEntry]:
             context_window=context_window,
             reasoning=reasoning,
             input=input_types,
+            api=api_type,
         ))
     return results
 
@@ -133,7 +150,7 @@ async def load_model_catalog(
     if _model_catalog_future is not None:
         return await _model_catalog_future
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     fut: asyncio.Future[list[ModelCatalogEntry]] = loop.create_future()
     _model_catalog_future = fut
 

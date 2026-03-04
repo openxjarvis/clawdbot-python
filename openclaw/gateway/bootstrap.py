@@ -33,13 +33,19 @@ except ImportError:
 
 
 def _config_as_dict(cfg) -> dict:
-    """Convert config object or dict to plain dict safely."""
+    """Convert config object or dict to plain dict safely.
+
+    Uses exclude_none=True so that callers can safely use
+    .get("key", {}) without hitting None — mirrors TS optional-chaining
+    behaviour where absent/null keys produce undefined (not crash).
+    """
     if cfg is None:
         return {}
     if isinstance(cfg, dict):
-        return cfg
+        # Strip explicit None values for consistency with model_dump path
+        return {k: v for k, v in cfg.items() if v is not None}
     if hasattr(cfg, "model_dump"):
-        return cfg.model_dump()
+        return cfg.model_dump(exclude_none=True)
     return {}
 
 logger = logging.getLogger(__name__)
@@ -180,7 +186,7 @@ class GatewayBootstrap:
         # Step 3.5: Run gateway update check (writes ~/.openclaw/update-check.json)
         try:
             from ..infra.update_startup import run_gateway_update_check
-            asyncio.ensure_future(run_gateway_update_check(self.config or {}))
+            asyncio.create_task(run_gateway_update_check(self.config or {}))
         except Exception as exc:
             logger.debug("update-check: skipped: %s", exc)
 
@@ -291,6 +297,12 @@ class GatewayBootstrap:
             )
             # Create hook runner from loaded registry
             self._hook_runner = PluginHookRunner(self.plugin_registry)
+            # Wire hook runner into global SubagentRegistry for subagent lifecycle hooks
+            try:
+                from ..agents.subagent_registry import get_global_registry
+                get_global_registry().set_hook_runner(self._hook_runner)
+            except Exception as _sub_exc:
+                logger.debug(f"Could not wire hook_runner into SubagentRegistry: {_sub_exc}")
         except Exception as e:
             logger.warning(f"Plugin loading skipped: {e}")
             from ..plugins.types import create_empty_plugin_registry
@@ -566,6 +578,7 @@ class GatewayBootstrap:
             # the corresponding config section is present and enabled.
             _BUILTIN_CHANNELS: dict[str, str] = {
                 "telegram": "openclaw.channels.telegram.enhanced_telegram.EnhancedTelegramChannel",
+                "feishu": "openclaw.channels.feishu.channel.FeishuChannel",
             }
             for builtin_id, class_path in _BUILTIN_CHANNELS.items():
                 ch_config_raw = channels_config_dict.get(builtin_id)
@@ -600,6 +613,30 @@ class GatewayBootstrap:
                     logger.warning(f"❌ Failed to start built-in channel '{builtin_id}': {e}", exc_info=True)
 
             logger.info(f"Started {started_count} channels from plugin registry")
+
+            # Wire global channel registry for ChannelHandlerTool client resolution
+            try:
+                from ..plugins.channel_tool import set_global_channel_registry
+                set_global_channel_registry(self.channel_manager)
+            except Exception as _ctr_exc:
+                logger.debug("Could not set global channel registry: %s", _ctr_exc)
+
+            # Register channel plugin tools (e.g. feishu_chat, feishu_doc, etc.)
+            # These are stored as PluginToolRegistration entries with ChannelHandlerTool
+            # factory objects — wire them into the ToolRegistry now that channels are up.
+            if self.plugin_registry and self.tool_registry:
+                _channel_tool_count = 0
+                for reg in (self.plugin_registry.tools or []):
+                    from ..plugins.channel_tool import ChannelHandlerTool
+                    if isinstance(reg.factory, ChannelHandlerTool):
+                        try:
+                            self.tool_registry.register(reg.factory)
+                            _channel_tool_count += 1
+                        except Exception as _te:
+                            logger.debug("Could not register channel tool %s: %s", reg.names, _te)
+                if _channel_tool_count:
+                    logger.info(f"Registered {_channel_tool_count} channel plugin tools")
+
         except Exception as e:
             logger.error(f"Channel manager creation failed: {e}")
             results["errors"].append(f"channel_manager: {e}")
@@ -769,9 +806,9 @@ class GatewayBootstrap:
             server_task = asyncio.create_task(self.server.start(start_channels=False))
 
             # Poll up to 3 s for the server to bind its port
-            deadline = asyncio.get_event_loop().time() + 3.0
+            deadline = asyncio.get_running_loop().time() + 3.0
             bound = False
-            while asyncio.get_event_loop().time() < deadline:
+            while asyncio.get_running_loop().time() < deadline:
                 await asyncio.sleep(0.1)
                 # If the task already finished it must have failed
                 if server_task.done():

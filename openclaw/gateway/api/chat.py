@@ -35,18 +35,13 @@ NO_GATEWAY_TIMEOUT_MS = 2_147_000_000
 
 def is_chat_stop_command_text(text: str) -> bool:
     """
-    Return True if the text is a stop command (/stop or known abort triggers).
-    Mirrors TS isChatStopCommandText().
+    Return True if the text is exactly the ``/stop`` stop command.
+
+    TS ``isChatStopCommandText()`` only matches the literal string ``/stop``
+    (case-insensitive, trimmed).  Broader "abort"/"cancel" aliases were a
+    Python-only divergence that could accidentally stop legitimate messages.
     """
-    trimmed = text.strip()
-    if not trimmed:
-        return False
-    lower = trimmed.lower()
-    if lower == "/stop":
-        return True
-    # Known abort trigger words
-    _ABORT_TRIGGERS = frozenset(["abort", "cancel", "/abort", "/cancel", "stop", "/quit"])
-    return lower in _ABORT_TRIGGERS
+    return text.strip().lower() == "/stop"
 
 
 def resolve_chat_run_expires_at_ms(
@@ -179,20 +174,28 @@ def resolve_transcript_path(
     return sessions_dir / f"{session_id}.jsonl"
 
 
-def ensure_transcript_file(transcript_path: Path, session_id: str) -> tuple[bool, str | None]:
-    """Ensure transcript file exists"""
+CURRENT_SESSION_VERSION = 3
+
+
+def ensure_transcript_file(
+    transcript_path: Path,
+    session_id: str,
+    cwd: str | None = None,
+) -> tuple[bool, str | None]:
+    """Ensure transcript file exists with a v3 session header."""
     if transcript_path.exists():
         return True, None
-    
+
     try:
         transcript_path.parent.mkdir(parents=True, exist_ok=True)
-        # Write session header
-        header = {
+        header: dict[str, Any] = {
             "type": "session",
-            "version": 1,
+            "version": CURRENT_SESSION_VERSION,
             "id": session_id,
             "timestamp": datetime.now(UTC).isoformat(),
         }
+        if cwd:
+            header["cwd"] = cwd
         with open(transcript_path, "w", encoding="utf-8") as f:
             f.write(json.dumps(header) + "\n")
         return True, None
@@ -228,36 +231,75 @@ def read_session_messages(transcript_path: Path, limit: int = 200) -> list[dict[
         return []
 
 
+def _read_last_entry_id(transcript_path: Path) -> str | None:
+    """Return the ``id`` of the last JSONL entry in the transcript (for parentId chain)."""
+    try:
+        last_line: str | None = None
+        with open(transcript_path, "rb") as f:
+            # Efficient backwards scan — read last non-empty line
+            f.seek(0, 2)
+            file_size = f.tell()
+            buf = b""
+            pos = file_size
+            while pos > 0:
+                read_size = min(512, pos)
+                pos -= read_size
+                f.seek(pos)
+                chunk = f.read(read_size)
+                buf = chunk + buf
+                lines = buf.split(b"\n")
+                for line in reversed(lines):
+                    stripped = line.strip()
+                    if stripped:
+                        last_line = stripped.decode("utf-8", errors="replace")
+                        break
+                if last_line:
+                    break
+        if last_line:
+            entry = json.loads(last_line)
+            return entry.get("id")
+    except Exception:
+        pass
+    return None
+
+
 def append_message_to_transcript(
     transcript_path: Path,
     message: dict[str, Any],
     create_if_missing: bool = True,
+    cwd: str | None = None,
 ) -> tuple[bool, str | None, str | None]:
     """
-    Append message to transcript
-    
+    Append a message entry to the JSONL transcript.
+
+    Each entry gets a full UUID and a ``parentId`` pointing to the previous
+    entry, forming a linked-list DAG that the compaction algorithm traverses.
+
     Returns:
         (success, message_id, error)
     """
-    message_id = str(uuid.uuid4())[:8]
+    message_id = str(uuid.uuid4())
     now = datetime.now(UTC)
-    
+
     # Ensure file exists
     if not transcript_path.exists() and create_if_missing:
-        # Extract session_id from path (filename without .jsonl)
         session_id = transcript_path.stem
-        success, error = ensure_transcript_file(transcript_path, session_id)
+        success, error = ensure_transcript_file(transcript_path, session_id, cwd=cwd)
         if not success:
             return False, None, error
-    
-    # Build transcript entry
-    entry = {
+
+    # Resolve parentId from the current last entry
+    parent_id = _read_last_entry_id(transcript_path)
+
+    entry: dict[str, Any] = {
         "type": "message",
         "id": message_id,
         "timestamp": now.isoformat(),
         "message": message,
     }
-    
+    if parent_id:
+        entry["parentId"] = parent_id
+
     try:
         with open(transcript_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
@@ -855,7 +897,19 @@ class ChatSendMethod:
             # Stream events from run_turn() async generator — this is the correct
             # pattern: events arrive in real time via an internal asyncio.Queue,
             # so they are never missed regardless of await scheduling.
-            async for event in runtime.run_turn(session, message, tools, images=images, system_prompt=system_prompt):
+            # Pass session_key and run_id so the active-run registry uses the
+            # meaningful key (e.g. "agent:xxx:...") instead of the raw UUID,
+            # enabling steer/abort lookups and tool-policy spawnedBy resolution.
+            # Mirrors TS where runEmbeddedPiAgent always receives sessionKey.
+            async for event in runtime.run_turn(
+                session,
+                message,
+                tools,
+                images=images,
+                system_prompt=system_prompt,
+                session_key=session_key,
+                run_id=run_id,
+            ):
                 evt_type = getattr(event, "type", "")
                 event_data: dict[str, Any] = {}
                 if hasattr(event, "data") and isinstance(event.data, dict):

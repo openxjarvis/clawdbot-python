@@ -92,7 +92,7 @@ class TelegramDraftStream:
                 text=trimmed
             )
             self.last_sent_text = trimmed
-            self.last_sent_at = asyncio.get_event_loop().time()
+            self.last_sent_at = asyncio.get_running_loop().time()
         except Exception as e:
             logger.error(f"Draft stream failed: {e}")
             self.stopped = True

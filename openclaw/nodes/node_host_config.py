@@ -99,7 +99,7 @@ async def load_node_host_config() -> NodeHostConfig | None:
         except (OSError, json.JSONDecodeError):
             return None
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     raw = await loop.run_in_executor(None, _read)
     if raw is None:
         return None
@@ -131,7 +131,7 @@ async def save_node_host_config(config: NodeHostConfig) -> None:
         except OSError:
             pass  # best-effort
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, _write)
 
 

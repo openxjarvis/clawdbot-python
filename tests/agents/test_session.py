@@ -42,7 +42,7 @@ class TestSessionCreation:
     
     def test_session_file_path(self, test_session):
         """Test session file path generation."""
-        expected_path = test_session.workspace_dir / ".sessions" / "test-session-123.json"
+        expected_path = test_session.workspace_dir / ".sessions" / "test-session-123.jsonl"
         assert test_session._session_file == expected_path
 
 

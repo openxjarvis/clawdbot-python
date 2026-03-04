@@ -28,6 +28,10 @@ logger = logging.getLogger(__name__)
 # ACP protocol version — keep in sync with @agentclientprotocol/sdk
 PROTOCOL_VERSION = "1.0"
 
+# Rate limit defaults: max 120 sessions per 10-second window
+_SESSION_CREATE_RATE_LIMIT_MAX = 120
+_SESSION_CREATE_RATE_LIMIT_WINDOW_MS = 10_000
+
 
 @dataclass
 class _PendingPrompt:
@@ -38,6 +42,33 @@ class _PendingPrompt:
     sent_text_length: int = 0
     sent_text: str = ""
     tool_calls: set[str] = field(default_factory=set)
+
+
+class _FixedWindowRateLimiter:
+    """Simple fixed-window rate limiter (aligned with TS infra/fixed-window-rate-limit.ts)."""
+
+    def __init__(self, max_requests: int, window_ms: int) -> None:
+        self._max = max(1, max_requests)
+        self._window_s = max(1.0, window_ms / 1000.0)
+        self._count = 0
+        self._window_start: float = 0.0
+
+    def consume(self) -> tuple[bool, float]:
+        """
+        Try to consume one request slot.
+
+        Returns (allowed, retry_after_s). retry_after_s is 0 when allowed.
+        """
+        import time
+        now = time.monotonic()
+        if now - self._window_start >= self._window_s:
+            self._window_start = now
+            self._count = 0
+        if self._count < self._max:
+            self._count += 1
+            return True, 0.0
+        retry_after = self._window_s - (now - self._window_start)
+        return False, max(0.0, retry_after)
 
 
 class AcpGatewayAgent:
@@ -65,6 +96,16 @@ class AcpGatewayAgent:
             (lambda msg: sys.stderr.write(f"[acp] {msg}\n"))
             if self._opts.verbose
             else (lambda msg: None)
+        )
+
+        rate_cfg = getattr(self._opts, "session_create_rate_limit", None) or {}
+        max_req = (rate_cfg.get("max_requests") if isinstance(rate_cfg, dict) else None) \
+            or _SESSION_CREATE_RATE_LIMIT_MAX
+        window_ms = (rate_cfg.get("window_ms") if isinstance(rate_cfg, dict) else None) \
+            or _SESSION_CREATE_RATE_LIMIT_WINDOW_MS
+        self._session_rate_limiter = _FixedWindowRateLimiter(
+            max_requests=int(max_req),
+            window_ms=int(window_ms),
         )
 
     def start(self) -> None:
@@ -114,61 +155,126 @@ class AcpGatewayAgent:
     async def authenticate(self, params: dict) -> dict:
         return {"ok": True}
 
-    async def new_session(self, params: dict) -> dict:
-        import os
-        meta = parse_session_meta(params.get("_meta"))
-        cwd = os.getcwd()
-        fallback_key = f"agent:main:{uuid.uuid4().hex[:8]}"
-        try:
-            session_key = await resolve_session_key(
-                meta=meta,
-                fallback_key=fallback_key,
-                gateway=self._gateway,
-                opts=self._opts,
+    def _enforce_session_create_rate_limit(self, method: str) -> None:
+        """Raise if the session creation rate limit is exceeded."""
+        allowed, retry_after_s = self._session_rate_limiter.consume()
+        if not allowed:
+            raise RuntimeError(
+                f"ACP session creation rate limit exceeded for {method}; "
+                f"retry after {int(retry_after_s) + 1}s."
             )
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
 
+    async def _resolve_session_key_from_meta(
+        self,
+        meta: Any,
+        fallback_key: str,
+    ) -> str:
+        """
+        Resolve a gateway session key from ACP _meta, then optionally reset it.
+        Mirrors private resolveSessionKeyFromMeta() in translator.ts.
+        """
+        session_key = await resolve_session_key(
+            meta=meta,
+            fallback_key=fallback_key,
+            gateway=self._gateway,
+            opts=self._opts,
+        )
         await reset_session_if_needed(
             meta=meta,
             session_key=session_key,
             gateway=self._gateway,
             opts=self._opts,
         )
+        return session_key
 
-        session = self._session_store.create_session(session_key=session_key, cwd=cwd)
+    async def new_session(self, params: dict) -> dict:
+        import os
+        mcp_servers = params.get("mcpServers") or []
+        if mcp_servers:
+            self._log(f"ignoring {len(mcp_servers)} MCP servers")
+
+        self._enforce_session_create_rate_limit("newSession")
+
+        session_id = str(uuid.uuid4())
+        meta = parse_session_meta(params.get("_meta"))
+        cwd = params.get("cwd") or os.getcwd()
+        fallback_key = f"acp:{session_id}"
+
+        session_key = await self._resolve_session_key_from_meta(meta, fallback_key)
+        session = self._session_store.create_session(
+            session_key=session_key, cwd=cwd, session_id=session_id
+        )
+        self._log(f"newSession: {session.session_id} -> {session.session_key}")
         await self._send_available_commands(session.session_id)
-        return {"ok": True, "sessionId": session.session_id, "sessionKey": session_key}
+        return {"sessionId": session.session_id}
 
     async def load_session(self, params: dict) -> dict:
         import os
-        meta = parse_session_meta(params.get("_meta"))
-        cwd = os.getcwd()
-        session_key = params.get("sessionId") or params.get("sessionKey") or ""
-        if not session_key:
-            return {"ok": False, "error": "sessionId or sessionKey required"}
+        mcp_servers = params.get("mcpServers") or []
+        if mcp_servers:
+            self._log(f"ignoring {len(mcp_servers)} MCP servers")
 
+        requested_id = params.get("sessionId", "")
+        if not self._session_store.has_session(requested_id):
+            self._enforce_session_create_rate_limit("loadSession")
+
+        meta = parse_session_meta(params.get("_meta"))
+        cwd = params.get("cwd") or os.getcwd()
+        fallback_key = requested_id or str(uuid.uuid4())
+
+        session_key = await self._resolve_session_key_from_meta(meta, fallback_key)
         session = self._session_store.create_session(
-            session_key=session_key, cwd=cwd, session_id=params.get("sessionId")
+            session_key=session_key, cwd=cwd, session_id=requested_id or None
         )
-        await reset_session_if_needed(
-            meta=meta,
-            session_key=session_key,
-            gateway=self._gateway,
-            opts=self._opts,
-        )
+        self._log(f"loadSession: {session.session_id} -> {session.session_key}")
         await self._send_available_commands(session.session_id)
-        return {"ok": True, "sessionId": session.session_id}
+        return {}
 
     async def list_sessions(self, params: dict) -> dict:
+        import os
+        limit = read_number(params.get("_meta"), ["limit"]) or 100
         try:
-            result = await self._gateway.request("sessions.list", {})
-            return {"ok": True, "sessions": result or []}
+            result = await self._gateway.request("sessions.list", {"limit": limit})
+            cwd = params.get("cwd") or os.getcwd()
+            sessions = result.get("sessions", []) if isinstance(result, dict) else (result or [])
+            return {
+                "sessions": [
+                    {
+                        "sessionId": s.get("key", ""),
+                        "cwd": cwd,
+                        "title": s.get("displayName") or s.get("label") or s.get("key", ""),
+                        "updatedAt": s.get("updatedAt"),
+                        "_meta": {
+                            "sessionKey": s.get("key"),
+                            "kind": s.get("kind"),
+                            "channel": s.get("channel"),
+                        },
+                    }
+                    for s in sessions
+                    if isinstance(s, dict)
+                ],
+                "nextCursor": None,
+            }
         except Exception as e:
-            return {"ok": False, "error": str(e), "sessions": []}
+            return {"sessions": [], "nextCursor": None, "error": str(e)}
 
     async def set_session_mode(self, params: dict) -> dict:
-        return {"ok": True}
+        session_id = params.get("sessionId", "")
+        session = self._session_store.get_session(session_id)
+        if not session:
+            raise RuntimeError(f"Session {session_id} not found")
+        mode_id = params.get("modeId")
+        if not mode_id:
+            return {}
+        try:
+            await self._gateway.request("sessions.patch", {
+                "key": session.session_key,
+                "thinkingLevel": mode_id,
+            })
+            self._log(f"setSessionMode: {session_id} -> {mode_id}")
+        except Exception as exc:
+            self._log(f"setSessionMode error: {exc}")
+        return {}
 
     async def prompt(self, params: dict) -> dict:
         session_id = params.get("sessionId", "")
@@ -189,7 +295,7 @@ class AcpGatewayAgent:
         cancel_event = asyncio.Event()
         self._session_store.set_active_run(session_id, run_id, cancel_event)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         future: asyncio.Future = loop.create_future()
 
         pending = _PendingPrompt(
@@ -218,7 +324,7 @@ class AcpGatewayAgent:
         if timeout_ms is not None:
             request_payload["timeoutMs"] = timeout_ms
 
-        asyncio.ensure_future(
+        asyncio.create_task(
             self._gateway.request("chat.send", request_payload, expect_final=True)
         ).add_done_callback(
             lambda t: self._on_chat_send_done(t, session_id)
@@ -321,7 +427,9 @@ class AcpGatewayAgent:
             return
 
         if state == "final":
-            self._finish_prompt(pending.session_id, "end_turn")
+            raw_stop_reason = payload.get("stopReason")
+            stop_reason = "max_tokens" if raw_stop_reason == "max_tokens" else "end_turn"
+            self._finish_prompt(pending.session_id, stop_reason)
         elif state == "aborted":
             self._finish_prompt(pending.session_id, "cancelled")
         elif state == "error":

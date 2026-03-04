@@ -48,6 +48,8 @@ _agent_runtime: Any | None = None
 _wizard_handler: Any | None = None
 _plugin_manager: Any | None = None
 _queue_manager: Any | None = None
+_node_registry: Any | None = None
+_node_event_handler: Any | None = None
 
 RESET_COMMAND_RE = re.compile(r"^/(new|reset)(?:\s+([\s\S]*))?$", re.IGNORECASE)
 BARE_SESSION_RESET_PROMPT = (
@@ -60,9 +62,9 @@ BARE_SESSION_RESET_PROMPT = (
 )
 
 
-def set_global_instances(session_manager, tool_registry, channel_registry, agent_runtime, wizard_handler=None, queue_manager=None):
+def set_global_instances(session_manager, tool_registry, channel_registry, agent_runtime, wizard_handler=None, queue_manager=None, node_registry=None, node_event_handler=None):
     """Set global instances for handlers to use"""
-    global _session_manager, _tool_registry, _channel_registry, _agent_runtime, _wizard_handler, _plugin_manager, _queue_manager
+    global _session_manager, _tool_registry, _channel_registry, _agent_runtime, _wizard_handler, _plugin_manager, _queue_manager, _node_registry, _node_event_handler
     _session_manager = session_manager
     _tool_registry = tool_registry
     _channel_registry = channel_registry
@@ -70,6 +72,8 @@ def set_global_instances(session_manager, tool_registry, channel_registry, agent
     _wizard_handler = wizard_handler
     _plugin_manager = None
     _queue_manager = queue_manager
+    _node_registry = node_registry
+    _node_event_handler = node_event_handler
 
 
 def _get_current_config() -> dict:
@@ -1555,22 +1559,56 @@ async def handle_node_describe(connection: Any, params: dict[str, Any]) -> dict[
 
 @register_handler("node.invoke")
 async def handle_node_invoke(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Invoke a command on a node"""
-    from openclaw.nodes.manager import get_node_manager
-    
+    """Invoke a command on a node via the live NodeRegistry WebSocket connection."""
     node_id = params.get("nodeId")
     command = str(params.get("command", "")).strip()
     command_params = params.get("params", {})
-    timeout_ms = params.get("timeoutMs")
+    timeout_ms = int(params.get("timeoutMs") or 30_000)
     idempotency_key = params.get("idempotencyKey")
 
     if not node_id or not command:
         raise ValueError("nodeId and command required")
     if command in ("system.execApprovals.get", "system.execApprovals.set"):
         raise ValueError("node.invoke does not allow system.execApprovals.*; use exec.approvals.node.*")
-    
+
+    # Validate allowed commands via NodeManager persistence layer
+    from openclaw.nodes.manager import get_node_manager
     node_manager = get_node_manager()
-    result = await node_manager.invoke_node(
+    node_info = node_manager.get_node(node_id)
+    if node_info is not None:
+        allowed_commands = node_info.metadata.get("commands") if isinstance(node_info.metadata, dict) else None
+        if isinstance(allowed_commands, list) and allowed_commands and command not in allowed_commands:
+            raise ValueError(f"Node command not allowed: {command}")
+
+    # Use live NodeRegistry to send the invocation over WebSocket
+    registry = _node_registry
+    gateway = getattr(connection, "gateway", None)
+    if registry is None and gateway is not None:
+        registry = getattr(gateway, "node_registry", None)
+
+    if registry is not None:
+        from openclaw.gateway.node_registry import NodeInvokeResult
+        result: NodeInvokeResult = await registry.invoke(
+            node_id=node_id,
+            command=command,
+            params=command_params,
+            timeout_ms=timeout_ms,
+            idempotency_key=idempotency_key,
+        )
+        if not result.ok:
+            error = result.error or {}
+            raise ValueError(f"Node invoke failed: {error.get('message', 'unknown error')} [{error.get('code', '')}]")
+        return {
+            "ok": True,
+            "nodeId": node_id,
+            "command": command,
+            "payload": result.payload,
+            "payloadJSON": result.payload_json,
+        }
+
+    # Fallback: node not yet connected via registry — queue via NodeManager (offline path)
+    logger.warning(f"NodeRegistry not available for node.invoke; falling back to NodeManager queue for node={node_id!r}")
+    queued = await node_manager.invoke_node(
         node_id,
         command,
         command_params,
@@ -1581,7 +1619,7 @@ async def handle_node_invoke(connection: Any, params: dict[str, Any]) -> dict[st
         "ok": True,
         "nodeId": node_id,
         "command": command,
-        "payload": result,
+        "payload": queued,
         "payloadJSON": None,
     }
 
@@ -2121,7 +2159,7 @@ async def handle_node_rename(connection: Any, params: dict[str, Any]) -> dict[st
 
 @register_handler("node.event")
 async def handle_node_event(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Publish node event payload."""
+    """Publish node event payload and dispatch to NodeEventHandler."""
     event = str(params.get("event", "")).strip()
     if not event:
         raise ValueError("event is required")
@@ -2146,6 +2184,8 @@ async def handle_node_event(connection: Any, params: dict[str, Any]) -> dict[str
         if isinstance(payload_json, str)
         else json.dumps(payload) if payload is not None else None
     )
+
+    # Broadcast raw event to all WS clients for observability
     gateway = getattr(connection, "gateway", None)
     if gateway is not None and hasattr(gateway, "broadcast_event"):
         try:
@@ -2161,14 +2201,23 @@ async def handle_node_event(connection: Any, params: dict[str, Any]) -> dict[str
             )
         except Exception:
             pass
+
+    # Route to NodeEventHandler for semantic handling (mirrors TS server-node-events.ts)
+    handler = _node_event_handler
+    if handler is None and gateway is not None:
+        handler = getattr(gateway, "node_event_handler", None)
+    if handler is not None:
+        try:
+            await handler.handle_node_event(node_id, event, payload)
+        except Exception as exc:
+            logger.warning(f"NodeEventHandler.handle_node_event raised: {exc}", exc_info=True)
+
     return {"ok": True}
 
 
 @register_handler("node.invoke.result")
 async def handle_node_invoke_result(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Handle node invoke callback result."""
-    from openclaw.nodes.manager import get_node_manager
-
+    """Handle node invoke callback result — resolves the pending Future in NodeRegistry."""
     invocation_id = params.get("invocationId") or params.get("id")
     if not invocation_id:
         raise ValueError("invocationId is required")
@@ -2176,23 +2225,47 @@ async def handle_node_invoke_result(connection: Any, params: dict[str, Any]) -> 
     provided_node_id = params.get("nodeId")
     if caller_node_id and provided_node_id and str(provided_node_id).strip() != caller_node_id:
         raise ValueError("nodeId mismatch")
-    result_payload = params.get("result")
-    if result_payload is None:
-        payload_json = params.get("payloadJSON")
-        payload = params.get("payload")
-        if payload is None and payload_json is not None and not isinstance(payload_json, str):
-            payload = payload_json
-            payload_json = None
-        result_payload = {
-            "nodeId": caller_node_id or params.get("nodeId"),
-            "ok": bool(params.get("ok", True)),
-            "payload": payload,
-            "payloadJSON": payload_json if isinstance(payload_json, str) else None,
-            "error": params.get("error"),
-        }
+
+    node_id = caller_node_id or (str(provided_node_id).strip() if provided_node_id else None) or "node"
+
+    payload_json = params.get("payloadJSON")
+    payload = params.get("payload")
+    if payload is None and payload_json is not None and not isinstance(payload_json, str):
+        payload = payload_json
+        payload_json = None
+    ok = bool(params.get("ok", True))
+    error = params.get("error") if not ok else None
+
+    # Resolve via NodeRegistry (live WS invoke path)
+    registry = _node_registry
+    gateway = getattr(connection, "gateway", None)
+    if registry is None and gateway is not None:
+        registry = getattr(gateway, "node_registry", None)
+
+    if registry is not None:
+        ack = registry.resolve_invoke_result(
+            invocation_id=invocation_id,
+            node_id=node_id,
+            ok=ok,
+            payload=payload,
+            payload_json=payload_json if isinstance(payload_json, str) else None,
+            error=error,
+        )
+        if ack:
+            return {"ok": True, "ack": True}
+
+    # Fallback: resolve via NodeManager (offline/queued path)
+    from openclaw.nodes.manager import get_node_manager
     node_manager = get_node_manager()
-    ack = bool(node_manager.resolve_invoke_result(invocation_id, result_payload))
-    if not ack:
+    result_payload = {
+        "nodeId": node_id,
+        "ok": ok,
+        "payload": payload,
+        "payloadJSON": payload_json if isinstance(payload_json, str) else None,
+        "error": error,
+    }
+    ack_fallback = bool(node_manager.resolve_invoke_result(invocation_id, result_payload))
+    if not ack_fallback:
         return {"ok": True, "ack": False, "ignored": True}
     return {"ok": True, "ack": True}
 
@@ -2780,6 +2853,58 @@ async def handle_node_canvas_capability_refresh(connection: Any, params: dict[st
 async def handle_secrets_reload(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
     """Reload secrets from disk."""
     return {"ok": True, "reloaded": True}
+
+
+@register_handler("secrets.resolve")
+async def handle_secrets_resolve(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
+    """Resolve secret references for a given command and set of target IDs.
+
+    Mirrors TS secrets.resolve gateway method. Validates commandName and targetIds,
+    then resolves the corresponding secret values from the configured secret providers.
+    """
+    command_name = params.get("commandName", "") if isinstance(params, dict) else ""
+    target_ids = params.get("targetIds", []) if isinstance(params, dict) else []
+
+    if not isinstance(command_name, str) or not command_name.strip():
+        return {
+            "ok": False,
+            "error": {"code": "INVALID_REQUEST", "message": "invalid secrets.resolve params: commandName"},
+        }
+
+    if not isinstance(target_ids, list):
+        return {
+            "ok": False,
+            "error": {"code": "INVALID_REQUEST", "message": "invalid secrets.resolve params: targetIds"},
+        }
+
+    command_name = command_name.strip()
+    cleaned_ids = [t.strip() for t in target_ids if isinstance(t, str) and t.strip()]
+
+    try:
+        from openclaw.secrets.resolver import resolve_secrets_for_command
+        result = await resolve_secrets_for_command(
+            command_name=command_name,
+            target_ids=cleaned_ids,
+        )
+        return {
+            "ok": True,
+            "assignments": result.get("assignments", []),
+            "diagnostics": result.get("diagnostics", []),
+            "inactiveRefPaths": result.get("inactiveRefPaths", []),
+        }
+    except ImportError:
+        # Secrets resolver not yet implemented — return empty assignments
+        return {
+            "ok": True,
+            "assignments": [],
+            "diagnostics": [],
+            "inactiveRefPaths": [],
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": {"code": "UNAVAILABLE", "message": str(exc)},
+        }
 
 
 @register_handler("tools.catalog")

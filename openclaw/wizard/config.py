@@ -134,6 +134,107 @@ def configure_discord_enhanced() -> dict:
     }
 
 
+def configure_feishu_enhanced() -> dict:
+    """Configure Feishu / Lark with App credentials and DM policy."""
+    import os
+
+    print("\nGet your Feishu / Lark app credentials from the Feishu Open Platform:")
+    print("  1. Visit https://open.feishu.cn/app (or open.larksuite.com for Lark)")
+    print("  2. Create or select your app")
+    print("  3. Go to Credentials & Basic Info to copy App ID and App Secret\n")
+
+    env_app_id = os.getenv("FEISHU_APP_ID") or os.getenv("LARK_APP_ID")
+    env_app_secret = os.getenv("FEISHU_APP_SECRET") or os.getenv("LARK_APP_SECRET")
+
+    if env_app_id:
+        use_env = input(f"Use FEISHU_APP_ID ({env_app_id[:8]}…) from environment? [Y/n]: ").strip().lower()
+        app_id = env_app_id if use_env != "n" else input("Feishu App ID: ").strip()
+    else:
+        app_id = input("Feishu App ID: ").strip()
+
+    if not app_id:
+        return {}
+
+    if env_app_secret and env_app_id == app_id:
+        use_env = input("Use FEISHU_APP_SECRET from environment? [Y/n]: ").strip().lower()
+        app_secret = env_app_secret if use_env != "n" else input("Feishu App Secret: ").strip()
+    else:
+        app_secret = input("Feishu App Secret: ").strip()
+
+    if not app_secret:
+        return {}
+
+    # Connection mode
+    print("\nConnection mode:")
+    print("  1. WebSocket (Long Connection) — recommended, no public URL needed")
+    print("  2. Webhook (HTTP) — requires a public HTTPS URL")
+    mode_choice = input("Choose mode [1]: ").strip()
+    use_websocket = mode_choice != "2"
+
+    webhook_path = ""
+    if not use_websocket:
+        webhook_path = input("Webhook path (default: /feishu/event): ").strip() or "/feishu/event"
+
+    # DM policy
+    print("\nDM Policy (who can message your bot):")
+    print("  1. Open - Allow all users")
+    print("  2. Pairing - Require approval (recommended)")
+    dm_policy = "open" if input("Choose DM policy [2]: ").strip() == "1" else "pairing"
+
+    config: dict = {
+        "enabled": True,
+        "appId": app_id,
+        "appSecret": app_secret,
+        "useWebSocket": use_websocket,
+        "dmPolicy": dm_policy,
+    }
+    if not use_websocket and webhook_path:
+        config["webhookPath"] = webhook_path
+
+    return config
+
+
+def configure_whatsapp_enhanced() -> dict:
+    """Configure WhatsApp via Baileys bridge (QR-code pairing, no API key required)."""
+    print("\nWhatsApp uses a local Baileys bridge (Node.js) for connectivity.")
+    print("You will scan a QR code to link your WhatsApp account on first start.\n")
+
+    # Account name / identifier
+    account_name = input("Account name / identifier (e.g. 'personal', default: 'default'): ").strip() or "default"
+
+    # DM policy
+    print("\nDM Policy:")
+    print("  1. Open - Accept messages from any number")
+    print("  2. Pairing - Require approval (recommended)")
+    print("  3. Allowlist - Specific numbers only (E.164 format, e.g. +1234567890)")
+    policy_choice = input("Choose DM policy [2]: ").strip()
+    if policy_choice == "1":
+        dm_policy = "open"
+    elif policy_choice == "3":
+        dm_policy = "allowlist"
+    else:
+        dm_policy = "pairing"
+
+    config: dict = {
+        "enabled": True,
+        "accounts": {
+            account_name: {
+                "enabled": True,
+                "dmPolicy": dm_policy,
+                "groupPolicy": "allowlist",
+            }
+        },
+    }
+
+    if dm_policy == "allowlist":
+        raw = input("Allowed phone numbers (E.164, comma-separated, e.g. +1234567890): ").strip()
+        if raw:
+            numbers = [n.strip() for n in raw.split(",") if n.strip()]
+            config["accounts"][account_name]["allowFrom"] = numbers
+
+    return config
+
+
 async def configure_channels() -> dict:
     """Configure chat channels.
     
@@ -164,6 +265,22 @@ async def configure_channels() -> dict:
             channels["discord"] = dc_config
             print("✓ Discord configured\n")
     
+    # Feishu / Lark
+    setup_feishu = input("Configure Feishu / Lark? [y/N]: ").strip().lower()
+    if setup_feishu == "y":
+        fs_config = configure_feishu_enhanced()
+        if fs_config:
+            channels["feishu"] = fs_config
+            print("✓ Feishu / Lark configured\n")
+    
+    # WhatsApp
+    setup_whatsapp = input("Configure WhatsApp? [y/N]: ").strip().lower()
+    if setup_whatsapp == "y":
+        wa_config = configure_whatsapp_enhanced()
+        if wa_config:
+            channels["whatsapp"] = wa_config
+            print("✓ WhatsApp configured\n")
+
     # Slack
     setup_slack = input("Configure Slack? [y/N]: ").strip().lower()
     if setup_slack == "y":

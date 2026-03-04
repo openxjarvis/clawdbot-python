@@ -126,16 +126,57 @@ class PluginApi:
 
     def register_tool(
         self,
-        tool: Any,
+        tool: Any = None,
         opts: dict[str, Any] | None = None,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        schema: dict[str, Any] | None = None,
+        parameters: dict[str, Any] | None = None,
+        handler: Any = None,
+        execute: Any = None,
     ) -> None:
         """Register an agent tool from this plugin.
 
-        Args:
-            tool: Tool object or factory function
-            opts: Options dict with optional 'name', 'names', 'optional' keys
+        Accepts two call styles:
+
+        Legacy style (tool object / factory):
+            api.register_tool(tool_obj)
+            api.register_tool(tool_obj, opts={"name": "..."})
+
+        Named style (used by channel plugins like feishu):
+            api.register_tool(name="my_tool", description="...",
+                              schema={...}, handler=async_fn)
         """
         opts = opts or {}
+
+        # Named-kwargs style: wrap handler into a ChannelHandlerTool
+        if name or handler or execute:
+            tool_name = name or (opts.get("name") or "")
+            tool_desc = description or ""
+            tool_schema = schema or parameters or {}
+            tool_handler = handler or execute
+            if tool_name and tool_handler:
+                from .channel_tool import ChannelHandlerTool
+                wrapped = ChannelHandlerTool(
+                    tool_name=tool_name,
+                    description=tool_desc,
+                    schema=tool_schema,
+                    handler=tool_handler,
+                )
+                reg = PluginToolRegistration(
+                    plugin_id=self.id,
+                    factory=wrapped,
+                    names=[tool_name],
+                    optional=False,
+                    source=self.source,
+                )
+                self._registry.tools.append(reg)
+                logger.debug(f"[{self.id}] registered channel tool: {tool_name}")
+            else:
+                logger.warning(f"[{self.id}] register_tool(name=...) called without name or handler")
+            return
+
         names: list[str] = []
         if "names" in opts:
             names = list(opts["names"])

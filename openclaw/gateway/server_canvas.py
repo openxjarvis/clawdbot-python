@@ -29,7 +29,7 @@ async def start_canvas_host_server(
     """
     # Check if enabled
     if config:
-        canvas_config = config.get("canvas", {})
+        canvas_config = config.get("canvas") or {}
         if not canvas_config.get("enabled", True):
             logger.info("Canvas Host Server disabled in config")
             return None

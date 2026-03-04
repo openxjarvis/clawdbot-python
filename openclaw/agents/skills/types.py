@@ -13,7 +13,7 @@ from typing import Any
 class Skill:
     """
     Skill definition (matches @mariozechner/pi-coding-agent).
-    
+
     Attributes:
         name: Skill name
         description: Skill description
@@ -26,6 +26,11 @@ class Skill:
     location: str
     source: str = "unknown"
     metadata: "OpenClawSkillMetadata | None" = None
+
+    @property
+    def file_path(self) -> str:
+        """Alias for ``location`` — matches TS ``skill.filePath``."""
+        return self.location
 
 
 @dataclass

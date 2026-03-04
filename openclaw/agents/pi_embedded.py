@@ -193,11 +193,7 @@ def abort_embedded_pi_run(session_id: str) -> None:
             result = abort_fn()
             if asyncio.iscoroutine(result):
                 try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        asyncio.ensure_future(result)
-                    else:
-                        loop.run_until_complete(result)
+                    asyncio.ensure_future(result)
                 except RuntimeError:
                     pass
     except Exception as exc:

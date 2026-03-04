@@ -34,11 +34,35 @@ _cached_config_mtime_ns: Optional[int] = None
 # JSON5 parsing
 # ---------------------------------------------------------------------------
 
+# Matches string literals (to skip) or comments (to strip).
+# String-aware so that // inside "http://..." is never treated as a comment.
+_JSON5_TOKEN_RE = re.compile(
+    r'"(?:[^"\\]|\\.)*"'   # double-quoted string literal
+    r"|'(?:[^'\\]|\\.)*'"  # single-quoted string literal
+    r"|//[^\n]*"            # // line comment
+    r"|/\*.*?\*/",          # /* block comment */
+    flags=re.DOTALL,
+)
+
+
+def _strip_json5_comments(text: str) -> str:
+    """Remove JSON5 // and /* */ comments, leaving string literals intact."""
+    def _replacer(m: re.Match) -> str:
+        s = m.group(0)
+        if s.startswith('"') or s.startswith("'"):
+            return s  # preserve string content unchanged
+        return ""  # erase comment
+
+    return _JSON5_TOKEN_RE.sub(_replacer, text)
+
+
 def _parse_json5(text: str) -> Any:
     """
     Parse JSON5 text (comments + trailing commas).
 
     Falls back to strict json if json5 library is unavailable.
+    Uses a string-aware comment stripper so that URLs like
+    "http://127.0.0.1:11434" are never mangled.
     """
     try:
         import json5  # type: ignore[import]
@@ -46,10 +70,8 @@ def _parse_json5(text: str) -> Any:
     except ImportError:
         pass
 
-    # Minimal JSON5 → JSON stripper: remove // and /* */ comments,
-    # remove trailing commas before ] or }.
-    text = re.sub(r"//[^\n]*", "", text)
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    # String-aware comment stripping + trailing-comma removal.
+    text = _strip_json5_comments(text)
     text = re.sub(r",\s*([\]}])", r"\1", text)
     return json.loads(text)
 

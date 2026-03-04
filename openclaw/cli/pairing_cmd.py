@@ -15,10 +15,12 @@ def _notify_pairing_approved(channel: str, sender_id: str, account_id: str | Non
     """Send an approval notification to the user via the channel's bot API.
 
     Mirrors TS notifyPairingApproved() → adapter.notifyApproval().
-    Currently supports: telegram.
+    Supports: telegram, feishu.
     """
     if channel == "telegram":
         _telegram_notify_approved(sender_id, account_id)
+    elif channel in ("feishu", "lark"):
+        _feishu_notify_approved(sender_id, account_id)
     else:
         raise NotImplementedError(f"Notification not yet implemented for channel: {channel}")
 
@@ -67,6 +69,81 @@ def _telegram_notify_approved(chat_id: str, account_id: str | None = None) -> No
         result = _json.loads(resp.read())
     if not result.get("ok"):
         raise RuntimeError(f"Telegram API error: {result}")
+
+
+def _feishu_notify_approved(open_id: str, account_id: str | None = None) -> None:
+    """Send PAIRING_APPROVED_MESSAGE to a Feishu user via the tenant access token REST API.
+
+    This runs in the CLI (sync) context, so we use urllib / requests directly.
+    Mirrors TS feishuPlugin.pairing.notifyApproval().
+    """
+    import json as _json
+    import urllib.request
+    from pathlib import Path
+
+    # Load Feishu credentials from openclaw.json
+    cfg_path = Path.home() / ".openclaw" / "openclaw.json"
+    if not cfg_path.exists():
+        raise RuntimeError("openclaw.json not found — cannot send Feishu notification")
+
+    raw = _json.loads(cfg_path.read_text())
+    feishu_raw: dict = raw.get("channels", {}).get("feishu", {})
+
+    # Resolve account-specific or top-level credentials
+    accounts: dict = feishu_raw.get("accounts", {})
+    acct_cfg: dict = {}
+    if account_id and account_id in accounts:
+        acct_cfg = accounts[account_id]
+    elif accounts:
+        # Use first account as default
+        acct_cfg = next(iter(accounts.values()), {})
+
+    app_id: str = acct_cfg.get("appId") or feishu_raw.get("appId") or ""
+    app_secret: str = acct_cfg.get("appSecret") or feishu_raw.get("appSecret") or ""
+    domain_raw: str = acct_cfg.get("domain") or feishu_raw.get("domain") or "feishu"
+
+    if not app_id or not app_secret:
+        raise RuntimeError("Feishu appId/appSecret not found in config")
+
+    # Resolve API base URL
+    if domain_raw == "lark":
+        api_base = "https://open.larksuite.com/open-apis"
+    elif domain_raw.startswith("http"):
+        api_base = domain_raw.rstrip("/") + "/open-apis"
+    else:
+        api_base = "https://open.feishu.cn/open-apis"
+
+    # Step 1: get tenant access token
+    token_url = f"{api_base}/auth/v3/tenant_access_token/internal"
+    token_payload = _json.dumps({"app_id": app_id, "app_secret": app_secret}).encode()
+    token_req = urllib.request.Request(
+        token_url, data=token_payload, headers={"Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(token_req, timeout=10) as resp:
+        token_data = _json.loads(resp.read())
+    if token_data.get("code") != 0:
+        raise RuntimeError(f"Feishu token error: {token_data.get('msg')}")
+    tenant_token: str = token_data["tenant_access_token"]
+
+    # Step 2: send IM message to the user (open_id)
+    msg_url = f"{api_base}/im/v1/messages?receive_id_type=open_id"
+    msg_payload = _json.dumps({
+        "receive_id": open_id,
+        "msg_type": "text",
+        "content": _json.dumps({"text": PAIRING_APPROVED_MESSAGE}),
+    }).encode()
+    msg_req = urllib.request.Request(
+        msg_url,
+        data=msg_payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {tenant_token}",
+        },
+    )
+    with urllib.request.urlopen(msg_req, timeout=10) as resp:
+        msg_data = _json.loads(resp.read())
+    if msg_data.get("code") != 0:
+        raise RuntimeError(f"Feishu IM error: code={msg_data.get('code')} msg={msg_data.get('msg')}")
 
 
 @pairing_app.command("list")

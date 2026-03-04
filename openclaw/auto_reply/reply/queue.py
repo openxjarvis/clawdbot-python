@@ -408,7 +408,7 @@ def schedule_followup_drain(
         loop.create_task(_drain())
     except RuntimeError:
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             loop.create_task(_drain())
         except RuntimeError:
             pass

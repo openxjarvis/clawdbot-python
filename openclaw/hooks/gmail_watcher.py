@@ -26,12 +26,13 @@ async def start_gmail_watcher(config: dict) -> dict:
         Dict with started (bool) and reason (str | None)
     """
     # Check if hooks are enabled
-    hooks_config = config.get("hooks", {})
+    # Use `or {}` because Pydantic model_dump() sets hooks=None rather than omitting the key
+    hooks_config = config.get("hooks") or {}
     if not hooks_config.get("enabled", False):
         return {"started": False, "reason": "hooks not enabled"}
-    
+
     # Check for Gmail account configuration
-    gmail_config = hooks_config.get("gmail", {})
+    gmail_config = hooks_config.get("gmail") or {}
     account = gmail_config.get("account")
     
     if not account:
