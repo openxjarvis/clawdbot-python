@@ -20,7 +20,7 @@ Example usage:
             print(event.data.get("text", ""))
 """
 
-__version__ = "0.6.0"
+__version__ = "0.8.2"
 __author__ = "OpenClaw Contributors"
 
 try:

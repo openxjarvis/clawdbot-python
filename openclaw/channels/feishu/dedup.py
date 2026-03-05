@@ -15,6 +15,8 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from openclaw.config.paths import STATE_DIR as _STATE_DIR
+
 if TYPE_CHECKING:
     from .config import ResolvedFeishuAccount
 
@@ -136,7 +138,7 @@ class FeishuDedup:
 
     def __init__(self, account_id: str) -> None:
         self._memory = _MemoryDedup()
-        data_dir = Path.home() / ".openclaw" / "feishu" / "dedup"
+        data_dir = Path(_STATE_DIR) / "feishu" / "dedup"
         self._persistent = _PersistentDedup(data_dir / f"{account_id}.json")
 
     def is_duplicate(self, msg_id: str) -> bool:

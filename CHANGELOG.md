@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.2] - 2026-03-04
+
+### Added
+- Feishu plugin fully refactored into self-contained `extensions/feishu/src/` structure, aligning with TypeScript `clawdbot-feishu` architecture
+- 11 granular Feishu Bitable tools (create/update/delete table, fields, records, views, forms)
+- Feishu Calendar, Task (v2), Urgent, Drive, Wiki, Doc tools in Feishu plugin
+- `ensure_media_dir()` and `ensure_sandboxes_dir()` bootstrapped on startup, mirroring TS `media/` and `sandboxes/` directory structure
+
+### Fixed
+- Feishu typing indicator: `EmojiType` → `Emoji` Python SDK correction (silent `ImportError` resolved)
+- Telegram sticker cache: wrong `state/telegram/sticker-cache.json` path fixed to use `STATE_DIR / "telegram"`
+- Cron job channel routing: messages now correctly delivered back to the originating channel/account
+- Feishu typing indicator now uses `Typing` emoji reactions as a visual progress signal
+
+### Changed
+- All hardcoded `Path.home() / ".openclaw"` references replaced with `STATE_DIR` from `openclaw.config.paths`, ensuring `OPENCLAW_STATE_DIR` env-var overrides work everywhere
+- `cli/cron_cmd.py` consolidated to use `_CRON_STORE` / `_CRON_HISTORY` constants
+- `extensions/feishu/` plugin is now the authoritative location for all Feishu-specific tools (moved from `openclaw/channels/feishu/tools/`)
+
 ## [Unreleased]
 
 ### Added

@@ -1,6 +1,6 @@
-"""feishu_chat tool — chat info and member listing.
+"""feishu_chat tool — group chat management.
 
-Mirrors TypeScript: extensions/feishu/src/chat.ts
+Mirrors TypeScript: clawdbot-feishu/src/channel.ts (chat operations)
 """
 from __future__ import annotations
 
@@ -12,23 +12,33 @@ logger = logging.getLogger(__name__)
 
 TOOL_NAME = "feishu_chat"
 TOOL_DESCRIPTION = (
-    "Get information about a Feishu group chat or list its members. "
-    "Use chat_id starting with 'oc_' for groups."
+    "Manage Feishu group chats: get info, list/add members, search, create, update, delete, "
+    "read/write group announcements, and check bot membership. "
+    "Use chat_id starting with 'oc_' for groups. "
+    "Note: 'delete' requires the bot to be the group owner."
 )
 TOOL_SCHEMA = {
     "type": "object",
     "properties": {
         "chat_id": {
             "type": "string",
-            "description": "The Feishu chat ID (e.g. oc_xxxxxxxx) to get info for.",
+            "description": "The Feishu chat ID (e.g. oc_xxxxxxxx).",
         },
         "action": {
             "type": "string",
-            "enum": ["info", "members", "search", "create", "update"],
+            "enum": [
+                "info", "members", "search", "create", "update",
+                "delete", "add_members", "get_announcement",
+                "update_announcement", "check_membership",
+            ],
             "description": (
-                "Action: 'info' returns chat metadata, 'members' lists members, "
-                "'search' finds chats by keyword, 'create' creates a new group chat, "
-                "'update' updates chat settings."
+                "'info': chat metadata; 'members': list members; "
+                "'search': find chats by keyword; 'create': new group; "
+                "'update': update settings; 'delete': disband (bot must be owner); "
+                "'add_members': add user(s) to chat; "
+                "'get_announcement': read group announcement; "
+                "'update_announcement': write group announcement (markdown); "
+                "'check_membership': check if bot is in the chat."
             ),
         },
         "query": {
@@ -37,16 +47,20 @@ TOOL_SCHEMA = {
         },
         "name": {
             "type": "string",
-            "description": "Group chat name for 'create' or 'update' action.",
+            "description": "Group chat name for 'create' or 'update'.",
         },
         "description": {
             "type": "string",
-            "description": "Group chat description for 'create' or 'update' action.",
+            "description": "Group chat description for 'create' or 'update'.",
         },
         "user_id_list": {
             "type": "array",
             "items": {"type": "string"},
-            "description": "List of user open_ids to add when creating a chat.",
+            "description": "List of user open_ids to add (create or add_members).",
+        },
+        "content": {
+            "type": "string",
+            "description": "Announcement content (markdown) for 'update_announcement'.",
         },
         "page_token": {
             "type": "string",
@@ -199,6 +213,115 @@ async def run_feishu_chat(
             if not response.success():
                 return {"error": f"code={response.code} msg={response.msg}"}
             return {"chat_id": chat_id, "status": "updated"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    elif action == "delete":
+        if not chat_id:
+            return {"error": "chat_id is required for delete"}
+        try:
+            from lark_oapi.api.im.v1 import DeleteChatRequest
+
+            request = DeleteChatRequest.builder().chat_id(chat_id).build()
+            response = await loop.run_in_executor(None, lambda: client.im.v1.chat.delete(request))
+            if not response.success():
+                return {"error": f"code={response.code} msg={response.msg}"}
+            return {"chat_id": chat_id, "status": "deleted"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    elif action == "add_members":
+        if not chat_id:
+            return {"error": "chat_id is required for add_members"}
+        user_ids = params.get("user_id_list") or []
+        if not user_ids:
+            return {"error": "user_id_list is required for add_members"}
+        try:
+            from lark_oapi.api.im.v1 import CreateChatMembersRequest, CreateChatMembersRequestBody
+
+            request = (
+                CreateChatMembersRequest.builder()
+                .chat_id(chat_id)
+                .member_id_type("open_id")
+                .request_body(
+                    CreateChatMembersRequestBody.builder()
+                    .id_list(user_ids)
+                    .build()
+                )
+                .build()
+            )
+            response = await loop.run_in_executor(None, lambda: client.im.v1.chat_members.create(request))
+            if not response.success():
+                return {"error": f"code={response.code} msg={response.msg}"}
+            return {
+                "chat_id": chat_id,
+                "status": "members_added",
+                "invalid_id_list": getattr(response.data, "invalid_id_list", []) or [],
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    elif action == "get_announcement":
+        if not chat_id:
+            return {"error": "chat_id is required for get_announcement"}
+        try:
+            from lark_oapi.api.im.v1 import GetChatAnnouncementRequest
+
+            request = GetChatAnnouncementRequest.builder().chat_id(chat_id).build()
+            response = await loop.run_in_executor(None, lambda: client.im.v1.chat_announcement.get(request))
+            if not response.success():
+                return {"error": f"code={response.code} msg={response.msg}"}
+            data = response.data
+            return {
+                "chat_id": chat_id,
+                "content": getattr(data, "content", ""),
+                "revision_id": getattr(data, "revision_id", ""),
+                "update_time": getattr(data, "update_time", ""),
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+    elif action == "update_announcement":
+        if not chat_id:
+            return {"error": "chat_id is required for update_announcement"}
+        content = params.get("content", "")
+        if not content:
+            return {"error": "content is required for update_announcement"}
+        try:
+            from lark_oapi.api.im.v1 import PatchChatAnnouncementRequest, PatchChatAnnouncementRequestBody
+
+            request = (
+                PatchChatAnnouncementRequest.builder()
+                .chat_id(chat_id)
+                .request_body(
+                    PatchChatAnnouncementRequestBody.builder()
+                    .revision_id("0")
+                    .requests([{"type": "replace_all", "content": content}])
+                    .build()
+                )
+                .build()
+            )
+            response = await loop.run_in_executor(None, lambda: client.im.v1.chat_announcement.patch(request))
+            if not response.success():
+                return {"error": f"code={response.code} msg={response.msg}"}
+            return {"chat_id": chat_id, "status": "announcement_updated"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    elif action == "check_membership":
+        if not chat_id:
+            return {"error": "chat_id is required for check_membership"}
+        try:
+            from lark_oapi.api.im.v1 import IsInChatChatMembersRequest
+
+            request = IsInChatChatMembersRequest.builder().chat_id(chat_id).build()
+            response = await loop.run_in_executor(None, lambda: client.im.v1.chat_members.is_in_chat(request))
+            if not response.success():
+                return {"error": f"code={response.code} msg={response.msg}"}
+            return {
+                "chat_id": chat_id,
+                "is_in_chat": getattr(response.data, "is_in_chat", False),
+            }
         except Exception as e:
             return {"error": str(e)}
 

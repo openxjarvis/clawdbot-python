@@ -72,15 +72,15 @@ async def _add_reaction(client: Any, message_id: str, account_id: str) -> str | 
 
     Returns the reaction_id (needed to delete it later), or None on failure.
     """
-    from lark_oapi.api.im.v1 import CreateMessageReactionRequest, CreateMessageReactionRequestBody
-    from lark_oapi.api.im.v1.model import EmojiType
-
     cb = _get_circuit_breaker(account_id)
     if cb.open:
         return None
 
     try:
-        emoji = EmojiType.builder().emoji_type(_TYPING_EMOJI).build()
+        from lark_oapi.api.im.v1 import CreateMessageReactionRequest, CreateMessageReactionRequestBody
+        from lark_oapi.api.im.v1.model import Emoji
+
+        emoji = Emoji.builder().emoji_type(_TYPING_EMOJI).build()
         request = (
             CreateMessageReactionRequest.builder()
             .message_id(message_id)
@@ -110,7 +110,9 @@ async def _add_reaction(client: Any, message_id: str, account_id: str) -> str | 
                 )
             return None
 
-        return response.data.reaction_id if response.data else None
+        reaction_id = response.data.reaction_id if response.data else None
+        logger.debug("[feishu] Added typing reaction to %s -> reaction_id=%s", message_id, reaction_id)
+        return reaction_id
 
     except Exception as e:
         logger.warning("[feishu] Error adding typing reaction to %s: %s", message_id, e)
@@ -119,13 +121,13 @@ async def _add_reaction(client: Any, message_id: str, account_id: str) -> str | 
 
 async def _remove_reaction(client: Any, message_id: str, reaction_id: str, account_id: str) -> None:
     """Remove the 'Typing' emoji reaction."""
-    from lark_oapi.api.im.v1 import DeleteMessageReactionRequest
-
     cb = _get_circuit_breaker(account_id)
     if cb.open:
         return
 
     try:
+        from lark_oapi.api.im.v1 import DeleteMessageReactionRequest
+
         request = (
             DeleteMessageReactionRequest.builder()
             .message_id(message_id)

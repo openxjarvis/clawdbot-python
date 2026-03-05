@@ -7,7 +7,7 @@ packages = ["openclaw"]
 
 [project]
 name = "openclaw-python"
-version = "0.6.0"
+version = "0.8.2"
 description = "Personal AI assistant platform - Python implementation of OpenClaw"
 readme = "README.md"
 requires-python = ">=3.11"

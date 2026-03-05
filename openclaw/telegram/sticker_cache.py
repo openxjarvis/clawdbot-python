@@ -15,7 +15,8 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-CACHE_FILE = Path.home() / ".openclaw" / "state" / "telegram" / "sticker-cache.json"
+from openclaw.config.paths import STATE_DIR as _STATE_DIR
+CACHE_FILE = Path(_STATE_DIR) / "telegram" / "sticker-cache.json"
 CACHE_VERSION = 1
 
 

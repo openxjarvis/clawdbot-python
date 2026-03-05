@@ -184,6 +184,44 @@ def ensure_logs_dir(root_dir: Path) -> dict:
     return {"dir": logs_dir}
 
 
+def ensure_media_dir(root_dir: Path) -> dict:
+    """Ensure media/ directory exists for media pipeline storage.
+
+    Mirrors TS src/media/store.ts — resolveMediaDir() = stateDir/media.
+    Creates media/ and media/remote-cache/ (used by the media server for
+    remote-URL downloads keyed by session).
+
+    Args:
+        root_dir: OpenClaw root directory
+
+    Returns:
+        Dict with directory info
+    """
+    media_dir = root_dir / "media"
+    media_dir.mkdir(parents=True, exist_ok=True)
+    (media_dir / "remote-cache").mkdir(exist_ok=True)
+    logger.debug("Media directory: %s", media_dir)
+    return {"dir": str(media_dir)}
+
+
+def ensure_sandboxes_dir(root_dir: Path) -> dict:
+    """Ensure sandboxes/ directory exists for per-session sandbox workspaces.
+
+    Mirrors TS src/agents/sandbox/constants.ts — DEFAULT_SANDBOX_WORKSPACE_ROOT =
+    stateDir/sandboxes. Each sandbox session mounts its own subdirectory here.
+
+    Args:
+        root_dir: OpenClaw root directory
+
+    Returns:
+        Dict with directory info
+    """
+    sandboxes_dir = root_dir / "sandboxes"
+    sandboxes_dir.mkdir(parents=True, exist_ok=True)
+    logger.debug("Sandboxes directory: %s", sandboxes_dir)
+    return {"dir": str(sandboxes_dir)}
+
+
 def ensure_root_directories(root_dir: str | Path) -> dict:
     """Ensure all necessary root-level directories and files exist.
     
@@ -193,6 +231,8 @@ def ensure_root_directories(root_dir: str | Path) -> dict:
     - completions/ - Shell completion scripts
     - canvas/ - Interactive canvas with index.html
     - logs/ - Log files including gateway.err.log
+    - media/ - Media pipeline storage (+ media/remote-cache/)
+    - sandboxes/ - Per-session Docker sandbox workspace roots
     
     Args:
         root_dir: OpenClaw root directory path
@@ -238,7 +278,19 @@ def ensure_root_directories(root_dir: str | Path) -> dict:
     except Exception as e:
         logger.warning("Failed to ensure logs dir: %s", e)
         result["logs"] = {"error": str(e)}
-    
+
+    try:
+        result["media"] = ensure_media_dir(root_dir)
+    except Exception as e:
+        logger.warning("Failed to ensure media dir: %s", e)
+        result["media"] = {"error": str(e)}
+
+    try:
+        result["sandboxes"] = ensure_sandboxes_dir(root_dir)
+    except Exception as e:
+        logger.warning("Failed to ensure sandboxes dir: %s", e)
+        result["sandboxes"] = {"error": str(e)}
+
     return result
 
 
@@ -483,4 +535,6 @@ __all__ = [
     "ensure_completions_dir",
     "ensure_canvas_dir",
     "ensure_logs_dir",
+    "ensure_media_dir",
+    "ensure_sandboxes_dir",
 ]

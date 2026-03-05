@@ -2,14 +2,20 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Optional
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
+from openclaw.config.paths import STATE_DIR as _STATE_DIR
+
 console = Console()
 cron_app = typer.Typer(help="Scheduled tasks (cron)", no_args_is_help=False)
+
+_CRON_STORE = Path(_STATE_DIR) / "cron" / "jobs.json"
+_CRON_HISTORY = Path(_STATE_DIR) / "cron" / "history.json"
 
 
 # ---------------------------------------------------------------------------
@@ -17,7 +23,6 @@ cron_app = typer.Typer(help="Scheduled tasks (cron)", no_args_is_help=False)
 # ---------------------------------------------------------------------------
 
 def _load_raw_config() -> dict:
-    from pathlib import Path
     from ..config.loader import load_config_raw
     from ..config.paths import resolve_config_path
     try:
@@ -26,7 +31,7 @@ def _load_raw_config() -> dict:
             return load_config_raw(Path(cfg_path)) or {}
     except Exception:
         pass
-    default = Path.home() / ".openclaw" / "openclaw.json"
+    default = Path(_STATE_DIR) / "openclaw.json"
     if default.exists():
         try:
             return load_config_raw(default) or {}
@@ -50,8 +55,7 @@ def _get_cron_jobs(raw: dict) -> dict:
 
 def _load_jobs_from_store() -> list:
     """Read jobs directly from ~/.openclaw/cron/jobs.json (the authoritative store)."""
-    from pathlib import Path
-    store = Path.home() / ".openclaw" / "cron" / "jobs.json"
+    store = _CRON_STORE
     if not store.exists():
         return []
     try:
@@ -263,8 +267,7 @@ def add(
         "deleteAfterRun": not keep_after_run,
         "enabled": True,
     }
-    from pathlib import Path
-    store = Path.home() / ".openclaw" / "cron" / "jobs.json"
+    store = _CRON_STORE
     store.parent.mkdir(parents=True, exist_ok=True)
     try:
         existing = []
@@ -295,8 +298,7 @@ def edit(
     json_output: bool = typer.Option(False, "--json", help="Output JSON"),
 ):
     """Edit an existing cron job"""
-    from pathlib import Path
-    store = Path.home() / ".openclaw" / "cron" / "jobs.json"
+    store = _CRON_STORE
     if not store.exists():
         console.print(f"[red]No cron jobs found[/red]")
         raise typer.Exit(1)
@@ -339,8 +341,7 @@ def delete(
     json_output: bool = typer.Option(False, "--json", help="Output JSON"),
 ):
     """Delete a cron job"""
-    from pathlib import Path
-    store = Path.home() / ".openclaw" / "cron" / "jobs.json"
+    store = _CRON_STORE
     if not store.exists():
         console.print(f"[yellow]No cron jobs found[/yellow]")
         raise typer.Exit(1)
@@ -401,8 +402,7 @@ def status(
     json_output: bool = typer.Option(False, "--json", help="Output JSON"),
 ):
     """Show execution history/status of cron jobs"""
-    from pathlib import Path
-    log_file = Path.home() / ".openclaw" / "cron" / "history.json"
+    log_file = _CRON_HISTORY
     if not log_file.exists():
         if json_output:
             print(json.dumps([]))

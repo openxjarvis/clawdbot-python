@@ -14,6 +14,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from openclaw.config.paths import STATE_DIR as _STATE_DIR
+
 
 @dataclass
 class DeviceAuthToken:
@@ -105,7 +107,7 @@ class DevicePairingManager:
             state_dir: Directory for state files (default: ~/.openclaw/devices/)
         """
         if state_dir is None:
-            state_dir = Path.home() / ".openclaw" / "devices"
+            state_dir = Path(_STATE_DIR) / "devices"
         
         self.state_dir = Path(state_dir)
         self.pending_path = self.state_dir / "pending.json"

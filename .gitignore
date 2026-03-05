@@ -67,3 +67,7 @@ htmlcov/
 
 # Local backup files (never commit)
 .backup_local_files/
+
+# Agent-generated output — belongs in ~/.openclaw/workspace/, not the project root
+*.csv
+generate_*.py

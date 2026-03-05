@@ -24,6 +24,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Optional, Union
 
+from openclaw.config.paths import STATE_DIR as _STATE_DIR
+
 logger = logging.getLogger(__name__)
 
 _cached_config: Optional["ClawdbotConfig"] = None
@@ -166,7 +168,7 @@ def _deep_merge(base: dict, override: dict) -> dict:
 def _append_config_audit(config_path: Path, event: str, details: str = "") -> None:
     """Append an entry to config-audit.jsonl (matches TS config/io.ts audit log)."""
     # TS writes to stateDir/logs/config-audit.jsonl, not next to the config file
-    audit_file = Path.home() / ".openclaw" / "logs" / "config-audit.jsonl"
+    audit_file = Path(_STATE_DIR) / "logs" / "config-audit.jsonl"
     try:
         audit_file.parent.mkdir(parents=True, exist_ok=True)
         entry = json.dumps({
