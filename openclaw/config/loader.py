@@ -167,8 +167,10 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 def _append_config_audit(config_path: Path, event: str, details: str = "") -> None:
     """Append an entry to config-audit.jsonl (matches TS config/io.ts audit log)."""
-    # TS writes to stateDir/logs/config-audit.jsonl, not next to the config file
-    audit_file = Path(_STATE_DIR) / "logs" / "config-audit.jsonl"
+    # TS writes to stateDir/logs/config-audit.jsonl, not next to the config file.
+    # Resolve dynamically so that Path.home() patches in tests take effect.
+    from .paths import resolve_state_dir
+    audit_file = resolve_state_dir() / "logs" / "config-audit.jsonl"
     try:
         audit_file.parent.mkdir(parents=True, exist_ok=True)
         entry = json.dumps({

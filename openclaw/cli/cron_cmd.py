@@ -108,11 +108,23 @@ def list_crons(
     except Exception:
         pass
 
-    # Fallback: read directly from the cron store JSON file
+    # Fallback: read directly from the cron store JSON file, then from config
     jobs_list = _load_jobs_from_store()
 
+    if not jobs_list:
+        # Also try loading from config-defined jobs (mirrors TS cron-cli fallback)
+        raw = _load_raw_config()
+        config_jobs = _get_cron_jobs(raw)
+        jobs_list = [
+            {"id": jid, "name": jid, **jcfg}
+            for jid, jcfg in config_jobs.items()
+            if isinstance(jcfg, dict)
+        ]
+
     if json_output:
-        console.print(json.dumps(jobs_list, indent=2, ensure_ascii=False))
+        # Return a dict keyed by job id (mirrors TS shape)
+        jobs_dict = {j.get("id", j.get("name", "")): j for j in jobs_list} if jobs_list else {}
+        console.print(json.dumps(jobs_dict, indent=2, ensure_ascii=False))
         return
 
     if not jobs_list:

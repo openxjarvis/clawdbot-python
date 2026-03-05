@@ -433,7 +433,7 @@ class UnifiedBrowserTool(AgentTool):
         from openclaw.config.loader import load_config
 
         cfg = load_config(as_dict=True) or {}
-        browser_config = cfg.get("browser", {})
+        browser_config = cfg.get("browser") or {}
         enabled = browser_config.get("enabled", False)
 
         normalized_sandbox = (sandbox_bridge_url or "").strip().rstrip("/")

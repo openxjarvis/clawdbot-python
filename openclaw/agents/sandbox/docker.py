@@ -290,8 +290,18 @@ class DockerSandbox:
         # Network
         args.extend(["--network", self.config.network_mode])
         
-        # Environment variables
-        for key, value in self.config.env.items():
+        # Environment variables — sanitize before injecting into container
+        from .sanitize_env_vars import sanitize_env_vars
+        sanitized = sanitize_env_vars(self.config.env)
+        if sanitized.blocked:
+            logger.info(
+                "Sandbox: blocked %d sensitive env var(s) from container: %s",
+                len(sanitized.blocked),
+                ", ".join(sanitized.blocked),
+            )
+        for warning in sanitized.warnings:
+            logger.warning("Sandbox env var warning: %s", warning)
+        for key, value in sanitized.allowed.items():
             args.extend(["-e", f"{key}={value}"])
         
         # Workspace mount

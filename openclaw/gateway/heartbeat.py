@@ -76,6 +76,7 @@ class HeartbeatConfig:
         enabled: bool | None = None,
         model: str | None = None,
         include_reasoning: bool = False,
+        light_context: bool = False,
         target: str = "last",
         to: str | None = None,
         account_id: str | None = None,
@@ -95,6 +96,7 @@ class HeartbeatConfig:
             self.every = every
         self.model = model
         self.include_reasoning = include_reasoning
+        self.light_context = light_context
         self.target = target
         self.to = to
         self.account_id = account_id
@@ -145,6 +147,7 @@ class HeartbeatConfig:
         return (
             f"HeartbeatConfig(enabled={self.enabled!r}, every={self.every!r}, "
             f"model={self.model!r}, include_reasoning={self.include_reasoning!r}, "
+            f"light_context={self.light_context!r}, "
             f"target={self.target!r}, to={self.to!r}, account_id={self.account_id!r}, "
             f"prompt={self.prompt!r}, ack_max_chars={self.ack_max_chars!r}, "
             f"session={self.session!r}, suppress_tool_error_warnings={self.suppress_tool_error_warnings!r}, "
@@ -246,53 +249,12 @@ def is_heartbeat_content_effectively_empty(content: str | None) -> bool:
     return True
 
 
-def build_exec_event_prompt(deliver_to_user: bool = True) -> str:
-    """Build the LLM prompt for an exec-event triggered heartbeat.
-
-    Mirrors TS buildExecEventPrompt().
-    """
-    if not deliver_to_user:
-        return (
-            "An async command you ran earlier has completed. "
-            "The result is shown in the system messages above. "
-            "Handle the result internally. Do not relay it to the user unless explicitly requested."
-        )
-    return (
-        "An async command you ran earlier has completed. "
-        "The result is shown in the system messages above. "
-        "Please relay the command output to the user in a helpful way. "
-        "If the command succeeded, share the relevant output. "
-        "If it failed, explain what went wrong."
-    )
-
-
-def build_cron_event_prompt(
-    pending_events: list[str],
-    deliver_to_user: bool = True,
-) -> str:
-    """Build the LLM prompt for a cron-triggered heartbeat.
-
-    Mirrors TS buildCronEventPrompt().
-    """
-    event_text = "\n".join(pending_events).strip()
-    if not event_text:
-        if not deliver_to_user:
-            return (
-                "A scheduled cron event was triggered, but no event content was found. "
-                "Handle this internally and reply HEARTBEAT_OK when nothing needs user-facing follow-up."
-            )
-        return "A scheduled cron event was triggered, but no event content was found. Reply HEARTBEAT_OK."
-    if not deliver_to_user:
-        return (
-            "A scheduled reminder has been triggered. The reminder content is:\n\n"
-            + event_text
-            + "\n\nHandle this reminder internally. Do not relay it to the user unless explicitly requested."
-        )
-    return (
-        "A scheduled reminder has been triggered. The reminder content is:\n\n"
-        + event_text
-        + "\n\nPlease relay this reminder to the user in a helpful and friendly way."
-    )
+from ..infra.heartbeat_events_filter import (  # noqa: E402 — placed here for locality
+    build_cron_event_prompt,
+    build_exec_event_prompt,
+    is_cron_system_event,
+    is_exec_completion_event,
+)
 
 
 async def prune_heartbeat_transcript(
@@ -506,17 +468,30 @@ class HeartbeatManager:
         except Exception:
             pass
 
+        # Build run_turn kwargs — light_context skips full history (mirrors TS lightContext).
+        run_kwargs: dict[str, Any] = {
+            "session_key": self._session_key,
+            "messages": [{"role": "user", "content": self._config.prompt}],
+            "stream": True,
+        }
+        if self._config.light_context:
+            run_kwargs["light_context"] = True
+        if self._config.model:
+            run_kwargs["model"] = self._config.model
+        if self._config.include_reasoning:
+            run_kwargs["include_reasoning"] = True
+
         try:
             content_parts: list[str] = []
-            async for event in self._agent_runtime.run_turn(
-                session_key=self._session_key,
-                messages=[{"role": "user", "content": self._config.prompt}],
-                stream=True,
-            ):
+            reasoning_parts: list[str] = []
+            async for event in self._agent_runtime.run_turn(**run_kwargs):
                 etype = getattr(event, "type", None) or (event.get("type") if isinstance(event, dict) else "")
                 data = getattr(event, "data", None) or (event.get("data", {}) if isinstance(event, dict) else {})
                 if etype == "agent_text":
                     content_parts.append(data.get("text", "") if isinstance(data, dict) else "")
+                elif etype == "agent_reasoning":
+                    # Collect reasoning tokens when include_reasoning=True (mirrors TS)
+                    reasoning_parts.append(data.get("text", "") if isinstance(data, dict) else "")
                 elif etype == "agent_error":
                     logger.error("Heartbeat agent error: %s", data)
                 elif etype == "agent_complete":
@@ -561,6 +536,13 @@ class HeartbeatManager:
 
             if vis.use_indicator:
                 await self._emit_indicator(is_ok)
+
+            # Deliver reasoning as a separate message when include_reasoning=True (mirrors TS)
+            if self._config.include_reasoning and reasoning_parts and vis.show_alerts:
+                reasoning_text = "".join(reasoning_parts).strip()
+                if reasoning_text:
+                    logger.debug("Heartbeat delivering reasoning message")
+                    await self._deliver(f"Reasoning:\n{reasoning_text}")
 
         except Exception as exc:
             logger.error("Heartbeat execution failed: %s", exc, exc_info=True)
@@ -651,6 +633,7 @@ def resolve_heartbeat_config(
         every=str(every),
         model=base.get("model"),
         include_reasoning=base.get("includeReasoning", base.get("include_reasoning", False)),
+        light_context=base.get("lightContext", base.get("light_context", False)),
         target=base.get("target", "last"),
         to=base.get("to"),
         account_id=base.get("accountId") or base.get("account_id"),
@@ -677,7 +660,10 @@ __all__ = [
     "_is_heartbeat_ok",
     "_parse_interval_minutes",
     "is_heartbeat_content_effectively_empty",
+    # Re-exported from infra/heartbeat_events_filter.py
     "build_exec_event_prompt",
     "build_cron_event_prompt",
+    "is_cron_system_event",
+    "is_exec_completion_event",
     "prune_heartbeat_transcript",
 ]

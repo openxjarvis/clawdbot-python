@@ -13,21 +13,24 @@ logger = logging.getLogger(__name__)
 
 
 def compute_next_run(schedule: CronScheduleType, now_ms: int | None = None) -> int | None:
-    """Compute next run time in milliseconds."""
+    """Compute next run time in milliseconds.
+
+    Exceptions from ``_compute_cron_schedule`` (e.g. invalid cron expressions)
+    are intentionally NOT caught here — they propagate to callers such as
+    ``_recompute_job_next_run`` which tracks schedule errors via
+    ``_record_schedule_error``.  This mirrors TS behaviour where
+    ``computeJobNextRunAtMs`` throws on bad expressions.
+    """
     if now_ms is None:
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    try:
-        if isinstance(schedule, AtSchedule):
-            return _compute_at_schedule(schedule, now_ms)
-        elif isinstance(schedule, EverySchedule):
-            return _compute_every_schedule(schedule, now_ms)
-        elif isinstance(schedule, CronSchedule):
-            return _compute_cron_schedule(schedule, now_ms)
-        else:
-            logger.error(f"Unknown schedule type: {type(schedule)}")
-            return None
-    except Exception as e:
-        logger.error(f"Error computing next run: {e}", exc_info=True)
+    if isinstance(schedule, AtSchedule):
+        return _compute_at_schedule(schedule, now_ms)
+    elif isinstance(schedule, EverySchedule):
+        return _compute_every_schedule(schedule, now_ms)
+    elif isinstance(schedule, CronSchedule):
+        return _compute_cron_schedule(schedule, now_ms)
+    else:
+        logger.error(f"Unknown schedule type: {type(schedule)}")
         return None
 
 
@@ -64,25 +67,30 @@ def _compute_every_schedule(schedule: EverySchedule, now_ms: int) -> int | None:
     return anchor_ms + (intervals_passed + 1) * every_ms
 
 
-def _compute_cron_schedule(schedule: CronSchedule, now_ms: int) -> int | None:
-    """Cron expression schedule — matches TS computeNextRunAtMs for kind="cron"."""
+def _compute_cron_schedule(schedule: CronSchedule, now_ms: int) -> int:
+    """Cron expression schedule — matches TS computeNextRunAtMs for kind="cron".
+
+    Raises ``ValueError`` on invalid expression so that callers (e.g.
+    ``_recompute_job_next_run``) can catch it and record a schedule error.
+    TS behaviour: exceptions propagate from ``computeJobNextRunAtMs`` and are
+    caught in ``recordScheduleComputeError``.
+    """
+    now_dt = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
+
+    # Apply timezone if specified — tz errors fall back to UTC silently
+    tz_str = schedule.tz or "UTC"
     try:
-        now_dt = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
+        tz = ZoneInfo(tz_str)
+        now_dt = now_dt.astimezone(tz)
+    except (ZoneInfoNotFoundError, Exception):
+        pass  # Fallback to UTC
 
-        # Apply timezone if specified
-        tz_str = schedule.tz or "UTC"
-        try:
-            tz = ZoneInfo(tz_str)
-            now_dt = now_dt.astimezone(tz)
-        except (ZoneInfoNotFoundError, Exception):
-            pass  # Fallback to UTC
-
+    try:
         cron = croniter(schedule.expr, now_dt)
         next_dt = cron.get_next(datetime)
         return int(next_dt.timestamp() * 1000)
     except Exception as e:
-        logger.error(f"Error computing cron schedule for expr={schedule.expr!r}: {e}")
-        return None
+        raise ValueError(f"invalid cron expression {schedule.expr!r}: {e}") from e
 
 
 def format_next_run(next_run_ms: int | None) -> str:

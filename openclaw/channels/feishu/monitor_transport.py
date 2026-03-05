@@ -100,22 +100,25 @@ async def start_websocket_transport(
 
         new_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(new_loop)   # thread-local: safe
+
+        # Lock only covers the loop-reference patch, NOT the blocking start().
+        # Holding the lock across start() would deadlock multi-account setups
+        # because the second account waits forever for the first to finish.
         with _WS_START_LOCK:
-            # Override SDK's captured-at-import main loop reference.
-            # This MUST be inside the lock so concurrent accounts don't race.
             _lark_ws_mod.loop = new_loop
+
+        try:
+            ws_client.start()
+        except Exception as exc:
+            logger.warning(
+                "[feishu] WS thread exited with error for account=%s: %s",
+                account.account_id, exc,
+            )
+        finally:
             try:
-                ws_client.start()
-            except Exception as exc:
-                logger.warning(
-                    "[feishu] WS thread exited with error for account=%s: %s",
-                    account.account_id, exc,
-                )
-            finally:
-                try:
-                    new_loop.close()
-                except Exception:
-                    pass
+                new_loop.close()
+            except Exception:
+                pass
 
     ws_thread = threading.Thread(
         target=_run_ws_thread,

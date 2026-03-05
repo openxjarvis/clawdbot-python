@@ -47,6 +47,21 @@ ERROR_BACKOFF_SCHEDULE_MS = [
     60 * 60_000,   # 5th+ error →  60 min
 ]
 
+# One-shot (at) transient retry backoff (first 3 steps only — mirrors TS default)
+ERROR_BACKOFF_RETRY_MS = ERROR_BACKOFF_SCHEDULE_MS[:3]  # [30s, 1min, 5min]
+DEFAULT_MAX_TRANSIENT_RETRIES = 3
+DEFAULT_FAILURE_ALERT_AFTER = 3
+DEFAULT_FAILURE_ALERT_COOLDOWN_MS = 60 * 60_000  # 1 hour
+
+# Transient error patterns (mirrors TS TRANSIENT_PATTERNS)
+import re as _re
+_TRANSIENT_PATTERNS: dict[str, _re.Pattern] = {
+    "rate_limit": _re.compile(r"rate[_ ]limit|too many requests|429|resource has been exhausted|cloudflare", _re.I),
+    "network": _re.compile(r"network|econnreset|econnrefused|fetch failed|socket", _re.I),
+    "timeout": _re.compile(r"timeout|etimedout", _re.I),
+    "server_error": _re.compile(r"\b5\d{2}\b"),
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -59,6 +74,128 @@ def _now_ms() -> int:
 def _error_backoff_ms(consecutive_errors: int) -> int:
     idx = min(consecutive_errors - 1, len(ERROR_BACKOFF_SCHEDULE_MS) - 1)
     return ERROR_BACKOFF_SCHEDULE_MS[max(0, idx)]
+
+
+def _is_transient_cron_error(error: str | None, retry_on: list[str] | None = None) -> bool:
+    """Return True if the error string matches known transient patterns.
+
+    Mirrors TS ``isTransientCronError()``.
+    """
+    if not error or not isinstance(error, str):
+        return False
+    keys = retry_on if retry_on else list(_TRANSIENT_PATTERNS.keys())
+    return any(_TRANSIENT_PATTERNS.get(k, _re.compile(r"^$")).search(error) for k in keys)
+
+
+def _resolve_retry_config(cron_config: dict) -> dict:
+    """Resolve transient retry configuration from global cron config.
+
+    Mirrors TS ``resolveRetryConfig()``.
+    """
+    retry = cron_config.get("retry", {}) if isinstance(cron_config, dict) else {}
+    max_attempts = retry.get("maxAttempts") if isinstance(retry, dict) else None
+    backoff_ms = retry.get("backoffMs") if isinstance(retry, dict) else None
+    retry_on = retry.get("retryOn") if isinstance(retry, dict) else None
+    return {
+        "max_attempts": max_attempts if isinstance(max_attempts, int) else DEFAULT_MAX_TRANSIENT_RETRIES,
+        "backoff_ms": backoff_ms if isinstance(backoff_ms, list) and backoff_ms else ERROR_BACKOFF_RETRY_MS,
+        "retry_on": retry_on if isinstance(retry_on, list) and retry_on else None,
+    }
+
+
+def _resolve_delivery_status(job: CronJob, delivered: bool | None) -> str:
+    """Map delivered flag to a CronDeliveryStatus string.
+
+    Mirrors TS ``resolveDeliveryStatus()``.
+    """
+    if delivered is True:
+        return "delivered"
+    if delivered is False:
+        return "not-delivered"
+    # Determine if delivery was requested at all
+    try:
+        from .normalize import resolve_cron_delivery_plan
+        plan = resolve_cron_delivery_plan(job)
+        return "unknown" if plan.get("requested") else "not-requested"
+    except Exception:
+        return "not-requested"
+
+
+def _resolve_failure_alert_config(job: CronJob, cron_config: dict) -> dict | None:
+    """Resolve the effective failure alert config for a job.
+
+    Merges job-level failureAlert → global cronConfig.failureAlert → defaults.
+    Returns None if alerts are disabled (job.failure_alert is False or global is
+    not enabled and no job-level config exists).
+
+    Mirrors TS ``resolveFailureAlert()``.
+    """
+    from .types import CronFailureAlert as _CronFailureAlert
+
+    global_cfg = cron_config.get("failureAlert", {}) if isinstance(cron_config, dict) else {}
+    job_cfg = job.failure_alert
+
+    # Explicit disable
+    if job_cfg is False:
+        return None
+
+    # No job config AND global not explicitly enabled
+    if not job_cfg and not (isinstance(global_cfg, dict) and global_cfg.get("enabled") is True):
+        return None
+
+    jc: dict = {}
+    gc: dict = global_cfg if isinstance(global_cfg, dict) else {}
+    if isinstance(job_cfg, _CronFailureAlert):
+        jc = {
+            "after": job_cfg.after_n_errors,
+            "cooldownMs": job_cfg.cooldown_ms,
+            "channel": None,
+            "to": None,
+            "mode": None,
+            "accountId": None,
+        }
+    elif isinstance(job_cfg, dict):
+        jc = job_cfg
+
+    def _clamp_pos(v: Any, fallback: int) -> int:
+        if isinstance(v, (int, float)) and v >= 1:
+            return int(v)
+        return fallback
+
+    def _clamp_non_neg(v: Any, fallback: int) -> int:
+        if isinstance(v, (int, float)) and v >= 0:
+            return int(v)
+        return fallback
+
+    def _norm_channel(v: Any) -> str | None:
+        if isinstance(v, str) and v.strip():
+            return v.strip().lower()
+        return None
+
+    def _norm_to(v: Any) -> str | None:
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+        return None
+
+    mode = jc.get("mode") or gc.get("mode")
+    explicit_to = _norm_to(jc.get("to"))
+    channel = (
+        _norm_channel(jc.get("channel"))
+        or _norm_channel(job.delivery.channel if job.delivery else None)
+        or "last"
+    )
+    to_val = explicit_to if mode == "webhook" else (
+        explicit_to or _norm_to(job.delivery.to if job.delivery else None)
+    )
+
+    return {
+        "after": _clamp_pos(jc.get("after") or gc.get("after"), DEFAULT_FAILURE_ALERT_AFTER),
+        "cooldown_ms": _clamp_non_neg(jc.get("cooldownMs") or gc.get("cooldownMs"), DEFAULT_FAILURE_ALERT_COOLDOWN_MS),
+        "channel": channel,
+        "to": to_val,
+        "mode": mode,
+        "account_id": jc.get("accountId") or gc.get("accountId"),
+    }
 
 
 def _resolve_stable_cron_offset_ms(job_id: str, stagger_ms: int) -> int:
@@ -243,20 +380,40 @@ def _apply_job_result(
     error: str | None,
     started_at: int,
     ended_at: int,
-) -> bool:
-    """Apply execution result to job state. Returns True if job should be deleted."""
+    delivered: bool | None = None,
+    cron_config: dict | None = None,
+) -> tuple[bool, dict | None]:
+    """Apply execution result to job state.
+
+    Returns (should_delete, failure_alert_params | None).
+    ``failure_alert_params`` is non-None when a failure alert should be fired;
+    callers use it to invoke the external ``send_failure_alert`` callback.
+
+    Mirrors TS ``applyJobResult()`` in service/timer.ts.
+    """
+    cfg = cron_config or {}
+
     job.state.running_at_ms = None
     job.state.last_run_at_ms = started_at
-    job.state.last_status = status
+    # Set both fields: lastRunStatus (preferred) and lastStatus (back-compat)
+    job.state.last_run_status = status          # TS: lastRunStatus
+    job.state.last_status = status              # TS: lastStatus (alias)
     job.state.last_duration_ms = max(0, ended_at - started_at)
     job.state.last_error = error
+    job.state.last_delivered = delivered        # TS: lastDelivered
+    delivery_status = _resolve_delivery_status(job, delivered)
+    job.state.last_delivery_status = delivery_status   # TS: lastDeliveryStatus
+    job.state.last_delivery_error = (           # TS: lastDeliveryError
+        error if delivery_status == "not-delivered" else None
+    )
     job.updated_at_ms = ended_at
 
-    # Track consecutive errors
+    # Track consecutive errors; reset on success and clear cooldown gate
     if status == "error":
         job.state.consecutive_errors = (job.state.consecutive_errors or 0) + 1
     else:
         job.state.consecutive_errors = 0
+        job.state.last_failure_alert_at_ms = None   # reset cooldown on success
 
     should_delete = (
         isinstance(job.schedule, AtSchedule)
@@ -264,18 +421,67 @@ def _apply_job_result(
         and status == "ok"
     )
 
+    # --- Failure alert resolution (mirrors TS resolveFailureAlert + emitFailureAlert) ---
+    failure_alert_params: dict | None = None
+    if status == "error":
+        alert_cfg = _resolve_failure_alert_config(job, cfg)
+        if alert_cfg:
+            consecutive = job.state.consecutive_errors or 0
+            is_best_effort = (
+                (job.delivery and getattr(job.delivery, "best_effort", False))
+                or (isinstance(job.payload, AgentTurnPayload)
+                    and getattr(job.payload, "best_effort_deliver", False))
+            )
+            if not is_best_effort and consecutive >= alert_cfg["after"]:
+                now_ms = _now_ms()
+                last_alert = job.state.last_failure_alert_at_ms or 0
+                cooldown_ms = max(0, alert_cfg["cooldown_ms"])
+                in_cooldown = (now_ms - last_alert) < cooldown_ms
+                if not in_cooldown:
+                    failure_alert_params = {
+                        "job": job,
+                        "error": error,
+                        "consecutive_errors": consecutive,
+                        "channel": alert_cfg["channel"],
+                        "to": alert_cfg["to"],
+                        "mode": alert_cfg["mode"],
+                        "account_id": alert_cfg["account_id"],
+                    }
+                    job.state.last_failure_alert_at_ms = now_ms
+
     if not should_delete:
         if isinstance(job.schedule, AtSchedule):
-            # One-shot: disable after any terminal status
-            job.enabled = False
-            job.state.next_run_ms = None
-            if status == "error":
-                logger.warning(
-                    f"cron: disabling one-shot job {job.id!r} after error — "
-                    f"consecutiveErrors={job.state.consecutive_errors}"
-                )
+            if status in ("ok", "skipped"):
+                # One-shot completed normally: disable
+                job.enabled = False
+                job.state.next_run_ms = None
+            elif status == "error":
+                # Check if error is transient and retries remain (mirrors TS #24355)
+                retry_cfg = _resolve_retry_config(cfg)
+                consecutive = job.state.consecutive_errors or 0
+                transient = _is_transient_cron_error(error, retry_cfg["retry_on"])
+                if transient and consecutive <= retry_cfg["max_attempts"]:
+                    # Schedule retry with backoff
+                    backoff_schedule = retry_cfg["backoff_ms"]
+                    idx = min(consecutive - 1, len(backoff_schedule) - 1)
+                    backoff = backoff_schedule[max(0, idx)]
+                    job.state.next_run_ms = ended_at + backoff
+                    logger.info(
+                        "cron: scheduling one-shot retry after transient error for job %r "
+                        "(consecutiveErrors=%d, backoffMs=%d, nextRunAtMs=%d)",
+                        job.id, consecutive, backoff, job.state.next_run_ms,
+                    )
+                else:
+                    # Permanent error or max retries exhausted: disable
+                    job.enabled = False
+                    job.state.next_run_ms = None
+                    reason = "max retries exhausted" if transient else "permanent error"
+                    logger.warning(
+                        "cron: disabling one-shot job %r after error (%s, consecutiveErrors=%d)",
+                        job.id, reason, consecutive,
+                    )
         elif status == "error" and job.enabled:
-            # Exponential backoff
+            # Recurring job: exponential backoff
             backoff = _error_backoff_ms(job.state.consecutive_errors or 1)
             normal_next = compute_job_next_run_at_ms(job, ended_at)
             backoff_next = ended_at + backoff
@@ -283,9 +489,8 @@ def _apply_job_result(
                 max(normal_next, backoff_next) if normal_next is not None else backoff_next
             )
             logger.info(
-                f"cron: error backoff for job {job.id!r} — "
-                f"consecutiveErrors={job.state.consecutive_errors}, "
-                f"backoffMs={backoff}, nextRunAtMs={job.state.next_run_ms}"
+                "cron: error backoff for job %r — consecutiveErrors=%d, backoffMs=%d, nextRunAtMs=%d",
+                job.id, job.state.consecutive_errors, backoff, job.state.next_run_ms,
             )
         elif job.enabled:
             natural_next = compute_job_next_run_at_ms(job, ended_at)
@@ -300,7 +505,7 @@ def _apply_job_result(
         else:
             job.state.next_run_ms = None
 
-    return should_delete
+    return should_delete, failure_alert_params
 
 
 def _is_job_runnable(
@@ -436,7 +641,12 @@ class CronService:
         self.jobs = {j.id: j for j in jobs}
 
         if not skip_recompute:
-            _recompute_next_runs(list(self.jobs.values()))
+            # Use maintenance-mode recompute on initial load: only fill in None
+            # values, never advance past-due nextRunAtMs.  This preserves the
+            # stored past-due timestamps so that _run_missed_jobs() can still
+            # detect them.  start() calls the full _recompute_next_runs() AFTER
+            # running missed jobs, mirroring the TS order.
+            _recompute_next_runs_for_maintenance(list(self.jobs.values()))
 
         logger.debug(f"Store loaded: {len(self.jobs)} jobs (force={force_reload})")
 
@@ -495,21 +705,24 @@ class CronService:
 
             await self._ensure_loaded()
 
-            # Clear stale running markers and run missed jobs
+            # Clear stale running markers
             now = _now_ms()
             for job in self.jobs.values():
                 if job.state.running_at_ms is not None:
                     logger.warning(f"cron: clearing stale running marker for job {job.id!r}")
                     job.state.running_at_ms = None
 
-            _recompute_next_runs(list(self.jobs.values()), now)
-            await self._persist()
-
-            # Create timer
+            # Create timer before running missed jobs (timer is used by _arm_timer inside)
             self._timer = CronTimer(on_timer_callback=self._on_timer)
 
-            # Run overdue jobs (missed while process was down)
+            # Run overdue jobs (missed while process was down) BEFORE recomputing next runs.
+            # TS does the same: runMissedJobs() is called before recomputeNextRuns() so that
+            # past-due nextRunAtMs values are not silently advanced past due-time without firing.
             await self._run_missed_jobs(now)
+
+            # Now recompute and persist
+            _recompute_next_runs(list(self.jobs.values()), now)
+            await self._persist()
 
             self._arm_timer()
             self._service_running = True
@@ -801,16 +1014,21 @@ class CronService:
             error: str | None = r.get("error")
             started_at: int = r["started_at"]
             ended_at: int = r["ended_at"]
+            delivered: bool | None = r.get("delivered")
 
-            should_delete = _apply_job_result(job, status, error, started_at, ended_at)
+            should_delete, alert_params = _apply_job_result(
+                job, status, error, started_at, ended_at,
+                delivered=delivered,
+                cron_config=self.cron_config,
+            )
 
             self._emit_job_finished(job, r, started_at)
             self._append_run_log(job, r)
 
-            # Failure alert subsystem (Gap 3): fire after N consecutive errors
-            if status == "error" and job.failure_alert and self.send_failure_alert:
+            # Fire failure alert if _apply_job_result resolved one
+            if alert_params and self.send_failure_alert:
                 asyncio.create_task(
-                    self._maybe_send_failure_alert(job, error)
+                    self._fire_failure_alert(alert_params)
                 )
 
             if should_delete and job.id in self.jobs:
@@ -898,11 +1116,19 @@ class CronService:
         ended_at = _now_ms()
         status: Literal["ok", "error", "skipped"] = core_result.get("status", "error")
         error: str | None = core_result.get("error")
+        delivered: bool | None = core_result.get("delivered")
 
-        should_delete = _apply_job_result(job, status, error, started_at, ended_at)
+        should_delete, alert_params = _apply_job_result(
+            job, status, error, started_at, ended_at,
+            delivered=delivered,
+            cron_config=self.cron_config,
+        )
 
         self._emit_job_finished(job, core_result, started_at)
         self._append_run_log(job, {**core_result, "started_at": started_at, "ended_at": ended_at})
+
+        if alert_params and self.send_failure_alert:
+            asyncio.create_task(self._fire_failure_alert(alert_params))
 
         if should_delete and job.id in self.jobs:
             del self.jobs[job.id]
@@ -1048,6 +1274,8 @@ class CronService:
             "status": res.get("status", "ok"),
             "error": res.get("error"),
             "summary": res.get("summary"),
+            "delivered": res.get("delivered"),          # TS: pass through for lastDelivered tracking
+            "delivery_attempted": res.get("deliveryAttempted") or res.get("delivery_attempted"),
             "session_id": res.get("session_id") or res.get("sessionId"),
             "session_key": res.get("session_key") or res.get("sessionKey"),
             "model": res.get("model"),
@@ -1059,46 +1287,49 @@ class CronService:
     # Emit / log helpers
     # ------------------------------------------------------------------
 
-    async def _maybe_send_failure_alert(self, job: CronJob, last_error: str | None) -> None:
-        """Fire failure alert if threshold and cooldown conditions are met.
+    async def _fire_failure_alert(self, params: dict) -> None:
+        """Invoke the external send_failure_alert callback with full routing params.
 
-        Mirrors TS cron/service.ts failure alert logic.
-        Checks consecutive_errors >= failure_alert.after_n_errors and
-        enforces cooldown via last_failure_alert_at_ms.
+        ``params`` is the dict returned by ``_resolve_failure_alert_config`` and
+        populated by ``_apply_job_result``.  The cooldown gate timestamp is already
+        written to ``job.state.last_failure_alert_at_ms`` before this is called, so
+        here we just deliver the alert and persist state.
+
+        Mirrors TS ``emitFailureAlert()`` in service/timer.ts.
         """
-        import time as _time
-        fa = job.failure_alert
-        if not fa or not self.send_failure_alert:
+        if not self.send_failure_alert:
             return
 
-        consecutive = job.state.consecutive_errors or 0
-        if consecutive < fa.after_n_errors:
-            return
+        job: CronJob = params["job"]
+        error: str | None = params.get("error")
+        consecutive: int = params.get("consecutive_errors", 0)
+        channel: str | None = params.get("channel")
+        to: str | None = params.get("to")
+        mode: str | None = params.get("mode")
+        account_id: str | None = params.get("account_id")
 
-        now_ms = int(_time.time() * 1000)
-        last_alert = job.state.last_failure_alert_at_ms or 0
-        if now_ms - last_alert < fa.cooldown_ms:
-            logger.debug(
-                "cron: failure alert suppressed for job %r (cooldown %dms remaining)",
-                job.id,
-                fa.cooldown_ms - (now_ms - last_alert),
-            )
-            return
+        safe_job_name = job.name or job.id
+        truncated_error = (error or "unknown error").strip()[:200]
+        text = f'Cron job "{safe_job_name}" failed {consecutive} times\nLast error: {truncated_error}'
 
         logger.info(
-            "cron: sending failure alert for job %r (consecutiveErrors=%d)",
-            job.id, consecutive,
+            "cron: sending failure alert for job %r (consecutiveErrors=%d, channel=%s)",
+            job.id, consecutive, channel,
         )
         try:
-            ok = await self.send_failure_alert(job, consecutive, last_error)
-            if ok:
-                # Update cooldown gate under lock so it persists
-                job.state.last_failure_alert_at_ms = now_ms
-                if self._store:
-                    try:
-                        self._store.save(list(self.jobs.values()))
-                    except Exception:
-                        pass
+            ok = await self.send_failure_alert(
+                job, consecutive, error,
+                text=text,
+                channel=channel,
+                to=to,
+                mode=mode,
+                account_id=account_id,
+            )
+            if ok and self._store:
+                try:
+                    self._store.save(list(self.jobs.values()))
+                except Exception:
+                    pass
         except Exception as e:
             logger.error("cron: failure alert send error for job %r: %s", job.id, e)
 

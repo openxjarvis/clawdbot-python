@@ -140,15 +140,16 @@ class CronJobState:
     next_run_ms: int | None = None        # TS: nextRunAtMs
     running_at_ms: int | None = None      # TS: runningAtMs
     last_run_at_ms: int | None = None     # TS: lastRunAtMs
-    last_status: Literal["ok", "error", "skipped"] | None = None
+    last_run_status: Literal["ok", "error", "skipped"] | None = None  # TS: lastRunStatus (preferred)
+    last_status: Literal["ok", "error", "skipped"] | None = None      # TS: lastStatus (back-compat alias)
     last_error: str | None = None
     last_duration_ms: int | None = None   # TS: lastDurationMs
     consecutive_errors: int = 0           # TS: consecutiveErrors
     schedule_error_count: int | None = None  # TS: scheduleErrorCount
     # Delivery tracking fields (TS: lastDeliveryStatus / lastDeliveryError / lastDelivered)
-    last_delivery_status: Literal["ok", "error", "skipped"] | None = None
+    last_delivery_status: Literal["delivered", "not-delivered", "unknown", "not-requested"] | None = None
     last_delivery_error: str | None = None
-    last_delivered: int | None = None     # TS: lastDelivered (epoch ms of last successful delivery)
+    last_delivered: bool | None = None    # TS: lastDelivered (bool)
     last_failure_alert_at_ms: int | None = None  # TS: lastFailureAlertAtMs — cooldown gate
 
 
@@ -369,6 +370,8 @@ class CronJob:
             state_dict["running_at_ms"] = self.state.running_at_ms
         if self.state.last_run_at_ms is not None:
             state_dict["last_run_at_ms"] = self.state.last_run_at_ms
+        if self.state.last_run_status is not None:
+            state_dict["last_run_status"] = self.state.last_run_status
         if self.state.last_status is not None:
             state_dict["last_status"] = self.state.last_status
         if self.state.last_error is not None:
@@ -526,6 +529,7 @@ class CronJob:
             next_run_ms=state_data.get("next_run_ms") or state_data.get("nextRunAtMs"),
             running_at_ms=state_data.get("running_at_ms") or state_data.get("runningAtMs"),
             last_run_at_ms=state_data.get("last_run_at_ms") or state_data.get("lastRunAtMs"),
+            last_run_status=state_data.get("last_run_status") or state_data.get("lastRunStatus"),
             last_status=state_data.get("last_status") or state_data.get("lastStatus"),
             last_error=state_data.get("last_error") or state_data.get("lastError"),
             last_duration_ms=state_data.get("last_duration_ms") or state_data.get("lastDurationMs"),
@@ -540,7 +544,8 @@ class CronJob:
             ),
             last_delivery_status=state_data.get("last_delivery_status") or state_data.get("lastDeliveryStatus"),
             last_delivery_error=state_data.get("last_delivery_error") or state_data.get("lastDeliveryError"),
-            last_delivered=state_data.get("last_delivered") or state_data.get("lastDelivered"),
+            last_delivered=state_data.get("last_delivered") if state_data.get("last_delivered") is not None
+                           else state_data.get("lastDelivered"),
             last_failure_alert_at_ms=(
                 state_data.get("last_failure_alert_at_ms")
                 or state_data.get("lastFailureAlertAtMs")

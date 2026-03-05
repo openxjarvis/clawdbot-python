@@ -3,15 +3,13 @@
 Periodically sends heartbeat messages to agents to trigger proactive behavior.
 Supports:
 - Multi-agent with per-agent intervals
-- Active hours (timezone-aware)
+- Active hours (HH:MM + IANA timezone-aware, mirrors TS heartbeat-active-hours.ts)
 - Queue-aware (skips if requests in flight)
-- Duplicate suppression (24h window)
 - Delivery target resolution
 """
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
 from typing import Any, Callable
 
 from .heartbeat_events import (
@@ -22,11 +20,9 @@ from .heartbeat_events import (
 
 logger = logging.getLogger(__name__)
 
-# Global state
+# Global enable/disable flag (mirrors TS heartbeatsEnabled)
 _heartbeats_enabled = True
 _running_tasks: dict[str, asyncio.Task] = {}
-_last_sent: dict[str, datetime] = {}
-_suppression_window = timedelta(hours=24)
 
 
 def set_heartbeats_enabled(enabled: bool) -> None:
@@ -42,7 +38,7 @@ def is_heartbeat_enabled_for_agent(
     """Check if heartbeat is enabled for a specific agent"""
     if not _heartbeats_enabled:
         return False
-    
+
     heartbeat_config = agent_config.get("heartbeat", {})
     return heartbeat_config.get("enabled", False)
 
@@ -53,20 +49,18 @@ def resolve_heartbeat_interval_ms(
     """Resolve heartbeat interval in milliseconds"""
     heartbeat_config = agent_config.get("heartbeat", {})
     interval = heartbeat_config.get("interval", "1h")
-    
-    # Parse duration string
+
     if isinstance(interval, (int, float)):
         return int(interval)
-    
+
     multipliers = {"s": 1000, "m": 60_000, "h": 3_600_000, "d": 86_400_000}
-    
     for suffix, mult in multipliers.items():
         if interval.endswith(suffix):
             try:
                 return int(float(interval[:-1]) * mult)
             except ValueError:
                 pass
-    
+
     return 3_600_000  # Default 1 hour
 
 
@@ -85,32 +79,50 @@ def resolve_heartbeat_prompt(
 def _is_within_active_hours(
     agent_config: dict[str, Any],
 ) -> bool:
-    """Check if current time is within active hours"""
+    """Check if current time is within active hours.
+
+    Supports HH:MM strings and IANA timezone names, mirroring
+    TS heartbeat-active-hours.ts / HeartbeatManager._is_active_hours().
+    """
     heartbeat_config = agent_config.get("heartbeat", {})
-    active_hours = heartbeat_config.get("activeHours")
-    
+    active_hours = heartbeat_config.get("activeHours") or heartbeat_config.get("active_hours")
+
     if not active_hours:
         return True  # No restriction
-    
+
+    # Delegate to the shared helper in gateway/heartbeat.py
+    try:
+        from ..gateway.heartbeat import ActiveHoursConfig, _in_active_hours
+
+        if isinstance(active_hours, dict):
+            cfg = ActiveHoursConfig(
+                start=active_hours.get("start", "00:00"),
+                end=active_hours.get("end", "24:00"),
+                timezone=active_hours.get("timezone"),
+            )
+            return _in_active_hours(cfg)
+    except Exception:
+        pass
+
+    # Fallback: basic integer-hour comparison (no tz)
+    from datetime import datetime
     now = datetime.now()
-    start_hour = active_hours.get("start", 0)
-    end_hour = active_hours.get("end", 24)
-    
+    if isinstance(active_hours, dict):
+        start_raw = active_hours.get("start", 0)
+        end_raw = active_hours.get("end", 24)
+        try:
+            start_hour = int(str(start_raw).split(":")[0])
+            end_hour = int(str(end_raw).split(":")[0])
+        except (ValueError, IndexError):
+            return True
+    else:
+        return True
+
     current_hour = now.hour
-    
     if start_hour <= end_hour:
         return start_hour <= current_hour < end_hour
-    else:
-        # Overnight range (e.g., 22-6)
-        return current_hour >= start_hour or current_hour < end_hour
-
-
-def _should_suppress(agent_id: str) -> bool:
-    """Check if heartbeat should be suppressed (duplicate within window)"""
-    last = _last_sent.get(agent_id)
-    if last is None:
-        return False
-    return datetime.now() - last < _suppression_window
+    # Overnight range (e.g. 22-6)
+    return current_hour >= start_hour or current_hour < end_hour
 
 
 async def run_heartbeat_once(
@@ -120,8 +132,7 @@ async def run_heartbeat_once(
     is_busy_fn: Callable[[str], bool] | None = None,
 ) -> None:
     """Execute a single heartbeat for an agent"""
-    
-    # Check if enabled
+
     if not is_heartbeat_enabled_for_agent(agent_config):
         emit_heartbeat_event(HeartbeatEvent(
             event_type=HeartbeatEventType.SKIPPED,
@@ -129,8 +140,7 @@ async def run_heartbeat_once(
             reason="disabled",
         ))
         return
-    
-    # Check active hours
+
     if not _is_within_active_hours(agent_config):
         emit_heartbeat_event(HeartbeatEvent(
             event_type=HeartbeatEventType.SKIPPED,
@@ -138,8 +148,7 @@ async def run_heartbeat_once(
             reason="outside_active_hours",
         ))
         return
-    
-    # Check if agent is busy (queue-aware)
+
     if is_busy_fn and is_busy_fn(agent_id):
         emit_heartbeat_event(HeartbeatEvent(
             event_type=HeartbeatEventType.SKIPPED,
@@ -147,30 +156,17 @@ async def run_heartbeat_once(
             reason="agent_busy",
         ))
         return
-    
-    # Check duplicate suppression
-    if _should_suppress(agent_id):
-        emit_heartbeat_event(HeartbeatEvent(
-            event_type=HeartbeatEventType.SKIPPED,
-            agent_id=agent_id,
-            reason="suppressed",
-        ))
-        return
-    
-    # Send heartbeat
+
     prompt = resolve_heartbeat_prompt(agent_config)
-    
+
     try:
         emit_heartbeat_event(HeartbeatEvent(
             event_type=HeartbeatEventType.SENT,
             agent_id=agent_id,
         ))
-        
-        _last_sent[agent_id] = datetime.now()
-        
+
         result = await execute_fn(agent_id, prompt)
-        
-        # Determine outcome
+
         if result:
             emit_heartbeat_event(HeartbeatEvent(
                 event_type=HeartbeatEventType.OK_TOKEN,
@@ -181,7 +177,7 @@ async def run_heartbeat_once(
                 event_type=HeartbeatEventType.OK_EMPTY,
                 agent_id=agent_id,
             ))
-    
+
     except Exception as e:
         logger.error(f"Heartbeat failed for agent {agent_id}: {e}")
         emit_heartbeat_event(HeartbeatEvent(
@@ -200,18 +196,18 @@ async def _heartbeat_loop(
     """Internal heartbeat loop for an agent"""
     interval_ms = resolve_heartbeat_interval_ms(agent_config)
     interval_sec = interval_ms / 1000.0
-    
+
     logger.info(f"Heartbeat loop started for agent {agent_id} (interval: {interval_sec}s)")
-    
+
     while True:
         try:
             await asyncio.sleep(interval_sec)
-            
+
             if not _heartbeats_enabled:
                 continue
-            
+
             await run_heartbeat_once(agent_id, agent_config, execute_fn, is_busy_fn)
-        
+
         except asyncio.CancelledError:
             logger.info(f"Heartbeat loop cancelled for agent {agent_id}")
             break
@@ -227,12 +223,12 @@ def start_heartbeat_runner(
 ) -> Callable:
     """
     Start heartbeat runners for all configured agents.
-    
+
     Args:
         agents: Dict of agent_id -> agent_config
         execute_fn: Async function(agent_id, prompt) to execute heartbeat
         is_busy_fn: Function(agent_id) -> bool to check if agent is busy
-    
+
     Returns:
         stop function to cancel all heartbeat tasks
     """
@@ -243,11 +239,11 @@ def start_heartbeat_runner(
             )
             _running_tasks[agent_id] = task
             logger.info(f"Started heartbeat for agent: {agent_id}")
-    
+
     def stop():
         for agent_id, task in _running_tasks.items():
             task.cancel()
             logger.info(f"Stopped heartbeat for agent: {agent_id}")
         _running_tasks.clear()
-    
+
     return stop

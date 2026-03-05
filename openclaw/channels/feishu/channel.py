@@ -58,6 +58,8 @@ class FeishuChannel(ChannelPlugin):
         self._default_outbound: FeishuOutboundAdapter | None = None
         # {message_id: reaction_id} — tracks pending "Typing" reactions
         self._typing_reactions: dict[str, str] = {}
+        # Channel silence watchdog
+        self._heartbeat_monitor = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -86,11 +88,39 @@ class FeishuChannel(ChannelPlugin):
             client = create_feishu_client(default_account)
             self._default_outbound = FeishuOutboundAdapter(client, default_account)
 
+        # Channel silence watchdog — mirrors TS DEFAULT_STALE_EVENT_THRESHOLD_MS (30 min)
+        try:
+            from openclaw.auto_reply.heartbeat_monitor import HeartbeatMonitor
+            from openclaw.infra.heartbeat_wake import request_heartbeat_now
+
+            async def _on_feishu_silence(channel_id: str) -> None:
+                logger.info("Feishu channel silence detected — requesting heartbeat wake")
+                request_heartbeat_now(reason="wake", agent_id=None, session_key=None)
+
+            self._heartbeat_monitor = HeartbeatMonitor(
+                channel_id=self.id,
+                timeout_seconds=30 * 60,
+                health_check_callback=_on_feishu_silence,
+            )
+            await self._heartbeat_monitor.start()
+        except Exception as _exc:
+            logger.debug("Feishu heartbeat monitor init failed: %s", _exc)
+            self._heartbeat_monitor = None
+
+        # Wrap message handler to reset the silence watchdog on each message
+        _base_handler = self._message_handler
+        _monitor_ref = self._heartbeat_monitor
+
+        async def _monitored_handler(msg: "InboundMessage") -> None:
+            if _monitor_ref is not None:
+                _monitor_ref.reset()
+            await _base_handler(msg)
+
         # Start monitor in background
         self._monitor_task = asyncio.create_task(
             start_feishu_monitor(
                 config,
-                self._message_handler,
+                _monitored_handler,
                 self.id,
                 self._stop_event,
             ),
@@ -110,6 +140,13 @@ class FeishuChannel(ChannelPlugin):
                 await asyncio.wait_for(self._monitor_task, timeout=5.0)
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
+
+        if self._heartbeat_monitor and getattr(self._heartbeat_monitor, "is_running", lambda: False)():
+            try:
+                await self._heartbeat_monitor.stop()
+            except Exception:
+                pass
+        self._heartbeat_monitor = None
 
         self._monitor_task = None
         self._stop_event = None

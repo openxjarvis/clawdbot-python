@@ -379,21 +379,34 @@ class BuiltinMemoryManager:
         self,
         query: str,
         opts: dict[str, Any] | None = None,
+        *,
+        limit: int | None = None,
+        use_vector: bool | None = None,
+        use_hybrid: bool | None = None,
+        sources: "list[MemorySource] | None" = None,
+        vector_weight: float | None = None,
     ) -> list[MemorySearchResult]:
-        """Dict-opts adapter — delegates to hybrid or FTS search.
+        """Unified search adapter — accepts both dict-opts and keyword-args calling conventions.
 
-        Accepts the same ``search(query, opts)`` signature as
-        ``SimpleMemorySearchManager`` so this class is a drop-in replacement.
+        Supports:
+        - ``search(query, opts)``  — SimpleMemorySearchManager drop-in
+        - ``search(query, limit=5, use_vector=False)``  — direct kwargs API
         """
         opts = opts or {}
-        limit = int(opts.get("maxResults", opts.get("limit", 10)))
+        effective_limit = limit if limit is not None else int(opts.get("maxResults", opts.get("limit", 10)))
         include_sessions = bool(opts.get("includeSessions") or opts.get("include_sessions"))
 
-        sources: list[MemorySource] | None = None
-        if include_sessions:
-            sources = [MemorySource.MEMORY, MemorySource.SESSIONS]
+        effective_sources = sources
+        if effective_sources is None and include_sessions:
+            effective_sources = [MemorySource.MEMORY, MemorySource.SESSIONS]
 
-        return await self._hybrid_search(query, limit, sources)
+        effective_use_vector = use_vector if use_vector is not None else bool(opts.get("use_vector", False))
+        effective_use_hybrid = use_hybrid if use_hybrid is not None else bool(opts.get("use_hybrid", True))
+        effective_vector_weight = vector_weight if vector_weight is not None else float(opts.get("vector_weight", 0.7))
+
+        if effective_use_vector or effective_use_hybrid:
+            return await self._hybrid_search(query, effective_limit, effective_sources)
+        return await self._fts_search(query, effective_limit, effective_sources)
 
     def status(self) -> "MemoryProviderStatus":
         """Return provider status (matches SimpleMemorySearchManager.status())."""

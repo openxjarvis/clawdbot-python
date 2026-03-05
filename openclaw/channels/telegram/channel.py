@@ -153,6 +153,9 @@ class TelegramChannel(ChannelPlugin):
         self._text_fragment_buffer: dict[str, dict] = {}
         self._text_fragment_processing: asyncio.Task | None = None
 
+        # Channel watchdog: reset on each message, wakes heartbeat on silence
+        self._heartbeat_monitor = None
+
         if bot_token is not None:
             if not bot_token:
                 raise ValueError("bot_token cannot be an empty string")
@@ -430,6 +433,24 @@ class TelegramChannel(ChannelPlugin):
         self._health_monitor_task: asyncio.Task | None = asyncio.create_task(
             self._run_health_monitor()
         )
+        # Channel silence watchdog — mirrors TS DEFAULT_STALE_EVENT_THRESHOLD_MS (30 min)
+        try:
+            from openclaw.auto_reply.heartbeat_monitor import HeartbeatMonitor
+            from openclaw.infra.heartbeat_wake import request_heartbeat_now
+
+            async def _on_silence(channel_id: str) -> None:
+                logger.info("Telegram channel silence detected — requesting heartbeat wake")
+                request_heartbeat_now(reason="wake", agent_id=None, session_key=None)
+
+            self._heartbeat_monitor = HeartbeatMonitor(
+                channel_id=self.id,
+                timeout_seconds=30 * 60,
+                health_check_callback=_on_silence,
+            )
+            await self._heartbeat_monitor.start()
+        except Exception as _exc:
+            logger.debug("Heartbeat monitor init failed: %s", _exc)
+            self._heartbeat_monitor = None
         logger.info("Telegram channel started")
 
     async def stop(self) -> None:
@@ -441,6 +462,11 @@ class TelegramChannel(ChannelPlugin):
         health_task = getattr(self, "_health_monitor_task", None)
         if health_task and not health_task.done():
             health_task.cancel()
+        if self._heartbeat_monitor and getattr(self._heartbeat_monitor, "is_running", lambda: False)():
+            try:
+                await self._heartbeat_monitor.stop()
+            except Exception:
+                pass
         if self._app:
             logger.info("Stopping Telegram channel...")
             try:
@@ -1298,6 +1324,10 @@ class TelegramChannel(ChannelPlugin):
             return
 
         message = update.message
+
+        # Reset the silence watchdog — channel is alive
+        if self._heartbeat_monitor:
+            self._heartbeat_monitor.reset()
 
         # Deduplication — mirrors TS bot-updates.ts
         dedup_key = message_key(message.chat_id, message.message_id)

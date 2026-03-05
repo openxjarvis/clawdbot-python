@@ -19,12 +19,23 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_COALESCE_MS: int = 250
 DEFAULT_RETRY_MS: int = 1_000
+
+
+class HeartbeatReasonKind(str, Enum):
+    """Priority-ordered wake reason kinds — mirrors TS HeartbeatReasonKind."""
+
+    RETRY = "retry"
+    INTERVAL = "interval"
+    DEFAULT = "default"
+    ACTION = "action"
+
 
 REASON_PRIORITY: dict[str, int] = {
     "RETRY": 0,

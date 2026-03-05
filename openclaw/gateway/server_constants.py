@@ -55,7 +55,7 @@ def get_handshake_timeout_ms() -> int:
     return DEFAULT_HANDSHAKE_TIMEOUT_MS
 
 
-TICK_INTERVAL_MS = 30_000          # Gateway tick / heartbeat interval
+TICK_INTERVAL_MS = 5_000           # Gateway tick broadcast interval (matches server TICK_INTERVAL_S=5)
 HEALTH_REFRESH_INTERVAL_MS = 60_000  # Health status refresh interval
 DEDUPE_TTL_MS = 5 * 60_000         # 5 minutes (matches TS)
 DEDUPE_MAX = 1_000                  # Max dedupe cache entries

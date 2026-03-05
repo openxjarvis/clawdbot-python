@@ -95,6 +95,8 @@ class GatewayBootstrap:
         self.discovery = None
         self.config_reloader = None
         self.heartbeat_stop = None
+        self._heartbeat_managers: list = []
+        self._heartbeat_wake_disposer = None
         self.plugin_registry = None
         self._hook_runner = None
         self._maintenance_tasks: list[asyncio.Task] = []
@@ -690,20 +692,81 @@ class GatewayBootstrap:
         # Event handlers are registered within the gateway server
         results["steps_completed"] += 1
         
-        # Step 18: Start heartbeat runner
+        # Step 18: Start heartbeat runner (HeartbeatManager per agent — mirrors TS startHeartbeatRunner)
         logger.info("Step 18: Starting heartbeat runner")
         try:
-            from ..infra.heartbeat_runner import start_heartbeat_runner
-            agents_config = {}
+            from ..gateway.heartbeat import HeartbeatManager, resolve_heartbeat_config
+            from ..infra.heartbeat_wake import set_heartbeat_wake_handler
+
+            self._heartbeat_managers: list[HeartbeatManager] = []
+            self._heartbeat_wake_disposer = None
+
+            cfg_dict = _config_as_dict(self.config)
+            agents_cfg_dict = cfg_dict.get("agents") or {}
+            defaults_cfg = agents_cfg_dict.get("defaults") or {}
+            agents_list = agents_cfg_dict.get("agents") or []
+
             if self.config.agents and self.config.agents.agents:
                 for agent in self.config.agents.agents:
-                    agents_config[agent.id] = {"heartbeat": {"enabled": False}}
-            
-            if agents_config:
-                self.heartbeat_stop = start_heartbeat_runner(
-                    agents_config,
-                    execute_fn=self._execute_heartbeat,
-                )
+                    # Find the per-agent config dict (may be empty if only defaults configured)
+                    agent_cfg: dict = {}
+                    for a in agents_list:
+                        if isinstance(a, dict) and a.get("id") == agent.id:
+                            agent_cfg = a
+                            break
+
+                    hb_config = resolve_heartbeat_config(agent_cfg, defaults_cfg)
+                    if hb_config is None or not hb_config.enabled:
+                        logger.debug("Heartbeat disabled for agent %s", agent.id)
+                        continue
+
+                    hb_mgr = HeartbeatManager(
+                        config=hb_config,
+                        agent_runtime=self,
+                        session_key=f"agent:{agent.id}:main",
+                    )
+                    self._heartbeat_managers.append(hb_mgr)
+                    logger.info(
+                        "HeartbeatManager created for agent %s (every=%s)",
+                        agent.id,
+                        hb_config.every,
+                    )
+
+            # Wire the heartbeat wake handler so cron / manual triggers reach all managers
+            async def _wake_handler(opts: dict) -> dict:
+                for mgr in self._heartbeat_managers:
+                    try:
+                        await mgr.trigger_now()
+                    except Exception as _exc:
+                        logger.warning("Heartbeat wake error: %s", _exc)
+                return {"status": "ran"}
+
+            self._heartbeat_wake_disposer = set_heartbeat_wake_handler(_wake_handler)
+
+            # Start all managers
+            for hb_mgr in self._heartbeat_managers:
+                asyncio.create_task(hb_mgr.start())
+
+            # Provide an async-compatible stop callable for shutdown
+            async def _stop_heartbeats_async() -> None:
+                for mgr in self._heartbeat_managers:
+                    await mgr.stop()
+                if self._heartbeat_wake_disposer:
+                    self._heartbeat_wake_disposer()
+
+            # heartbeat_stop is called synchronously from shutdown(); wrap it
+            def _stop_heartbeats() -> None:
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        asyncio.ensure_future(_stop_heartbeats_async())
+                    else:
+                        loop.run_until_complete(_stop_heartbeats_async())
+                except Exception as _e:
+                    logger.debug("Heartbeat stop error: %s", _e)
+
+            self.heartbeat_stop = _stop_heartbeats
+
         except Exception as e:
             logger.warning(f"Heartbeat runner failed: {e}")
         results["steps_completed"] += 1

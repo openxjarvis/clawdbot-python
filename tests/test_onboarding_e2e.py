@@ -152,7 +152,7 @@ class TestOnboardingWizardAdvanced:
                 "9000",  # Custom port
                 "1",  # Loopback bind
                 "1",  # Token auth
-                "3",  # Skip channels
+                "5",  # Skip channels (1=Telegram 2=Discord 3=Feishu 4=WhatsApp 5=Skip)
                 "",   # User name (skip)
                 "",   # Timezone (default)
                 "",   # Personality (default)
@@ -315,7 +315,7 @@ class TestOnboardingExistingConfig:
                 "",   # Default port
                 "",   # Default bind
                 "",   # Default auth
-                "3",  # Skip channels
+                "5",  # Skip channels (1=Telegram 2=Discord 3=Feishu 4=WhatsApp 5=Skip)
                 "",   # User name (skip)
                 "",   # Timezone (default)
                 "",   # Personality (default)
