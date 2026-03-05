@@ -3,7 +3,7 @@
 > A Python implementation of [OpenClaw](https://github.com/openclaw/openclaw) — a self-hosted personal AI assistant you can run anywhere.
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
-[![MIT License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: Source Available](https://img.shields.io/badge/License-Source%20Available-blue.svg)](LICENSE)
 [![Tested: Telegram + Feishu + Ollama](https://img.shields.io/badge/Tested-Telegram%20%2B%20Feishu%20%2B%20Ollama-green.svg)](#tested-configurations)
 
 ---
@@ -750,4 +750,8 @@ This Python implementation tracks [OpenClaw TypeScript](https://github.com/openc
 
 ## License
 
-MIT — see [LICENSE](LICENSE) for details.
+**OpenXJarvis Source Available License** — free for personal, educational, and non-commercial use. Commercial use requires written authorization from the author.
+
+Contact for commercial licensing: xjarvis@openxjarvis.com
+
+See [LICENSE](LICENSE) for full terms (English + 中文).

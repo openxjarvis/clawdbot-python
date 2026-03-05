@@ -1,21 +1,79 @@
-MIT License
+OpenXJarvis Source Available License
 
-Copyright (c) 2026 OpenClaw-Python Contributors
+Copyright (c) 2026 xjarvis (xjarvis@openxjarvis.com)
+All rights reserved.
+
+─────────────────────────────────────────────────────────────────────────────
+ENGLISH
+─────────────────────────────────────────────────────────────────────────────
+
+Grant of License
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+of this software and associated documentation files (the "Software"), to use,
+copy, modify, and distribute the Software solely for the following purposes:
 
-The above copyright notice and this permission notice shall be included in all
+  • Personal use (private, non-revenue-generating use by an individual)
+  • Educational use (academic research, coursework, non-commercial study)
+  • Open-source projects (distributed under a comparable non-commercial
+    license with no commercial revenue derived from the Software)
+  • Evaluation and prototyping (internal testing only, not deployed in
+    production for commercial purposes)
+
+Commercial Use Restriction
+
+Any use of the Software for commercial purposes — including but not limited
+to: integrating the Software into a product or service that generates revenue,
+using the Software to provide paid services to third parties, deploying the
+Software in a commercial SaaS or on-premises product, or any other use
+primarily intended for commercial advantage or monetary compensation —
+requires a separate written commercial license granted by the copyright holder.
+
+To obtain a commercial license, contact: xjarvis@openxjarvis.com
+
+Conditions
+
+The above copyright notice and this license notice shall be included in all
 copies or substantial portions of the Software.
+
+Disclaimer
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+─────────────────────────────────────────────────────────────────────────────
+中文（具有同等法律效力）
+─────────────────────────────────────────────────────────────────────────────
+
+许可证授权
+
+在本许可证条款下，任何人可以免费获取本软件及相关文档文件（以下简称"本软件"），
+并在以下用途范围内使用、复制、修改和分发本软件：
+
+  • 个人使用（个人私用，不产生商业收益）
+  • 教育用途（学术研究、课程学习、非商业性学习）
+  • 开源项目（须以同类非商业许可证分发，且不从本软件中获取商业收益）
+  • 评估与原型开发（仅限内部测试，不用于商业生产环境部署）
+
+商业使用限制
+
+任何以商业目的使用本软件的行为，包括但不限于：将本软件集成到产生收益的产品或
+服务中、利用本软件向第三方提供付费服务、将本软件部署于商业 SaaS 或商业本地化
+产品中，或任何以获取商业利益或金钱报酬为主要目的的使用行为，均须事先获得版权
+持有人单独出具的书面商业授权许可。
+
+如需商业授权，请联系：xjarvis@openxjarvis.com
+
+附加条件
+
+本软件的所有副本或实质性部分均须包含上述版权声明及本许可证声明。
+
+免责声明
+
+本软件按"现状"提供，不附带任何明示或暗示的保证，包括但不限于对适销性、特定
+用途适用性及非侵权性的保证。在任何情况下，版权持有人均不对因本软件或其使用而
+产生的任何索赔、损害或其他责任承担责任，无论该责任源于合同、侵权或其他原因。
