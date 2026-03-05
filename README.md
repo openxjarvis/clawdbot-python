@@ -4,7 +4,7 @@
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![MIT License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Tested: Telegram + Gemini](https://img.shields.io/badge/Tested-Telegram%20%2B%20Gemini-green.svg)](#tested-configurations)
+[![Tested: Telegram + Feishu + Ollama](https://img.shields.io/badge/Tested-Telegram%20%2B%20Feishu%20%2B%20Ollama-green.svg)](#tested-configurations)
 
 ---
 
@@ -85,7 +85,9 @@ Open **http://localhost:18789** for the Web UI, or just message your Telegram bo
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| **Telegram + Gemini ** | ✅ **Production Ready** | Fully tested and operational |
+| **Telegram + Gemini** | ✅ **Production Ready** | Fully tested and operational |
+| **Feishu (Lark) + Gemini** | ✅ **Production Ready** | WebSocket long-connection, card streaming, pairing |
+| **Ollama (local models)** | ✅ **Production Ready** | Llama 3.3, DeepSeek-Coder, Qwen — fully operational |
 | WhatsApp | 🧪 Verification in progress | QR link integration complete |
 | Discord | 🧪 Verification in progress | Bot API integration complete |
 | Slack | 🧪 Verification in progress | Socket Mode integration complete |
@@ -93,14 +95,12 @@ Open **http://localhost:18789** for the Web UI, or just message your Telegram bo
 | GPT-5.2 Pro | 🧪 Verification in progress | OpenAI API integration complete |
 | Claude Opus 4.6 | 🧪 Verification in progress | Anthropic API integration complete |
 | Gemini 3.1 Pro | 🧪 Verification in progress | Google API integration complete |
-| Grok 4 | 🧪 Verification in progress | xAI API integration complete |
-| DeepSeek V3.2 | 🧪 Verification in progress | DeepSeek API integration complete |
 | Web UI | ✅ **Production Ready** | Full feature parity with TypeScript |
 | Cron Scheduler | ✅ **Production Ready** | Autonomous task execution working |
 
-**Latest test:** Telegram bot + Gemini 3 Pro Preview running complex multi-tool workflows (web search, file operations, reasoning) — rock solid. 🚀
+**Latest test (Mar 2026):** Telegram + Feishu bots both running with Gemini 3 Pro Preview and local Ollama models — complex multi-tool workflows (web search, file operations, reasoning) fully operational across both channels. 🚀
 
-**Model Updates (Feb 2026):** Full support for GPT-5.2/5.3 Codex, Claude Opus 4.5/4.6, Gemini 3 Pro/Flash Preview, Gemini 2.5 Pro/Flash. Additional providers (Zhipu GLM-5, xAI Grok, DeepSeek, Qwen) coming soon.
+**Model Updates (Mar 2026):** Full support for GPT-5.2/5.3 Codex, Claude Opus 4.5/4.6, Gemini 3 Pro/Flash Preview, Gemini 2.5 Pro/Flash, and local Ollama models (Llama 3.3, DeepSeek-Coder, Qwen, Mistral). Additional cloud providers (xAI Grok, DeepSeek, Zhipu) coming soon.
 
 ---
 
@@ -389,6 +389,104 @@ uv run openclaw pairing approve telegram <code>
 
 ---
 
+## Feishu (Lark) Setup
+
+> **Requirement:** Feishu/Lark app with **Bot** capability enabled and **`im.message.receive_v1`** event subscribed.
+
+### 1. Create a Feishu App
+
+1. Open [https://open.feishu.cn/app](https://open.feishu.cn/app) → **Create App** → **Custom App**
+2. In the app: **"Add Capability"** → enable **Bot**
+3. Under **"Event Subscriptions"** → add `im.message.receive_v1` (required for receiving messages)
+4. **Publish the app** (Version Management → Create Version → Release)
+
+### 2. Configure openclaw.json
+
+Add the Feishu channel to `~/.openclaw/openclaw.json`:
+
+```json
+{
+  "channels": {
+    "feishu": {
+      "enabled": true,
+      "appId": "cli_xxxxxxxxxxxx",
+      "appSecret": "your_app_secret_here",
+      "useWebSocket": true,
+      "dmPolicy": "pairing"
+    }
+  }
+}
+```
+
+> **`dmPolicy` options:** `"pairing"` (default — users must pair first), `"open"` (anyone can chat), `"allowlist"` (explicit allowlist only).
+
+### 3. Start and Pair
+
+```bash
+uv run openclaw start
+```
+
+Once running, send any message to the bot in Feishu. With `dmPolicy: "pairing"`, the bot replies with a pairing code. Approve it from the CLI:
+
+```bash
+uv run openclaw pairing list feishu
+uv run openclaw pairing approve feishu <code>
+```
+
+After approval, the bot responds normally. To skip pairing entirely, set `"dmPolicy": "open"`.
+
+### Feishu Features
+
+| Feature | Status |
+|---------|--------|
+| DM (private chat) | ✅ Working |
+| Group chat (with @mention) | ✅ Working |
+| Streaming card responses | ✅ Working |
+| Message reactions (typing indicator) | ✅ Working |
+| Feishu Doc / Wiki tools | ✅ Working |
+| Feishu Bitable tools | ✅ Working |
+| Feishu Calendar tools | ✅ Working |
+
+---
+
+## Ollama (Local Models) Setup
+
+Run any local model (Llama, DeepSeek, Qwen, Mistral, etc.) without sending data to external APIs.
+
+### 1. Install and Start Ollama
+
+```bash
+# Install Ollama (macOS)
+brew install ollama
+ollama serve
+
+# Pull a model
+ollama pull llama3.3
+ollama pull deepseek-coder
+ollama pull qwen2.5:14b
+```
+
+### 2. Configure in openclaw.json
+
+```json
+{
+  "agent": {
+    "model": "ollama/llama3.3",
+    "fallbackModels": ["ollama/qwen2.5:14b"]
+  }
+}
+```
+
+Or switch model at runtime via CLI:
+
+```bash
+uv run openclaw models set ollama/llama3.3
+```
+
+> **Ollama endpoint:** Defaults to `http://localhost:11434`. Override via `OLLAMA_BASE_URL` in `.env` for remote Ollama instances.
+
+---
+
 ## Architecture Overview
 
 ```
@@ -399,7 +497,8 @@ openclaw-python/
 │   │   ├── tools/           # 24+ built-in tools
 │   │   └── skills/          # 56+ modular skills (loaded at runtime)
 │   ├── channels/            # Messaging integrations
-│   │   └── telegram/        # Telegram channel (fully operational)
+│   │   ├── telegram/        # Telegram channel (production)
+│   │   └── feishu/          # Feishu/Lark channel (production)
 │   ├── gateway/             # WebSocket gateway server
 │   │   ├── api/             # RPC method handlers
 │   │   └── protocol/        # WebSocket frame protocol
@@ -520,6 +619,7 @@ npm install && npm run build
 | Channel | Status | Verification |
 |---------|--------|-------------|
 | Telegram | ✅ Production | ✅ Battle-tested |
+| **Feishu / Lark** | ✅ **Production** | ✅ **Battle-tested** |
 | Discord | ✅ Implemented | 🧪 In verification |
 | Slack | ✅ Implemented | 🧪 In verification |
 | WhatsApp | ✅ Implemented | 🧪 In verification |
@@ -529,13 +629,14 @@ npm install && npm run build
 | Provider | Status | Verification |
 |----------|--------|-------------|
 | Google Gemini | ✅ Production | ✅ Battle-tested |
+| **Ollama (local)** | ✅ **Production** | ✅ **Battle-tested** |
 | Anthropic Claude | ✅ Implemented | 🧪 In verification |
 | OpenAI GPT | ✅ Implemented | 🧪 In verification |
-| Local LLMs (Ollama) | ✅ Implemented | 🧪 In verification |
 
 ### Roadmap
-- 🎯 **Next:** Complete verification of all channels and models
-- 🎯 **Q2 2026:** Voice integration
+- 🎯 **Next:** Complete verification of Discord, Slack, WhatsApp
+- 🎯 **Q2 2026:** Voice integration (Whisper STT + TTS)
+- 🎯 **Q2 2026:** xAI Grok, DeepSeek, Zhipu GLM providers
 - 🎯 **Continuous:** Maintain 100% alignment with OpenClaw TypeScript
 
 ---
@@ -567,6 +668,7 @@ This Python implementation tracks [OpenClaw TypeScript](https://github.com/openc
 | Channel | Status in Python | Notes |
 |---------|------------------|-------|
 | **Telegram** | ✅ **Production** | Bot API — fully tested |
+| **Feishu / Lark** | ✅ **Production** | WebSocket long-connection — fully tested |
 | **WhatsApp** | ✅ Implemented | QR link — verification in progress |
 | **Discord** | ✅ Implemented | Bot API — verification in progress |
 | **Slack** | ✅ Implemented | Socket Mode — verification in progress |
@@ -583,7 +685,7 @@ This Python implementation tracks [OpenClaw TypeScript](https://github.com/openc
 | **Anthropic** | ✅ **Implemented** | Claude Opus 4.6, Claude Opus 4.5, Claude Sonnet 4, Claude 3.7 Sonnet, Claude 3.5 Haiku |
 | **Google Gemini** | ✅ **Implemented** | Gemini 3 Pro/Flash Preview (Feb 2026 🆕), Gemini 2.5 Pro/Flash, Gemini 2.0 Flash |
 | **AWS Bedrock** | ✅ **Implemented** | Claude 3.x, Llama 3.3, Mistral, Command R+, Titan |
-| **Ollama** | ✅ **Implemented** | Llama 3.3, DeepSeek-Coder, Mistral, CodeLlama, Qwen (local) |
+| **Ollama** | ✅ **Production** | Llama 3.3, DeepSeek-Coder, Mistral, CodeLlama, Qwen (local) — fully tested |
 | **xAI (Grok)** | 🚧 Q2 2026 | Grok 4, Grok 3 |
 | **Zhipu AI** | 🚧 Q2 2026 | GLM-5 (745B MoE), GLM-4.7 |
 | **DeepSeek** | 🚧 Q2 2026 | DeepSeek V3.2 (671B MoE), DeepSeek-R1 |
