@@ -5,6 +5,7 @@
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![MIT License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Tested: Telegram + Feishu + Ollama](https://img.shields.io/badge/Tested-Telegram%20%2B%20Feishu%20%2B%20Ollama-green.svg)](#tested-configurations)
+[![User Guide 中文/EN](https://img.shields.io/badge/User%20Guide-中文%20%2F%20EN-orange.svg)](GUIDE.md)
 
 ---
 
@@ -13,6 +14,8 @@
 > ⚠️ **测试版声明** — 本项目目前处于测试初期阶段，由我一个人开发，存在部分 bug 和不完善之处。目前更新非常频繁，正在快速迭代中。**第一个目标是完全对齐 OpenClaw（TypeScript 版）。** 
 
 ---
+
+> 📖 **使用指南（中文/English）:** 安装、Telegram、飞书、Ollama、所有 CLI 命令 → **[GUIDE.md](GUIDE.md)**
 
 ✅ **v0.8.3 已支持 Telegram + 飞书 + Ollama** — Feishu (Lark) WebSocket 长连接、卡片流式输出、Pairing 配对全部可用。Telegram and Feishu channels are both production-ready in this release.
 
