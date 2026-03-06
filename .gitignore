@@ -71,3 +71,14 @@ htmlcov/
 # Agent-generated output — belongs in ~/.openclaw/workspace/, not the project root
 *.csv
 generate_*.py
+
+# Runtime workspace state (agent sessions, memory, identity files)
+workspace/
+
+# Tests — kept locally, not published
+tests/
+
+# Temporary output files
+news_summary.md
+news_summary.txt
+video_project/
