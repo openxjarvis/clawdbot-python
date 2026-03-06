@@ -10,7 +10,7 @@
 
 > ⚠️ **Beta Notice** — This project is in early beta and currently solo-developed. Bugs and rough edges are expected. We are iterating fast — updates are frequent. **Our first goal is full alignment with OpenClaw (TypeScript).** Feedback and bug reports are very welcome!
 >
-> ⚠️ **测试版声明** — 本项目目前处于测试初期阶段，由我一个人开发，存在部分 bug 和不完善之处。目前更新非常频繁，正在快速迭代中。**第一个目标是完全对齐 OpenClaw（TypeScript 版）。** 欢迎进群反馈问题和需求！
+> ⚠️ **测试版声明** — 本项目目前处于测试初期阶段，由我一个人开发，存在部分 bug 和不完善之处。目前更新非常频繁，正在快速迭代中。**第一个目标是完全对齐 OpenClaw（TypeScript 版）。** 
 
 ---
 
@@ -106,9 +106,9 @@ Open **http://localhost:18789** for the Web UI, or just message your Telegram bo
 
 ## Preview
 
-<img src="assets/telegram-preview.jpg" alt="Jarvis on Telegram" width="280" />&nbsp;<img src="assets/IMG_1511.jpg" alt="Jarvis on Telegram" width="280" />
+<img src="assets/telegram-preview.jpg" alt="Jarvis on Telegram" width="280" />&nbsp;<img src="assets/IMG_1511.jpg" alt="Jarvis on Telegram" width="280" />&nbsp;<img src="assets/IMG_1543.PNG" alt="Jarvis on Feishu" width="280" />
 
-*Jarvis responding on Telegram — powered by OpenXJarvis*
+*Jarvis responding on Telegram and Feishu — powered by OpenXJarvis*
 
 ---
 
