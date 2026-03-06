@@ -109,7 +109,7 @@ Open **http://localhost:18789** for the Web UI, or just message your Telegram bo
 
 ## Preview
 
-<img src="assets/telegram-preview.jpg" alt="Jarvis on Telegram" width="280" />&nbsp;<img src="assets/IMG_1511.jpg" alt="Jarvis on Telegram" width="280" />&nbsp;<img src="assets/IMG_1544.jpg" alt="Jarvis on Feishu" width="280" />
+<img src="assets/telegram-preview.jpg" alt="Jarvis on Telegram" width="200" />&nbsp;<img src="assets/IMG_1511.jpg" alt="Jarvis on Telegram" width="200" />&nbsp;<img src="assets/IMG_1544.jpg" alt="Jarvis on Feishu" width="200" />
 
 *Jarvis responding on Telegram and Feishu — powered by OpenXJarvis*
 
