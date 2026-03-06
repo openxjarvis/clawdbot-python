@@ -40,6 +40,10 @@ class SlackChannel(ChannelPlugin):
         self._text_chunk_limit: int = 4000
         self._media_max_mb: int = 8
         self._reaction_notifications: bool = True
+        # Native AI streaming (chat.startStream/appendStream/stopStream)
+        # Mirrors TS nativeStreaming + streaming config fields
+        self._native_streaming_enabled: bool = False
+        self._team_id: str | None = None
 
     # -------------------------------------------------------------------------
     # Lifecycle
@@ -68,6 +72,12 @@ class SlackChannel(ChannelPlugin):
             config.get("reactionNotifications", config.get("reaction_notifications", True))
         )
 
+        # Native AI streaming — enabled when both streaming:"partial" and nativeStreaming:true
+        # Mirrors TS isSlackStreamingEnabled(): mode === "partial" && nativeStreaming === true
+        _streaming_mode = config.get("streaming") or "off"
+        _native_streaming = bool(config.get("nativeStreaming") or config.get("native_streaming"))
+        self._native_streaming_enabled = _streaming_mode == "partial" and _native_streaming
+
         if not self._bot_token or not signing_secret:
             raise ValueError("Slack botToken and signingSecret are required")
 
@@ -95,6 +105,15 @@ class SlackChannel(ChannelPlugin):
             if self._app_token:
                 handler = AsyncSocketModeHandler(self._app, self._app_token)
                 await handler.start_async()
+
+            # Fetch team_id via auth.test — required for native streaming DM streams
+            if self._native_streaming_enabled:
+                try:
+                    auth_resp = await self._app.client.auth_test()
+                    self._team_id = auth_resp.get("team_id")
+                    logger.debug("[slack] native streaming enabled, team_id=%s", self._team_id)
+                except Exception as _ae:
+                    logger.debug("[slack] auth.test failed: %s", _ae)
 
             self._running = True
             logger.info("Slack channel started")

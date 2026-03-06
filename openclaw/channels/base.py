@@ -400,6 +400,12 @@ class ChannelPlugin(ABC):
 
         Don't override this - override the hooks instead.
         """
+        if self._running:
+            logger.warning(
+                "[%s] Channel.start() called while already running — ignoring duplicate start",
+                self.id,
+            )
+            return
         try:
             await self.on_init()
             await self.on_start(config)

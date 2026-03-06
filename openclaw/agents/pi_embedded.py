@@ -173,18 +173,21 @@ def queue_embedded_pi_message(session_id: str, text: str) -> bool:
     return handle.queue_message(text)
 
 
-def abort_embedded_pi_run(session_id: str) -> None:
+def abort_embedded_pi_run(session_id: str) -> bool:
     """Request abort for the active run of *session_id*.
 
     Sets the ``abort_event`` on the handle and also tries to call
     ``pi_session.abort()`` if available.  Non-blocking — callers should use
     ``wait_for_embedded_pi_run_end`` if they need to await completion.
 
+    Returns True if a handle was found and abort was requested, False if no
+    active run was found for the session.
+
     Mirrors TS ``abortEmbeddedPiRun``.
     """
     handle = ACTIVE_EMBEDDED_RUNS.get(session_id)
     if handle is None:
-        return
+        return False
     handle.abort_event.set()
     try:
         abort_fn = getattr(handle.pi_session, "abort", None)
@@ -199,6 +202,7 @@ def abort_embedded_pi_run(session_id: str) -> None:
     except Exception as exc:
         logger.debug("abort_embedded_pi_run: abort error: %s", exc)
     logger.info("abort_embedded_pi_run: abort requested for session %s", session_id[:8])
+    return True
 
 
 async def wait_for_embedded_pi_run_end(

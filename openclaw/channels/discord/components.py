@@ -299,6 +299,81 @@ def _add_channel_select(view: Any, spec: dict[str, Any], on_interaction: Callabl
     view.add_item(select)
 
 
+def build_discord_buttons_view(
+    buttons: list[list[dict]],
+    on_click: Callable[..., Awaitable],
+    timeout: float = 1800.0,
+) -> Any:
+    """
+    Build a discord.ui.View from the [[buttons:...]] directive format.
+
+    buttons: 2D list from parse_inline_directives(), each dict has:
+      - "text": display label
+      - "callback_data": string dispatched to agent on click
+
+    Mirrors TS: src/discord/components.ts createButtonComponent()
+    Used by DiscordChannel.send_text(buttons=...) to attach interactive
+    buttons to the agent's reply.
+
+    TTL is 30 minutes (1800s) to match TS component registry TTL.
+    """
+    import discord
+
+    view = discord.ui.View(timeout=timeout)
+
+    for row in buttons:
+        for btn_spec in row:
+            label = str(btn_spec.get("text", ""))
+            if not label:
+                continue
+            callback_data = str(
+                btn_spec.get("callback_data", btn_spec.get("text", ""))
+            )
+            style_key = btn_spec.get("style", "primary")
+            style = _resolve_button_style(style_key)
+            custom_id = _make_custom_id("btn")
+
+            btn = discord.ui.Button(
+                label=label[:80],
+                style=style,
+                custom_id=custom_id,
+            )
+
+            # Capture loop variables in the closure
+            _label = label
+            _callback_data = callback_data
+            _custom_id = custom_id
+
+            async def callback(
+                interaction: discord.Interaction,
+                _cd: str = _callback_data,
+                _lbl: str = _label,
+                _cid: str = _custom_id,
+            ) -> None:
+                try:
+                    await interaction.response.defer(ephemeral=True)
+                except Exception:
+                    pass
+                ctx = {
+                    "type": "button",
+                    "custom_id": _cid,
+                    "label": _lbl,
+                    "callback_data": _cd,
+                    "user_id": str(interaction.user.id) if interaction.user else "",
+                    "user_name": getattr(interaction.user, "display_name", "") if interaction.user else "",
+                    "channel_id": str(interaction.channel_id) if interaction.channel_id else "",
+                    "message_id": str(interaction.message.id) if interaction.message else "",
+                    "guild_id": str(interaction.guild_id) if interaction.guild_id else None,
+                }
+                await on_click(_cd, ctx)
+
+            btn.callback = callback  # type: ignore[method-assign]
+            _registry.register(custom_id, lambda i, p, cd=callback_data, lbl=label: None)
+            view.add_item(btn)
+
+    return view
+
+
 def _add_modal_trigger(view: Any, spec: dict[str, Any], on_interaction: Callable) -> None:
     """
     Add a button that opens a Modal when clicked.

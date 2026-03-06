@@ -60,14 +60,38 @@ class GatewayConfig(BaseModel):
     tailscale: GatewayTailscaleConfig | None = Field(default=None)
 
 
+class ApplyPatchConfig(BaseModel):
+    """apply_patch tool sub-configuration (aligned with TS ExecToolConfig.applyPatch)"""
+    enabled: bool = Field(default=True)
+    workspace_only: bool = Field(default=True, alias="workspaceOnly")
+    allow_models: list[str] | None = Field(default=None, alias="allowModels")
+
+    model_config = {"populate_by_name": True}
+
+
 class ExecToolConfig(BaseModel):
-    """Exec tool configuration"""
-    host: str = Field(default="gateway")
-    security: str = Field(default="full")
-    ask: str = Field(default="off")
-    safe_bins: list[str] = Field(default_factory=lambda: ["python", "pip", "git", "node", "npm"])
-    path_prepend: list[str] = Field(default_factory=list)
-    timeout_sec: int = Field(default=120)
+    """Exec tool configuration (fully aligned with TS ExecToolConfig)"""
+    host: str = Field(default="gateway")          # "sandbox" | "gateway" | "node"
+    security: str = Field(default="deny")         # TS default: "deny"
+    ask: str = Field(default="on-miss")           # TS default: "on-miss"
+    ask_fallback: str = Field(default="deny", alias="askFallback")
+    node: str | None = Field(default=None)        # bound node id for host=node
+    safe_bins: list[str] = Field(
+        default_factory=lambda: ["python", "pip", "git", "node", "npm"],
+        alias="safeBins",
+    )
+    safe_bin_trusted_dirs: list[str] = Field(default_factory=list, alias="safeBinTrustedDirs")
+    safe_bin_profiles: dict[str, Any] = Field(default_factory=dict, alias="safeBinProfiles")
+    path_prepend: list[str] = Field(default_factory=list, alias="pathPrepend")
+    timeout_sec: int = Field(default=120, alias="timeoutSec")
+    background_ms: int = Field(default=10_000, alias="backgroundMs")       # auto-background after N ms
+    approval_running_notice_ms: int = Field(default=10_000, alias="approvalRunningNoticeMs")
+    cleanup_ms: int = Field(default=1_800_000, alias="cleanupMs")           # 30 min TTL for finished sessions
+    notify_on_exit: bool = Field(default=False, alias="notifyOnExit")
+    notify_on_exit_empty_success: bool = Field(default=False, alias="notifyOnExitEmptySuccess")
+    apply_patch: ApplyPatchConfig = Field(default_factory=ApplyPatchConfig, alias="applyPatch")
+
+    model_config = {"populate_by_name": True}
 
 
 class AgentToAgentConfig(BaseModel):
@@ -82,14 +106,85 @@ class SessionsToolsConfig(BaseModel):
     visibility: str = Field(default="tree")  # "self" | "tree" | "agent" | "all"
 
 
-class ToolsConfig(BaseModel):
-    """Tools configuration (aligned with TypeScript)"""
-    profile: str = Field(default="full")
+class ElevatedAllowFromEntry(BaseModel):
+    """Per-provider sender allowlist for /elevated mode"""
+    provider: str
+    senders: list[str] = Field(default_factory=list)
+
+
+class ElevatedConfig(BaseModel):
+    """Elevated mode configuration (aligned with TS elevated config)"""
+    enabled: bool = Field(default=False)
+    allow_from: list[ElevatedAllowFromEntry] | None = Field(default=None, alias="allowFrom")
+
+    model_config = {"populate_by_name": True}
+
+
+class ToolPolicyConfig(BaseModel):
+    """Per-provider or per-sender tool policy (aligned with TS ToolPolicyConfig)"""
+    allow: list[str] | None = Field(default=None)
+    also_allow: list[str] | None = Field(default=None, alias="alsoAllow")
+    deny: list[str] | None = Field(default=None)
+    profile: str | None = Field(default=None)
+
+    model_config = {"populate_by_name": True}
+
+
+class LoopDetectionConfig(BaseModel):
+    """Tool loop detection configuration (aligned with TS ToolLoopDetectionConfig)"""
+    enabled: bool = Field(default=True)
+    window: int = Field(default=10)
+    threshold: int = Field(default=5)
+
+
+class MessageCrossContextConfig(BaseModel):
+    """Cross-context message send permissions (aligned with TS)"""
+    allow_within_provider: bool = Field(default=True, alias="allowWithinProvider")
+    allow_across_providers: bool = Field(default=False, alias="allowAcrossProviders")
+
+    model_config = {"populate_by_name": True}
+
+
+class SubagentsToolsConfig(BaseModel):
+    """Subagent tool policy defaults (aligned with TS subagents.tools)"""
+    allow: list[str] | None = Field(default=None)
+    also_allow: list[str] | None = Field(default=None, alias="alsoAllow")
+    deny: list[str] | None = Field(default=None)
+
+    model_config = {"populate_by_name": True}
+
+
+class SandboxToolsConfig(BaseModel):
+    """Sandbox tool policy at ToolsConfig level (aligned with TS sandbox.tools)"""
     allow: list[str] | None = Field(default=None)
     deny: list[str] | None = Field(default=None)
+
+
+class FsToolsConfig(BaseModel):
+    """Filesystem tool restrictions (aligned with TS FsToolsConfig)"""
+    workspace_only: bool = Field(default=False, alias="workspaceOnly")
+
+    model_config = {"populate_by_name": True}
+
+
+class ToolsConfig(BaseModel):
+    """Tools configuration (aligned with TypeScript ToolsConfig)"""
+    profile: str = Field(default="full")
+    allow: list[str] | None = Field(default=None)
+    also_allow: list[str] | None = Field(default=None, alias="alsoAllow")
+    deny: list[str] | None = Field(default=None)
+    by_provider: dict[str, ToolPolicyConfig] | None = Field(default=None, alias="byProvider")
+    elevated: ElevatedConfig | None = Field(default=None)
     exec: ExecToolConfig | None = Field(default_factory=ExecToolConfig)
-    agentToAgent: AgentToAgentConfig | None = Field(default=None)
+    fs: FsToolsConfig | None = Field(default=None)
+    subagents: SubagentsToolsConfig | None = Field(default=None)
+    sandbox: SandboxToolsConfig | None = Field(default=None)
+    loop_detection: LoopDetectionConfig | None = Field(default=None, alias="loopDetection")
     sessions: SessionsToolsConfig | None = Field(default=None)
+    message: MessageCrossContextConfig | None = Field(default=None)
+    agentToAgent: AgentToAgentConfig | None = Field(default=None)
+
+    model_config = {"populate_by_name": True}
 
 
 class SoftTrimConfig(BaseModel):
@@ -160,8 +255,38 @@ class IdentityConfig(BaseModel):
 
 
 class SandboxDockerConfig(BaseModel):
-    """Docker-level sandbox configuration."""
-    binds: list[str] = Field(default_factory=list)  # "host:container:mode" strings
+    """Docker-level sandbox configuration (aligned with TS SandboxDockerSettings)."""
+    image: str | None = Field(default=None)
+    container_prefix: str | None = Field(default=None, alias="containerPrefix")
+    workdir: str | None = Field(default=None)
+    read_only_root: bool | None = Field(default=None, alias="readOnlyRoot")
+    tmpfs: list[str] | None = Field(default=None)
+    network: str | None = Field(default=None)
+    user: str | None = Field(default=None)
+    cap_drop: list[str] | None = Field(default=None, alias="capDrop")
+    env: dict[str, str] | None = Field(default=None)
+    setup_command: str | None = Field(default=None, alias="setupCommand")
+    pids_limit: int | None = Field(default=None, alias="pidsLimit")
+    memory: str | int | None = Field(default=None)
+    memory_swap: str | int | None = Field(default=None, alias="memorySwap")
+    cpus: float | None = Field(default=None)
+    ulimits: dict[str, Any] | None = Field(default=None)
+    seccomp_profile: str | None = Field(default=None, alias="seccompProfile")
+    apparmor_profile: str | None = Field(default=None, alias="apparmorProfile")
+    dns: list[str] | None = Field(default=None)
+    extra_hosts: list[str] | None = Field(default=None, alias="extraHosts")
+    binds: list[str] = Field(default_factory=list)
+    dangerously_allow_reserved_container_targets: bool = Field(
+        default=False, alias="dangerouslyAllowReservedContainerTargets"
+    )
+    dangerously_allow_external_bind_sources: bool = Field(
+        default=False, alias="dangerouslyAllowExternalBindSources"
+    )
+    dangerously_allow_container_namespace_join: bool = Field(
+        default=False, alias="dangerouslyAllowContainerNamespaceJoin"
+    )
+
+    model_config = {"populate_by_name": True}
 
 
 class SandboxBrowserConfig(BaseModel):
@@ -338,11 +463,28 @@ class TelegramDmConfig(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class TelegramCapabilitiesConfig(BaseModel):
+    """
+    Telegram capabilities configuration (aligned with TS TelegramCapabilitiesConfig).
+    Controls which features the bot exposes per chat type.
+    """
+    inline_buttons: str | None = Field(
+        default=None,
+        alias="inlineButtons",
+        description=(
+            "Inline button scope: off | dm | group | all | allowlist (default). "
+            "Mirrors TS TelegramInlineButtonsScope."
+        ),
+    )
+
+    model_config = {"populate_by_name": True}
+
+
 class TelegramChannelConfig(BaseModel):
     """Telegram channel configuration"""
-    
+
     model_config = {"populate_by_name": True}
-    
+
     enabled: bool = Field(default=True)
     botToken: str | None = Field(default=None, alias="bot_token")
     tokenFile: str | None = Field(default=None, alias="token_file")
@@ -391,7 +533,7 @@ class TelegramChannelConfig(BaseModel):
     mediaMaxMb: int | None = Field(default=None, alias="media_max_mb")
     
     # Misc
-    capabilities: Any | None = Field(default=None)
+    capabilities: TelegramCapabilitiesConfig | Any | None = Field(default=None)
     linkPreview: bool | None = Field(default=None, alias="link_preview")
     responsePrefix: str | None = Field(default=None, alias="response_prefix")
     configWrites: bool | None = Field(default=None, alias="config_writes")

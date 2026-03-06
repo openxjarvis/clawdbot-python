@@ -1,76 +1,69 @@
 ---
 name: model-usage
-description: Track and report model usage and costs
-version: 1.0.0
-author: ClawdBot
-tags: [monitoring, usage, costs]
-requires_bins: []
-requires_env: []
-requires_config: []
+description: Use CodexBar CLI local cost usage to summarize per-model usage for Codex or Claude, including the current (most recent) model or a full model breakdown. Trigger when asked for model-level usage/cost data from codexbar, or when you need a scriptable per-model summary from codexbar cost JSON.
+metadata:
+  {
+    "openclaw":
+      {
+        "emoji": "📊",
+        "os": ["darwin"],
+        "requires": { "bins": ["codexbar"] },
+        "install":
+          [
+            {
+              "id": "brew-cask",
+              "kind": "brew",
+              "formula": "steipete/tap/codexbar",
+              "bins": ["codexbar"],
+              "label": "Install CodexBar (brew cask)",
+            },
+          ],
+      },
+  }
 ---
 
-# Model Usage Tracking
+# Model usage
 
-Track LLM usage, token consumption, and estimate costs.
+## Overview
 
-## Monitoring
+Get per-model usage cost from CodexBar's local cost logs. Supports "current model" (most recent daily entry) or "all models" summaries for Codex or Claude.
 
-### Token Usage
-Track tokens used in conversations:
-- Input tokens
-- Output tokens
-- Total tokens
+TODO: add Linux CLI support guidance once CodexBar CLI install path is documented for Linux.
 
-### Cost Estimation
+## Quick start
 
-#### Anthropic Pricing (as of 2026)
-- Claude Opus 4.5: $15 per MTok input, $75 per MTok output
-- Claude Sonnet 3.5: $3 per MTok input, $15 per MTok output
+1. Fetch cost JSON via CodexBar CLI or pass a JSON file.
+2. Use the bundled script to summarize by model.
 
-#### OpenAI Pricing
-- GPT-4 Turbo: $10 per MTok input, $30 per MTok output
-- GPT-4: $30 per MTok input, $60 per MTok output
-
-## Usage Examples
-
-User: "How many tokens have I used today?"
-1. Query session history
-2. Sum token counts
-3. Present totals
-
-User: "Estimate my costs for this month"
-1. Gather usage statistics
-2. Calculate costs per model
-3. Present breakdown
-
-User: "Which model is most efficient for my use case?"
-1. Compare token usage patterns
-2. Calculate cost per conversation
-3. Recommend most efficient model
-
-## Best Practices
-
-- Log token usage with each API call
-- Store usage data in session metadata
-- Provide cost estimates before expensive operations
-- Suggest model switching for cost optimization
-
-## Data Structure
-
-```python
-usage = {
-    "model": "claude-opus-4-5",
-    "input_tokens": 1500,
-    "output_tokens": 500,
-    "cost_usd": 0.06,  # Estimated
-    "timestamp": "2026-01-27T00:00:00Z"
-}
+```bash
+python {baseDir}/scripts/model_usage.py --provider codex --mode current
+python {baseDir}/scripts/model_usage.py --provider codex --mode all
+python {baseDir}/scripts/model_usage.py --provider claude --mode all --format json --pretty
 ```
 
-## Reporting
+## Current model logic
 
-Generate usage reports:
-- Daily/weekly/monthly summaries
-- Per-model breakdown
-- Cost trends
-- Token efficiency metrics
+- Uses the most recent daily row with `modelBreakdowns`.
+- Picks the model with the highest cost in that row.
+- Falls back to the last entry in `modelsUsed` when breakdowns are missing.
+- Override with `--model <name>` when you need a specific model.
+
+## Inputs
+
+- Default: runs `codexbar cost --format json --provider <codex|claude>`.
+- File or stdin:
+
+```bash
+codexbar cost --provider codex --format json > /tmp/cost.json
+python {baseDir}/scripts/model_usage.py --input /tmp/cost.json --mode all
+cat /tmp/cost.json | python {baseDir}/scripts/model_usage.py --input - --mode current
+```
+
+## Output
+
+- Text (default) or JSON (`--format json --pretty`).
+- Values are cost-only per model; tokens are not split by model in CodexBar output.
+
+## References
+
+- Read `references/codexbar-cli.md` for CLI flags and cost JSON fields.

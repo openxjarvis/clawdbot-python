@@ -1,38 +1,50 @@
 ---
 name: eightctl
-description: 8BitDo controller management
-version: 1.0.0
-author: ClawdBot
-tags: [gaming, controller]
-requires_bins: []
-requires_env: []
-requires_config: []
+description: Control Eight Sleep pods (status, temperature, alarms, schedules).
+homepage: https://eightctl.sh
+metadata:
+  {
+    "openclaw":
+      {
+        "emoji": "🎛️",
+        "requires": { "bins": ["eightctl"] },
+        "install":
+          [
+            {
+              "id": "go",
+              "kind": "go",
+              "module": "github.com/steipete/eightctl/cmd/eightctl@latest",
+              "bins": ["eightctl"],
+              "label": "Install eightctl (go)",
+            },
+          ],
+      },
+  }
 ---
 
-# 8BitDo Controller
+# eightctl
 
-8BitDo controller management
+Use `eightctl` for Eight Sleep pod control. Requires auth.
 
-## Available Tools
+Auth
 
-This skill uses ClawdBot's standard tools:
-- **bash** - Execute commands
-- **read_file** - Read files
-- **write_file** - Write files  
-- **web_fetch** - Fetch web content
-- **web_search** - Search the web
+- Config: `~/.config/eightctl/config.yaml`
+- Env: `EIGHTCTL_EMAIL`, `EIGHTCTL_PASSWORD`
 
-## Usage Examples
+Quick start
 
-User: "Help me with 8bitdo controller"
-1. Assess what the user needs
-2. Use appropriate tools
-3. Provide helpful response
+- `eightctl status`
+- `eightctl on|off`
+- `eightctl temp 20`
 
-## Configuration
+Common tasks
 
-Check documentation for specific setup requirements.
+- Alarms: `eightctl alarm list|create|dismiss`
+- Schedules: `eightctl schedule list|create|update`
+- Audio: `eightctl audio state|play|pause`
+- Base: `eightctl base info|angle`
 
-## Notes
+Notes
 
-This skill requires integration with 8BitDo Controller service/application.
+- API is unofficial and rate-limited; avoid repeated logins.
+- Confirm before changing temperature or alarms.

@@ -513,26 +513,23 @@ async def spawn_subagent_direct(
     child_session_key = f"agent:{target_agent_id}:subagent:{uuid.uuid4()}"
 
     # Sandbox mode enforcement (mirrors TS lines 372-385)
-    try:
-        from openclaw.agents.sandbox import resolve_sandbox_runtime_status
-        requester_runtime = resolve_sandbox_runtime_status(cfg, requester_internal_key)
-        child_runtime = resolve_sandbox_runtime_status(cfg, child_session_key)
-        if not child_runtime.get("sandboxed") and (
-            requester_runtime.get("sandboxed") or sandbox_mode == "require"
-        ):
-            if requester_runtime.get("sandboxed"):
-                return SpawnSubagentResult(
-                    status="forbidden",
-                    error="Sandboxed sessions cannot spawn unsandboxed subagents. "
-                    "Set a sandboxed target agent or use the same agent runtime.",
-                )
+    from openclaw.agents.sandbox import resolve_sandbox_runtime_status
+    requester_runtime = resolve_sandbox_runtime_status(cfg, requester_internal_key)
+    child_runtime = resolve_sandbox_runtime_status(cfg, child_session_key)
+    if not child_runtime.get("sandboxed") and (
+        requester_runtime.get("sandboxed") or sandbox_mode == "require"
+    ):
+        if requester_runtime.get("sandboxed"):
             return SpawnSubagentResult(
                 status="forbidden",
-                error='sessions_spawn sandbox="require" needs a sandboxed target runtime. '
-                'Pick a sandboxed agentId or use sandbox="inherit".',
+                error="Sandboxed sessions cannot spawn unsandboxed subagents. "
+                "Set a sandboxed target agent or use the same agent runtime.",
             )
-    except ImportError:
-        pass  # sandbox module not yet implemented
+        return SpawnSubagentResult(
+            status="forbidden",
+            error='sessions_spawn sandbox="require" needs a sandboxed target runtime. '
+            'Pick a sandboxed agentId or use sandbox="inherit".',
+        )
     child_depth = caller_depth + 1
     spawned_by_key = requester_internal_key
     

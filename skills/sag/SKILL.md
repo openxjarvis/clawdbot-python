@@ -1,38 +1,87 @@
 ---
 name: sag
-description: System administration and monitoring
-version: 1.0.0
-author: ClawdBot
-tags: [sysadmin, monitoring]
-requires_bins: []
-requires_env: []
-requires_config: []
+description: ElevenLabs text-to-speech with mac-style say UX.
+homepage: https://sag.sh
+metadata:
+  {
+    "openclaw":
+      {
+        "emoji": "🗣️",
+        "requires": { "bins": ["sag"], "env": ["ELEVENLABS_API_KEY"] },
+        "primaryEnv": "ELEVENLABS_API_KEY",
+        "install":
+          [
+            {
+              "id": "brew",
+              "kind": "brew",
+              "formula": "steipete/tap/sag",
+              "bins": ["sag"],
+              "label": "Install sag (brew)",
+            },
+          ],
+      },
+  }
 ---
 
-# SAG
+# sag
 
-System administration and monitoring
+Use `sag` for ElevenLabs TTS with local playback.
 
-## Available Tools
+API key (required)
 
-This skill uses ClawdBot's standard tools:
-- **bash** - Execute commands
-- **read_file** - Read files
-- **write_file** - Write files  
-- **web_fetch** - Fetch web content
-- **web_search** - Search the web
+- `ELEVENLABS_API_KEY` (preferred)
+- `SAG_API_KEY` also supported by the CLI
 
-## Usage Examples
+Quick start
 
-User: "Help me with sag"
-1. Assess what the user needs
-2. Use appropriate tools
-3. Provide helpful response
+- `sag "Hello there"`
+- `sag speak -v "Roger" "Hello"`
+- `sag voices`
+- `sag prompting` (model-specific tips)
 
-## Configuration
+Model notes
 
-Check documentation for specific setup requirements.
+- Default: `eleven_v3` (expressive)
+- Stable: `eleven_multilingual_v2`
+- Fast: `eleven_flash_v2_5`
 
-## Notes
+Pronunciation + delivery rules
 
-This skill requires integration with SAG service/application.
+- First fix: respell (e.g. "key-note"), add hyphens, adjust casing.
+- Numbers/units/URLs: `--normalize auto` (or `off` if it harms names).
+- Language bias: `--lang en|de|fr|...` to guide normalization.
+- v3: SSML `<break>` not supported; use `[pause]`, `[short pause]`, `[long pause]`.
+- v2/v2.5: SSML `<break time="1.5s" />` supported; `<phoneme>` not exposed in `sag`.
+
+v3 audio tags (put at the entrance of a line)
+
+- `[whispers]`, `[shouts]`, `[sings]`
+- `[laughs]`, `[starts laughing]`, `[sighs]`, `[exhales]`
+- `[sarcastic]`, `[curious]`, `[excited]`, `[crying]`, `[mischievously]`
+- Example: `sag "[whispers] keep this quiet. [short pause] ok?"`
+
+Voice defaults
+
+- `ELEVENLABS_VOICE_ID` or `SAG_VOICE_ID`
+
+Confirm voice + speaker before long output.
+
+## Chat voice responses
+
+When Peter asks for a "voice" reply (e.g., "crazy scientist voice", "explain in voice"), generate audio and send it:
+
+```bash
+# Generate audio file
+sag -v Clawd -o /tmp/voice-reply.mp3 "Your message here"
+
+# Then include in reply:
+# MEDIA:/tmp/voice-reply.mp3
+```
+
+Voice character tips:
+
+- Crazy scientist: Use `[excited]` tags, dramatic pauses `[short pause]`, vary intensity
+- Calm: Use `[whispers]` or slower pacing
+- Dramatic: Use `[sings]` or `[shouts]` sparingly
+
+Default voice for Clawd: `lj2rcrvANS3gaWWnczSX` (or just `-v Clawd`)

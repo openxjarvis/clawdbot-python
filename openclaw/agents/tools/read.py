@@ -20,7 +20,7 @@ from ..types import AgentToolResult, Content, ImageContent, TextContent
 from .base import AgentToolBase
 from .default_operations import DefaultReadOperations
 from .operations import ReadOperations
-from .path_utils import resolve_read_path
+from .path_utils import check_workspace_path, resolve_read_path
 from .truncate import (
     DEFAULT_MAX_BYTES,
     DEFAULT_MAX_LINES,
@@ -35,6 +35,7 @@ def create_read_tool(
     cwd: str,
     operations: ReadOperations | None = None,
     auto_resize_images: bool = True,
+    workspace_dir: str | None = None,
 ) -> AgentToolBase:
     """
     Create a read tool configured for a specific working directory.
@@ -107,7 +108,10 @@ def create_read_tool(
             
             # Resolve path with macOS compatibility
             absolute_path = resolve_read_path(path, cwd)
-            
+
+            # Enforce fs.workspaceOnly if configured
+            check_workspace_path(absolute_path, workspace_dir)
+
             # Check if already cancelled
             if signal and signal.is_set():
                 raise asyncio.CancelledError("Operation aborted")

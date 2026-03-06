@@ -378,8 +378,8 @@ _BOOTSTRAP_FILENAMES = [
 # Note: MEMORY.md/memory.md are loaded separately via resolve_memory_bootstrap_entries
 
 # Per-file size limits (bytes) matching TS agents.bootstrap defaults
-_DEFAULT_MAX_CHARS_PER_FILE = 32_000
-_DEFAULT_TOTAL_MAX_CHARS = 128_000
+_DEFAULT_MAX_CHARS_PER_FILE = 20_000   # aligns with TS DEFAULT_BOOTSTRAP_MAX_CHARS
+_DEFAULT_TOTAL_MAX_CHARS = 150_000    # aligns with TS DEFAULT_BOOTSTRAP_TOTAL_MAX_CHARS
 
 
 def resolve_bootstrap_context_for_run(

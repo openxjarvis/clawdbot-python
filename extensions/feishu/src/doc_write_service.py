@@ -207,7 +207,9 @@ async def _convert_markdown(client: Any, doc_token: str, markdown: str) -> tuple
         raise RuntimeError(f"lark_oapi SDK does not support document.convert: {e}") from e
 
     body = ConvertDocumentRequestBody.builder().content_type("markdown").content(markdown).build()
-    req = ConvertDocumentRequest.builder().document_id(doc_token).request_body(body).build()
+    # Note: ConvertDocumentRequest.builder() has no document_id() method —
+    # this API converts content standalone and doesn't require an existing document.
+    req = ConvertDocumentRequest.builder().request_body(body).build()
     resp = await loop.run_in_executor(None, lambda: client.docx.v1.document.convert(req))
     if not resp.success():
         raise RuntimeError(f"document.convert failed: {resp.msg}, code={resp.code}")
@@ -408,7 +410,8 @@ async def _insert_plain_paragraph(client: Any, doc_token: str, content: str) -> 
     text_run = TextRun.builder().content(content).build()
     elem = TextElement.builder().text_run(text_run).build()
     text = Text.builder().elements([elem]).build()
-    block = Block.builder().block_type(2).paragraph(text).build()
+    # Block.builder() uses .text() not .paragraph() in the installed lark_oapi version.
+    block = Block.builder().block_type(2).text(text).build()
 
     req = (
         CreateDocumentBlockChildrenRequest.builder()

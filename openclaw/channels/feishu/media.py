@@ -349,5 +349,5 @@ def get_msg_type_for_file(filename: str) -> str:
     if ext in _AUDIO_EXTENSIONS:
         return "audio"
     if ext in {".mp4", ".mov", ".avi", ".mkv", ".webm"}:
-        return "file"
+        return "media"
     return "file"

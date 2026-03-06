@@ -1,12 +1,7 @@
 ---
 name: food-order
-description: Order food from delivery services
-version: 1.0.0
-author: ClawdBot
-tags: [food, delivery]
-requires_bins: []
-requires_env: []
-requires_config: []
+description: "Order food from delivery services via web browsing and fetch tools. Use when user asks to order food, find food delivery options, or browse restaurant menus."
+metadata: { "openclaw": { "emoji": "🍔", "requires": {} } }
 ---
 
 # Food Ordering

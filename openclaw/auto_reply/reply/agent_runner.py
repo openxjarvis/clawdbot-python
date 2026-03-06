@@ -56,6 +56,19 @@ class ReplyContext:
     typing_send_fn: Callable[[], Awaitable[None]] | None = None
     timeout_ms: int = DEFAULT_AGENT_TIMEOUT_MS
     abort_event: asyncio.Event | None = None  # set to abort mid-run
+    # Streaming preview support — channel creates and passes these
+    stream_callback: Callable[[str], None] | None = None  # called with full accumulated text on each delta
+    draft_stream: Any | None = None  # streaming session reference for lifecycle (clear/stop)
+    # Status reactions — emoji on the inbound user message showing agent state
+    # Mirrors TS StatusReactionController (Telegram, Discord, etc.)
+    status_reactions: Any | None = None
+    # Two-lane reasoning streaming — separate draft stream for <think> content.
+    # reasoning_level: "off" | "on" | "stream"
+    # reasoning_stream_callback: called with accumulated reasoning text on each delta
+    # reasoning_draft_stream: TelegramDraftStream for the reasoning lane
+    reasoning_level: str = "off"
+    reasoning_stream_callback: Callable[[str], None] | None = None
+    reasoning_draft_stream: Any | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -160,9 +173,19 @@ async def _run_agent_now(ctx: ReplyContext) -> None:
         # Check abort before starting
         if ctx.abort_event and ctx.abort_event.is_set():
             logger.info("_run_agent_now: aborted before start for session %s", ctx.session_id[:8])
+            await _cleanup_draft_stream_on_abort(ctx)
             return
 
         timeout_s = (ctx.timeout_ms or DEFAULT_AGENT_TIMEOUT_MS) / 1000.0
+
+        # Transition status reaction from "queued" → "thinking" just before the
+        # agent turn starts. Mirrors TS: statusReactionController.setThinking()
+        # called in bot-message-dispatch.ts before dispatchReplyWithBufferedBlockDispatcher.
+        if ctx.status_reactions:
+            try:
+                await ctx.status_reactions.set_thinking()
+            except Exception:
+                pass
 
         try:
             response_text, has_error = await asyncio.wait_for(
@@ -181,15 +204,107 @@ async def _run_agent_now(ctx: ReplyContext) -> None:
             # get "run-now" instead of "enqueue-followup" forever.  The run_id
             # guard inside clear_active_embedded_run prevents clearing a newer run.
             clear_active_embedded_run(ctx.session_id, run_id)
+            await _cleanup_draft_stream_on_abort(ctx)
             return
 
-        await _deliver_response(ctx, response_text, has_error)
+        # Handle streaming preview lifecycle before delivering the final response.
+        #
+        # Feishu (FeishuReplyDispatcher):
+        #   - When streaming card is active → stream_finalize() sends the final
+        #     text, patches settings (streaming_mode: false), and stops typing.
+        #     _deliver_response() is skipped — finalize already delivered the text.
+        #   - When streaming is NOT active (CardKit failed / disabled) →
+        #     stop_typing() first, then _deliver_response() → _channel_send()
+        #     → dispatcher.send() which handles render_mode.
+        #
+        # Telegram (TelegramDraftStream):
+        #   - clear() deletes the editMessageText preview bubble.
+        #   - _deliver_response() then sends the final formatted message fresh.
+        _skip_deliver = False
+        if ctx.draft_stream is not None:
+            _has_finalize = hasattr(ctx.draft_stream, "stream_finalize")
+            _has_active = hasattr(ctx.draft_stream, "is_streaming_active")
+            if _has_finalize and _has_active:
+                # FeishuReplyDispatcher path
+                if ctx.draft_stream.is_streaming_active():
+                    # Parse buttons from response before finalizing — they'll be
+                    # patched onto the card after streaming_mode is turned off.
+                    from openclaw.auto_reply.directive_tags import parse_inline_directives
+                    _finalize_text = response_text or ""
+                    _finalize_buttons = None
+                    try:
+                        _dir = parse_inline_directives(_finalize_text, strip_reply_tags=True)
+                        _finalize_buttons = _dir.buttons
+                        _finalize_text = _dir.text or _finalize_text
+                    except Exception:
+                        pass
+                    # Streaming card is live — finalize it with the full response text
+                    try:
+                        await ctx.draft_stream.stream_finalize(
+                            _finalize_text, buttons=_finalize_buttons
+                        )
+                    except Exception as _fe:
+                        logger.debug("stream_finalize failed (non-fatal): %s", _fe)
+                    _skip_deliver = True
+                else:
+                    # Streaming was not started (CardKit failed or disabled) — stop
+                    # the typing indicator so it doesn't linger, then fall through to
+                    # _deliver_response() which will call dispatcher.send() via _channel_send.
+                    try:
+                        if hasattr(ctx.draft_stream, "stop_typing"):
+                            await ctx.draft_stream.stop_typing()
+                    except Exception:
+                        pass
+            else:
+                # TelegramDraftStream (or other preview stream) — delete the preview
+                # bubble so the final formatted message arrives cleanly.
+                try:
+                    if hasattr(ctx.draft_stream, "clear"):
+                        await ctx.draft_stream.clear()
+                except Exception as _ds_exc:
+                    logger.debug("draft_stream.clear() failed (non-fatal): %s", _ds_exc)
+
+        # --- Reasoning lane cleanup ---
+        # Stop the reasoning draft stream and strip reasoning blocks from the
+        # answer text so the final reply contains only the visible answer.
+        # Mirrors TS lane cleanup in the finally block of dispatchTelegramMessage.
+        if ctx.reasoning_level != "off" and response_text:
+            from openclaw.channels.telegram.reasoning import strip_reasoning_from_text
+            response_text = strip_reasoning_from_text(response_text) or response_text
+        if ctx.reasoning_draft_stream is not None:
+            try:
+                if hasattr(ctx.reasoning_draft_stream, "stop"):
+                    await ctx.reasoning_draft_stream.stop()
+            except Exception:
+                pass
+
+        if not _skip_deliver:
+            await _deliver_response(ctx, response_text, has_error)
+
+        # Set terminal status reaction after delivery.
+        # Mirrors TS: setDone() / setError() at the end of dispatchTelegramMessage.
+        if ctx.status_reactions:
+            try:
+                if has_error:
+                    await ctx.status_reactions.set_error()
+                else:
+                    await ctx.status_reactions.set_done()
+            except Exception:
+                pass
 
     except asyncio.CancelledError:
         logger.info("_run_agent_now: cancelled for session %s", ctx.session_id[:8])
+        await _cleanup_draft_stream_on_abort(ctx)
         raise
     except Exception as exc:
         logger.error("_run_agent_now: error for session %s: %s", ctx.session_id[:8], exc, exc_info=True)
+        await _cleanup_draft_stream_on_abort(ctx)
+        # Mark as error in status reactions on unexpected exception
+        if ctx.status_reactions:
+            try:
+                await ctx.status_reactions.set_error()
+            except Exception:
+                pass
         try:
             await ctx.channel_send(
                 f"Sorry, I encountered an error: {str(exc)[:100]}",
@@ -203,6 +318,41 @@ async def _run_agent_now(ctx: ReplyContext) -> None:
             ctx.typing_ctrl.mark_dispatch_idle()
         # Schedule followup drain — mirrors TS finalizeWithFollowup
         finalize_with_followup(ctx)
+
+
+async def _cleanup_draft_stream_on_abort(ctx: "ReplyContext") -> None:
+    """Emergency cleanup of streaming sessions on timeout/cancel/error.
+
+    Ensures Feishu streaming cards are closed (streaming_mode=false) and
+    Telegram preview bubbles are cleared, even when the agent run is aborted
+    mid-stream. Prevents worker task leaks and stale "⏳ Thinking..." cards.
+    """
+    if ctx.draft_stream is None:
+        return
+    try:
+        _has_finalize = hasattr(ctx.draft_stream, "stream_finalize")
+        _has_active = hasattr(ctx.draft_stream, "is_streaming_active")
+        if _has_finalize and _has_active:
+            # Feishu: finalize with empty text to close streaming_mode
+            if ctx.draft_stream.is_streaming_active():
+                try:
+                    await ctx.draft_stream.stream_finalize("", buttons=None)
+                except Exception as _e:
+                    logger.debug("_cleanup_draft_stream_on_abort: finalize failed: %s", _e)
+            elif hasattr(ctx.draft_stream, "stop_typing"):
+                try:
+                    await ctx.draft_stream.stop_typing()
+                except Exception:
+                    pass
+        else:
+            # Telegram: clear the preview bubble
+            if hasattr(ctx.draft_stream, "clear"):
+                try:
+                    await ctx.draft_stream.clear()
+                except Exception as _e:
+                    logger.debug("_cleanup_draft_stream_on_abort: clear failed: %s", _e)
+    except Exception as exc:
+        logger.debug("_cleanup_draft_stream_on_abort: unexpected error: %s", exc)
 
 
 async def _execute_agent_turn(
@@ -234,6 +384,10 @@ async def _execute_agent_turn(
         run_id=run_id,
         session_key=ctx.session_key,
         typing_signaler=typing_signaler,
+        stream_callback=ctx.stream_callback,
+        status_reactions=ctx.status_reactions,
+        reasoning_stream_callback=ctx.reasoning_stream_callback,
+        reasoning_level=ctx.reasoning_level,
     )
 
 
@@ -302,6 +456,7 @@ async def _deliver_response(
 ) -> None:
     """Deliver accumulated response text back to the channel."""
     from openclaw.auto_reply.media_parse import split_media_from_output
+    from openclaw.auto_reply.directive_tags import parse_inline_directives
 
     if not response_text and not has_error:
         return
@@ -310,11 +465,22 @@ async def _deliver_response(
         return
 
     try:
-        media_result = split_media_from_output(response_text)
-        display_text = media_result.text if media_result.text is not None else response_text
+        # Parse [[buttons:...]] directive before splitting media
+        directive_result = parse_inline_directives(response_text, strip_reply_tags=True)
+        buttons = directive_result.buttons  # list[list[dict]] | None
+        # Use the text with the buttons directive stripped for further processing
+        cleaned_text = directive_result.text if directive_result.text else response_text
+
+        media_result = split_media_from_output(cleaned_text)
+        display_text = media_result.text if media_result.text is not None else cleaned_text
 
         if display_text:
-            await ctx.channel_send(display_text, ctx.chat_target, reply_to=ctx.reply_to_id)
+            await ctx.channel_send(
+                display_text,
+                ctx.chat_target,
+                reply_to=ctx.reply_to_id,
+                buttons=buttons,
+            )
 
         # Send media files
         session_workspace: str | None = getattr(ctx, "session_workspace", None)

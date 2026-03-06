@@ -440,6 +440,12 @@ async def handle_feishu_card_action(
     """
     Convert a card button action into a synthetic InboundMessage.
 
+    When the agent sends a card with buttons (via [[buttons:...]] directive),
+    pressing a button triggers this handler. It:
+      1. Immediately patches the original card to disable all buttons — prevents
+         double-press and gives instant visual feedback (mirrors TS bot-handlers.ts).
+      2. Dispatches a synthetic InboundMessage to the agent so it can respond.
+
     Mirrors TS handleFeishuCardAction().
     """
     try:
@@ -461,7 +467,10 @@ async def handle_feishu_card_action(
             return
 
         value: dict[str, Any] = getattr(action_val, "value", {}) or {}
-        text = value.get("text") or json.dumps(value)
+        # Prefer the "callback" field set by card_builder.build_button_card(),
+        # fall back to "text" or the whole value as JSON.
+        callback = value.get("callback") or value.get("text") or json.dumps(value)
+        text = callback  # what gets sent to the agent as the synthetic message
 
         # Get context for chat_id and message_id
         context = getattr(action, "context", None)
@@ -470,6 +479,31 @@ async def handle_feishu_card_action(
 
         if not chat_id:
             return
+
+        # --- Disable buttons immediately (visual feedback, prevent double-press) ---
+        # Fetch the original card content, rebuild it with all buttons disabled,
+        # and PATCH the message. Done fire-and-forget so we don't delay the agent.
+        if message_id:
+            async def _disable_buttons() -> None:
+                try:
+                    from .send import get_feishu_message, patch_feishu_card
+                    from .card_builder import build_card_with_disabled_buttons
+                    msg_data = await get_feishu_message(client, message_id)
+                    if msg_data:
+                        raw_content = msg_data.get("body", {}).get("content", "")
+                        if raw_content:
+                            try:
+                                card_json = json.loads(raw_content)
+                                disabled_card = build_card_with_disabled_buttons(
+                                    card_json, selected_callback=callback
+                                )
+                                await patch_feishu_card(client, message_id, disabled_card)
+                            except Exception as _pe:
+                                logger.debug("[feishu] Card disable patch error: %s", _pe)
+                except Exception as _de:
+                    logger.debug("[feishu] Card disable fetch error: %s", _de)
+
+            asyncio.create_task(_disable_buttons())
 
         inbound = InboundMessage(
             channel_id=channel_id,
@@ -484,6 +518,7 @@ async def handle_feishu_card_action(
                 "feishu_account_id": account.account_id,
                 "feishu_is_card_action": True,
                 "feishu_action_value": value,
+                "feishu_action_callback": callback,
             },
         )
 

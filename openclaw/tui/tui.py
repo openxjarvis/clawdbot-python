@@ -120,14 +120,24 @@ class TUI:
         except Exception:
             pass
 
-        # Try to connect to gateway
+        # Try to connect to gateway — retry with backoff for up to ~10 s so that
+        # launching the TUI right after (or alongside) the gateway doesn't immediately
+        # fail.  Mirrors the TS tui startup which also retries on ECONNREFUSED.
         gateway_connected = False
-        try:
-            await self._gateway.connect()
-            gateway_connected = True
-            await self._load_history()
-        except Exception as exc:
-            logger.warning("Gateway not reachable: %s", exc)
+        _retry_delays = [0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]
+        for i, _delay in enumerate(_retry_delays):
+            if _delay:
+                await asyncio.sleep(_delay)
+            try:
+                await self._gateway.connect()
+                gateway_connected = True
+                await self._load_history()
+                break
+            except Exception as exc:
+                if i == len(_retry_delays) - 1:
+                    logger.warning("Gateway not reachable: %s", exc)
+                else:
+                    logger.debug("Gateway not ready yet (attempt %d): %s", i + 1, exc)
 
         # Choose TUI mode: pi_tui (TTY) or readline fallback
         if (gateway_connected and sys.stdin.isatty() and sys.stdout.isatty()):
@@ -340,8 +350,18 @@ class TUI:
                 if user_input.lower() in ("/exit", "/quit", "quit", "exit"):
                     break
                 if not gateway_connected:
-                    self._print("[offline] No gateway connected.\n")
-                    continue
+                    # Try reconnecting before giving up
+                    self._print(_dim("Trying to reconnect to gateway…\n"))
+                    try:
+                        await self._gateway.connect()
+                        gateway_connected = True
+                        self._print(_green("✓ Gateway connected.\n"))
+                    except Exception:
+                        self._print(
+                            f"{_yellow('⚠ Gateway not running.')}"
+                            f" Start it with: openclaw gateway start\n"
+                        )
+                        continue
                 await self._send_message_readline(user_input)
             except (KeyboardInterrupt, EOFError):
                 break

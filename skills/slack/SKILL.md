@@ -1,120 +1,144 @@
 ---
 name: slack
-description: Advanced Slack workspace operations
-version: 1.0.0
-author: ClawdBot
-tags: [slack, communication, workplace]
-requires_bins: []
-requires_env: [SLACK_BOT_TOKEN]
-requires_config: []
+description: Use when you need to control Slack from OpenClaw via the slack tool, including reacting to messages or pinning/unpinning items in Slack channels or DMs.
+metadata: { "openclaw": { "emoji": "💬", "requires": { "config": ["channels.slack"] } } }
 ---
 
-# Slack Advanced Operations
+# Slack Actions
 
-Advanced Slack operations beyond basic messaging.
+## Overview
 
-## Available Tools
+Use `slack` to react, manage pins, send/edit/delete messages, and fetch member info. The tool uses the bot token configured for OpenClaw.
 
-- **message**: Send messages to Slack channels
-- **slack_actions**: Slack-specific operations
-- **web_fetch**: Access Slack Web API
+## Inputs to collect
 
-## Slack Web API
+- `channelId` and `messageId` (Slack message timestamp, e.g. `1712023032.1234`).
+- For reactions, an `emoji` (Unicode or `:name:`).
+- For message sends, a `to` target (`channel:<id>` or `user:<id>`) and `content`.
 
-Base URL: `https://slack.com/api/`
+Message context lines include `slack message id` and `channel` fields you can reuse directly.
 
-### Common Operations
+## Actions
 
-#### Post Message
-```
-POST https://slack.com/api/chat.postMessage
-Headers:
-  Authorization: Bearer {SLACK_BOT_TOKEN}
-Body: {
-  "channel": "C1234567890",
-  "text": "Message text",
-  "blocks": [...]
+### Action groups
+
+| Action group | Default | Notes                  |
+| ------------ | ------- | ---------------------- |
+| reactions    | enabled | React + list reactions |
+| messages     | enabled | Read/send/edit/delete  |
+| pins         | enabled | Pin/unpin/list         |
+| memberInfo   | enabled | Member info            |
+| emojiList    | enabled | Custom emoji list      |
+
+### React to a message
+
+```json
+{
+  "action": "react",
+  "channelId": "C123",
+  "messageId": "1712023032.1234",
+  "emoji": "✅"
 }
 ```
 
-#### Upload File
-```
-POST https://slack.com/api/files.upload
-Body: {
-  "channels": "C1234567890",
-  "content": "file content",
-  "filename": "file.txt"
+### List reactions
+
+```json
+{
+  "action": "reactions",
+  "channelId": "C123",
+  "messageId": "1712023032.1234"
 }
 ```
 
-#### List Channels
-```
-GET https://slack.com/api/conversations.list
-```
+### Send a message
 
-#### Get Channel History
-```
-GET https://slack.com/api/conversations.history?channel={channel_id}
-```
-
-#### Add Reaction
-```
-POST https://slack.com/api/reactions.add
-Body: {
-  "channel": "C1234567890",
-  "timestamp": "1234567890.123456",
-  "name": "thumbsup"
+```json
+{
+  "action": "sendMessage",
+  "to": "channel:C123",
+  "content": "Hello from OpenClaw"
 }
 ```
 
-## Block Kit
+### Edit a message
 
-Slack supports rich message formatting with Block Kit:
-
-```python
-blocks = [
-    {
-        "type": "section",
-        "text": {"type": "mrkdwn", "text": "*Bold text*"}
-    },
-    {
-        "type": "actions",
-        "elements": [
-            {
-                "type": "button",
-                "text": {"type": "plain_text", "text": "Click Me"},
-                "action_id": "button_click"
-            }
-        ]
-    }
-]
+```json
+{
+  "action": "editMessage",
+  "channelId": "C123",
+  "messageId": "1712023032.1234",
+  "content": "Updated text"
+}
 ```
 
-## Usage Examples
+### Delete a message
 
-User: "Send a formatted message to #general"
-1. Build blocks with Block Kit
-2. POST to chat.postMessage
-
-User: "Upload this file to Slack"
-1. Read file content
-2. POST to files.upload
-
-User: "List all channels in workspace"
-1. GET conversations.list
-2. Format and present
-
-## Environment Setup
-
-```bash
-export SLACK_BOT_TOKEN="xoxb-..."
+```json
+{
+  "action": "deleteMessage",
+  "channelId": "C123",
+  "messageId": "1712023032.1234"
+}
 ```
 
-Get token from: https://api.slack.com/apps
+### Read recent messages
 
-## Required Scopes
+```json
+{
+  "action": "readMessages",
+  "channelId": "C123",
+  "limit": 20
+}
+```
 
-- `chat:write` - Send messages
-- `files:write` - Upload files
-- `channels:read` - List channels
-- `reactions:write` - Add reactions
+### Pin a message
+
+```json
+{
+  "action": "pinMessage",
+  "channelId": "C123",
+  "messageId": "1712023032.1234"
+}
+```
+
+### Unpin a message
+
+```json
+{
+  "action": "unpinMessage",
+  "channelId": "C123",
+  "messageId": "1712023032.1234"
+}
+```
+
+### List pinned items
+
+```json
+{
+  "action": "listPins",
+  "channelId": "C123"
+}
+```
+
+### Member info
+
+```json
+{
+  "action": "memberInfo",
+  "userId": "U123"
+}
+```
+
+### Emoji list
+
+```json
+{
+  "action": "emojiList"
+}
+```
+
+## Ideas to try
+
+- React with ✅ to mark completed tasks.
+- Pin key decisions or weekly status updates.

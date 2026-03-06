@@ -159,6 +159,10 @@ class PiAgentRuntime:
 
         self._hook_runner: Any | None = hook_runner
 
+        # SyncManager reference — set externally by GatewayServer after memory init
+        # Used for per-turn session export tracking (matches TS onSessionTranscriptUpdate).
+        self._sync_manager: Any | None = None
+
         # Per-session pool: openclaw session_id → pi_coding_agent.AgentSession
         self._pool: dict[str, Any] = {}
 
@@ -499,13 +503,31 @@ class PiAgentRuntime:
                 "content": f"[Conversation history summary]\n{enriched_summary}",
                 "timestamp": 0,  # Place at beginning
             }
-            
+
             new_history = [compaction_message] + kept_messages
             pi_session._conversation_history = new_history
-            
-            # Step 5: Update compactionCount in SessionEntry
-            # This would require access to session_manager
-            # For now, log the compaction
+
+            # Step 5: Write summary to memory/compact-YYYY-MM-DD.md
+            # Mirrors TS session-memory hook — ensures summary survives process restart.
+            try:
+                from datetime import datetime, timezone as _tz
+                today = datetime.now(_tz.utc).strftime("%Y-%m-%d")
+                memory_dir = Path(self.cwd) / "memory"
+                memory_dir.mkdir(parents=True, exist_ok=True)
+                compact_file = memory_dir / f"compact-{today}.md"
+                header = (
+                    f"# Compaction: {today}\n"
+                    f"- **Session**: {session_id}\n"
+                    f"- **Dropped**: {len(dropped_messages)} messages "
+                    f"({prune_result['dropped_tokens']} tokens)\n\n"
+                )
+                # Append so multiple compactions in the same day accumulate
+                with compact_file.open("a", encoding="utf-8") as fh:
+                    fh.write(header + enriched_summary + "\n\n---\n\n")
+                logger.debug("Compaction summary appended to %s", compact_file)
+            except Exception as write_exc:
+                logger.warning("Could not write compaction summary to disk: %s", write_exc)
+
             logger.info(f"Session {session_id[:8]} compaction completed successfully")
 
             compaction_result = {
@@ -531,6 +553,52 @@ class PiAgentRuntime:
         except Exception as e:
             logger.error(f"Compaction execution failed: {e}", exc_info=True)
             return None
+
+    # ------------------------------------------------------------------
+    # Pre-compaction memory flush — mirrors TS agent-runner-memory.ts
+    # ------------------------------------------------------------------
+
+    async def _run_memory_flush(
+        self,
+        session_id: str,
+        pi_session: Any,
+    ) -> None:
+        """Run a quick AI turn instructing the agent to write important memories.
+
+        Mirrors TS runMemoryFlushIfNeeded() / runMemoryFlushAgentTurn() in
+        src/auto-reply/reply/agent-runner-memory.ts.
+
+        The agent is given a one-shot turn with a fixed system prompt that
+        instructs it to write anything worth remembering to
+        ``memory/YYYY-MM-DD.md`` (append-only). This ensures critical context
+        survives before old messages are discarded by compaction.
+        """
+        from datetime import datetime, timezone as _tz
+        today = datetime.now(_tz.utc).strftime("%Y-%m-%d")
+        memory_path = f"memory/{today}.md"
+
+        flush_prompt = (
+            "Pre-compaction memory flush. "
+            f"Store durable memories now (use `{memory_path}`; create `memory/` if needed). "
+            "IMPORTANT: If the file already exists, APPEND new content only — "
+            "never overwrite existing content. "
+            "Write significant decisions, findings, open TODOs, and key context that "
+            "should survive a context reset. Be concise. "
+            "Only call write/edit tools — do NOT call any other tools. "
+            "When done, output ONLY the word: DONE"
+        )
+
+        try:
+            if hasattr(pi_session, 'prompt'):
+                logger.info("[%s] Running pre-compaction memory flush to %s", session_id[:8], memory_path)
+                import asyncio as _asyncio
+                await _asyncio.wait_for(
+                    pi_session.prompt(flush_prompt, None),
+                    timeout=60.0,
+                )
+                logger.debug("[%s] Pre-compaction memory flush completed", session_id[:8])
+        except Exception as exc:
+            logger.warning("[%s] Pre-compaction memory flush turn failed: %s", session_id[:8], exc)
 
     # ------------------------------------------------------------------
     # Tool result truncation — mirrors TS truncateOversizedToolResultsInSession
@@ -782,6 +850,7 @@ class PiAgentRuntime:
         images: list[str] | None = None,
         run_id: str | None = None,
         session_key: str | None = None,
+        stream_callback: Any | None = None,
     ) -> AsyncIterator[Any]:
         """Stream agent events for one conversation turn.
 
@@ -860,6 +929,33 @@ class PiAgentRuntime:
                         effective_system_prompt = prompt_result["prepend_context"]
             except Exception as exc:
                 logger.warning(f"before_prompt_build hook failed: {exc}")
+
+        # --- Plugin Hook: before_agent_start (legacy — consolidates model resolve + prompt build) ---
+        # Mirrors TS: before_agent_start fires alongside before_model_resolve + before_prompt_build
+        # for plugins that registered the legacy hook instead of the two newer hooks.
+        if self._hook_runner:
+            try:
+                legacy_result = await self._hook_runner.run_before_agent_start(
+                    {
+                        "model": effective_model or model or self.model_str,
+                        "system_prompt": effective_system_prompt or system_prompt,
+                        "config": self.config,
+                    },
+                    self._build_agent_ctx(session_id),
+                )
+                if legacy_result:
+                    if legacy_result.get("model_override") and not effective_model:
+                        effective_model = legacy_result["model_override"]
+                        logger.debug(f"[hooks] before_agent_start: model overridden to {effective_model}")
+                    if legacy_result.get("system_prompt") and not effective_system_prompt:
+                        effective_system_prompt = legacy_result["system_prompt"]
+                    if legacy_result.get("prepend_context"):
+                        base = effective_system_prompt or system_prompt or ""
+                        effective_system_prompt = (
+                            legacy_result["prepend_context"] + ("\n\n" + base if base else "")
+                        )
+            except Exception as exc:
+                logger.warning(f"before_agent_start hook failed: {exc}")
 
         # Use effective values going forward
         if effective_model and effective_model != model:
@@ -1240,12 +1336,34 @@ class PiAgentRuntime:
                                         'keepRecentTokens': compaction_config.get('keepRecentTokens', 20000),
                                     }
 
+                                    # Pre-compaction memory flush — mirrors TS agent-runner-memory.ts
+                                    # When context exceeds (contextWindow - reserveTokens - 4000),
+                                    # write a dated memory file so critical info survives before
+                                    # old messages are discarded.
+                                    _reserve = compaction_settings['reserveTokens']
+                                    _flush_threshold = context_window - _reserve - 4000
+                                    _flush_state_key = f"_memory_flush_done_{session_id}"
+                                    if (
+                                        context_tokens > _flush_threshold
+                                        and not getattr(self, _flush_state_key, False)
+                                    ):
+                                        setattr(self, _flush_state_key, True)
+                                        try:
+                                            await self._run_memory_flush(
+                                                session_id=session_id,
+                                                pi_session=_pi_session,
+                                            )
+                                        except Exception as _flush_exc:
+                                            logger.warning("Pre-compaction memory flush failed: %s", _flush_exc)
+
                                     if should_compact(context_tokens, context_window, compaction_settings):
                                         logger.warning(
                                             f"Auto-compaction triggered: {context_tokens} tokens "
-                                            f"exceeds threshold ({context_window - compaction_settings['reserveTokens']})"
+                                            f"exceeds threshold ({context_window - _reserve})"
                                         )
-                                
+                                        # Reset flush flag for next compaction cycle
+                                        setattr(self, _flush_state_key, False)
+
                                         # Phase 3: Execute compaction (300s hard timeout — mirrors TS compactionSafetyTimeout)
                                         try:
                                             compaction_result = await asyncio.wait_for(
@@ -1329,6 +1447,7 @@ class PiAgentRuntime:
 
                     prompt_task = asyncio.create_task(_run_prompt())
                     collected_events: list[Any] = []
+                    _stream_accumulated: str = ""
 
                     try:
                         while True:
@@ -1337,6 +1456,25 @@ class PiAgentRuntime:
                                 if event is _SENTINEL:
                                     break
                                 collected_events.append(event)
+
+                                # Real-time streaming: call stream_callback with each
+                                # text delta as it arrives, before the model run ends.
+                                # This drives TelegramDraftStream / SlackDraftStream
+                                # so the preview updates live during generation.
+                                if stream_callback is not None:
+                                    _ev_type = getattr(event, "type", None)
+                                    _ev_data = getattr(event, "data", {}) or {}
+                                    if _ev_type == EventType.TEXT:
+                                        _delta = _ev_data.get("text", "")
+                                        if _delta:
+                                            _stream_accumulated += _delta
+                                            try:
+                                                _cb_result = stream_callback(_stream_accumulated)
+                                                if asyncio.iscoroutine(_cb_result):
+                                                    asyncio.create_task(_cb_result)
+                                            except Exception:
+                                                pass
+
                             except Exception as queue_exc:
                                 logger.error(f"[{session_id[:8]}] Event queue get error: {queue_exc}", exc_info=True)
                                 break
@@ -1370,6 +1508,40 @@ class PiAgentRuntime:
 
                     for ev in collected_events:
                         try:
+                            # --- Plugin Hooks: before_tool_call / after_tool_call ---
+                            # Fired observationally (not blocking) when tool execution events arrive.
+                            # Mirrors TS pi-tools.before-tool-call.ts and pi-embedded-subscribe.handlers.tools.ts.
+                            if self._hook_runner:
+                                ev_type = getattr(ev, "type", None)
+                                ev_data = getattr(ev, "data", {}) or {}
+                                if ev_type == EventType.TOOL_EXECUTION_START and self._hook_runner.has_hooks("before_tool_call"):
+                                    try:
+                                        asyncio.create_task(self._hook_runner.run_before_tool_call(
+                                            {
+                                                "tool_name": ev_data.get("tool_name", ""),
+                                                "params": ev_data.get("arguments", {}),
+                                                "tool_call_id": ev_data.get("tool_call_id"),
+                                            },
+                                            self._build_agent_ctx(session_id),
+                                        ))
+                                    except Exception:
+                                        pass
+                                elif ev_type == EventType.TOOL_EXECUTION_END and self._hook_runner.has_hooks("after_tool_call"):
+                                    try:
+                                        asyncio.create_task(self._hook_runner.run_after_tool_call(
+                                            {
+                                                "tool_name": ev_data.get("tool_name", ""),
+                                                "params": ev_data.get("arguments", {}),
+                                                "tool_call_id": ev_data.get("tool_call_id"),
+                                                "result": ev_data.get("result"),
+                                                "error": ev_data.get("error"),
+                                                "is_error": ev_data.get("is_error", False),
+                                            },
+                                            self._build_agent_ctx(session_id),
+                                        ))
+                                    except Exception:
+                                        pass
+
                             await self._dispatch_event(ev)
                             yield ev
                         except Exception as dispatch_exc:
@@ -1429,6 +1601,34 @@ class PiAgentRuntime:
                             )
                     except Exception as e:
                         logger.warning(f"Failed to update session token statistics: {e}")
+
+                    # Phase 2b: Session export — track message count and export to memory
+                    # if threshold reached (mirrors TS SyncManager.export_session_if_needed).
+                    if not _quota_error and hasattr(self, '_sync_manager') and self._sync_manager is not None:
+                        try:
+                            session_path = None
+                            if hasattr(self, 'session_manager') and self.session_manager:
+                                try:
+                                    entry = self.session_manager.get_entry_by_id(session_id)
+                                    if entry and hasattr(entry, 'session_id'):
+                                        from pathlib import Path as _Path
+                                        sessions_dir = _Path(self.cwd) / ".openclaw" / "sessions"
+                                        session_path = sessions_dir / f"{entry.session_id}.jsonl"
+                                except Exception:
+                                    pass
+                            if session_path:
+                                last_msg = None
+                                if hasattr(pi_session, '_conversation_history') and pi_session._conversation_history:
+                                    last_msg = pi_session._conversation_history[-1]
+                                asyncio.create_task(
+                                    self._sync_manager.export_session_if_needed(
+                                        session_id=session_id,
+                                        message=last_msg or {},
+                                        session_path=session_path,
+                                    )
+                                )
+                        except Exception as se_exc:
+                            logger.debug("Session export scheduling failed: %s", se_exc)
 
                     # --- Plugin Hook: agent_end (fire-and-forget, parallel) ---
                     if self._hook_runner and self._hook_runner.has_hooks("agent_end") and not _quota_error:

@@ -1,38 +1,49 @@
 ---
 name: songsee
-description: Music recognition and identification
-version: 1.0.0
-author: ClawdBot
-tags: [music, shazam]
-requires_bins: []
-requires_env: []
-requires_config: []
+description: Generate spectrograms and feature-panel visualizations from audio with the songsee CLI.
+homepage: https://github.com/steipete/songsee
+metadata:
+  {
+    "openclaw":
+      {
+        "emoji": "🌊",
+        "requires": { "bins": ["songsee"] },
+        "install":
+          [
+            {
+              "id": "brew",
+              "kind": "brew",
+              "formula": "steipete/tap/songsee",
+              "bins": ["songsee"],
+              "label": "Install songsee (brew)",
+            },
+          ],
+      },
+  }
 ---
 
-# Song Recognition
+# songsee
 
-Music recognition and identification
+Generate spectrograms + feature panels from audio.
 
-## Available Tools
+Quick start
 
-This skill uses ClawdBot's standard tools:
-- **bash** - Execute commands
-- **read_file** - Read files
-- **write_file** - Write files  
-- **web_fetch** - Fetch web content
-- **web_search** - Search the web
+- Spectrogram: `songsee track.mp3`
+- Multi-panel: `songsee track.mp3 --viz spectrogram,mel,chroma,hpss,selfsim,loudness,tempogram,mfcc,flux`
+- Time slice: `songsee track.mp3 --start 12.5 --duration 8 -o slice.jpg`
+- Stdin: `cat track.mp3 | songsee - --format png -o out.png`
 
-## Usage Examples
+Common flags
 
-User: "Help me with song recognition"
-1. Assess what the user needs
-2. Use appropriate tools
-3. Provide helpful response
+- `--viz` list (repeatable or comma-separated)
+- `--style` palette (classic, magma, inferno, viridis, gray)
+- `--width` / `--height` output size
+- `--window` / `--hop` FFT settings
+- `--min-freq` / `--max-freq` frequency range
+- `--start` / `--duration` time slice
+- `--format` jpg|png
 
-## Configuration
+Notes
 
-Check documentation for specific setup requirements.
-
-## Notes
-
-This skill requires integration with Song Recognition service/application.
+- WAV/MP3 decode native; other formats use ffmpeg if available.
+- Multiple `--viz` renders a grid.

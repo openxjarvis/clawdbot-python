@@ -1,12 +1,7 @@
 ---
 name: discord-adv
-description: Advanced Discord server and channel management
-version: 1.0.0
-author: ClawdBot
-tags: [discord, community, gaming]
-requires_bins: []
-requires_env: [DISCORD_BOT_TOKEN]
-requires_config: []
+description: "Advanced Discord server management via Discord API v10: send embeds, create channels, manage roles, moderation. Use when managing Discord server structure, sending rich embedded messages, or moderating users. Requires DISCORD_BOT_TOKEN."
+metadata: { "openclaw": { "emoji": "🔧", "requires": { "env": ["DISCORD_BOT_TOKEN"] } } }
 ---
 
 # Discord Advanced Operations

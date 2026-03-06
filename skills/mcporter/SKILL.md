@@ -1,38 +1,61 @@
 ---
 name: mcporter
-description: Minecraft server management
-version: 1.0.0
-author: ClawdBot
-tags: [minecraft, gaming]
-requires_bins: []
-requires_env: []
-requires_config: []
+description: Use the mcporter CLI to list, configure, auth, and call MCP servers/tools directly (HTTP or stdio), including ad-hoc servers, config edits, and CLI/type generation.
+homepage: http://mcporter.dev
+metadata:
+  {
+    "openclaw":
+      {
+        "emoji": "📦",
+        "requires": { "bins": ["mcporter"] },
+        "install":
+          [
+            {
+              "id": "node",
+              "kind": "node",
+              "package": "mcporter",
+              "bins": ["mcporter"],
+              "label": "Install mcporter (node)",
+            },
+          ],
+      },
+  }
 ---
 
-# Minecraft Porter
+# mcporter
 
-Minecraft server management
+Use `mcporter` to work with MCP servers directly.
 
-## Available Tools
+Quick start
 
-This skill uses ClawdBot's standard tools:
-- **bash** - Execute commands
-- **read_file** - Read files
-- **write_file** - Write files  
-- **web_fetch** - Fetch web content
-- **web_search** - Search the web
+- `mcporter list`
+- `mcporter list <server> --schema`
+- `mcporter call <server.tool> key=value`
 
-## Usage Examples
+Call tools
 
-User: "Help me with minecraft porter"
-1. Assess what the user needs
-2. Use appropriate tools
-3. Provide helpful response
+- Selector: `mcporter call linear.list_issues team=ENG limit:5`
+- Function syntax: `mcporter call "linear.create_issue(title: \"Bug\")"`
+- Full URL: `mcporter call https://api.example.com/mcp.fetch url:https://example.com`
+- Stdio: `mcporter call --stdio "bun run ./server.ts" scrape url=https://example.com`
+- JSON payload: `mcporter call <server.tool> --args '{"limit":5}'`
 
-## Configuration
+Auth + config
 
-Check documentation for specific setup requirements.
+- OAuth: `mcporter auth <server | url> [--reset]`
+- Config: `mcporter config list|get|add|remove|import|login|logout`
 
-## Notes
+Daemon
 
-This skill requires integration with Minecraft Porter service/application.
+- `mcporter daemon start|status|stop|restart`
+
+Codegen
+
+- CLI: `mcporter generate-cli --server <name>` or `--command <url>`
+- Inspect: `mcporter inspect-cli <path> [--json]`
+- TS: `mcporter emit-ts <server> --mode client|types`
+
+Notes
+
+- Config default: `./config/mcporter.json` (override with `--config`).
+- Prefer `--output json` for machine-readable results.

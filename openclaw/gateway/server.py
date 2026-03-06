@@ -517,6 +517,7 @@ class GatewayServer:
         
         # Initialize memory manager (lazy initialization)
         self._memory_manager = None
+        self._sync_manager = None  # SyncManager started alongside memory manager
         
         # Initialize approval manager
         from openclaw.exec.approval_manager import ExecApprovalManager
@@ -707,31 +708,61 @@ class GatewayServer:
         self.connections -= disconnected
     
     def get_memory_manager(self):
-        """Get or create memory manager (lazy initialization)"""
+        """Get or create memory manager (lazy initialization).
+
+        Also starts SyncManager (file watcher + 30-min periodic sync) on first
+        call — mirrors TS MemoryIndexManager.get() which wires up chokidar and
+        the interval sync inside the constructor.
+        """
         if self._memory_manager is None:
             try:
                 from openclaw.memory.builtin_manager import BuiltinMemoryManager
-                
+                from openclaw.memory.sync_manager import SyncManager
+
                 # Determine workspace directory
                 workspace_dir = Path.home() / ".openclaw" / "workspace"
                 if self.agent_runtime and hasattr(self.agent_runtime, 'workspace_dir'):
                     workspace_dir = Path(self.agent_runtime.workspace_dir)
-                
+
                 # Use default agent_id
                 agent_id = "main"
                 if self.config and hasattr(self.config, 'agent') and hasattr(self.config.agent, 'id'):
                     agent_id = self.config.agent.id
-                
+
                 self._memory_manager = BuiltinMemoryManager(
                     agent_id=agent_id,
                     workspace_dir=workspace_dir,
-                    embedding_provider="openai"
+                    embedding_provider="openai",
                 )
                 logger.info(f"Memory manager initialized for agent '{agent_id}' at {workspace_dir}")
+
+                # Start SyncManager — file watcher + periodic 30-min sync
+                # Matches TS ensureWatcher() + ensureIntervalSync() in manager-sync-ops.ts
+                sync_manager = SyncManager(
+                    memory_manager=self._memory_manager,
+                    workspace_path=workspace_dir,
+                )
+                import asyncio
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        loop.create_task(sync_manager.start())
+                    else:
+                        logger.debug("No running event loop — SyncManager will be started later")
+                except Exception as sm_exc:
+                    logger.warning("SyncManager could not be scheduled: %s", sm_exc)
+
+                # Store sync_manager reference so it isn't GC'd
+                self._sync_manager = sync_manager
+
+                # Wire sync_manager into agent_runtime so per-turn export works
+                if self.agent_runtime is not None and hasattr(self.agent_runtime, '_sync_manager'):
+                    self.agent_runtime._sync_manager = sync_manager
+
             except Exception as e:
                 logger.error(f"Failed to initialize memory manager: {e}", exc_info=True)
                 return None
-        
+
         return self._memory_manager
 
     def _get_assistant_name(self) -> str:

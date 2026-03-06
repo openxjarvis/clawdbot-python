@@ -375,13 +375,13 @@ Follow these steps in order. If any step fails, report the failure and stop.
 0. SETUP — Ensure GH_TOKEN is available:
 ```
 
-export GH_TOKEN=$(node -e "const fs=require('fs'); const c=JSON.parse(fs.readFileSync('/data/.clawdbot/openclaw.json','utf8')); console.log(c.skills?.entries?.['gh-issues']?.apiKey || '')")
+export GH_TOKEN=$(jq -r '.skills.entries["gh-issues"].apiKey // empty' /data/.clawdbot/openclaw.json 2>/dev/null)
 
 ```
 If that fails, also try:
 ```
 
-export GH_TOKEN=$(cat ~/.openclaw/openclaw.json 2>/dev/null | node -e "const fs=require('fs');const d=JSON.parse(fs.readFileSync(0,'utf8'));console.log(d.skills?.entries?.['gh-issues']?.apiKey||'')")
+export GH_TOKEN=$(jq -r '.skills.entries["gh-issues"].apiKey // empty' ~/.openclaw/openclaw.json 2>/dev/null)
 
 ```
 Verify: echo "Token: ${GH_TOKEN:0:10}..."
@@ -745,7 +745,7 @@ Follow these steps in order:
 0. SETUP — Ensure GH_TOKEN is available:
 ```
 
-export GH_TOKEN=$(node -e "const fs=require('fs'); const c=JSON.parse(fs.readFileSync('/data/.clawdbot/openclaw.json','utf8')); console.log(c.skills?.entries?.['gh-issues']?.apiKey || '')")
+export GH_TOKEN=$(jq -r '.skills.entries["gh-issues"].apiKey // empty' /data/.clawdbot/openclaw.json 2>/dev/null || jq -r '.skills.entries["gh-issues"].apiKey // empty' ~/.openclaw/openclaw.json 2>/dev/null)
 
 ```
 Verify: echo "Token: ${GH_TOKEN:0:10}..."

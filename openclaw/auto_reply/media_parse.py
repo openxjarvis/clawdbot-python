@@ -53,10 +53,26 @@ def _is_valid_media_source(candidate: str) -> bool:
 
 
 def _normalize_media_source(raw: str) -> str:
-    """Expand ~ and strip surrounding quotes."""
+    """Expand ~ and strip surrounding quotes.
+
+    Also strips trailing caption text that the agent may append after the
+    file path on the same line, e.g.:
+        /path/to/file.pptx 这是今日新闻 PPT。
+    We detect this by finding the last file-extension boundary and trimming
+    anything after it when the remaining suffix contains non-path characters.
+    """
     raw = raw.strip().strip("'\"")
     if raw.startswith("~"):
         raw = str(Path(raw).expanduser())
+
+    # Strip trailing caption text from local paths (not URLs)
+    if " " in raw and not raw.startswith(("http://", "https://", "file://")):
+        # Find the rightmost file extension followed by space (e.g. ".pptx ")
+        ext_match = re.search(r'(\.[a-zA-Z0-9]{1,10})\s', raw)
+        if ext_match:
+            path_end = ext_match.start() + len(ext_match.group(1))
+            raw = raw[:path_end]
+
     return raw
 
 

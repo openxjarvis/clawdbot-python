@@ -66,6 +66,7 @@ async def run_onboarding_wizard(
     non_interactive: bool = False,
     accept_risk: bool = False,
     flow: Optional[str] = None,
+    config_path: Optional[Path] = None,
 ) -> dict:
     """
     Run onboarding wizard

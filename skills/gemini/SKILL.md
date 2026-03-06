@@ -1,38 +1,43 @@
 ---
 name: gemini
-description: Google Gemini AI integration
-version: 1.0.0
-author: ClawdBot
-tags: [ai, gemini, google]
-requires_bins: []
-requires_env: []
-requires_config: []
+description: Gemini CLI for one-shot Q&A, summaries, and generation.
+homepage: https://ai.google.dev/
+metadata:
+  {
+    "openclaw":
+      {
+        "emoji": "♊️",
+        "requires": { "bins": ["gemini"] },
+        "install":
+          [
+            {
+              "id": "brew",
+              "kind": "brew",
+              "formula": "gemini-cli",
+              "bins": ["gemini"],
+              "label": "Install Gemini CLI (brew)",
+            },
+          ],
+      },
+  }
 ---
 
-# Google Gemini
+# Gemini CLI
 
-Google Gemini AI integration
+Use Gemini in one-shot mode with a positional prompt (avoid interactive mode).
 
-## Available Tools
+Quick start
 
-This skill uses ClawdBot's standard tools:
-- **bash** - Execute commands
-- **read_file** - Read files
-- **write_file** - Write files  
-- **web_fetch** - Fetch web content
-- **web_search** - Search the web
+- `gemini "Answer this question..."`
+- `gemini --model <name> "Prompt..."`
+- `gemini --output-format json "Return JSON"`
 
-## Usage Examples
+Extensions
 
-User: "Help me with google gemini"
-1. Assess what the user needs
-2. Use appropriate tools
-3. Provide helpful response
+- List: `gemini --list-extensions`
+- Manage: `gemini extensions <command>`
 
-## Configuration
+Notes
 
-Check documentation for specific setup requirements.
-
-## Notes
-
-This skill requires integration with Google Gemini service/application.
+- If auth is required, run `gemini` once interactively and follow the login flow.
+- Avoid `--yolo` for safety.

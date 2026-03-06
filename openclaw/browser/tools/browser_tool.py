@@ -452,7 +452,10 @@ class UnifiedBrowserTool(AgentTool):
 
         if not enabled:
             raise RuntimeError(
-                "Browser control is disabled. Set browser.enabled=true in ~/.openclaw/openclaw.json."
+                "PERMANENT_ERROR: Browser is disabled in this environment (browser.enabled=false). "
+                "Do NOT retry this tool call. "
+                "Use platform-specific API tools instead (e.g. Feishu API for Feishu, "
+                "requests/curl for web, etc.)."
             )
 
         return None

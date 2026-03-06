@@ -430,8 +430,10 @@ async def load_gateway_plugins(
             ))
             continue
 
-        # Detect plugin definition: can be module-level 'plugin' object,
-        # or module-level 'register' function, or OpenClawPluginDefinition-like dict/object
+        # Detect plugin definition: can be module-level 'plugin' object or dict,
+        # or module-level 'register' function, or OpenClawPluginDefinition-like dict/object.
+        # Python plugins commonly use a dict literal: plugin = {"id": ..., "register": fn}
+        # In that case getattr() on a dict returns None for all keys — use .get() instead.
         plugin_def = getattr(module, "plugin", None) or getattr(module, "PLUGIN", None)
         register_fn = None
         plugin_name = plugin_id
@@ -440,14 +442,21 @@ async def load_gateway_plugins(
         plugin_kind = None
         plugin_config_for_plugin: dict[str, Any] | None = None
 
+        def _def_get(key: str, default: Any = None) -> Any:
+            """Get a field from plugin_def regardless of whether it is a dict or object."""
+            if isinstance(plugin_def, dict):
+                return plugin_def.get(key, default)
+            return getattr(plugin_def, key, default)
+
         if plugin_def is not None:
-            plugin_name = getattr(plugin_def, "name", plugin_id) or plugin_id
-            plugin_version = getattr(plugin_def, "version", None)
-            plugin_description = getattr(plugin_def, "description", None)
-            plugin_kind = getattr(plugin_def, "kind", None)
-            register_fn = getattr(plugin_def, "register", None)
-        else:
-            # Try module-level register() function
+            plugin_name = _def_get("name", plugin_id) or plugin_id
+            plugin_version = _def_get("version")
+            plugin_description = _def_get("description")
+            plugin_kind = _def_get("kind")
+            register_fn = _def_get("register")
+
+        if register_fn is None:
+            # Fallback: try a top-level register() function on the module itself
             register_fn = getattr(module, "register", None)
 
         if register_fn is None:

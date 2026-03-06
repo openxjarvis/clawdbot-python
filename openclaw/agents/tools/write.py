@@ -20,7 +20,7 @@ from ..types import AgentToolResult, TextContent
 from .base import AgentToolBase
 from .default_operations import DefaultWriteOperations
 from .operations import WriteOperations
-from .path_utils import resolve_to_cwd
+from .path_utils import check_workspace_path, resolve_to_cwd
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 def create_write_tool(
     cwd: str,
     operations: WriteOperations | None = None,
+    workspace_dir: str | None = None,
 ) -> AgentToolBase:
     """
     Create a write tool configured for a specific working directory.
@@ -90,6 +91,10 @@ def create_write_tool(
             
             # Resolve path
             absolute_path = resolve_to_cwd(path, cwd)
+
+            # Enforce fs.workspaceOnly if configured
+            check_workspace_path(absolute_path, workspace_dir)
+
             dir_path = os.path.dirname(absolute_path)
             
             # Check if already cancelled

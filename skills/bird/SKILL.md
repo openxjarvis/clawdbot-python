@@ -1,12 +1,7 @@
 ---
 name: bird
-description: Twitter/X social media integration
-version: 1.0.0
-author: ClawdBot
-tags: [twitter, social]
-requires_bins: []
-requires_env: []
-requires_config: []
+description: "Twitter/X social media integration via web API. Use when user asks to search Twitter/X content, read tweets, or interact with Twitter/X data using web fetch tools."
+metadata: { "openclaw": { "emoji": "🐦", "requires": {} } }
 ---
 
 # Twitter/X

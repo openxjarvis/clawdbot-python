@@ -137,37 +137,96 @@ def is_local_direct_request(
 
 class AuthRateLimiter:
     """
-    Small auth limiter used by gateway connect.
+    Auth rate limiter — aligned with TS src/gateway/auth-rate-limit.ts.
+
+    Features:
+    - 4 named scopes: "default", "shared-secret", "device-token", "hook-auth"
+    - maxAttempts=10 per scope within windowMs=60s
+    - lockoutMs=300_000 (5-min lockout) after exceeding maxAttempts
+    - Loopback IPs are always exempt from rate limiting
     """
 
-    def __init__(self, limit: int = 8, window_ms: int = 60_000):
+    # Scope-specific defaults matching TS auth-rate-limit.ts
+    SCOPE_LIMITS: dict[str, int] = {
+        "default": 10,
+        "shared-secret": 10,
+        "device-token": 10,
+        "hook-auth": 10,
+    }
+
+    def __init__(
+        self,
+        limit: int = 10,
+        window_ms: int = 60_000,
+        lockout_ms: int = 300_000,
+    ):
         self.limit = limit
         self.window_ms = window_ms
+        self.lockout_ms = lockout_ms  # 5-min lockout after maxAttempts exceeded
         self._buckets: dict[tuple[str, str], list[int]] = {}
+        self._lockouts: dict[tuple[str, str], int] = {}  # key -> lockout_until_ms
 
     def _now_ms(self) -> int:
         import time
-
         return int(time.time() * 1000)
 
+    def _scope_limit(self, scope: str) -> int:
+        # If a custom limit was injected (not the default 10), always honour it.
+        # Otherwise fall back to per-scope defaults (SCOPE_LIMITS).
+        if self.limit != 10:
+            return self.limit
+        return self.SCOPE_LIMITS.get(scope, self.limit)
+
     def check(self, ip: str | None, scope: str) -> tuple[bool, int | None]:
+        """Check if the request is allowed. Loopback IPs always pass."""
+        if is_loopback_address(ip):
+            return True, None
+
         key = (ip or "unknown", scope)
         now = self._now_ms()
+
+        # Check lockout first
+        lockout_until = self._lockouts.get(key)
+        if lockout_until and now < lockout_until:
+            retry_after_ms = lockout_until - now
+            return False, retry_after_ms
+        if lockout_until and now >= lockout_until:
+            # Lockout expired — clear it and reset bucket
+            del self._lockouts[key]
+            self._buckets.pop(key, None)
+
         cut = now - self.window_ms
         bucket = [ts for ts in self._buckets.get(key, []) if ts >= cut]
         self._buckets[key] = bucket
-        if len(bucket) >= self.limit:
+
+        scope_limit = self._scope_limit(scope)
+        if len(bucket) >= scope_limit:
             retry_after_ms = max(0, self.window_ms - (now - bucket[0]))
             return False, retry_after_ms
         return True, None
 
     def record_failure(self, ip: str | None, scope: str) -> None:
+        """Record a failed auth attempt; triggers lockout after maxAttempts."""
+        if is_loopback_address(ip):
+            return
+
         key = (ip or "unknown", scope)
-        self._buckets.setdefault(key, []).append(self._now_ms())
+        now = self._now_ms()
+        cut = now - self.window_ms
+        bucket = [ts for ts in self._buckets.get(key, []) if ts >= cut]
+        bucket.append(now)
+        self._buckets[key] = bucket
+
+        # Trigger lockout if limit exceeded
+        scope_limit = self._scope_limit(scope)
+        if len(bucket) >= scope_limit and key not in self._lockouts:
+            self._lockouts[key] = now + self.lockout_ms
 
     def reset(self, ip: str | None, scope: str) -> None:
+        """Reset rate limit state for an IP+scope (e.g. on successful auth)."""
         key = (ip or "unknown", scope)
         self._buckets.pop(key, None)
+        self._lockouts.pop(key, None)
 
 
 def authorize_gateway_token(
@@ -220,6 +279,50 @@ def authorize_gateway_password(
         return AuthResult(ok=False, reason="password_mismatch")
     
     return AuthResult(ok=True, method=AuthMethod.PASSWORD)
+
+
+def _verify_tailscale_whois(client_ip: str, ts_login_header: str | None) -> AuthResult | None:
+    """
+    Verify Tailscale identity via local whois API (mirrors TS readTailscaleWhoisIdentity).
+
+    Calls http://100.100.100.100/localapi/v0/whois?addr=<ip> to get the identity
+    for the connecting IP, then cross-checks the tailscale-user-login header.
+
+    Returns:
+        AuthResult if Tailscale is running and the IP is a Tailscale peer.
+        None if Tailscale is not running (e.g. non-Tailscale connection).
+    """
+    import urllib.request
+    import urllib.error
+    import json as _json
+
+    try:
+        url = f"http://100.100.100.100/localapi/v0/whois?addr={client_ip}"
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            data = _json.loads(resp.read().decode("utf-8"))
+    except urllib.error.URLError:
+        # Tailscale not running or peer not found — not a Tailscale connection
+        return None
+    except Exception as exc:
+        logger.debug(f"Tailscale whois lookup failed for {client_ip}: {exc}")
+        return None
+
+    user_profile = data.get("UserProfile") or {}
+    login_name: str = (user_profile.get("LoginName") or "").strip()
+
+    if not login_name:
+        # Could not identify user — treat as failed
+        return AuthResult(ok=False, reason="tailscale_identity_unknown")
+
+    # Cross-check the tailscale-user-login header if provided
+    if ts_login_header and not safe_equal(ts_login_header.strip(), login_name):
+        logger.warning(
+            f"Tailscale whois mismatch: header '{ts_login_header}' != whois '{login_name}'"
+        )
+        return AuthResult(ok=False, reason="tailscale_login_mismatch")
+
+    return AuthResult(ok=True, method=AuthMethod.TAILSCALE, user=login_name)
 
 
 def authorize_gateway_connect(
@@ -305,11 +408,16 @@ def authorize_gateway_connect(
             rate_limiter.reset(client_ip, rate_limit_scope)
         return AuthResult(ok=True, method=AuthMethod.TRUSTED_PROXY, user=user_value)
     
-    # Tailscale auth (if enabled)
+    # Tailscale auth — if enabled, verify via local Tailscale API whois endpoint
     if allow_tailscale and client_ip:
-        # TODO: Implement Tailscale whois lookup
-        # For now, we don't have Tailscale integration in Python
-        logger.debug("Tailscale auth not yet implemented in Python")
+        ts_login = _header_value(headers, "tailscale-user-login")
+        ts_result = _verify_tailscale_whois(client_ip, ts_login)
+        if ts_result is not None:
+            if ts_result.ok:
+                if rate_limiter is not None:
+                    rate_limiter.reset(client_ip, rate_limit_scope)
+                return ts_result
+            # Tailscale whois lookup failed — fall through to other auth methods
     
     # Token auth
     if auth_mode == AuthMode.TOKEN:

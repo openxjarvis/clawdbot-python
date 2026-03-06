@@ -226,14 +226,43 @@ class DockerSandbox:
     
     async def start(self) -> str:
         """
-        Start sandbox container
-        
+        Start sandbox container.
+
         Returns:
             Container name
         """
         if self._started:
             return self.container_name or ""
-        
+
+        # Security validation before docker run (mirrors TS context.ts validateSandboxSecurity)
+        try:
+            from openclaw.security.validate_sandbox_security import validate_sandbox_security
+            sandbox_cfg: dict = {}
+            if getattr(self.config, "network_mode", None):
+                sandbox_cfg["network"] = self.config.network_mode
+            if getattr(self.config, "seccomp_profile", None):
+                sandbox_cfg["seccompProfile"] = self.config.seccomp_profile
+            if getattr(self.config, "apparmor_profile", None):
+                sandbox_cfg["apparmorProfile"] = self.config.apparmor_profile
+            # Collect bind mounts for validation
+            binds: list[str] = []
+            if self.workspace_dir:
+                # Use /app to avoid reserved container path /workspace
+                binds.append(f"{self.workspace_dir}:/app:rw")
+            extra_binds = getattr(self.config, "binds", None)
+            if extra_binds:
+                binds.extend(extra_binds)
+            if binds:
+                sandbox_cfg["binds"] = binds
+
+            allowed_source_roots: list[str] = []
+            if self.workspace_dir:
+                allowed_source_roots.append(str(self.workspace_dir))
+
+            validate_sandbox_security(sandbox_cfg, allowed_source_roots=allowed_source_roots)
+        except ImportError:
+            pass  # validation module not yet available — skip
+
         # Ensure image exists
         await ensure_docker_image(self.config.image)
         

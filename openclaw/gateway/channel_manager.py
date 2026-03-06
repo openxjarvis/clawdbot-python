@@ -1437,7 +1437,172 @@ class ChannelManager:
                                 f"[{channel_id}] Audio transcription failed: {_audio_err}"
                             )
 
-                # Build a channel send function for the ReplyContext
+                # --- Telegram streaming preview (draft stream) ---
+                # Create a TelegramDraftStream for Telegram channels so that
+                # each text_delta from the agent is shown as a live preview
+                # (editMessageText throttled at 1s). Mirrors TS draft-stream.ts.
+                _draft_stream = None
+                _stream_callback = None
+                _feishu_dispatcher = None
+
+                _status_reactions = None
+                _reasoning_level = "off"
+                _reasoning_draft = None
+                _reasoning_callback = None
+
+                if hasattr(channel, "_app") and channel._app is not None:
+                    # Telegram channel
+                    try:
+                        from openclaw.channels.telegram.draft_stream import TelegramDraftStream
+                        _is_dm_tg = getattr(message, "chat_type", "") == "direct"
+                        _draft_stream = TelegramDraftStream(
+                            bot_api=channel._app.bot,
+                            chat_id=int(message.chat_id),
+                            reply_to_message_id=int(message.message_id) if message.message_id else None,
+                            throttle_ms=1000,
+                            min_initial_chars=20,
+                            is_dm=_is_dm_tg,
+                        )
+                        # .update() is synchronous — create_task handles the async
+                        # send/edit internally via asyncio.create_task inside the class.
+                        _stream_callback = _draft_stream.update
+                    except Exception as _ds_err:
+                        logger.debug("Failed to create TelegramDraftStream: %s", _ds_err)
+                        _draft_stream = None
+                        _stream_callback = None
+
+                    # Reasoning lane — second TelegramDraftStream for <think> content.
+                    # Mirrors TS reasoning-lane-coordinator.ts + lane-delivery.ts.
+                    _reasoning_level = "off"
+                    _reasoning_draft = None
+                    _reasoning_callback = None
+                    try:
+                        _tg_cfg_r = getattr(channel, "_config", None) or {}
+                        from openclaw.channels.telegram.reasoning import resolve_reasoning_level
+                        _reasoning_level = resolve_reasoning_level(_tg_cfg_r)
+                        if _reasoning_level == "stream":
+                            from openclaw.channels.telegram.draft_stream import TelegramDraftStream as _TDS2
+                            _reasoning_draft = _TDS2(
+                                bot_api=channel._app.bot,
+                                chat_id=int(message.chat_id),
+                                reply_to_message_id=None,  # standalone reasoning bubble
+                                throttle_ms=1000,
+                                min_initial_chars=10,
+                            )
+                            _reasoning_callback = _reasoning_draft.update
+                    except Exception as _rl_err:
+                        logger.debug("Failed to create reasoning draft stream: %s", _rl_err)
+                        _reasoning_level = "off"
+                        _reasoning_draft = None
+                        _reasoning_callback = None
+
+                    # Status reactions — emoji on user's inbound message showing agent state.
+                    # Mirrors TS createStatusReactionController in bot-message-context.ts.
+                    try:
+                        _tg_cfg = getattr(channel, "_config", None) or {}
+                        _sr_cfg = (
+                            _tg_cfg.get("messages", {}).get("statusReactions")
+                            or _tg_cfg.get("statusReactions")
+                            or {}
+                        )
+                        if _sr_cfg.get("enabled") and message.message_id:
+                            from openclaw.channels.telegram.status_reactions import TelegramStatusReactions
+                            _status_reactions = TelegramStatusReactions(
+                                bot=channel._app.bot,
+                                chat_id=int(message.chat_id),
+                                message_id=int(message.message_id),
+                                emojis=_sr_cfg.get("emojis") or {},
+                            )
+                            # Set queued immediately on message arrival
+                            await _status_reactions.set_queued()
+                    except Exception as _sr_err:
+                        logger.debug("Failed to create TelegramStatusReactions: %s", _sr_err)
+                        _status_reactions = None
+
+                elif (
+                    channel.__class__.__name__ == "SlackChannel"
+                    and getattr(channel, "_native_streaming_enabled", False)
+                ):
+                    # Slack native AI streaming — chat.startStream / appendStream / stopStream.
+                    # Requires thread_ts (the ts of the inbound message, which becomes the thread).
+                    # For DMs, recipient_user_id is also required by the Slack API.
+                    # Mirrors TS src/slack/streaming.ts + dispatch.ts deliverWithStreaming.
+                    try:
+                        thread_ts = (
+                            message.metadata.get("thread_ts")
+                            or message.message_id
+                        ) if message.metadata else message.message_id
+
+                        if thread_ts:
+                            from openclaw.channels.slack.streaming import SlackDraftStream as _SDS
+                            _is_dm_slack = getattr(message, "chat_type", "") == "direct"
+                            _slack_draft = _SDS(
+                                client=channel._app.client,
+                                channel=str(message.chat_id),
+                                thread_ts=str(thread_ts),
+                                team_id=getattr(channel, "_team_id", None),
+                                user_id=str(message.sender_id) if _is_dm_slack else None,
+                            )
+                            _draft_stream = _slack_draft
+                            _stream_callback = _slack_draft.update
+                        else:
+                            logger.debug("[slack-stream] no thread_ts available — streaming disabled")
+                    except Exception as _ss_err:
+                        logger.debug("Failed to create SlackDraftStream: %s", _ss_err)
+                        _draft_stream = None
+                        _stream_callback = None
+
+                elif channel.__class__.__name__ == "FeishuChannel":
+                    # Feishu channel — FeishuReplyDispatcher handles typing indicator +
+                    # CardKit streaming card. Mirrors TS extensions/feishu/src/reply-dispatcher.ts.
+                    try:
+                        import time as _time_module
+                        from openclaw.channels.feishu.accounts import get_default_account as _gda
+                        from openclaw.channels.feishu.client import create_feishu_client as _cfc
+                        from openclaw.channels.feishu.reply_dispatcher import create_feishu_reply_dispatcher as _cfrd
+
+                        _feishu_cfg = getattr(channel, "_cfg", None)
+                        if _feishu_cfg:
+                            _feishu_account = _gda(_feishu_cfg)
+                            if _feishu_account:
+                                _feishu_client = _cfc(_feishu_account)
+                                _is_p2p = getattr(message, "chat_type", "") == "direct"
+                                _feishu_dispatcher = _cfrd(
+                                    _feishu_client,
+                                    _feishu_account,
+                                    chat_id=str(message.chat_id),
+                                    is_p2p=_is_p2p,
+                                    reply_to_message_id=str(message.message_id) if message.message_id else None,
+                                    message_timestamp=_time_module.time(),
+                                )
+                                # Start typing indicator immediately (emoji reaction on inbound msg)
+                                await _feishu_dispatcher.start_typing()
+                                # Start streaming card — creates a CardKit card with streaming_mode:true
+                                # and sends it as an interactive message. Falls back silently if
+                                # CardKit is not available or streaming is disabled in config.
+                                streaming_ok = await _feishu_dispatcher.start_streaming()
+                                _draft_stream = _feishu_dispatcher
+                                if streaming_ok:
+                                    # Wire incremental updates: each text_delta feeds into the card
+                                    _stream_callback = _feishu_dispatcher.stream_update
+                    except Exception as _fs_err:
+                        logger.debug("Failed to create FeishuReplyDispatcher: %s", _fs_err)
+                        _feishu_dispatcher = None
+                        _draft_stream = None
+
+                # Build a channel send function for the ReplyContext.
+                # Feishu: routes text through FeishuReplyDispatcher.send() so it respects
+                #   render_mode (auto/card/raw) and handles chunk splitting.
+                # Telegram: passes buttons=kwarg for InlineKeyboardMarkup support.
+                # Other channels: standard channel.send_text() path.
+                # Resolve Telegram forum topic thread_id from the inbound message metadata.
+                # Mirrors TS buildTelegramThreadReplyParams() used in get-reply-run.ts.
+                _tg_thread_id: int | None = None
+                if message.metadata:
+                    _raw_tid = message.metadata.get("message_thread_id") or message.metadata.get("thread_id")
+                    if isinstance(_raw_tid, int) and _raw_tid > 0:
+                        _tg_thread_id = _raw_tid
+
                 async def _channel_send(
                     text: str | None,
                     target: Any,
@@ -1445,6 +1610,7 @@ class ChannelManager:
                     reply_to: Any = None,
                     media_url: str | None = None,
                     media_type: str | None = None,
+                    buttons: Any = None,
                     **_kw: Any,
                 ) -> None:
                     if media_url:
@@ -1455,11 +1621,28 @@ class ChannelManager:
                             reply_to=reply_to,
                         )
                     elif text:
-                        await channel.send_text(
-                            target=target,
-                            text=text,
-                            reply_to=reply_to,
-                        )
+                        if _feishu_dispatcher is not None:
+                            # Feishu fallback path (streaming not active): route through
+                            # dispatcher.send() which respects render_mode + stops typing.
+                            await _feishu_dispatcher.send(text, buttons=buttons)
+                        else:
+                            # Telegram and other channels
+                            try:
+                                await channel.send_text(
+                                    target=target,
+                                    text=text,
+                                    reply_to=reply_to,
+                                    buttons=buttons,
+                                    session_key=session_key,
+                                    message_thread_id=_tg_thread_id,
+                                )
+                            except TypeError:
+                                # Fallback: channel.send_text doesn't accept all kwargs
+                                await channel.send_text(
+                                    target=target,
+                                    text=text,
+                                    reply_to=reply_to,
+                                )
 
                 # Resolve session_id for active-run tracking
                 session_id_for_run = session.session_id if session else session_key
@@ -1479,10 +1662,24 @@ class ChannelManager:
                 # (steer / enqueue-followup / interrupt / run-now)
                 from openclaw.auto_reply.reply.agent_runner import ReplyContext, run_prepared_reply
 
+                # Prepend MEDIA reply hint when inbound images are present.
+                # Mirrors TS get-reply-run.ts mediaReplyHint (line 368-372):
+                # agents learn the safe MEDIA: path convention before replying.
+                effective_message_text = message_text
+                if inbound_images:
+                    _media_reply_hint = (
+                        "To send an image back, prefer the message tool. "
+                        "If you must inline, use MEDIA:https://example.com/image.jpg "
+                        "or a safe relative path like MEDIA:./image.jpg. "
+                        "Avoid absolute paths (MEDIA:/...) and ~ paths — they are blocked for security. "
+                        "Keep caption in the text body."
+                    )
+                    effective_message_text = f"{_media_reply_hint}\n{message_text}".strip()
+
                 reply_ctx = ReplyContext(
                     session_id=session_id_for_run,
                     session_key=session_key,
-                    message_text=message_text,
+                    message_text=effective_message_text,
                     runtime=runtime,
                     session=session,
                     tools=self.tools,
@@ -1498,6 +1695,12 @@ class ChannelManager:
                     session_workspace=session_workspace,
                     typing_ctrl=typing_ctrl,
                     typing_send_fn=_send_typing,
+                    stream_callback=_stream_callback,
+                    draft_stream=_draft_stream,
+                    status_reactions=_status_reactions,
+                    reasoning_level=_reasoning_level,
+                    reasoning_stream_callback=_reasoning_callback,
+                    reasoning_draft_stream=_reasoning_draft,
                 )
 
                 # Fire-and-forget: handler returns immediately.

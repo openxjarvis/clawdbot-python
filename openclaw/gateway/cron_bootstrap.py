@@ -595,7 +595,7 @@ async def _deliver_via_channels(
         # Find sessions belonging to this agent and extract their channel+chat_id.
         delivery_targets = _extract_delivery_targets(all_session_keys, agent_part, running)
 
-        for ch_id, chat_id in delivery_targets:
+        for ch_id, chat_id, thread_id in delivery_targets:
             channel = cm.get_channel(ch_id)
             if not channel:
                 continue
@@ -603,7 +603,10 @@ async def _deliver_via_channels(
             # Send text (without MEDIA: lines)
             if display_text:
                 try:
-                    await channel.send_text(target=chat_id, text=display_text)
+                    _send_kwargs: dict = {}
+                    if thread_id is not None:
+                        _send_kwargs["message_thread_id"] = thread_id
+                    await channel.send_text(target=chat_id, text=display_text, **_send_kwargs)
                     logger.info(f"cron: delivered text to {ch_id} chat_id={chat_id}")
                 except Exception as e:
                     logger.warning(f"cron: send_text failed {ch_id} chat_id={chat_id}: {e}")
@@ -638,32 +641,36 @@ def _extract_delivery_targets(
     all_session_keys: list[str],
     agent_part: str | None,
     running_channel_ids: list[str],
-) -> list[tuple[str, str]]:
+) -> list[tuple[str, str, int | None]]:
     """
-    Extract (channel_id, chat_id) delivery pairs from session keys.
+    Extract (channel_id, chat_id, thread_id) delivery triples from session keys.
 
     Mirrors TS resolveSessionDeliveryTarget("last") — finds all active
     channel sessions for this agent and returns the channel + recipient.
 
-    Session key format: agent:<agent>:<channel>:<kind>:<peer_id>
-    Supports: telegram, feishu, discord, whatsapp, slack, line, imessage
+    Session key formats:
+      Standard:     agent:<agent>:<channel>:<kind>:<peer_id>
+      Forum topic:  agent:<agent>:telegram:group:<chat_id>:topic:<thread_id>
+                    agent:<agent>:telegram:group:<chat_id>:thread:<thread_id>
+
+    For Telegram forum topic sessions the peer is <chat_id>, NOT the last segment
+    (which would be the topic/thread ID). thread_id is returned separately so
+    callers can pass message_thread_id to send_text.
     """
-    # Channel id → last segment extractor (peer_id position is always last)
     _KNOWN_CHANNELS = {
         "telegram", "feishu", "discord", "whatsapp", "slack",
         "line", "imessage", "lark",
     }
-    targets: list[tuple[str, str]] = []
+    targets: list[tuple[str, str, int | None]] = []
     seen: set[tuple[str, str]] = set()
 
     for sk in all_session_keys:
         parts = sk.split(":")
-        # Expect: agent:<agent>:<channel>:<kind>:<peer_id>
+        # Minimum: agent:<agent>:<channel>:<kind>:<peer_id>
         if len(parts) < 5 or parts[0] != "agent":
             continue
         sk_agent = parts[1]
         sk_channel = parts[2]
-        sk_peer = parts[-1]
 
         if agent_part and sk_agent != agent_part:
             continue
@@ -671,13 +678,30 @@ def _extract_delivery_targets(
             continue
         if sk_channel not in running_channel_ids:
             continue
+
+        # Detect Telegram forum topic patterns:
+        #   agent:A:telegram:group:<chat_id>:topic:<thread_id>
+        #   agent:A:telegram:group:<chat_id>:thread:<thread_id>
+        thread_id: int | None = None
+        sk_peer = parts[-1]
+        if sk_channel == "telegram" and len(parts) >= 7:
+            for _sep in ("topic", "thread"):
+                try:
+                    sep_idx = parts.index(_sep, 4)  # look after channel segment
+                    sk_peer = ":".join(parts[4:sep_idx])  # chat_id may contain ":"
+                    _tid_str = parts[sep_idx + 1] if sep_idx + 1 < len(parts) else ""
+                    thread_id = int(_tid_str) if _tid_str.lstrip("-").isdigit() else None
+                    break
+                except (ValueError, IndexError):
+                    pass
+
         if not sk_peer:
             continue
 
         key = (sk_channel, sk_peer)
         if key not in seen:
             seen.add(key)
-            targets.append(key)
+            targets.append((sk_channel, sk_peer, thread_id))
 
     return targets
 

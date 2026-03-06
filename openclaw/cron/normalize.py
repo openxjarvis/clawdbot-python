@@ -109,12 +109,15 @@ def resolve_cron_stagger_ms(schedule: Any) -> int:
 
 
 def compute_staggered_next_run_ms(base_next_run_ms: int, job_id: str, stagger_ms: int) -> int:
-    """Add a deterministic per-job SHA256-based offset within [0, stagger_ms)."""
+    """Add a deterministic per-job SHA256-based offset within [0, stagger_ms).
+
+    Uses the first **4 bytes** (uint32) of SHA256 — matches TS ``resolveStableCronOffset``
+    and ``_resolve_stable_cron_offset_ms`` in service.py.
+    """
     if stagger_ms <= 0:
         return base_next_run_ms
     digest = hashlib.sha256(job_id.encode()).digest()
-    # Use first 8 bytes as uint64
-    value = int.from_bytes(digest[:8], "big")
+    value = int.from_bytes(digest[:4], "big")
     offset = value % stagger_ms
     return base_next_run_ms + offset
 
@@ -691,6 +694,12 @@ def normalize_cron_job_input(
         sched = nxt.get("schedule")
         if isinstance(sched, dict) and sched.get("kind") == "at" and "delete_after_run" not in nxt:
             nxt["delete_after_run"] = True
+
+        # anchor_ms default for "every" jobs — mirrors TS anchorMs = nowMs at creation time
+        # Ensures the job fires ~everyMs after creation, not from the Unix epoch.
+        if isinstance(sched, dict) and sched.get("kind") == "every" and "anchor_ms" not in sched:
+            import time as _time
+            sched["anchor_ms"] = int(_time.time() * 1000)
 
         # stagger for top-of-hour cron
         if isinstance(sched, dict) and sched.get("kind") == "cron":

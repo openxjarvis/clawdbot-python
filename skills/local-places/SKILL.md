@@ -1,12 +1,7 @@
 ---
 name: local-places
-description: Local business and location search
-version: 1.0.0
-author: ClawdBot
-tags: [location, local]
-requires_bins: []
-requires_env: []
-requires_config: []
+description: "Search for local businesses, restaurants, and places of interest using web search and fetch tools. Use when user asks to find nearby places, local businesses, or location-based information."
+metadata: { "openclaw": { "emoji": "📍", "requires": {} } }
 ---
 
 # Local Places

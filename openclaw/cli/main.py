@@ -26,6 +26,7 @@ def start(
     port: int = typer.Option(18789, "--port", "-p", help="WebSocket port for gateway"),
     telegram: bool = typer.Option(True, "--telegram/--no-telegram", help="Enable Telegram channel"),
     log_level: str = typer.Option("INFO", "--log-level", "-l", help="Log level"),
+    force: bool = typer.Option(False, "--force", "-f", help="Kill any existing gateway process and restart"),
 ):
     """
     Start OpenClaw server with all features (Gateway + Channels)
@@ -98,7 +99,7 @@ def start(
         
         async def start_gateway():
             bootstrap = GatewayBootstrap()
-            results = await bootstrap.bootstrap()
+            results = await bootstrap.bootstrap(force=force)
             
             # Keep running
             console.print(f"\n[green]✓[/green] Gateway running on ws://127.0.0.1:{results.get('gateway_port', 18789)}")
@@ -133,7 +134,25 @@ def start(
     except KeyboardInterrupt:
         console.print("\n\n[yellow]Shutting down...[/yellow]")
     except Exception as e:
-        console.print(f"\n[red]Error:[/red] {e}")
+        from openclaw.gateway.error_codes import GatewayLockError
+        if isinstance(e, GatewayLockError):
+            # Try to read PID from the lock file for a helpful message
+            try:
+                from openclaw.infra.gateway_lock import resolve_gateway_lock_path
+                import json as _json
+                _lock_path = resolve_gateway_lock_path(str(config_path))
+                _lock_data = _json.loads(_lock_path.read_text()) if _lock_path.exists() else {}
+                _pid = _lock_data.get("pid", "")
+                pid_hint = f" (PID: {_pid})" if _pid else ""
+            except Exception:
+                pid_hint = ""
+            console.print(
+                f"\n[yellow]⚠ Gateway already running{pid_hint}[/yellow]\n"
+                f"  To force-restart: [cyan]uv run openclaw start --force[/cyan]\n"
+                f"  Or kill manually: [cyan]kill {pid_hint.strip(' ()').replace('PID: ', '') or '<pid>'}[/cyan]"
+            )
+        else:
+            console.print(f"\n[red]Error:[/red] {e}")
         raise typer.Exit(1)
 
 

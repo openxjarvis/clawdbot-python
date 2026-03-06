@@ -13,12 +13,36 @@ Provides typed execution of all 24 plugin lifecycle hooks with:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from typing import Any, Callable
 
 from .types import PluginRegistry, TypedPluginHookRegistration
 
 logger = logging.getLogger(__name__)
+
+
+def _call_hook_handler(handler: Callable, event: Any, ctx: Any) -> Any:
+    """Call a hook handler with the right number of arguments.
+
+    Some plugins define handlers as ``fn(event)`` (1 arg); others use
+    ``fn(event, ctx)`` (2 args, matching the TS convention).  Inspect the
+    signature so both forms work without requiring plugins to be rewritten.
+    """
+    try:
+        sig = inspect.signature(handler)
+        n_params = len([
+            p for p in sig.parameters.values()
+            if p.kind not in (
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            )
+        ])
+    except (ValueError, TypeError):
+        n_params = 2
+    if n_params >= 2:
+        return handler(event, ctx)
+    return handler(event)
 
 
 def _get_hooks_for_name(
@@ -80,7 +104,7 @@ class PluginHookRunner:
 
         async def _run_one(hook: TypedPluginHookRegistration) -> None:
             try:
-                result = hook.handler(event, ctx)
+                result = _call_hook_handler(hook.handler, event, ctx)
                 if asyncio.isfuture(result) or asyncio.iscoroutine(result):
                     await result
             except Exception as exc:
@@ -110,7 +134,7 @@ class PluginHookRunner:
 
         for hook in hooks:
             try:
-                handler_result = hook.handler(event, ctx)
+                handler_result = _call_hook_handler(hook.handler, event, ctx)
                 if asyncio.isfuture(handler_result) or asyncio.iscoroutine(handler_result):
                     handler_result = await handler_result
 
@@ -144,7 +168,11 @@ class PluginHookRunner:
 
         for hook in hooks:
             try:
-                out = hook.handler({**event, "message": current_message} if current_message else event, ctx)
+                out = _call_hook_handler(
+                    hook.handler,
+                    {**event, "message": current_message} if current_message else event,
+                    ctx,
+                )
 
                 # Guard against accidental async handlers
                 if hasattr(out, "__await__") or asyncio.iscoroutine(out):

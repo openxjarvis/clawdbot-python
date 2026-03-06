@@ -4,6 +4,7 @@ Mirrors TypeScript: openclaw/src/cron/isolated-agent/session.ts
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from pathlib import Path
@@ -51,16 +52,75 @@ class IsolatedAgentSession:
         self.token_count: int = 0
         self.skills: list[str] = []
         self.metadata: dict[str, Any] = {}
-        
+
+        # Persisted metadata parsed from JSONL
+        self.last_run_at_ms: int | None = None
+        self.last_active_at_ms: int | None = None
+        self.compaction_count: int = 0
+
         # Load existing session if it exists
         if self.session_path.exists():
             self._load_metadata()
-    
+
     def _load_metadata(self) -> None:
-        """Load session metadata"""
-        # For now, just check if session exists
-        # Full metadata loading would parse the JSONL file
-        logger.debug(f"Loaded metadata for session: {self.session_key}")
+        """Parse session metadata from the JSONL file.
+
+        Mirrors TS ``loadCronSessionMetadata`` in isolated-agent/session.ts:
+        reads the last ``metadata`` entry from the JSONL to recover
+        ``last_active_at``, ``compaction_count``, etc.  These values are used
+        by ``is_fresh()`` to decide whether the session should be reset.
+
+        The JSONL format is one JSON object per line. Metadata lines are those
+        with ``"type": "metadata"`` (or the last line in the session file that
+        has a recognisable shape).  We also accept bare timestamp fields at
+        the top level so the reader works with both compacted and legacy files.
+        """
+        try:
+            last_ms: int | None = None
+            compaction_count = 0
+
+            with self.session_path.open("r", encoding="utf-8") as fh:
+                for raw_line in fh:
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+
+                    # Accept "metadata" typed entries (canonical format)
+                    entry_type = obj.get("type") or obj.get("role") or ""
+                    if entry_type == "metadata":
+                        ts = obj.get("last_active_at") or obj.get("lastActiveAt")
+                        if isinstance(ts, (int, float)):
+                            last_ms = int(ts)
+                        cc = obj.get("compaction_count") or obj.get("compactionCount")
+                        if isinstance(cc, int):
+                            compaction_count = cc
+                        continue
+
+                    # Also check for timestamp fields on any line (fallback)
+                    for ts_key in ("timestamp", "ts", "created_at", "last_active_at", "lastActiveAt"):
+                        ts_val = obj.get(ts_key)
+                        if isinstance(ts_val, (int, float)) and ts_val > 0:
+                            last_ms = int(ts_val)
+                            break
+
+            if last_ms is not None:
+                self.last_active_at_ms = last_ms
+                self.last_run_at_ms = last_ms
+            self.compaction_count = compaction_count
+            logger.debug(
+                "Loaded metadata for session %s: last_active_at=%s, compaction_count=%d",
+                self.session_key,
+                last_ms,
+                compaction_count,
+            )
+        except OSError as exc:
+            logger.debug("Could not read session file %s: %s", self.session_path, exc)
     
     def exists(self) -> bool:
         """Check if session exists"""
@@ -74,6 +134,10 @@ class IsolatedAgentSession:
         - "daily"   → fresh if last_run_at_ms was > 24 h ago (or missing)
         - "weekly"  → fresh if last_run_at_ms was > 7 days ago (or missing)
         - "never"   → never fresh (reuse session forever) — default
+
+        ``last_run_at_ms`` may be supplied by the caller (from job state).
+        If not supplied, falls back to ``self.last_run_at_ms`` loaded from the
+        JSONL session file by ``_load_metadata()``.
         """
         if not self.exists():
             return True
@@ -82,9 +146,11 @@ class IsolatedAgentSession:
         if reset_policy == "never":
             return False
         now_ms = int(time.time() * 1000)
-        if last_run_at_ms is None:
+        # Prefer caller-supplied value; fall back to value parsed from JSONL
+        effective_last_run = last_run_at_ms if last_run_at_ms is not None else self.last_run_at_ms
+        if effective_last_run is None:
             return True
-        elapsed_ms = now_ms - last_run_at_ms
+        elapsed_ms = now_ms - effective_last_run
         if reset_policy == "daily":
             return elapsed_ms > 24 * 60 * 60 * 1000
         if reset_policy == "weekly":

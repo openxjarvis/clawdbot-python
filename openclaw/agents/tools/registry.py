@@ -104,14 +104,28 @@ class ToolRegistry:
                 self._tools[t.name] = t
 
         # Advanced tools
-        for t in [
-            BrowserTool(),
+        _advanced: list[AgentTool] = []
+
+        # Only include BrowserTool when browser.enabled=true in config.
+        # When disabled, keeping the tool in the list causes the agent to retry
+        # it repeatedly (every ~2s) even though it always fails with a PERMANENT_ERROR.
+        try:
+            from openclaw.config.loader import load_config as _lc
+            _cfg = _lc(as_dict=True) or {}
+            _browser_enabled = _cfg.get("browser", {}).get("enabled", False)
+        except Exception:
+            _browser_enabled = False
+        if _browser_enabled:
+            _advanced.append(BrowserTool())
+
+        _advanced += [
             CronTool(channel_registry=self._channel_registry, session_manager=self._session_manager),
             PPTGeneratorTool(),
             PDFGeneratorTool(),
             TTSTool(),
             ProcessTool(),
-        ]:
+        ]
+        for t in _advanced:
             self._tools[t.name] = t
 
         # Channel actions (if channel registry available)

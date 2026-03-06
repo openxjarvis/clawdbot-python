@@ -56,47 +56,124 @@ def markdown_to_telegram_chunks(
 
 
 def markdown_to_html(text: str) -> str:
-    """Convert Markdown to Telegram HTML
-    
-    Telegram supports: <b>, <i>, <u>, <s>, <code>, <pre>, <a href="">
+    """Convert Markdown to Telegram HTML.
+
+    Telegram supports: <b>, <i>, <u>, <s>, <code>, <pre><code>, <a href="">,
+    <blockquote>, <tg-spoiler>.
+
+    Mirrors TS renderTelegramHtml() in src/telegram/format.ts:
+    - Headings (# / ## / ###) → <b>title</b> (Telegram has no native heading)
+    - Bold **text** → <b>text</b>
+    - Italic *text* / _text_ → <i>text</i>
+    - Strikethrough ~~text~~ → <s>text</s>
+    - Code blocks ```lang\\ncode``` → <pre><code>code</code></pre>
+    - Inline code `code` → <code>code</code>
+    - Links [text](url) → <a href="url">text</a>
+    - Blockquotes > text → <blockquote>text</blockquote>
+    - Horizontal rules (--- / ***) → stripped
+    - Numbered/bullet lists → preserved as-is (plain text)
     """
     if not text:
         return text
-    
-    # Escape HTML entities first
-    text = text.replace("&", "&amp;")
-    text = text.replace("<", "&lt;")
-    text = text.replace(">", "&gt;")
-    
+
+    lines = text.split("\n")
+    result_lines: List[str] = []
+    in_code_block = False
+    code_block_lines: List[str] = []
+    code_lang = ""
+
+    for line in lines:
+        # --- Fenced code blocks (``` ... ```) ---
+        if not in_code_block and line.strip().startswith("```"):
+            in_code_block = True
+            lang_match = re.match(r"^```(\w*)", line.strip())
+            code_lang = lang_match.group(1) if lang_match else ""
+            code_block_lines = []
+            continue
+        if in_code_block:
+            if line.strip() == "```":
+                in_code_block = False
+                inner = escape_html("\n".join(code_block_lines))
+                result_lines.append(f"<pre><code>{inner}</code></pre>")
+                code_block_lines = []
+                code_lang = ""
+            else:
+                code_block_lines.append(line)
+            continue
+
+        # --- Horizontal rules (--- / *** / ___) → strip ---
+        if re.match(r"^\s*[-*_]{3,}\s*$", line):
+            result_lines.append("")
+            continue
+
+        # --- Headings (# / ## / ### etc.) → bold ---
+        heading = re.match(r"^(#{1,6})\s+(.*)", line)
+        if heading:
+            content = _format_inline(heading.group(2))
+            result_lines.append(f"<b>{content}</b>")
+            continue
+
+        # --- Blockquote (> text) ---
+        bq = re.match(r"^>\s?(.*)", line)
+        if bq:
+            content = _format_inline(bq.group(1))
+            result_lines.append(f"<blockquote>{content}</blockquote>")
+            continue
+
+        # --- Regular line: apply inline formatting ---
+        result_lines.append(_format_inline(line))
+
+    # Unclosed code block — flush as pre
+    if in_code_block and code_block_lines:
+        inner = escape_html("\n".join(code_block_lines))
+        result_lines.append(f"<pre><code>{inner}</code></pre>")
+
+    return "\n".join(result_lines)
+
+
+def _format_inline(text: str) -> str:
+    """Apply inline markdown formatting to a single line of text.
+
+    Uses a placeholder strategy so bold/italic markers can span inline-code
+    segments (mirrors how the TS IR handles nested formatting):
+    1. Replace inline `code` with placeholders to protect them.
+    2. Escape HTML in the remaining text.
+    3. Apply bold / italic / strikethrough / link transforms.
+    4. Restore code placeholders as <code>...</code>.
+    """
+    # Step 1: stash inline code with placeholders
+    code_stash: List[str] = []
+
+    def _stash_code(m: re.Match) -> str:
+        code_stash.append(m.group(1))
+        return f"\x00CODE{len(code_stash) - 1}\x00"
+
+    text = re.sub(r"`([^`\n]+)`", _stash_code, text)
+
+    # Step 2: escape HTML entities in remaining text
+    text = escape_html(text)
+
+    # Step 3: apply inline transforms
     # Bold: **text** or __text__
-    text = re.sub(r'\*\*(.+?)\*\*', r'<b>\1</b>', text)
-    text = re.sub(r'__(.+?)__', r'<b>\1</b>', text)
-    
-    # Italic: *text* or _text_
-    text = re.sub(r'\*(.+?)\*', r'<i>\1</i>', text)
-    text = re.sub(r'_(.+?)_', r'<i>\1</i>', text)
-    
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
+    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text, flags=re.DOTALL)
+    # Italic: *text* (single asterisk, not adjacent to another *)
+    text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<i>\1</i>", text)
+    # Italic: _text_ (not adjacent to word chars)
+    text = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"<i>\1</i>", text)
     # Strikethrough: ~~text~~
-    text = re.sub(r'~~(.+?)~~', r'<s>\1</s>', text)
-    
-    # Code blocks BEFORE inline code (```code``` must be processed first)
-    text = re.sub(
-        r'```(?:\w+\n)?(.+?)```',
-        r'<pre><code>\1</code></pre>',
-        text,
-        flags=re.DOTALL
-    )
-    
-    # Inline code: `code` (process after code blocks)
-    text = re.sub(r'`([^`]+)`', r'<code>\1</code>', text)
-    
+    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
     # Links: [text](url)
     text = re.sub(
-        r'\[([^\]]+)\]\(([^\)]+)\)',
-        r'<a href="\2">\1</a>',
-        text
+        r"\[([^\]]+)\]\((https?://[^\)]+)\)",
+        lambda m: f'<a href="{escape_html_attr(m.group(2))}">{m.group(1)}</a>',
+        text,
     )
-    
+
+    # Step 4: restore code placeholders
+    for i, code in enumerate(code_stash):
+        text = text.replace(f"\x00CODE{i}\x00", f"<code>{escape_html(code)}</code>")
+
     return text
 
 

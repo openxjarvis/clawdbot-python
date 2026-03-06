@@ -1,38 +1,69 @@
 ---
 name: blogwatcher
-description: Monitor blogs and RSS feeds
-version: 1.0.0
-author: ClawdBot
-tags: [rss, blogs]
-requires_bins: []
-requires_env: []
-requires_config: []
+description: Monitor blogs and RSS/Atom feeds for updates using the blogwatcher CLI.
+homepage: https://github.com/Hyaxia/blogwatcher
+metadata:
+  {
+    "openclaw":
+      {
+        "emoji": "📰",
+        "requires": { "bins": ["blogwatcher"] },
+        "install":
+          [
+            {
+              "id": "go",
+              "kind": "go",
+              "module": "github.com/Hyaxia/blogwatcher/cmd/blogwatcher@latest",
+              "bins": ["blogwatcher"],
+              "label": "Install blogwatcher (go)",
+            },
+          ],
+      },
+  }
 ---
 
-# Blog Watcher
+# blogwatcher
 
-Monitor blogs and RSS feeds
+Track blog and RSS/Atom feed updates with the `blogwatcher` CLI.
 
-## Available Tools
+Install
 
-This skill uses ClawdBot's standard tools:
-- **bash** - Execute commands
-- **read_file** - Read files
-- **write_file** - Write files  
-- **web_fetch** - Fetch web content
-- **web_search** - Search the web
+- Go: `go install github.com/Hyaxia/blogwatcher/cmd/blogwatcher@latest`
 
-## Usage Examples
+Quick start
 
-User: "Help me with blog watcher"
-1. Assess what the user needs
-2. Use appropriate tools
-3. Provide helpful response
+- `blogwatcher --help`
 
-## Configuration
+Common commands
 
-Check documentation for specific setup requirements.
+- Add a blog: `blogwatcher add "My Blog" https://example.com`
+- List blogs: `blogwatcher blogs`
+- Scan for updates: `blogwatcher scan`
+- List articles: `blogwatcher articles`
+- Mark an article read: `blogwatcher read 1`
+- Mark all articles read: `blogwatcher read-all`
+- Remove a blog: `blogwatcher remove "My Blog"`
 
-## Notes
+Example output
 
-This skill requires integration with Blog Watcher service/application.
+```
+$ blogwatcher blogs
+Tracked blogs (1):
+
+  xkcd
+    URL: https://xkcd.com
+```
+
+```
+$ blogwatcher scan
+Scanning 1 blog(s)...
+
+  xkcd
+    Source: RSS | Found: 4 | New: 4
+
+Found 4 new article(s) total!
+```
+
+Notes
+
+- Use `blogwatcher <command> --help` to discover flags and options.

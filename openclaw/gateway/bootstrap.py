@@ -101,8 +101,9 @@ class GatewayBootstrap:
         self._hook_runner = None
         self._maintenance_tasks: list[asyncio.Task] = []
         self._close_handlers: list[Any] = []
-    
-    async def bootstrap(self, config_path: Path | None = None, allow_unconfigured: bool = False) -> dict[str, Any]:
+        self._gateway_lock = None  # GatewayLockHandle — released in shutdown()
+
+    async def bootstrap(self, config_path: Path | None = None, allow_unconfigured: bool = False, force: bool = False) -> dict[str, Any]:
         """
         Run the full bootstrap sequence.
         
@@ -114,7 +115,32 @@ class GatewayBootstrap:
             Dict with all initialized components
         """
         results = {"steps_completed": 0, "errors": []}
-        
+
+        # Pre-Step 0: Acquire gateway PID lock (mirrors TS acquireGatewayLock).
+        # This MUST happen before any channels start polling to ensure only one
+        # gateway instance is ever running.  Without this, two instances can both
+        # start Telegram polling simultaneously and fight forever with 409 Conflicts.
+        try:
+            from ..infra.gateway_lock import acquire_gateway_lock
+            from ..config.paths import resolve_gateway_port, DEFAULT_GATEWAY_PORT
+            from ..gateway.error_codes import GatewayLockError
+
+            _lock_config_path = str(config_path) if config_path else None
+            _lock_port = DEFAULT_GATEWAY_PORT  # best-effort; real port resolved later
+            self._gateway_lock = acquire_gateway_lock(
+                config_path=_lock_config_path,
+                port=_lock_port,
+                force=force,
+            )
+            logger.info("Gateway PID lock acquired (pid=%d)", os.getpid())
+        except Exception as _lock_exc:
+            from ..gateway.error_codes import GatewayLockError
+            if isinstance(_lock_exc, GatewayLockError):
+                raise
+            # Non-fatal: if lock infra is broken, log and continue (avoids boot failure
+            # on unusual filesystems / restricted environments).
+            logger.warning("Gateway PID lock unavailable: %s — proceeding without lock", _lock_exc)
+
         # Pre-Step: Validate configuration exists (matches TS behavior)
         # Note: config_path is passed from CLI, defaults to openclaw.json not config.json
         if config_path:
@@ -302,9 +328,12 @@ class GatewayBootstrap:
             # Wire hook runner into global SubagentRegistry for subagent lifecycle hooks
             try:
                 from ..agents.subagent_registry import get_global_registry
-                get_global_registry().set_hook_runner(self._hook_runner)
+                _registry = get_global_registry()
+                _registry.set_hook_runner(self._hook_runner)
+                # Wire gateway reference so announce/cleanup flows can call handlers directly
+                _registry.set_gateway(self)
             except Exception as _sub_exc:
-                logger.debug(f"Could not wire hook_runner into SubagentRegistry: {_sub_exc}")
+                logger.debug(f"Could not wire hook_runner/gateway into SubagentRegistry: {_sub_exc}")
         except Exception as e:
             logger.warning(f"Plugin loading skipped: {e}")
             from ..plugins.types import create_empty_plugin_registry
@@ -444,6 +473,27 @@ class GatewayBootstrap:
             except Exception as _e:
                 logger.debug("AgentsListTool registration skipped: %s", _e)
             
+            # Step 10b: Register plugin tools from the plugin registry into the tool registry.
+            # Must happen HERE (before ChannelManager is created at Step 13) so that the
+            # ChannelManager's frozen tools list includes all plugin tools (e.g. feishu_doc,
+            # feishu_chat, feishu_bitable, etc.). Channels don't need to be running yet —
+            # ChannelHandlerTool resolves the channel lazily via get_global_channel_registry().
+            if self.plugin_registry:
+                _plugin_tool_count = 0
+                for _reg in (self.plugin_registry.tools or []):
+                    try:
+                        from ..plugins.channel_tool import ChannelHandlerTool
+                        if isinstance(_reg.factory, ChannelHandlerTool):
+                            try:
+                                self.tool_registry.register(_reg.factory)
+                                _plugin_tool_count += 1
+                            except Exception as _te:
+                                logger.debug("Could not register plugin tool %s: %s", _reg.names, _te)
+                    except Exception:
+                        pass
+                if _plugin_tool_count:
+                    logger.info(f"Registered {_plugin_tool_count} plugin tools from plugin registry")
+
             tool_count = len(self.tool_registry.list_tools())
             logger.info(f"Registered {tool_count} tools")
         except Exception as e:
@@ -473,6 +523,43 @@ class GatewayBootstrap:
                 self.skill_loader.skills[skill.name] = skill
             skill_count = len(loaded_skills)
             logger.info(f"Loaded {skill_count} skills from {bundled_skills_dir}")
+
+            # Step 11b: Load skills from plugin directories (e.g. extensions/feishu/skills/).
+            # Each plugin's openclaw.plugin.json can list skill directories via "skills": ["./skills"].
+            # Without this, agents cannot see feishu tool usage patterns and resort to browser.
+            if self.plugin_registry:
+                _plugin_skill_count = 0
+                for _prec in self.plugin_registry.plugins:
+                    if _prec.status != "loaded" or not _prec.source:
+                        continue
+                    _plugin_py = Path(_prec.source)
+                    _plugin_dir = _plugin_py.parent if _plugin_py.is_file() else _plugin_py
+                    # Look for openclaw.plugin.json or plugin.json for skills list
+                    for _manifest_name in ("openclaw.plugin.json", "plugin.json"):
+                        _manifest_path = _plugin_dir / _manifest_name
+                        if not _manifest_path.is_file():
+                            continue
+                        try:
+                            import json as _json
+                            _manifest = _json.loads(_manifest_path.read_text())
+                            for _skill_rel in (_manifest.get("skills") or []):
+                                _skill_dir = (_plugin_dir / _skill_rel).resolve()
+                                if _skill_dir.is_dir():
+                                    _pskills = self.skill_loader.load_from_directory(
+                                        _skill_dir, source=f"plugin:{_prec.id}"
+                                    )
+                                    for _ps in _pskills:
+                                        self.skill_loader.skills[_ps.name] = _ps
+                                    if _pskills:
+                                        _plugin_skill_count += len(_pskills)
+                                        logger.debug(
+                                            f"Loaded {len(_pskills)} skills for plugin '{_prec.id}' from {_skill_dir}"
+                                        )
+                        except Exception as _se:
+                            logger.debug(f"Plugin skill loading error for {_prec.id}: {_se}")
+                        break  # Use first manifest found
+                if _plugin_skill_count:
+                    logger.info(f"Loaded {_plugin_skill_count} plugin skills from plugin registry")
         except Exception as e:
             logger.warning(f"Skills loading failed: {e}")
         results["steps_completed"] += 1
@@ -574,10 +661,11 @@ class GatewayBootstrap:
                     except Exception as e:
                         logger.warning(f"❌ Failed to start channel '{channel_id}': {e}")
 
-            # Auto-start built-in channels (telegram, etc.) from openclaw.json config.
-            # In TS, built-in channels are pre-registered in the plugin registry via
-            # extensions/ — here we replicate that by registering them directly when
-            # the corresponding config section is present and enabled.
+            # Auto-start built-in channels from openclaw.json config as a fallback
+            # for when the corresponding extension plugin failed to load or is absent.
+            # Channels that have a working extensions/ plugin (telegram, feishu) are
+            # already started above via the plugin registry; the duplicate-check below
+            # ensures we never start the same channel twice.
             _BUILTIN_CHANNELS: dict[str, str] = {
                 "telegram": "openclaw.channels.telegram.enhanced_telegram.EnhancedTelegramChannel",
                 "feishu": "openclaw.channels.feishu.channel.FeishuChannel",
@@ -596,7 +684,18 @@ class GatewayBootstrap:
                     logger.debug(f"Built-in channel '{builtin_id}' not enabled, skipping")
                     continue
                 if builtin_id in (self.channel_manager._channel_classes or {}):
-                    logger.debug(f"Built-in channel '{builtin_id}' already registered, skipping")
+                    logger.debug(f"Built-in channel '{builtin_id}' already registered (class), skipping")
+                    continue
+                existing_ch = self.channel_manager._channels.get(builtin_id)
+                if existing_ch is not None:
+                    if existing_ch.is_running():
+                        logger.debug(
+                            f"Built-in channel '{builtin_id}' already running (from plugin), skipping"
+                        )
+                        continue
+                    logger.debug(
+                        f"Built-in channel '{builtin_id}' already registered (instance), skipping"
+                    )
                     continue
                 try:
                     module_path, cls_name = class_path.rsplit(".", 1)
@@ -1233,4 +1332,12 @@ class GatewayBootstrap:
         except Exception:
             pass
         
+        # Release PID lock last so the new process can acquire it immediately
+        if self._gateway_lock is not None:
+            try:
+                self._gateway_lock.release()
+                logger.debug("Gateway PID lock released")
+            except Exception as _le:
+                logger.debug("Gateway PID lock release error: %s", _le)
+
         logger.info("Gateway shutdown complete")

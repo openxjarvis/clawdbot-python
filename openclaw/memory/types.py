@@ -14,6 +14,7 @@ class MemorySource(str, Enum):
     """Memory source type (matches TS MemorySource)."""
     MEMORY = "memory"
     SESSIONS = "sessions"
+    MANUAL = "manual"  # Manually added content (e.g. via memory.add RPC)
 
 
 @dataclass
@@ -27,8 +28,10 @@ class MemorySearchResult:
         end_line: End line number (1-indexed)
         score: Search score (0-1)
         snippet: Text snippet
-        source: Source type (memory | sessions)
+        source: Source type (memory | sessions | manual)
         citation: Optional citation string
+        id: Optional chunk id (used by BuiltinMemoryManager)
+        text: Full chunk text (used by BuiltinMemoryManager, alias for snippet)
     """
     path: str
     start_line: int
@@ -37,6 +40,8 @@ class MemorySearchResult:
     snippet: str
     source: MemorySource
     citation: str | None = None
+    id: str | None = None
+    text: str | None = None
 
 
 @dataclass

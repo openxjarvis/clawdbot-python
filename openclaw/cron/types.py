@@ -38,7 +38,7 @@ class CronSchedule:
     """Cron expression schedule (TS: kind="cron")"""
     expr: str       # TS: expr (was "expression")
     type: Literal["cron"] = "cron"
-    tz: str | None = "UTC"   # TS: tz
+    tz: str | None = None   # TS: tz — None means "use system timezone" (matches TS resolveCronTimezone)
     stagger_ms: int | None = None  # TS: staggerMs
 
     @property
@@ -432,7 +432,7 @@ class CronJob:
                 or schedule_data.get("expression")
                 or ""
             )
-            tz = schedule_data.get("tz") or schedule_data.get("timezone") or "UTC"
+            tz = schedule_data.get("tz") or schedule_data.get("timezone") or None
             stagger_ms = (
                 schedule_data.get("stagger_ms")
                 or schedule_data.get("staggerMs")

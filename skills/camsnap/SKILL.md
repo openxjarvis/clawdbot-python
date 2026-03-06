@@ -1,38 +1,45 @@
 ---
 name: camsnap
-description: Take camera snapshots
-version: 1.0.0
-author: ClawdBot
-tags: [camera, photo]
-requires_bins: []
-requires_env: []
-requires_config: []
+description: Capture frames or clips from RTSP/ONVIF cameras.
+homepage: https://camsnap.ai
+metadata:
+  {
+    "openclaw":
+      {
+        "emoji": "📸",
+        "requires": { "bins": ["camsnap"] },
+        "install":
+          [
+            {
+              "id": "brew",
+              "kind": "brew",
+              "formula": "steipete/tap/camsnap",
+              "bins": ["camsnap"],
+              "label": "Install camsnap (brew)",
+            },
+          ],
+      },
+  }
 ---
 
-# Camera Snapshot
+# camsnap
 
-Take camera snapshots
+Use `camsnap` to grab snapshots, clips, or motion events from configured cameras.
 
-## Available Tools
+Setup
 
-This skill uses ClawdBot's standard tools:
-- **bash** - Execute commands
-- **read_file** - Read files
-- **write_file** - Write files  
-- **web_fetch** - Fetch web content
-- **web_search** - Search the web
+- Config file: `~/.config/camsnap/config.yaml`
+- Add camera: `camsnap add --name kitchen --host 192.168.0.10 --user user --pass pass`
 
-## Usage Examples
+Common commands
 
-User: "Help me with camera snapshot"
-1. Assess what the user needs
-2. Use appropriate tools
-3. Provide helpful response
+- Discover: `camsnap discover --info`
+- Snapshot: `camsnap snap kitchen --out shot.jpg`
+- Clip: `camsnap clip kitchen --dur 5s --out clip.mp4`
+- Motion watch: `camsnap watch kitchen --threshold 0.2 --action '...'`
+- Doctor: `camsnap doctor --probe`
 
-## Configuration
+Notes
 
-Check documentation for specific setup requirements.
-
-## Notes
-
-This skill requires integration with Camera Snapshot service/application.
+- Requires `ffmpeg` on PATH.
+- Prefer a short test capture before longer clips.

@@ -21,7 +21,7 @@ from ..types import AgentToolResult, TextContent
 from .base import AgentToolBase
 from .default_operations import DefaultEditOperations
 from .operations import EditOperations
-from .path_utils import resolve_to_cwd
+from .path_utils import check_workspace_path, resolve_to_cwd
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 def create_edit_tool(
     cwd: str,
     operations: EditOperations | None = None,
+    workspace_dir: str | None = None,
 ) -> AgentToolBase:
     """
     Create an edit tool configured for a specific working directory.
@@ -96,7 +97,10 @@ def create_edit_tool(
             
             # Resolve path
             absolute_path = resolve_to_cwd(path, cwd)
-            
+
+            # Enforce fs.workspaceOnly if configured
+            check_workspace_path(absolute_path, workspace_dir)
+
             # Check if already cancelled
             if signal and signal.is_set():
                 raise asyncio.CancelledError("Operation aborted")

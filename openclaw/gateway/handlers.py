@@ -1566,14 +1566,34 @@ async def handle_node_invoke(connection: Any, params: dict[str, Any]) -> dict[st
     timeout_ms = int(params.get("timeoutMs") or 30_000)
     idempotency_key = params.get("idempotencyKey")
 
-    if not node_id or not command:
+    if not command:
         raise ValueError("nodeId and command required")
     if command in ("system.execApprovals.get", "system.execApprovals.set"):
         raise ValueError("node.invoke does not allow system.execApprovals.*; use exec.approvals.node.*")
 
-    # Validate allowed commands via NodeManager persistence layer
     from openclaw.nodes.manager import get_node_manager
     node_manager = get_node_manager()
+
+    # If nodeId is empty, auto-resolve to the first available node.
+    # Mirrors TS resolveNodeId(gatewayOpts, node, allowDefault=true) in nodes-utils.ts:
+    # when no node is specified the caller expects the gateway to pick the default.
+    if not node_id:
+        registry = _node_registry
+        gateway = getattr(connection, "gateway", None)
+        if registry is None and gateway is not None:
+            registry = getattr(gateway, "node_registry", None)
+        if registry is not None:
+            live_nodes = registry.list_nodes()
+            if live_nodes:
+                node_id = live_nodes[0].nodeId
+        if not node_id:
+            # Fall back to paired nodes list
+            paired = node_manager.list_paired_nodes()
+            if paired:
+                node_id = str(paired[0].get("nodeId", ""))
+        if not node_id:
+            raise ValueError("No nodes available; connect a node first")
+
     node_info = node_manager.get_node(node_id)
     if node_info is not None:
         allowed_commands = node_info.metadata.get("commands") if isinstance(node_info.metadata, dict) else None
@@ -1760,16 +1780,55 @@ async def handle_skills_status(connection: Any, params: dict[str, Any]) -> dict[
 
 @register_handler("skills.install")
 async def handle_skills_install(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Install a skill"""
-    skill_name = params.get("name")
-    return {"name": skill_name, "installed": True}
+    """Install a skill's dependencies (brew/npm/go/uv/download).
+
+    Mirrors TS skills install flow via syncSkillsToWorkspace + install specs.
+    """
+    skill_name = params.get("name", "")
+    from pathlib import Path as _Path
+    workspace_dir = _Path.home() / ".openclaw" / "workspace"
+    errors: list[str] = []
+
+    try:
+        from openclaw.agents.skills.workspace import load_workspace_skill_entries
+        from openclaw.agents.skills.installer import install_skill_dependencies
+
+        config_dict: dict = {}
+        if hasattr(connection, "config"):
+            config_dict = connection.config if isinstance(connection.config, dict) else {}
+
+        entries = load_workspace_skill_entries(str(workspace_dir), config_dict)
+        target = next(
+            (e for e in entries if e.skill.name == skill_name),
+            None,
+        )
+        if target is None:
+            return {"name": skill_name, "installed": False, "error": f"Skill '{skill_name}' not found"}
+
+        install_specs = getattr(getattr(target.skill, "metadata", None), "install", None) or []
+        success, errors = await install_skill_dependencies(target.skill, install_specs)
+        return {"name": skill_name, "installed": success, "errors": errors}
+    except Exception as exc:
+        logger.error("skills.install error: %s", exc, exc_info=True)
+        return {"name": skill_name, "installed": False, "error": str(exc)}
 
 
 @register_handler("skills.update")
 async def handle_skills_update(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Update a skill"""
-    skill_name = params.get("name")
-    return {"name": skill_name, "updated": True}
+    """Update a managed skill by re-syncing from its source.
+
+    Bumps the skills snapshot version so the next agent turn reloads skills.
+    Mirrors TS syncSkillsToWorkspace() triggered on update.
+    """
+    skill_name = params.get("name", "")
+    try:
+        from openclaw.agents.skills.refresh import bump_skills_snapshot_version
+        bump_skills_snapshot_version()
+        logger.info("skills.update: bumped snapshot version for '%s'", skill_name)
+        return {"name": skill_name, "updated": True}
+    except Exception as exc:
+        logger.error("skills.update error: %s", exc, exc_info=True)
+        return {"name": skill_name, "updated": False, "error": str(exc)}
 
 
 @register_handler("system")
@@ -2015,17 +2074,55 @@ async def handle_tts_set_provider(connection: Any, params: dict[str, Any]) -> di
 
 @register_handler("exec.approvals.node.get")
 async def handle_exec_approvals_node_get(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Node-scoped exec approval policy lookup."""
+    """Get exec approvals from a remote node — routes via NodeManager.invoke_node()."""
     node_id = params.get("nodeId")
-    return {"nodeId": node_id, "policy": None}
+    if not node_id:
+        return {"nodeId": node_id, "policy": None, "error": "nodeId required"}
+
+    from openclaw.nodes.manager import get_node_manager
+    manager = get_node_manager()
+    try:
+        result = await manager.invoke_node(
+            node_id,
+            "system.execApprovals.get",
+            {},
+            timeout_ms=10_000,
+        )
+        payload = result.get("result") or {}
+        return {"nodeId": node_id, "policy": payload.get("file"), "hash": payload.get("hash")}
+    except ValueError as exc:
+        return {"nodeId": node_id, "policy": None, "error": str(exc)}
+    except Exception as exc:
+        return {"nodeId": node_id, "policy": None, "error": f"invoke failed: {exc}"}
 
 
 @register_handler("exec.approvals.node.set")
 async def handle_exec_approvals_node_set(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
-    """Node-scoped exec approval policy set."""
+    """Set exec approvals on a remote node — routes via NodeManager.invoke_node()."""
     node_id = params.get("nodeId")
     policy = params.get("policy")
-    return {"ok": True, "nodeId": node_id, "policy": policy}
+    base_hash = params.get("baseHash")
+
+    if not node_id:
+        return {"ok": False, "error": "nodeId required"}
+
+    from openclaw.nodes.manager import get_node_manager
+    import json as _json
+    manager = get_node_manager()
+    try:
+        result = await manager.invoke_node(
+            node_id,
+            "system.execApprovals.set",
+            {"paramsJSON": _json.dumps({"file": policy, "baseHash": base_hash})},
+            timeout_ms=10_000,
+        )
+        payload = result.get("result") or {}
+        ok = payload.get("ok", False)
+        return {"ok": ok, "nodeId": node_id, "error": payload.get("error")}
+    except ValueError as exc:
+        return {"ok": False, "nodeId": node_id, "error": str(exc)}
+    except Exception as exc:
+        return {"ok": False, "nodeId": node_id, "error": f"invoke failed: {exc}"}
 
 
 @register_handler("exec.approval.waitDecision")
@@ -2428,24 +2525,55 @@ async def handle_channels_disconnect(connection: Any, params: dict[str, Any]) ->
 @register_handler("channels.send")
 async def handle_channels_send(connection: Any, params: dict[str, Any]) -> dict[str, Any]:
     """Send message via channel"""
+    import asyncio as _asyncio
     channel_id = params.get("channelId")
     target = params.get("target")
     text = params.get("text", "")
-    
+
     logger.info(f"Sending via {channel_id} to {target}: {text[:50]}...")
-    
+
     if not connection.gateway:
         return {"success": False, "error": "Gateway not available"}
-    
+
+    # --- Plugin Hook: message_sending (modifying, sequential) ---
+    # Mirrors TS infra/outbound/deliver.ts — can modify content or cancel the send.
+    _hook_runner = getattr(connection.gateway, "_hook_runner", None)
+    msg_ctx = {"channel_id": channel_id, "account_id": None, "conversation_id": None}
+    if _hook_runner:
+        try:
+            send_result = await _hook_runner.run_message_sending(
+                {"to": target, "content": text, "metadata": {"channelId": channel_id}},
+                msg_ctx,
+            )
+            if send_result:
+                if send_result.get("cancel"):
+                    logger.debug(f"[hooks] message_sending: send cancelled by plugin")
+                    return {"success": True, "sent": False, "cancelled": True}
+                if send_result.get("content"):
+                    text = send_result["content"]
+        except Exception as exc:
+            logger.debug(f"message_sending hook failed: {exc}")
+
     try:
         # Get channel from manager
         channel = connection.gateway.channel_manager.get_channel(channel_id)
         if not channel:
             return {"success": False, "error": f"Channel '{channel_id}' not found"}
-        
+
         # Send message
         message_id = await channel.send_text(target=target, text=text)
-        
+
+        # --- Plugin Hook: message_sent (void, parallel, fire-and-forget) ---
+        # Mirrors TS infra/outbound/deliver.ts — observe send outcome.
+        if _hook_runner and _hook_runner.has_hooks("message_sent"):
+            try:
+                _asyncio.create_task(_hook_runner.run_message_sent(
+                    {"to": target, "content": text, "success": True},
+                    msg_ctx,
+                ))
+            except Exception:
+                pass
+
         return {
             "success": True,
             "sent": True,
@@ -2455,6 +2583,17 @@ async def handle_channels_send(connection: Any, params: dict[str, Any]) -> dict[
         }
     except Exception as e:
         logger.error(f"Failed to send message: {e}", exc_info=True)
+
+        # --- Plugin Hook: message_sent on failure ---
+        if _hook_runner and _hook_runner.has_hooks("message_sent"):
+            try:
+                _asyncio.create_task(_hook_runner.run_message_sent(
+                    {"to": target, "content": text, "success": False, "error": str(e)},
+                    msg_ctx,
+                ))
+            except Exception:
+                pass
+
         return {"success": False, "error": str(e)}
 
 

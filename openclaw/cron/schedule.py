@@ -12,6 +12,35 @@ from .types import AtSchedule, CronSchedule, CronScheduleType, EverySchedule
 logger = logging.getLogger(__name__)
 
 
+def _resolve_cron_timezone(tz: str | None) -> ZoneInfo | None:
+    """Resolve effective timezone for a cron expression.
+
+    Mirrors TS ``resolveCronTimezone(tz?)``:
+    - Non-empty string → use that IANA TZ
+    - None / empty → fall back to **system local timezone**
+
+    Falls back to UTC if the system TZ is unknown/unresolvable.
+    """
+    trimmed = tz.strip() if isinstance(tz, str) else ""
+    if trimmed:
+        try:
+            return ZoneInfo(trimmed)
+        except (ZoneInfoNotFoundError, Exception) as exc:
+            logger.warning("cron: unknown timezone %r — falling back to system TZ: %s", trimmed, exc)
+            return None  # will fall through to system-TZ logic below
+
+    # No explicit tz → use system local timezone (mirrors TS Intl.DateTimeFormat().resolvedOptions().timeZone)
+    try:
+        # datetime.now().astimezone() carries the local tzinfo; use it directly.
+        local_tz = datetime.now().astimezone().tzinfo
+        if local_tz is not None:
+            return local_tz  # type: ignore[return-value]
+    except Exception:
+        pass
+    # Ultimate fallback: UTC
+    return ZoneInfo("UTC")
+
+
 def compute_next_run(schedule: CronScheduleType, now_ms: int | None = None) -> int | None:
     """Compute next run time in milliseconds.
 
@@ -70,20 +99,20 @@ def _compute_every_schedule(schedule: EverySchedule, now_ms: int) -> int | None:
 def _compute_cron_schedule(schedule: CronSchedule, now_ms: int) -> int:
     """Cron expression schedule — matches TS computeNextRunAtMs for kind="cron".
 
+    Timezone resolution mirrors TS ``resolveCronTimezone(tz?)``:
+    - ``schedule.tz`` is a non-empty IANA string → use it directly
+    - ``schedule.tz`` is None/empty → fall back to the **system local timezone**
+      (same as TS ``Intl.DateTimeFormat().resolvedOptions().timeZone``)
+
     Raises ``ValueError`` on invalid expression so that callers (e.g.
     ``_recompute_job_next_run``) can catch it and record a schedule error.
-    TS behaviour: exceptions propagate from ``computeJobNextRunAtMs`` and are
-    caught in ``recordScheduleComputeError``.
     """
     now_dt = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
 
-    # Apply timezone if specified — tz errors fall back to UTC silently
-    tz_str = schedule.tz or "UTC"
-    try:
-        tz = ZoneInfo(tz_str)
-        now_dt = now_dt.astimezone(tz)
-    except (ZoneInfoNotFoundError, Exception):
-        pass  # Fallback to UTC
+    # Resolve effective timezone (None → system TZ, matches TS resolveCronTimezone)
+    effective_tz = _resolve_cron_timezone(schedule.tz)
+    if effective_tz is not None:
+        now_dt = now_dt.astimezone(effective_tz)
 
     try:
         cron = croniter(schedule.expr, now_dt)

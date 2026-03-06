@@ -1,92 +1,81 @@
 ---
 name: obsidian
-description: Obsidian vault integration for markdown notes
-version: 1.0.0
-author: ClawdBot
-tags: [obsidian, notes, markdown, knowledge]
-requires_bins: []
-requires_env: []
-requires_config: []
+description: Work with Obsidian vaults (plain Markdown notes) and automate via obsidian-cli.
+homepage: https://help.obsidian.md
+metadata:
+  {
+    "openclaw":
+      {
+        "emoji": "💎",
+        "requires": { "bins": ["obsidian-cli"] },
+        "install":
+          [
+            {
+              "id": "brew",
+              "kind": "brew",
+              "formula": "yakitrak/yakitrak/obsidian-cli",
+              "bins": ["obsidian-cli"],
+              "label": "Install obsidian-cli (brew)",
+            },
+          ],
+      },
+  }
 ---
 
-# Obsidian Integration
+# Obsidian
 
-Manage Obsidian vault notes using file operations.
+Obsidian vault = a normal folder on disk.
 
-## Obsidian Vault Structure
+Vault structure (typical)
 
-Typical vault location:
-- macOS: `~/Documents/Obsidian Vault/`
-- Linux: `~/Documents/Obsidian Vault/`
-- Windows: `C:\Users\{user}\Documents\Obsidian Vault\`
+- Notes: `*.md` (plain text Markdown; edit with any editor)
+- Config: `.obsidian/` (workspace + plugin settings; usually don’t touch from scripts)
+- Canvases: `*.canvas` (JSON)
+- Attachments: whatever folder you chose in Obsidian settings (images/PDFs/etc.)
 
-## Available Tools
+## Find the active vault(s)
 
-- **read_file**: Read note content
-- **write_file**: Create or update notes
-- **edit_file**: Modify existing notes
-- **bash**: Search notes with grep/ripgrep
-- **web_fetch**: Access Obsidian API (if REST API plugin installed)
+Obsidian desktop tracks vaults here (source of truth):
 
-## Common Operations
+- `~/Library/Application Support/obsidian/obsidian.json`
 
-### Search Notes
-```bash
-rg "search term" ~/Documents/ObsidianVault/
-```
+`obsidian-cli` resolves vaults from that file; vault name is typically the **folder name** (path suffix).
 
-### Create Note
-```python
-# Write to: ~/Documents/ObsidianVault/NewNote.md
-content = """---
-tags: [tag1, tag2]
-created: 2026-01-27
----
+Fast “what vault is active / where are the notes?”
 
-# Note Title
+- If you’ve already set a default: `obsidian-cli print-default --path-only`
+- Otherwise, read `~/Library/Application Support/obsidian/obsidian.json` and use the vault entry with `"open": true`.
 
-Note content here...
-"""
-write_file(path="~/Documents/ObsidianVault/NewNote.md", content=content)
-```
+Notes
 
-### Update Note
-Use edit_file to modify existing notes.
+- Multiple vaults common (iCloud vs `~/Documents`, work/personal, etc.). Don’t guess; read config.
+- Avoid writing hardcoded vault paths into scripts; prefer reading the config or using `print-default`.
 
-### Link Notes
-Obsidian uses `[[Note Name]]` for internal links.
+## obsidian-cli quick start
 
-## Frontmatter
+Pick a default vault (once):
 
-Obsidian notes support YAML frontmatter:
-```yaml
----
-tags: [personal, work]
-created: 2026-01-27
-updated: 2026-01-27
----
-```
+- `obsidian-cli set-default "<vault-folder-name>"`
+- `obsidian-cli print-default` / `obsidian-cli print-default --path-only`
 
-## Usage Examples
+Search
 
-User: "Create a note about the meeting"
-1. Ask for note details
-2. Format with frontmatter
-3. Write to vault using write_file
+- `obsidian-cli search "query"` (note names)
+- `obsidian-cli search-content "query"` (inside notes; shows snippets + lines)
 
-User: "Search my notes for Python"
-1. Use bash with rg/grep
-2. Parse results
-3. Present formatted list
+Create
 
-User: "Update my daily note"
-1. Read current daily note
-2. Append new content
-3. Write back
+- `obsidian-cli create "Folder/New note" --content "..." --open`
+- Requires Obsidian URI handler (`obsidian://…`) working (Obsidian installed).
+- Avoid creating notes under “hidden” dot-folders (e.g. `.something/...`) via URI; Obsidian may refuse.
 
-## Configuration
+Move/rename (safe refactor)
 
-Set vault path in your queries or config:
-```python
-VAULT_PATH = "~/Documents/ObsidianVault/"
-```
+- `obsidian-cli move "old/path/note" "new/path/note"`
+- Updates `[[wikilinks]]` and common Markdown links across the vault (this is the main win vs `mv`).
+
+Delete
+
+- `obsidian-cli delete "path/note"`
+
+Prefer direct edits when appropriate: open the `.md` file and change it; Obsidian will pick it up.

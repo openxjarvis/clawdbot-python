@@ -56,10 +56,10 @@ class TestBootstrapSequence:
         
         bootstrap = GatewayBootstrap()
         
-        # Mock subsequent steps
+        # Mock subsequent steps; allow_unconfigured skips the first-run file check
         with patch.object(bootstrap, '_set_env_vars'):
             with patch("openclaw.gateway.bootstrap.detect_legacy_config", return_value=None):
-                results = await bootstrap.bootstrap()
+                results = await bootstrap.bootstrap(allow_unconfigured=True)
         
         # Should complete at least Step 2
         assert results["steps_completed"] >= 2
@@ -70,9 +70,11 @@ class TestBootstrapSequence:
         """Test bootstrap handles errors gracefully"""
         bootstrap = GatewayBootstrap()
         
-        # Force config load error
+        # Force config load error; allow_unconfigured bypasses the first-run file check
+        # so bootstrap proceeds to Step 2 where load_config is called and raises.
         with patch("openclaw.gateway.bootstrap.load_config", side_effect=Exception("Config error")):
-            results = await bootstrap.bootstrap()
+            with patch.object(bootstrap, '_set_env_vars'):
+                results = await bootstrap.bootstrap(allow_unconfigured=True)
         
         # Should record error
         assert len(results["errors"]) > 0
@@ -86,13 +88,13 @@ class TestBootstrapSequence:
         
         bootstrap = GatewayBootstrap()
         
-        # Mock dependencies
+        # Mock dependencies; allow_unconfigured bypasses the first-run file check
         with patch.object(bootstrap, '_set_env_vars'):
             with patch("openclaw.gateway.bootstrap.detect_legacy_config", return_value=None):
                 with patch("openclaw.gateway.bootstrap.start_diagnostic_heartbeat"):
                     # Mock provider creation
                     with patch("openclaw.agents.providers.create_provider", return_value=Mock()):
-                        results = await bootstrap.bootstrap()
+                        results = await bootstrap.bootstrap(allow_unconfigured=True)
         
         # Session manager should be created (Step 10)
         if results["steps_completed"] >= 10:

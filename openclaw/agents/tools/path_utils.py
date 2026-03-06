@@ -167,10 +167,41 @@ def try_macos_screenshot_path(path: str) -> str:
     return path
 
 
+def check_workspace_path(absolute_path: str, workspace_dir: str | None) -> None:
+    """
+    Enforce fs.workspaceOnly constraint — mirrors TS tool-fs-policy.ts checkWorkspacePath().
+
+    If workspace_dir is set (non-None), raises PermissionError when the resolved
+    path is outside the workspace directory tree.
+
+    Args:
+        absolute_path: Already-resolved absolute file path.
+        workspace_dir: Workspace root directory. None = no restriction.
+
+    Raises:
+        PermissionError: If path is outside the workspace directory.
+    """
+    if not workspace_dir:
+        return
+
+    import pathlib
+    try:
+        resolved = pathlib.Path(absolute_path).resolve()
+        workspace = pathlib.Path(workspace_dir).resolve()
+        resolved.relative_to(workspace)  # raises ValueError if not inside
+    except ValueError:
+        raise PermissionError(
+            f"fs.workspaceOnly is enabled: path '{absolute_path}' is outside "
+            f"the workspace directory '{workspace_dir}'. "
+            "Set fs.workspaceOnly=false to allow access outside the workspace."
+        )
+
+
 __all__ = [
     "expand_path",
     "resolve_to_cwd",
     "resolve_read_path",
+    "check_workspace_path",
     "try_nfd_variant",
     "try_curly_quote_variant",
     "try_macos_screenshot_path",

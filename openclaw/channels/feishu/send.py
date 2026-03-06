@@ -136,12 +136,16 @@ async def send_feishu_message(
     reply_to_message_id: str | None = None,
     reply_in_thread: bool = False,
     markdown_mode: str = "native",
+    card_override: dict | None = None,
 ) -> SendResult | None:
     """
     Send a text message to Feishu.
 
     Chooses post vs interactive card based on render_mode.
     Falls back from reply to create on withdrawn-message errors.
+
+    card_override: when provided, sends this pre-built card dict as an interactive
+    message instead of auto-building one from text. Useful for button cards.
 
     Mirrors TS sendMessageFeishu().
     """
@@ -150,17 +154,22 @@ async def send_feishu_message(
         ReplyMessageRequest, ReplyMessageRequestBody,
     )
 
-    # Apply markdown mode preprocessing (mirrors TS applyMarkdownMode)
-    processed_text = apply_markdown_mode(text, markdown_mode)
-
-    use_card = _should_use_card(processed_text, render_mode)
-
-    if use_card:
+    if card_override is not None:
+        # Use the caller-supplied card dict directly (e.g. button card)
         msg_type = "interactive"
-        content = build_interactive_card_content(processed_text)
+        content = json.dumps(card_override)
     else:
-        msg_type = "post"
-        content = json.dumps(build_post_message_payload(processed_text))
+        # Apply markdown mode preprocessing (mirrors TS applyMarkdownMode)
+        processed_text = apply_markdown_mode(text, markdown_mode)
+
+        use_card = _should_use_card(processed_text, render_mode)
+
+        if use_card:
+            msg_type = "interactive"
+            content = build_interactive_card_content(processed_text)
+        else:
+            msg_type = "post"
+            content = json.dumps(build_post_message_payload(processed_text))
 
     loop = asyncio.get_running_loop()
 

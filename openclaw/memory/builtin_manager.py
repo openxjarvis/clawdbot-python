@@ -263,13 +263,28 @@ class BuiltinMemoryManager:
             import time
             now = int(time.time())
             
-            for chunk in chunks:
+            # Batch-embed all chunks — mirrors TS manager-embedding-ops.ts
+            texts = [c['text'] for c in chunks]
+            embeddings: list[list[float] | None] = [None] * len(texts)
+            try:
+                batch_result = await self.embedder.embed_batch(texts)
+                raw = batch_result.embeddings if hasattr(batch_result, 'embeddings') else batch_result
+                if raw and len(raw) == len(texts):
+                    embeddings = list(raw)
+                else:
+                    logger.warning("embed_batch returned mismatched count (%d vs %d)", len(raw or []), len(texts))
+            except Exception as emb_exc:
+                logger.debug("Batch embedding failed (%s); chunks stored without embeddings for %s", emb_exc, file_path)
+
+            for i, chunk in enumerate(chunks):
                 chunk_id = f"{file_path}:{chunk['start_line']}-{chunk['end_line']}"
-                
+                emb = embeddings[i]
+                emb_blob = self._serialize_embedding(emb) if emb else None
+
                 self.db.execute("""
-                    INSERT INTO chunks 
-                    (id, path, source, start_line, end_line, hash, model, text, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO chunks
+                    (id, path, source, start_line, end_line, hash, model, text, embedding, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, [
                     chunk_id,
                     str(file_path),
@@ -279,7 +294,8 @@ class BuiltinMemoryManager:
                     self._hash_content(chunk['text']),
                     self._embedding_provider_name,
                     chunk['text'],
-                    now
+                    emb_blob,
+                    now,
                 ])
             
             # Update files table
@@ -343,24 +359,88 @@ class BuiltinMemoryManager:
         return hashlib.sha256(content.encode()).hexdigest()
     
     async def sync(self) -> dict:
-        """
-        Sync memory index with filesystem.
-        
+        """Sync memory index with filesystem.
+
+        Mirrors TS MemoryIndexManager.runSync():
+        1. Scan memory dirs for .md files + sessions dir for .jsonl files
+        2. Hash each file; skip unchanged (hash + mtime match DB)
+        3. Re-index changed/new files (delete old chunks, insert new with embeddings)
+        4. Remove DB entries for files that no longer exist
+
         Returns:
-            Sync statistics
+            Sync statistics dict
         """
         stats = {
             'files_added': 0,
             'files_updated': 0,
             'files_removed': 0,
-            'chunks_created': 0
+            'chunks_created': 0,
         }
-        
-        # TODO: Implement full sync logic
-        # - Scan memory directories
-        # - Add/update changed files
-        # - Remove deleted files
-        
+
+        if not self.db:
+            return stats
+
+        # -- 1. Discover candidate files on disk --
+        disk_files: dict[str, MemorySource] = {}
+
+        memory_file = self.workspace_dir / "MEMORY.md"
+        if memory_file.exists():
+            disk_files[str(memory_file)] = MemorySource.MEMORY
+
+        memory_dir = self.workspace_dir / "memory"
+        if memory_dir.is_dir():
+            for f in memory_dir.glob("*.md"):
+                if f.is_file():
+                    disk_files[str(f)] = MemorySource.MEMORY
+
+        sessions_dir = self.workspace_dir / ".openclaw" / "sessions"
+        if sessions_dir.is_dir():
+            for f in sessions_dir.glob("*.jsonl"):
+                if f.is_file():
+                    disk_files[str(f)] = MemorySource.SESSIONS
+
+        # -- 2. Compare against DB records --
+        db_files = {
+            row[0]: row[1]
+            for row in self.db.execute("SELECT path, hash FROM files").fetchall()
+        }
+
+        # -- 3. Index new/changed files --
+        import time as _time
+        for path_str, source in disk_files.items():
+            try:
+                fp = Path(path_str)
+                content = fp.read_text(encoding='utf-8')
+                new_hash = self._hash_content(content)
+                if db_files.get(path_str) == new_hash:
+                    continue  # unchanged
+
+                was_new = path_str not in db_files
+                added = await self.add_file(fp, source)
+                stats['chunks_created'] += added
+                if was_new:
+                    stats['files_added'] += 1
+                else:
+                    stats['files_updated'] += 1
+            except Exception as exc:
+                logger.warning("sync: error indexing %s: %s", path_str, exc)
+
+        # -- 4. Remove orphaned DB entries --
+        for path_str in list(db_files.keys()):
+            if path_str not in disk_files:
+                try:
+                    self.db.execute("DELETE FROM chunks WHERE path = ?", [path_str])
+                    self.db.execute("DELETE FROM files WHERE path = ?", [path_str])
+                    stats['files_removed'] += 1
+                except Exception as exc:
+                    logger.warning("sync: error removing orphan %s: %s", path_str, exc)
+
+        self.db.commit()
+        logger.info(
+            "BuiltinMemoryManager.sync complete: +%d added, ~%d updated, -%d removed, %d chunks",
+            stats['files_added'], stats['files_updated'],
+            stats['files_removed'], stats['chunks_created'],
+        )
         return stats
     
     def close(self) -> None:

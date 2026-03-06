@@ -23,14 +23,10 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────
 
 TOOL_NAME_ALIASES: dict[str, str] = {
-    # TS uses "exec" internally; Python uses "bash".  Keep both directions
-    # so that config written for either runtime resolves correctly.
-    "exec": "bash",
+    # TS ground truth: "bash" → "exec" (TS TOOL_NAME_ALIASES line 12-14)
+    # Callers may write "bash" in configs; canonical name is "exec".
+    "bash": "exec",
     "apply-patch": "apply_patch",
-    # Python-specific reverse alias (TS config may reference "read"/"write"/"edit")
-    "read": "read_file",
-    "write": "write_file",
-    "edit": "edit_file",
 }
 
 
@@ -44,16 +40,17 @@ TOOL_GROUPS: dict[str, list[str]] = {
     "group:memory": ["memory_search", "memory_get"],
     # Web tools
     "group:web": ["web_search", "web_fetch"],
-    # Basic workspace/file tools
-    "group:fs": ["read_file", "write_file", "edit_file", "apply_patch"],
-    # Host/runtime execution tools
-    "group:runtime": ["bash", "process"],
+    # File system tools (TS group:fs = read, write, edit, apply_patch)
+    "group:fs": ["read", "write", "edit", "apply_patch"],
+    # Runtime execution tools (TS group:runtime = exec, process)
+    "group:runtime": ["exec", "process"],
     # Session management tools
     "group:sessions": [
         "sessions_list",
         "sessions_history",
         "sessions_send",
         "sessions_spawn",
+        "subagents",
         "session_status",
     ],
     # UI helpers
@@ -64,7 +61,11 @@ TOOL_GROUPS: dict[str, list[str]] = {
     "group:messaging": ["message"],
     # Nodes + device tools
     "group:nodes": ["nodes"],
-    # All OpenClaw native tools (excludes provider plugins)
+    # Agents listing
+    "group:agents": ["agents_list"],
+    # Media generation
+    "group:media": ["image", "tts"],
+    # All OpenClaw native tools (includeInOpenClawGroup=true in TS tool-catalog.ts)
     "group:openclaw": [
         "browser",
         "canvas",
@@ -77,21 +78,80 @@ TOOL_GROUPS: dict[str, list[str]] = {
         "sessions_history",
         "sessions_send",
         "sessions_spawn",
+        "subagents",
         "session_status",
         "memory_search",
         "memory_get",
         "web_search",
         "web_fetch",
         "image",
+        "tts",
     ],
 }
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Owner-only tools (matches TS OWNER_ONLY_TOOL_NAMES)
+# Owner-only tools (matches TS OWNER_ONLY_TOOL_NAMES in src/agents/tool-policy.ts)
+# cron + gateway require operator.admin scope — never callable by arbitrary senders
 # ──────────────────────────────────────────────────────────────────────
 
-OWNER_ONLY_TOOL_NAMES: set[str] = {"whatsapp_login"}
+OWNER_ONLY_TOOL_NAMES: set[str] = {"whatsapp_login", "cron", "gateway"}
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Dangerous ACP tools (matches TS DANGEROUS_ACP_TOOLS in src/security/dangerous-tools.ts)
+# These tools must never be allowed through ACP without explicit operator opt-in
+# ──────────────────────────────────────────────────────────────────────
+
+DANGEROUS_ACP_TOOLS: list[str] = [
+    "exec",           # bash execution (canonical name)
+    "sessions_spawn",
+    "sessions_send",
+    "gateway",
+    "apply_patch",
+    "write",          # TS canonical file write tool name
+    "cron",
+    "nodes",
+]
+
+DANGEROUS_ACP_TOOL_NAMES: set[str] = set(DANGEROUS_ACP_TOOLS)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Sandbox default tool allow/deny constants
+# Matches TS src/agents/sandbox/constants.ts DEFAULT_TOOL_ALLOW / DEFAULT_TOOL_DENY
+# ──────────────────────────────────────────────────────────────────────
+
+# TS DEFAULT_TOOL_ALLOW (src/agents/sandbox/constants.ts lines 13-22):
+# exec, process, read, write, edit, apply_patch, image,
+# sessions_list, sessions_history, sessions_send, sessions_spawn, subagents, session_status
+DEFAULT_SANDBOX_TOOL_ALLOW: list[str] = [
+    "exec",
+    "process",
+    "read",
+    "write",
+    "edit",
+    "apply_patch",
+    "image",
+    "sessions_list",
+    "sessions_history",
+    "sessions_send",
+    "sessions_spawn",
+    "subagents",
+    "session_status",
+]
+
+DEFAULT_SANDBOX_TOOL_DENY: list[str] = [
+    "browser",
+    "canvas",
+    "nodes",
+    "cron",
+    "gateway",
+    "whatsapp_login",
+    "sessions_send",
+    "sessions_spawn",
+    "message",
+]
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -252,8 +312,10 @@ class ToolPolicy:
         allow: list[str] | None = None,
         deny: list[str] | None = None,
     ):
-        self.allow = allow or []
-        self.deny = deny or []
+        # Normalize at construction time so alias resolution is applied once,
+        # matching TS behavior where normalizeToolList() is called on allow/deny.
+        self.allow = normalize_tool_list(allow) if allow else []
+        self.deny = normalize_tool_list(deny) if deny else []
 
     def is_allowed(self, tool_name: str) -> bool:
         """Check if a tool is allowed by this policy."""

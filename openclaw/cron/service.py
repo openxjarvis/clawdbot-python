@@ -892,8 +892,79 @@ class CronService:
     # Timer callback (matches TS onTimer)
     # ------------------------------------------------------------------
 
+    async def _run_single_job(self, snap: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute one due job and return a result dict.
+
+        Extracted helper so ``_on_timer`` can run multiple jobs concurrently
+        via ``asyncio.gather``.  Mirrors TS timer loop per-job logic.
+        """
+        job_id: str = snap["id"]
+        job: CronJob = snap["job"]
+        started_at = _now_ms()
+        job.state.running_at_ms = started_at
+        self._emit(jobId=job_id, action="started", runAtMs=started_at)
+
+        timeout_ms = self._resolve_job_timeout_ms(job)
+
+        try:
+            if self.lane_manager:
+                from openclaw.agents.queuing.lanes import CommandLane
+
+                async def job_task():
+                    return await self._execute_job_core(job)
+
+                if timeout_ms is not None:
+                    core_result = await asyncio.wait_for(
+                        self.lane_manager.enqueue_in_lane(CommandLane.CRON, job_task),
+                        timeout=timeout_ms / 1000,
+                    )
+                else:
+                    core_result = await self.lane_manager.enqueue_in_lane(
+                        CommandLane.CRON, job_task
+                    )
+            else:
+                if timeout_ms is not None:
+                    core_result = await asyncio.wait_for(
+                        self._execute_job_core(job),
+                        timeout=timeout_ms / 1000,
+                    )
+                else:
+                    core_result = await self._execute_job_core(job)
+            return {
+                "id": job_id,
+                "job": job,
+                "started_at": started_at,
+                "ended_at": _now_ms(),
+                **core_result,
+            }
+        except asyncio.TimeoutError:
+            logger.warning("cron: job %r timed out after %sms", job_id, timeout_ms)
+            return {
+                "id": job_id,
+                "job": job,
+                "started_at": started_at,
+                "ended_at": _now_ms(),
+                "status": "error",
+                "error": "cron: job execution timed out",
+            }
+        except Exception as err:
+            logger.warning("cron: job %r failed: %s", job_id, err)
+            return {
+                "id": job_id,
+                "job": job,
+                "started_at": started_at,
+                "ended_at": _now_ms(),
+                "status": "error",
+                "error": str(err),
+            }
+
     async def _on_timer(self) -> None:
-        """Timer callback — matches TS onTimer with running-guard + re-arm."""
+        """Timer callback — matches TS onTimer with running-guard + re-arm.
+
+        Multiple due jobs are executed **concurrently** via ``asyncio.gather``,
+        bounded by ``max_concurrent_runs`` (default 1 — matches TS default).
+        This mirrors the TS ``maxConcurrentRuns`` limit in timer.ts.
+        """
         if self._timer_running:
             # Re-arm at MAX_TIMER_DELAY_MS to keep scheduler alive
             if self._timer:
@@ -904,72 +975,22 @@ class CronService:
         try:
             due_snapshots = await self._locked(self._pick_due_jobs)
 
-            results: list[Dict[str, Any]] = []
-            for snap in due_snapshots:
-                job_id: str = snap["id"]
-                job: CronJob = snap["job"]
-                started_at = _now_ms()
-                job.state.running_at_ms = started_at
-                self._emit(jobId=job_id, action="started", runAtMs=started_at)
+            if due_snapshots:
+                # Resolve max_concurrent_runs from cron config (default 1 — matches TS)
+                max_concurrent: int = int(self.cron_config.get("maxConcurrentRuns", 1))
+                if max_concurrent < 1:
+                    max_concurrent = 1
 
-                # Per-job timeout
-                timeout_ms = self._resolve_job_timeout_ms(job)
+                # Process in batches of max_concurrent, parallel within each batch
+                results: list[Dict[str, Any]] = []
+                for batch_start in range(0, len(due_snapshots), max_concurrent):
+                    batch = due_snapshots[batch_start: batch_start + max_concurrent]
+                    batch_results = await asyncio.gather(
+                        *[self._run_single_job(snap) for snap in batch],
+                        return_exceptions=False,
+                    )
+                    results.extend(batch_results)
 
-                try:
-                    # Execute in CommandLane.CRON if lane_manager available (aligned with TS)
-                    if self.lane_manager:
-                        from openclaw.agents.queuing.lanes import CommandLane
-                        
-                        async def job_task():
-                            return await self._execute_job_core(job)
-                        
-                        if timeout_ms is not None:
-                            core_result = await asyncio.wait_for(
-                                self.lane_manager.enqueue_in_lane(CommandLane.CRON, job_task),
-                                timeout=timeout_ms / 1000,
-                            )
-                        else:
-                            core_result = await self.lane_manager.enqueue_in_lane(
-                                CommandLane.CRON, job_task
-                            )
-                    else:
-                        # Fallback to direct execution (backward compat)
-                        if timeout_ms is not None:
-                            core_result = await asyncio.wait_for(
-                                self._execute_job_core(job),
-                                timeout=timeout_ms / 1000,
-                            )
-                        else:
-                            core_result = await self._execute_job_core(job)
-                    results.append({
-                        "id": job_id,
-                        "job": job,
-                        "started_at": started_at,
-                        "ended_at": _now_ms(),
-                        **core_result,
-                    })
-                except asyncio.TimeoutError:
-                    logger.warning(f"cron: job {job_id!r} timed out after {timeout_ms}ms")
-                    results.append({
-                        "id": job_id,
-                        "job": job,
-                        "started_at": started_at,
-                        "ended_at": _now_ms(),
-                        "status": "error",
-                        "error": "cron: job execution timed out",
-                    })
-                except Exception as err:
-                    logger.warning(f"cron: job {job_id!r} failed: {err}")
-                    results.append({
-                        "id": job_id,
-                        "job": job,
-                        "started_at": started_at,
-                        "ended_at": _now_ms(),
-                        "status": "error",
-                        "error": str(err),
-                    })
-
-            if results:
                 await self._locked(self._apply_results, results)
 
             # Session reaper (outside lock, self-throttled)
@@ -1426,7 +1447,7 @@ def _apply_job_patch(job: CronJob, patch: Dict[str, Any]) -> None:
             job.schedule = EverySchedule(every_ms=int(every_ms), type="every", anchor_ms=anchor_ms)
         elif stype == "cron":
             expr = sched.get("expr") or sched.get("expression") or ""
-            tz = sched.get("tz") or sched.get("timezone") or "UTC"
+            tz = sched.get("tz") or sched.get("timezone") or None
             stagger_ms = sched.get("stagger_ms") or sched.get("staggerMs")
             job.schedule = CronScheduleType(
                 expr=expr, type="cron", tz=tz,

@@ -21,34 +21,42 @@ from openclaw.security.tool_policy import (
 
 
 class TestToolNameAliases:
-    def test_exec_to_bash(self):
-        assert normalize_tool_name("exec") == "bash"
-
-    def test_read_to_read_file(self):
-        assert normalize_tool_name("read") == "read_file"
-
-    def test_write_to_write_file(self):
-        assert normalize_tool_name("write") == "write_file"
-
-    def test_edit_to_edit_file(self):
-        assert normalize_tool_name("edit") == "edit_file"
+    def test_bash_to_exec(self):
+        # TS ground truth: TOOL_NAME_ALIASES = {bash: "exec", "apply-patch": "apply_patch"}
+        assert normalize_tool_name("bash") == "exec"
 
     def test_apply_dash_patch(self):
         assert normalize_tool_name("apply-patch") == "apply_patch"
 
-    def test_no_alias(self):
-        assert normalize_tool_name("bash") == "bash"
+    def test_no_alias_read(self):
+        # TS canonical name for file read is "read" (no alias)
+        assert normalize_tool_name("read") == "read"
+
+    def test_no_alias_write(self):
+        assert normalize_tool_name("write") == "write"
+
+    def test_no_alias_edit(self):
+        assert normalize_tool_name("edit") == "edit"
+
+    def test_no_alias_exec(self):
+        # "exec" is already canonical — no reverse alias
+        assert normalize_tool_name("exec") == "exec"
+
+    def test_no_alias_web_search(self):
         assert normalize_tool_name("web_search") == "web_search"
 
     def test_case_insensitive(self):
-        assert normalize_tool_name("EXEC") == "bash"
-        assert normalize_tool_name("Read") == "read_file"
+        # BASH → exec (bash alias, case-insensitive)
+        assert normalize_tool_name("BASH") == "exec"
+        # READ → read (no alias)
+        assert normalize_tool_name("Read") == "read"
 
 
 class TestNormalizeToolList:
     def test_basic(self):
-        result = normalize_tool_list(["exec", "read", "bash"])
-        assert result == ["bash", "read_file", "bash"]
+        # bash→exec, read→read (no alias), exec→exec (no alias)
+        result = normalize_tool_list(["bash", "read", "exec"])
+        assert result == ["exec", "read", "exec"]
 
     def test_none(self):
         assert normalize_tool_list(None) == []
@@ -68,13 +76,15 @@ class TestToolGroups:
             assert group in TOOL_GROUPS, f"Missing group: {group}"
 
     def test_fs_group(self):
-        assert "read_file" in TOOL_GROUPS["group:fs"]
-        assert "write_file" in TOOL_GROUPS["group:fs"]
-        assert "edit_file" in TOOL_GROUPS["group:fs"]
+        # TS canonical names: read, write, edit, apply_patch
+        assert "read" in TOOL_GROUPS["group:fs"]
+        assert "write" in TOOL_GROUPS["group:fs"]
+        assert "edit" in TOOL_GROUPS["group:fs"]
         assert "apply_patch" in TOOL_GROUPS["group:fs"]
 
     def test_runtime_group(self):
-        assert "bash" in TOOL_GROUPS["group:runtime"]
+        # TS canonical: exec (not bash), process
+        assert "exec" in TOOL_GROUPS["group:runtime"]
         assert "process" in TOOL_GROUPS["group:runtime"]
 
     def test_sessions_group(self):
@@ -86,28 +96,28 @@ class TestToolGroups:
 class TestExpandToolGroups:
     def test_expand_fs(self):
         result = expand_tool_groups(["group:fs"])
-        assert "read_file" in result
-        assert "write_file" in result
-        assert "edit_file" in result
+        assert "read" in result
+        assert "write" in result
+        assert "edit" in result
         assert "apply_patch" in result
 
     def test_expand_mixed(self):
         result = expand_tool_groups(["group:fs", "group:runtime", "image"])
-        assert "read_file" in result
-        assert "bash" in result
+        assert "read" in result
+        assert "exec" in result
         assert "image" in result
 
     def test_dedup(self):
-        result = expand_tool_groups(["group:fs", "read_file"])
-        assert result.count("read_file") == 1
+        result = expand_tool_groups(["group:fs", "read"])
+        assert result.count("read") == 1
 
     def test_none(self):
         assert expand_tool_groups(None) == []
 
     def test_alias_in_group(self):
-        # "exec" should resolve to "bash" via alias, then not be a group
-        result = expand_tool_groups(["exec"])
-        assert "bash" in result
+        # "bash" normalizes to "exec", which is not a group, so stays as "exec"
+        result = expand_tool_groups(["bash"])
+        assert "exec" in result
 
 
 class TestToolProfiles:
@@ -152,9 +162,17 @@ class TestOwnerOnlyTools:
     def test_whatsapp_login(self):
         assert is_owner_only_tool_name("whatsapp_login")
 
+    def test_cron_owner_only(self):
+        assert is_owner_only_tool_name("cron")
+
+    def test_gateway_owner_only(self):
+        assert is_owner_only_tool_name("gateway")
+
     def test_regular_tool(self):
+        # exec (bash) is NOT owner-only at the openclaw admin level
         assert not is_owner_only_tool_name("bash")
-        assert not is_owner_only_tool_name("read_file")
+        assert not is_owner_only_tool_name("exec")
+        assert not is_owner_only_tool_name("read")
 
 
 class TestApplyOwnerOnlyToolPolicy:
@@ -180,32 +198,39 @@ class TestToolPolicy:
         assert p.is_allowed("anything")
 
     def test_deny(self):
+        # deny=["bash"] → self.deny=["exec"] (bash→exec alias)
         p = ToolPolicy(deny=["bash"])
-        assert not p.is_allowed("bash")
-        assert p.is_allowed("read_file")
+        assert not p.is_allowed("bash")   # bash→exec in deny
+        assert not p.is_allowed("exec")   # exec directly in deny
+        assert p.is_allowed("read")
 
     def test_allow_list(self):
-        p = ToolPolicy(allow=["bash", "read_file"])
-        assert p.is_allowed("bash")
+        p = ToolPolicy(allow=["bash", "read"])
+        assert p.is_allowed("bash")   # bash→exec, exec in allow
+        assert p.is_allowed("exec")   # exec in allow
         assert not p.is_allowed("web_search")
 
     def test_deny_precedence(self):
+        # allow=["bash"] → allow=["exec"], deny=["bash"] → deny=["exec"]
+        # deny takes precedence → exec denied
         p = ToolPolicy(allow=["bash"], deny=["bash"])
         assert not p.is_allowed("bash")
+        assert not p.is_allowed("exec")
 
     def test_wildcard(self):
         p = ToolPolicy(allow=["*"])
         assert p.is_allowed("anything")
 
     def test_group_expansion(self):
+        # group:fs = [read, write, edit, apply_patch]
         p = ToolPolicy(allow=["group:fs"])
-        assert p.is_allowed("read_file")
-        assert p.is_allowed("write_file")
-        assert not p.is_allowed("bash")
+        assert p.is_allowed("read")
+        assert p.is_allowed("write")
+        assert not p.is_allowed("exec")
 
     def test_alias_resolution(self):
+        # deny=["bash"] → deny=["exec"]; checking "exec" should be denied
         p = ToolPolicy(deny=["bash"])
-        # "exec" normalizes to "bash"
         assert not p.is_allowed("exec")
 
 

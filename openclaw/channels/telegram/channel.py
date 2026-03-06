@@ -144,6 +144,10 @@ class TelegramChannel(ChannelPlugin):
         self._conflict_backoff = _CONFLICT_BACKOFF_INITIAL
         self._conflict_retry_task: asyncio.Task | None = None
         self._conflict_recovery_in_progress: bool = False
+        # Monotonic timestamp of the most recent Conflict error — used by the
+        # health monitor to guard against resetting the backoff while conflicts
+        # are still occurring.  None means no conflict yet in this run.
+        self._last_conflict_at: float | None = None
 
         # Media group buffering (albums)
         self._media_group_buffer: dict[str, dict] = {}
@@ -244,6 +248,13 @@ class TelegramChannel(ChannelPlugin):
 
     async def start(self, config: dict[str, Any]) -> None:
         """Start Telegram bot"""
+        if self._running and self._app is not None:
+            logger.warning(
+                "Telegram channel already running — ignoring duplicate start() call "
+                "(likely both plugin and built-in paths tried to start the same instance)"
+            )
+            return
+
         self._bot_token = config.get("botToken") or config.get("bot_token")
 
         if not self._bot_token:
@@ -377,12 +388,31 @@ class TelegramChannel(ChannelPlugin):
 
         # Register conflict/error handler for update-processing errors
         # (Updater polling errors are handled via error_callback in start_polling below)
-        self._app.add_error_handler(self._handle_polling_error)
+        self._app.add_error_handler(self._handle_application_error)
 
-        # Delete any existing webhook and clear pending updates to avoid conflicts
-        # This ensures clean state when switching from webhook to polling mode
+        # Delete any existing webhook to ensure clean state when switching
+        # from webhook to polling mode.
         await self._app.bot.delete_webhook(drop_pending_updates=True)
         logger.info("Cleared webhook and pending updates")
+
+        # Restore persisted update offset so we don't reprocess old updates.
+        # Read BEFORE the pre-start probe so the probe can use the correct offset.
+        saved_offset = read_telegram_update_offset(account_id)
+        if saved_offset is not None:
+            logger.info("Resuming from persisted update offset %d", saved_offset)
+
+        # Invalidate any lingering getUpdates long-poll from a previous process.
+        # When the old gateway is killed (even with SIGKILL), its TCP connection
+        # to Telegram stays alive server-side for up to 30 seconds (the long-poll
+        # timeout).  delete_webhook() does NOT affect getUpdates connections —
+        # they are a completely separate API path.  The ONLY way to break the
+        # stale server-side long-poll is to send our OWN getUpdates request,
+        # which causes Telegram to terminate the old one with 409 Conflict.
+        await self._invalidate_stale_polling()
+
+        # Suppress PTB Updater's own ERROR-level logging for 409 Conflict errors.
+        import logging as _logging
+        _logging.getLogger("telegram.ext.Updater").setLevel(_logging.WARNING)
 
         # Register dynamic command handlers (all native commands from registry)
         # Must be after bot initialization so we have account_id and cfg
@@ -393,11 +423,6 @@ class TelegramChannel(ChannelPlugin):
 
         # Set bot menu button (optional)
         await self._setup_menu_button()
-
-        # Restore persisted update offset so we don't reprocess old updates
-        saved_offset = read_telegram_update_offset(account_id)
-        if saved_offset is not None:
-            logger.info("Resuming from persisted update offset %d", saved_offset)
 
         # Webhook vs polling mode (mirrors TS: webhookUrl → start_webhook)
         webhook_url = config.get("webhookUrl") or config.get("webhook_url")
@@ -420,11 +445,13 @@ class TelegramChannel(ChannelPlugin):
                 await self._app.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=False,
+                    error_callback=self._handle_updater_poll_error,
                 )
         else:
             await self._app.updater.start_polling(
                 allowed_updates=Update.ALL_TYPES,
                 drop_pending_updates=False,  # We already dropped via delete_webhook
+                error_callback=self._handle_updater_poll_error,
             )
 
         self._running = True
@@ -478,30 +505,52 @@ class TelegramChannel(ChannelPlugin):
             self._running = False
             logger.info("Telegram channel stopped")
 
-    async def _handle_polling_error(
+    async def _handle_application_error(
         self, update: object, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
-        """PTB global error handler — mirrors TS monitor.ts error handling.
+        """Application-level PTB error handler for update processing errors."""
+        self._handle_telegram_error(getattr(context, "error", None))
 
-        Handles Conflict (409), recoverable network errors, and unknown errors
-        with appropriate restart / retry strategies.
+    def _handle_updater_poll_error(self, exc: Exception) -> None:
+        """Non-async PTB polling callback for getUpdates errors.
+
+        PTB's `Updater.start_polling(error_callback=...)` requires a regular
+        function, not a coroutine. This is the path used for long-polling 409
+        Conflict errors from `getUpdates`.
+        """
+        self._handle_telegram_error(exc)
+
+    def _handle_telegram_error(self, exc: Exception | None) -> None:
+        """Handle Telegram updater/application errors.
+
+        Mirrors TS monitor.ts error handling for Conflict (409), recoverable
+        network errors, and unknown failures.
+
+        For Conflict errors we do NOT stop/reinitialize/restart the PTB Updater.
+        PTB's own ``network_retry_loop`` already retries ``getUpdates`` with
+        exponential backoff (0 → 1 → 1.5 → 2.25 → … → 30 s).  Stopping and
+        restarting the Updater is counter-productive because PTB's ``stop()``
+        sends a cleanup ``getUpdates(timeout=0)`` that creates a NEW server-side
+        connection, which then conflicts with the NEXT ``start_polling()`` call
+        — perpetuating the conflict forever.
+
+        Instead we just log and let PTB's retry loop keep trying.  The old
+        server-side long-poll dies within ~30 s; PTB will succeed on the next
+        retry after that.
         """
         import telegram.error as tg_err
 
-        exc = context.error
         if exc is None:
             return
 
         if isinstance(exc, tg_err.Conflict):
-            if self._conflict_recovery_in_progress:
-                logger.debug("Telegram Conflict — recovery already in progress, skipping duplicate")
-                return
+            import time as _time
+            self._last_conflict_at = _time.monotonic()
             logger.warning(
-                "Telegram Conflict (another bot instance is polling): %s — "
-                "restarting with backoff",
+                "Telegram Conflict (another bot instance polling) — "
+                "PTB retry loop will recover automatically: %s",
                 exc,
             )
-            self._schedule_polling_restart(reason="conflict")
 
         elif _is_recoverable_network_error(exc):
             # PTB's network_retry_loop already handles NetworkError/TimedOut by
@@ -521,9 +570,17 @@ class TelegramChannel(ChannelPlugin):
             logger.error("Unhandled Telegram error: %s", exc, exc_info=True)
 
     def _schedule_polling_restart(self, reason: str = "unknown") -> None:
-        """Schedule a polling restart, cancelling any in-progress restart."""
+        """Schedule a polling restart, cancelling any in-progress restart.
+
+        Sets _conflict_recovery_in_progress=True synchronously (before
+        create_task) so that rapid back-to-back Conflict errors cannot cancel
+        and recreate the task before it gets a chance to start.
+        """
         if self._conflict_recovery_in_progress:
             return
+        # Set flag synchronously so the next error handler call sees it
+        # immediately (before the task coroutine body starts executing).
+        self._conflict_recovery_in_progress = True
         if self._conflict_retry_task and not self._conflict_retry_task.done():
             self._conflict_retry_task.cancel()
         self._conflict_retry_task = asyncio.create_task(
@@ -531,29 +588,27 @@ class TelegramChannel(ChannelPlugin):
         )
 
     async def _restart_polling_after_conflict(self, reason: str = "unknown") -> None:
-        """Stop polling, wait with exponential backoff, then resume.
+        """Stop polling, invalidate server-side connections, and resume.
 
-        Mirrors TS ``runPollingCycle`` restart logic with
-        ``TELEGRAM_POLL_RESTART_POLICY``.
+        Used only by the health monitor for hard failures.  Conflict errors
+        from getUpdates are handled by PTB's built-in retry loop and do NOT
+        trigger this restart (see _handle_telegram_error).
         """
-        if self._conflict_recovery_in_progress:
-            return
-        self._conflict_recovery_in_progress = True
         try:
             import random
             wait = self._conflict_backoff
             jitter = wait * _POLL_JITTER * (2 * random.random() - 1)
             wait_with_jitter = max(0.5, wait + jitter)
 
-            # Increase backoff for the next failure (capped)
             self._conflict_backoff = min(
                 self._conflict_backoff * _POLL_BACKOFF_FACTOR,
                 _POLL_BACKOFF_MAX,
             )
             logger.info(
-                "Polling restart (%s): pausing %.1fs before retry",
+                "Polling restart (%s): pausing %.1fs before retry (next backoff=%.1fs)",
                 reason,
                 wait_with_jitter,
+                self._conflict_backoff,
             )
             await asyncio.sleep(wait_with_jitter)
 
@@ -574,23 +629,46 @@ class TelegramChannel(ChannelPlugin):
             except Exception as stop_exc:
                 logger.debug("Updater stop during restart (%s): %s", reason, stop_exc)
 
+            # After stop(), PTB's cleanup get_updates(timeout=0) may have left
+            # a brief server-side connection.  Invalidate it with our own probe
+            # + sleep before restarting, to avoid a self-inflicted 409 loop.
+            await self._invalidate_stale_polling()
+
             try:
-                # PTB v20+ lifecycle: stop() transitions Updater to STOPPED state.
-                # initialize() must be called to return to IDLE before start_polling().
                 await self._app.updater.initialize()
                 await self._app.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=False,
+                    error_callback=self._handle_updater_poll_error,
                 )
-                # Reset backoff on successful restart
-                self._conflict_backoff = _POLL_BACKOFF_INITIAL
-                logger.info("Polling restarted after %s (backoff reset)", reason)
+                logger.info("Polling restarted after %s", reason)
             except Exception as start_exc:
                 logger.error("Failed to restart polling (%s): %s", reason, start_exc)
                 self._conflict_recovery_in_progress = False
                 self._schedule_polling_restart(reason=reason)
         finally:
             self._conflict_recovery_in_progress = False
+
+    async def _invalidate_stale_polling(self) -> None:
+        """Send a short getUpdates probe to break any lingering server-side
+        long-poll, then sleep to let Telegram fully release the slot.
+
+        Called both during initial startup and before restart.
+        """
+        try:
+            saved_offset = None
+            if self._account_id:
+                saved_offset = read_telegram_update_offset(self._account_id)
+            _offset = (saved_offset + 1) if saved_offset is not None else None
+            await self._app.bot.get_updates(
+                offset=_offset,
+                timeout=0,
+                allowed_updates=Update.ALL_TYPES,
+            )
+            logger.debug("Polling slot claimed — old long-poll invalidated")
+        except Exception as exc:
+            logger.debug("Polling slot probe: %s (expected during transition)", exc)
+        await asyncio.sleep(1.5)
 
     async def _run_health_monitor(self) -> None:
         """Periodically check that the bot is reachable.
@@ -611,6 +689,25 @@ class TelegramChannel(ChannelPlugin):
                     timeout=_HEALTH_CHECK_TIMEOUT_S,
                 )
                 failures = 0  # reset on success
+                # Only reset the conflict backoff if no Conflict error has
+                # been seen recently.  get_me() succeeds even while conflicts
+                # are occurring (it's a different API endpoint), so we guard
+                # with _last_conflict_at to avoid resetting the backoff while
+                # the restart cycle is still active.
+                if self._conflict_backoff > _CONFLICT_BACKOFF_INITIAL:
+                    import time as _time
+                    _conflict_free_window = _HEALTH_CHECK_INTERVAL_S * 2  # 120s
+                    _since_last = (
+                        _time.monotonic() - self._last_conflict_at
+                        if self._last_conflict_at is not None
+                        else float("inf")
+                    )
+                    if _since_last >= _conflict_free_window:
+                        self._conflict_backoff = _CONFLICT_BACKOFF_INITIAL
+                        logger.info(
+                            "Conflict resolved (no conflict for %.0fs) — polling backoff reset",
+                            _since_last,
+                        )
             except asyncio.CancelledError:
                 break
             except Exception as exc:
@@ -705,8 +802,23 @@ class TelegramChannel(ChannelPlugin):
         except Exception:
             pass
 
-    async def send_text(self, target: str, text: str, reply_to: str | None = None, session_key: str | None = None) -> str:
-        """Send text message with Markdown support"""
+    async def send_text(
+        self,
+        target: str,
+        text: str,
+        reply_to: str | None = None,
+        session_key: str | None = None,
+        buttons: list[list[dict]] | None = None,
+        message_thread_id: int | None = None,
+    ) -> str:
+        """Send text message with Markdown→HTML conversion.
+
+        buttons: optional 2D list of inline keyboard buttons.  Each entry is a dict
+        with at least "text" and "callback_data" keys.  The buttons are only attached
+        when the configured inlineButtonsScope allows it for the target chat.
+        message_thread_id: Telegram forum topic thread ID (for supergroup forum replies).
+          Mirrors TS buildTelegramThreadReplyParams().
+        """
         if not self._app:
             raise RuntimeError("Telegram channel not started")
 
@@ -714,26 +826,66 @@ class TelegramChannel(ChannelPlugin):
         error_msg = None
         message_id = None
 
-        try:
-            # Parse target (chat_id)
-            chat_id = int(target) if target.lstrip("-").isdigit() else target
+        # Build InlineKeyboardMarkup when buttons are requested and allowed.
+        reply_markup = None
+        if buttons:
+            try:
+                from openclaw.telegram.send import build_inline_keyboard
+                from openclaw.channels.telegram.inline_buttons import (
+                    resolve_telegram_inline_buttons_scope,
+                    resolve_telegram_target_chat_type,
+                    validate_inline_buttons_for_target,
+                )
+                scope = resolve_telegram_inline_buttons_scope(
+                    self._config or {}, self._account_id
+                )
+                chat_type = resolve_telegram_target_chat_type(target)
+                if validate_inline_buttons_for_target(scope, chat_type):
+                    reply_markup = build_inline_keyboard(buttons)
+            except Exception as _btn_err:
+                logger.debug("Failed to build inline keyboard: %s", _btn_err)
+                reply_markup = None
 
-            # Send message with Markdown parsing
-            # Try Markdown first, fallback to plain text if parsing fails
+        try:
+            # str() guard: safe even if target is already int (mirrors TS chatId handling)
+            chat_id = int(target) if str(target).lstrip("-").isdigit() else target
+
+            # Build thread params for Telegram forum topics.
+            # Mirrors TS buildTelegramThreadReplyParams() in bot/helpers.ts.
+            thread_kwargs: dict[str, Any] = {}
+            if message_thread_id is not None:
+                thread_kwargs["message_thread_id"] = message_thread_id
+
+            # Convert markdown → Telegram HTML, then send with parse_mode="HTML".
+            # Mirrors TS: markdownToTelegramHtml + parse_mode: "HTML" in send.ts.
+            # On HTML parse error, fall back to plain text (strip tags).
+            from openclaw.channels.telegram.formatter import markdown_to_html
+            html_text = markdown_to_html(text)
+
             try:
                 message = await self._app.bot.send_message(
                     chat_id=chat_id,
-                    text=text,
+                    text=html_text,
                     reply_to_message_id=int(reply_to) if reply_to else None,
-                    parse_mode="Markdown"
+                    parse_mode="HTML",
+                    reply_markup=reply_markup,
+                    **thread_kwargs,
                 )
-            except Exception as markdown_error:
-                logger.debug(f"Markdown parsing failed, sending as plain text: {markdown_error}")
-                # Fallback to plain text
+            except Exception as html_error:
+                _err_str = str(html_error).lower()
+                # Re-raise immediately on "chat not found" — retrying with plain text
+                # won't help and masks the root cause diagnostic.
+                if "chat not found" in _err_str:
+                    raise
+                logger.debug(f"HTML parse error, retrying as plain text: {html_error}")
+                import re as _re
+                plain_text = _re.sub(r"<[^>]+>", "", html_text)
                 message = await self._app.bot.send_message(
                     chat_id=chat_id,
-                    text=text,
-                    reply_to_message_id=int(reply_to) if reply_to else None
+                    text=plain_text,
+                    reply_to_message_id=int(reply_to) if reply_to else None,
+                    reply_markup=reply_markup,
+                    **thread_kwargs,
                 )
 
             # Record sent message for reaction tracking
@@ -755,7 +907,17 @@ class TelegramChannel(ChannelPlugin):
 
         except Exception as e:
             error_msg = str(e)
-            logger.error(f"Failed to send Telegram message: {e}", exc_info=True)
+            # Enrich "Chat not found" with actionable diagnostics.
+            # Mirrors TS wrapTelegramChatNotFoundError() in send.ts.
+            if "chat not found" in error_msg.lower():
+                logger.error(
+                    "Telegram send failed: chat not found (chat_id=%s). "
+                    "Likely causes: bot not started in DM, bot removed from group/channel, "
+                    "group migrated to supergroup (new -100… ID), or wrong bot token.",
+                    target,
+                )
+            else:
+                logger.error(f"Failed to send Telegram message: {e}", exc_info=True)
 
             # Trigger message:sent hook for failure
             self._fire_message_sent_hook(
@@ -794,7 +956,7 @@ class TelegramChannel(ChannelPlugin):
         if not self._app:
             raise RuntimeError("Telegram channel not started")
 
-        resolved_chat_id = int(target) if target and target.lstrip("-").isdigit() else target
+        resolved_chat_id = int(target) if target and str(target).lstrip("-").isdigit() else target
 
         try:
             message = await self._app.bot.send_photo(
@@ -822,7 +984,7 @@ class TelegramChannel(ChannelPlugin):
         if not self._app:
             raise RuntimeError("Telegram channel not started")
 
-        chat_id = int(target) if target.lstrip("-").isdigit() else target
+        chat_id = int(target) if str(target).lstrip("-").isdigit() else target
 
         try:
             message = await self._app.bot.send_video(
@@ -850,7 +1012,7 @@ class TelegramChannel(ChannelPlugin):
         if not self._app:
             raise RuntimeError("Telegram channel not started")
 
-        chat_id = int(target) if target.lstrip("-").isdigit() else target
+        chat_id = int(target) if str(target).lstrip("-").isdigit() else target
 
         try:
             message = await self._app.bot.send_document(
@@ -878,7 +1040,7 @@ class TelegramChannel(ChannelPlugin):
         if not self._app:
             raise RuntimeError("Telegram channel not started")
 
-        chat_id = int(target) if target.lstrip("-").isdigit() else target
+        chat_id = int(target) if str(target).lstrip("-").isdigit() else target
 
         try:
             message = await self._app.bot.send_audio(
@@ -905,7 +1067,7 @@ class TelegramChannel(ChannelPlugin):
         if not self._app:
             raise RuntimeError("Telegram channel not started")
 
-        chat_id = int(target) if target.lstrip("-").isdigit() else target
+        chat_id = int(target) if str(target).lstrip("-").isdigit() else target
 
         try:
             message = await self._app.bot.send_location(
@@ -931,7 +1093,7 @@ class TelegramChannel(ChannelPlugin):
         if not self._app:
             raise RuntimeError("Telegram channel not started")
 
-        chat_id = int(target) if target.lstrip("-").isdigit() else target
+        chat_id = int(target) if str(target).lstrip("-").isdigit() else target
 
         try:
             message = await self._app.bot.send_poll(
@@ -958,7 +1120,7 @@ class TelegramChannel(ChannelPlugin):
         if not self._app:
             raise RuntimeError("Telegram channel not started")
 
-        chat_id = int(target) if target.lstrip("-").isdigit() else target
+        chat_id = int(target) if str(target).lstrip("-").isdigit() else target
 
         try:
             message = await self._app.bot.send_dice(
@@ -994,7 +1156,7 @@ class TelegramChannel(ChannelPlugin):
 
         from pathlib import Path
 
-        chat_id = int(target) if target.lstrip("-").isdigit() else target
+        chat_id = int(target) if str(target).lstrip("-").isdigit() else target
         reply_id = int(reply_to) if reply_to else None
 
         # Caption splitting — Telegram limit is 1024 chars for media captions
@@ -1733,13 +1895,24 @@ class TelegramChannel(ChannelPlugin):
                         raise
 
         else:
-            # Unknown callback_data — pass as synthetic text message to the agent
-            # Mirrors TS: any unhandled callbackData forwarded as user message
+            # Unknown callback_data — pass as synthetic text message to the agent.
+            # Mirrors TS: any unhandled callbackData forwarded as user message.
             if query.message and query.from_user:
                 chat = query.message.chat
                 sender = query.from_user
                 is_group = chat.type in ("group", "supergroup")
                 chat_type = "group" if is_group else "direct"
+
+                # Clear the inline keyboard on the original message so the user
+                # cannot double-press while the agent is processing the action.
+                # Mirrors TS bot-handlers.ts: answerCallbackQuery + edit markup.
+                try:
+                    await query.edit_message_reply_markup(reply_markup=None)
+                except Exception as _markup_err:
+                    # Non-fatal: message may have already been edited or deleted
+                    logger.debug(
+                        "Could not clear inline keyboard after callback: %s", _markup_err
+                    )
 
                 inbound = InboundMessage(
                     channel_id=self.id,
@@ -2736,6 +2909,8 @@ class TelegramChannel(ChannelPlugin):
                 "username": sender.username,
                 "chat_title": chat.title,
                 "chat_username": chat.username,
+                **({"message_thread_id": message.message_thread_id}
+                   if getattr(message, "message_thread_id", None) else {}),
             },
         )
 

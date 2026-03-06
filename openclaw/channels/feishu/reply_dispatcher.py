@@ -119,7 +119,14 @@ class FeishuReplyDispatcher:
         if not self._streaming_enabled:
             return False
 
-        session = FeishuStreamingSession(self._client, self._account)
+        # Pass block_coalesce from account config so that when streamingCoalesce
+        # is enabled in the account settings, only the final text is sent (no
+        # intermediate streaming updates). Mirrors TS blockStreamingCoalesce option.
+        _bsc = getattr(self._account, "block_streaming_coalesce", None)
+        _block_coalesce = getattr(_bsc, "enabled", False) if _bsc else False
+        session = FeishuStreamingSession(
+            self._client, self._account, block_coalesce=_block_coalesce
+        )
         ok = await session.start(
             self._receive_id,
             self._receive_id_type,
@@ -137,12 +144,34 @@ class FeishuReplyDispatcher:
         if self._streaming_session:
             await self._streaming_session.update(text)
 
-    async def stream_finalize(self, final_text: str) -> str | None:
-        """Finalize the streaming card and stop typing. Returns message_id."""
+    async def stream_finalize(
+        self,
+        final_text: str,
+        buttons: list[list[dict]] | None = None,
+    ) -> str | None:
+        """
+        Finalize the streaming card and stop typing. Returns message_id.
+
+        When buttons are provided, the streaming card is finalized with the
+        text first, then PATCH-ed again with a button card so users can
+        interact with the response (e.g. confirm / choose).
+        """
         msg_id: str | None = None
         if self._streaming_session:
             msg_id = await self._streaming_session.finalize(final_text)
             self._last_sent_id = msg_id
+
+            # If buttons are requested, patch the now-finalized card with a
+            # full button card (includes both the markdown text and ActionSet).
+            if buttons and msg_id:
+                try:
+                    from .card_builder import build_button_card
+                    from .send import patch_feishu_card
+                    button_card = build_button_card(final_text, buttons)
+                    await patch_feishu_card(self._client, msg_id, button_card)
+                except Exception as _be:
+                    logger.debug("[feishu] Failed to patch button card after finalize: %s", _be)
+
         await self.stop_typing()
         return msg_id
 
@@ -153,14 +182,27 @@ class FeishuReplyDispatcher:
     # Non-streaming single send
     # ------------------------------------------------------------------
 
-    async def send(self, text: str) -> str | None:
+    async def send(
+        self,
+        text: str,
+        buttons: list[list[dict]] | None = None,
+    ) -> str | None:
         """
         Send a complete text reply (non-streaming).
+
+        When buttons are provided, sends an interactive card with both the
+        markdown text and an ActionSet (button card), instead of a plain
+        post message. Button clicks are routed back as synthetic agent messages.
 
         Stops typing indicator when done.
         Returns message_id or None.
         """
         try:
+            card_override = None
+            if buttons:
+                from .card_builder import build_button_card
+                card_override = build_button_card(text, buttons)
+
             result = await send_feishu_message(
                 self._client,
                 receive_id=self._receive_id,
@@ -169,6 +211,7 @@ class FeishuReplyDispatcher:
                 render_mode=self._account.render_mode,
                 reply_to_message_id=self._reply_to_message_id,
                 reply_in_thread=self._reply_in_thread,
+                card_override=card_override,
             )
             msg_id = result.message_id if result else None
             self._last_sent_id = msg_id

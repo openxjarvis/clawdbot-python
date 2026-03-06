@@ -1,96 +1,197 @@
 ---
-name: discord-adv
-description: Advanced Discord server and channel management
-version: 1.0.0
-author: ClawdBot
-tags: [discord, community, gaming]
-requires_bins: []
-requires_env: [DISCORD_BOT_TOKEN]
-requires_config: []
+name: discord
+description: "Discord ops via the message tool (channel=discord)."
+metadata: { "openclaw": { "emoji": "🎮", "requires": { "config": ["channels.discord.token"] } } }
+allowed-tools: ["message"]
 ---
 
-# Discord Advanced Operations
+# Discord (Via `message`)
 
-Advanced Discord operations including server management, roles, channels, and moderation.
+Use the `message` tool. No provider-specific `discord` tool exposed to the agent.
 
-## Available Tools
+## Musts
 
-- **message**: Send messages to Discord channels
-- **discord_actions**: Discord-specific operations
-- **web_fetch**: Access Discord API
+- Always: `channel: "discord"`.
+- Respect gating: `channels.discord.actions.*` (some default off: `roles`, `moderation`, `presence`, `channels`).
+- Prefer explicit ids: `guildId`, `channelId`, `messageId`, `userId`.
+- Multi-account: optional `accountId`.
 
-## Discord API
+## Guidelines
 
-Base URL: `https://discord.com/api/v10/`
+- Avoid Markdown tables in outbound Discord messages.
+- Mention users as `<@USER_ID>`.
+- Prefer Discord components v2 (`components`) for rich UI; use legacy `embeds` only when you must.
 
-### Common Operations
+## Targets
 
-#### Send Message
-```
-POST https://discord.com/api/v10/channels/{channel_id}/messages
-Headers:
-  Authorization: Bot {DISCORD_BOT_TOKEN}
-Body: {
-  "content": "Message text",
-  "embeds": [...]
+- Send-like actions: `to: "channel:<id>"` or `to: "user:<id>"`.
+- Message-specific actions: `channelId: "<id>"` (or `to`) + `messageId: "<id>"`.
+
+## Common Actions (Examples)
+
+Send message:
+
+```json
+{
+  "action": "send",
+  "channel": "discord",
+  "to": "channel:123",
+  "message": "hello",
+  "silent": true
 }
 ```
 
-#### Create Channel
-```
-POST https://discord.com/api/v10/guilds/{guild_id}/channels
-Body: {
-  "name": "channel-name",
-  "type": 0
+Send with media:
+
+```json
+{
+  "action": "send",
+  "channel": "discord",
+  "to": "channel:123",
+  "message": "see attachment",
+  "media": "file:///tmp/example.png"
 }
 ```
 
-#### Add Role
-```
-PUT https://discord.com/api/v10/guilds/{guild_id}/members/{user_id}/roles/{role_id}
-```
+- Optional `silent: true` to suppress Discord notifications.
 
-#### Create Embed
-```python
-embed = {
-    "title": "Embed Title",
-    "description": "Embed description",
-    "color": 3447003,  # Blue
-    "fields": [
-        {"name": "Field 1", "value": "Value 1", "inline": True}
-    ],
-    "footer": {"text": "Footer text"},
-    "timestamp": "2026-01-27T00:00:00Z"
+Send with components v2 (recommended for rich UI):
+
+```json
+{
+  "action": "send",
+  "channel": "discord",
+  "to": "channel:123",
+  "message": "Status update",
+  "components": "[Carbon v2 components]"
 }
 ```
 
-## Usage Examples
+- `components` expects Carbon component instances (Container, TextDisplay, etc.) from JS/TS integrations.
+- Do not combine `components` with `embeds` (Discord rejects v2 + embeds).
 
-User: "Send an embed to #announcements"
-1. Build embed structure
-2. POST to channels/{channel_id}/messages
+Legacy embeds (not recommended):
 
-User: "Create a new voice channel"
-1. Get guild ID
-2. POST to guilds/{guild_id}/channels with type=2
-
-User: "Add moderator role to user"
-1. Find role ID
-2. PUT to add role
-
-## Environment Setup
-
-```bash
-export DISCORD_BOT_TOKEN="Bot ..."
+```json
+{
+  "action": "send",
+  "channel": "discord",
+  "to": "channel:123",
+  "message": "Status update",
+  "embeds": [{ "title": "Legacy", "description": "Embeds are legacy." }]
+}
 ```
 
-Get token from: https://discord.com/developers/applications
+- `embeds` are ignored when components v2 are present.
 
-## Permissions
+React:
 
-Bot needs appropriate permissions:
-- Manage Channels
-- Manage Roles
-- Send Messages
-- Embed Links
-- Attach Files
+```json
+{
+  "action": "react",
+  "channel": "discord",
+  "channelId": "123",
+  "messageId": "456",
+  "emoji": "✅"
+}
+```
+
+Read:
+
+```json
+{
+  "action": "read",
+  "channel": "discord",
+  "to": "channel:123",
+  "limit": 20
+}
+```
+
+Edit / delete:
+
+```json
+{
+  "action": "edit",
+  "channel": "discord",
+  "channelId": "123",
+  "messageId": "456",
+  "message": "fixed typo"
+}
+```
+
+```json
+{
+  "action": "delete",
+  "channel": "discord",
+  "channelId": "123",
+  "messageId": "456"
+}
+```
+
+Poll:
+
+```json
+{
+  "action": "poll",
+  "channel": "discord",
+  "to": "channel:123",
+  "pollQuestion": "Lunch?",
+  "pollOption": ["Pizza", "Sushi", "Salad"],
+  "pollMulti": false,
+  "pollDurationHours": 24
+}
+```
+
+Pins:
+
+```json
+{
+  "action": "pin",
+  "channel": "discord",
+  "channelId": "123",
+  "messageId": "456"
+}
+```
+
+Threads:
+
+```json
+{
+  "action": "thread-create",
+  "channel": "discord",
+  "channelId": "123",
+  "messageId": "456",
+  "threadName": "bug triage"
+}
+```
+
+Search:
+
+```json
+{
+  "action": "search",
+  "channel": "discord",
+  "guildId": "999",
+  "query": "release notes",
+  "channelIds": ["123", "456"],
+  "limit": 10
+}
+```
+
+Presence (often gated):
+
+```json
+{
+  "action": "set-presence",
+  "channel": "discord",
+  "activityType": "playing",
+  "activityName": "with fire",
+  "status": "online"
+}
+```
+
+## Writing Style (Discord)
+
+- Short, conversational, low ceremony.
+- No markdown tables.
+- Mention users as `<@USER_ID>`.

@@ -1,38 +1,38 @@
 ---
 name: openai-whisper
-description: Speech-to-text with Whisper
-version: 1.0.0
-author: ClawdBot
-tags: [ai, stt, whisper]
-requires_bins: []
-requires_env: []
-requires_config: []
+description: Local speech-to-text with the Whisper CLI (no API key).
+homepage: https://openai.com/research/whisper
+metadata:
+  {
+    "openclaw":
+      {
+        "emoji": "🎙️",
+        "requires": { "bins": ["whisper"] },
+        "install":
+          [
+            {
+              "id": "brew",
+              "kind": "brew",
+              "formula": "openai-whisper",
+              "bins": ["whisper"],
+              "label": "Install OpenAI Whisper (brew)",
+            },
+          ],
+      },
+  }
 ---
 
-# OpenAI Whisper
+# Whisper (CLI)
 
-Speech-to-text with Whisper
+Use `whisper` to transcribe audio locally.
 
-## Available Tools
+Quick start
 
-This skill uses ClawdBot's standard tools:
-- **bash** - Execute commands
-- **read_file** - Read files
-- **write_file** - Write files  
-- **web_fetch** - Fetch web content
-- **web_search** - Search the web
+- `whisper /path/audio.mp3 --model medium --output_format txt --output_dir .`
+- `whisper /path/audio.m4a --task translate --output_format srt`
 
-## Usage Examples
+Notes
 
-User: "Help me with openai whisper"
-1. Assess what the user needs
-2. Use appropriate tools
-3. Provide helpful response
-
-## Configuration
-
-Check documentation for specific setup requirements.
-
-## Notes
-
-This skill requires integration with OpenAI Whisper service/application.
+- Models download to `~/.cache/whisper` on first run.
+- `--model` defaults to `turbo` on this install.
+- Use smaller models for speed, larger for accuracy.

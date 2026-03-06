@@ -1,11 +1,7 @@
 ---
 name: web-search
-description: Search the web for information
-version: 1.0.0
-author: ClawdBot
-tags: [web, search, information]
-requires_bins: []
-requires_env: []
+description: "Search the web for information and fetch URL content. Use when user asks to search for recent information, look up websites, fetch web page content, or find online resources. No external tools required — uses built-in web_search and web_fetch capabilities."
+metadata: { "openclaw": { "emoji": "🔍", "always": true } }
 ---
 
 # Web Search

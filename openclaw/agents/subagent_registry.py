@@ -90,10 +90,20 @@ class SubagentRegistry:
         self._pending_lifecycle_errors: dict[str, asyncio.TimerHandle | asyncio.Task] = {}
         # Optional hook runner for subagent lifecycle hooks
         self._hook_runner: Any | None = hook_runner
+        # Optional gateway reference — wired in by bootstrap (mirrors TS pattern)
+        self._gateway: Any | None = None
 
     def set_hook_runner(self, hook_runner: Any) -> None:
         """Wire in a PluginHookRunner to fire subagent lifecycle hooks."""
         self._hook_runner = hook_runner
+
+    def set_gateway(self, gateway: Any) -> None:
+        """Wire in the GatewayServer so announce/cleanup flows can call it directly.
+
+        Mirrors TS pattern where the announce flow has direct access to the
+        gateway.  Called once during bootstrap after the server is created.
+        """
+        self._gateway = gateway
     
     def _resolve_archive_after_ms(self) -> int | None:
         """
@@ -423,33 +433,134 @@ class SubagentRegistry:
             # Unblock deferred sibling announces (mirrors TS retryDeferredCompletedAnnounces)
             self._retry_deferred_completed_announces(exclude_run_id=run_id)
     
-    async def _trigger_announce_and_cleanup(self, entry: SubagentRunRecord):
+    async def _trigger_announce_and_cleanup(self, entry: SubagentRunRecord) -> None:
+        """Trigger announce flow and cleanup for a completed run.
+
+        This method is the Python equivalent of TS ``startSubagentAnnounceCleanupFlow``
+        + ``runSubagentAnnounceFlow`` retry wrapper.  It:
+
+        1. Calls ``run_subagent_announce_flow`` with all keyword args unpacked
+           from the ``SubagentRunRecord`` (Bug 1 fix).
+        2. Retries up to ``MAX_ANNOUNCE_RETRY_COUNT`` times with exponential
+           backoff if the announce returns False / raises (Gap 3 fix).
+        3. Gives up after ``ANNOUNCE_EXPIRY_MS`` regardless of retry count.
+        4. Passes ``self._gateway`` so the announce flow can deliver directly
+           without needing a separate RPC client (Gap 5 fix).
+        5. Falls back to ``_cleanup_session`` for session deletion when gateway
+           is unavailable inside the announce flow.
+
+        Mirrors TS ``startSubagentAnnounceCleanupFlow()`` /
+        ``runSubagentAnnounceFlow()`` retry logic.
         """
-        Trigger announce flow and cleanup for completed run
-        
-        Used for restoring runs that ended during gateway restart.
-        
-        Args:
-            entry: SubagentRunRecord that has ended
-        """
-        try:
-            logger.info(f"Triggering announce and cleanup for run {entry.run_id}")
-            
-            # Import here to avoid circular dependency
-            from .subagent_announce import run_subagent_announce_flow
-            
-            # Trigger announce flow
-            await run_subagent_announce_flow(entry)
-            
-            # Cleanup session if requested
-            if entry.cleanup == "delete":
-                await self._cleanup_session(entry.child_session_key)
-            
-            # Mark cleanup completed
-            self.mark_cleanup_completed(entry.run_id)
-            
-        except Exception as e:
-            logger.error(f"Failed to trigger announce/cleanup for run {entry.run_id}: {e}")
+        from .subagent_announce import run_subagent_announce_flow
+
+        run_id = entry.run_id
+        timeout_ms = (
+            entry.run_timeout_seconds * 1000
+            if entry.run_timeout_seconds
+            else 300_000
+        )
+        now_ms = int(time.time() * 1000)
+
+        # Suppress announce for kills / steer-restarts (mirrors TS suppressAnnounceReason)
+        if entry.suppress_announce_reason in ("killed", "steer-restart"):
+            logger.debug(
+                "Skipping announce for run %s (reason=%s)",
+                run_id,
+                entry.suppress_announce_reason,
+            )
+            self.mark_cleanup_completed(run_id)
+            return
+
+        # Expiry check — give up if the run ended too long ago
+        if entry.ended_at and (now_ms - entry.ended_at) > ANNOUNCE_EXPIRY_MS:
+            logger.warning(
+                "Announce expiry give-up for run %s (ended %dms ago)",
+                run_id,
+                now_ms - entry.ended_at,
+            )
+            self.mark_cleanup_completed(run_id)
+            return
+
+        logger.info("Triggering announce and cleanup for run %s", run_id)
+
+        announced = False
+        attempt = 0
+        max_attempts = MAX_ANNOUNCE_RETRY_COUNT + 1  # initial + retries
+
+        while attempt < max_attempts:
+            # Re-check expiry on every retry iteration
+            now_ms = int(time.time() * 1000)
+            if entry.ended_at and (now_ms - entry.ended_at) > ANNOUNCE_EXPIRY_MS:
+                logger.warning(
+                    "Announce expiry give-up (retry %d) for run %s", attempt, run_id
+                )
+                break
+
+            try:
+                announced = await run_subagent_announce_flow(
+                    child_session_key=entry.child_session_key,
+                    child_run_id=run_id,
+                    requester_session_key=entry.requester_session_key,
+                    requester_origin=entry.requester_origin,
+                    requester_display_key=entry.requester_display_key,
+                    task=entry.task,
+                    timeout_ms=timeout_ms,
+                    cleanup=entry.cleanup,  # type: ignore[arg-type]
+                    # The run has already ended — skip the wait step
+                    wait_for_completion=False,
+                    started_at=entry.started_at,
+                    ended_at=entry.ended_at,
+                    label=entry.label,
+                    outcome=entry.outcome,
+                    expects_completion_message=entry.expects_completion_message,
+                    gateway=self._gateway,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Announce attempt %d failed for run %s: %s",
+                    attempt + 1,
+                    run_id,
+                    exc,
+                )
+                announced = False
+
+            if announced:
+                break
+
+            attempt += 1
+            if attempt < max_attempts:
+                # Exponential backoff: 1s, 2s, 4s … capped at MAX_ANNOUNCE_RETRY_DELAY_MS
+                delay_ms = min(
+                    MIN_ANNOUNCE_RETRY_DELAY_MS * (2 ** (attempt - 1)),
+                    MAX_ANNOUNCE_RETRY_DELAY_MS,
+                )
+                entry.announce_retry_count = attempt
+                entry.last_announce_retry_at = int(time.time() * 1000)
+                self._persist()
+                logger.info(
+                    "Announce retry %d/%d for run %s in %.1fs",
+                    attempt,
+                    MAX_ANNOUNCE_RETRY_COUNT,
+                    run_id,
+                    delay_ms / 1000,
+                )
+                await asyncio.sleep(delay_ms / 1000)
+
+        if not announced:
+            logger.warning(
+                "Could not announce run %s after %d attempt(s); proceeding with cleanup",
+                run_id,
+                attempt,
+            )
+
+        # Fallback session cleanup: when gateway was unavailable inside the
+        # announce flow, ``run_subagent_announce_flow`` skips deletion.
+        # We handle it here via RPC so the child session is always cleaned up.
+        if entry.cleanup == "delete" and not (self._gateway and announced):
+            await self._cleanup_session(entry.child_session_key)
+
+        self.mark_cleanup_completed(run_id)
     
     async def _resume_wait_for_completion(self, entry: SubagentRunRecord):
         """

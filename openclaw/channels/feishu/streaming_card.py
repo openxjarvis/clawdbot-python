@@ -102,6 +102,28 @@ def _truncate_summary(text: str, max_len: int = _SUMMARY_MAX_LEN) -> str:
 
 _token_cache: dict[str, tuple[str, float]] = {}   # key → (token, expire_at)
 
+# Module-level strong reference set to prevent asyncio task GC.
+# Python 3.12+ asyncio does NOT keep strong refs to tasks; if the FeishuStreamingSession
+# object is GC'd while the worker is pending, the task gets destroyed with a warning:
+#   "Task was destroyed but it is pending!"
+# We hold a strong ref here and remove it when the task completes.
+_active_worker_tasks: set = set()
+
+
+def _resolve_api_base(domain_url: str) -> str:
+    """Return the Feishu/Lark open-API base URL with /open-apis suffix.
+
+    Mirrors TS resolveApiBase() in streaming-card.ts:
+      - "https://open.larksuite.com" → "https://open.larksuite.com/open-apis"
+      - "https://custom.domain.com"  → "https://custom.domain.com/open-apis"
+      - "https://open.feishu.cn"     → "https://open.feishu.cn/open-apis"
+    If the URL already ends with /open-apis, it is returned unchanged.
+    """
+    base = domain_url.rstrip("/")
+    if base.endswith("/open-apis"):
+        return base
+    return f"{base}/open-apis"
+
 
 async def _get_tenant_token(
     app_id: str,
@@ -111,14 +133,15 @@ async def _get_tenant_token(
     """Fetch and cache a tenant_access_token. Mirrors TS getToken()."""
     import aiohttp
 
-    cache_key = f"{domain_url}:{app_id}"
+    api_base = _resolve_api_base(domain_url)
+    cache_key = f"{api_base}:{app_id}"
     cached = _token_cache.get(cache_key)
     if cached:
         token, expire_at = cached
         if time.time() < expire_at - 60:
             return token
 
-    url = f"{domain_url}/auth/v3/tenant_access_token/internal"
+    url = f"{api_base}/auth/v3/tenant_access_token/internal"
     payload = {"app_id": app_id, "app_secret": app_secret}
 
     try:
@@ -153,7 +176,8 @@ async def _cardkit_request(
     """Make an authenticated request to the CardKit REST API."""
     import aiohttp
 
-    url = f"{domain_url}{path}"
+    # CardKit API lives under /open-apis — mirrors TS resolveApiBase() usage.
+    url = f"{_resolve_api_base(domain_url)}{path}"
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json; charset=utf-8",
@@ -172,15 +196,26 @@ async def _cardkit_request(
             async with fn(url, **kwargs) as resp:
                 if resp.status not in {200, 201, 204}:
                     body = await resp.text()
-                    logger.debug(
-                        "[feishu] CardKit %s %s → %s: %s", method, path, resp.status, body[:200]
+                    logger.warning(
+                        "[feishu] CardKit %s %s → HTTP %s: %s",
+                        method, path, resp.status, body[:300],
                     )
                     return None
                 if resp.status == 204:
                     return {}
-                return await resp.json()
+                result = await resp.json()
+                # Feishu CardKit returns {"code": 0} on success; non-zero indicates error
+                code = result.get("code") if isinstance(result, dict) else None
+                if code is not None and code != 0:
+                    msg = result.get("msg", "unknown error")
+                    logger.warning(
+                        "[feishu] CardKit %s %s error: code=%s msg=%s",
+                        method, path, code, msg,
+                    )
+                    return None
+                return result
     except Exception as e:
-        logger.debug("[feishu] CardKit %s %s error: %s", method, path, e)
+        logger.warning("[feishu] CardKit %s %s error: %s", method, path, e)
         return None
 
 
@@ -299,8 +334,13 @@ class FeishuStreamingSession:
 
         self._message_id = msg_id
 
-        # Start background worker to drain update queue serially
+        # Start background worker to drain update queue serially.
+        # Keep a strong module-level reference so the task is not GC'd if the
+        # session object goes out of scope while the worker is still pending.
+        # Mirrors Python asyncio best-practice: "save a reference to avoid GC".
         self._worker_task = asyncio.create_task(self._update_worker())
+        _active_worker_tasks.add(self._worker_task)
+        self._worker_task.add_done_callback(_active_worker_tasks.discard)
         return True
 
     async def update(self, text: str) -> None:
@@ -365,7 +405,7 @@ class FeishuStreamingSession:
                     "summary": {"content": _truncate_summary(self._current_text)},
                 }
             }
-            await _cardkit_request(
+            patch_result = await _cardkit_request(
                 "PATCH",
                 f"{_CARDKIT_PATH_CARDS}/{self._card_id}/settings",
                 token=token,
@@ -376,6 +416,14 @@ class FeishuStreamingSession:
                     "uuid": f"c_{self._card_id}_{self._sequence}",
                 },
             )
+            if patch_result is None:
+                logger.warning(
+                    "[feishu] Failed to close streaming card (streaming_mode stays true). "
+                    "card_id=%s — see WARNING above for details",
+                    self._card_id,
+                )
+        elif not token:
+            logger.warning("[feishu] Cannot finalize streaming card: no tenant token")
 
         return self._message_id
 
@@ -425,13 +473,19 @@ class FeishuStreamingSession:
             "sequence": self._sequence,
             "uuid": f"s_{self._card_id}_{self._sequence}",  # per-update uuid — mirrors TS
         }
-        await _cardkit_request(
+        result = await _cardkit_request(
             "PUT",
             f"{_CARDKIT_PATH_CARDS}/{self._card_id}/elements/content/content",
             token=token,
             domain_url=self._account.domain_url,
             data=content_body,
         )
+        if result is None:
+            logger.debug(
+                "[feishu] CardKit content update failed (seq=%d, len=%d chars) — "
+                "see WARNING above for details",
+                self._sequence, len(text),
+            )
         self._current_text = text
         self._last_update_at = time.monotonic()
 

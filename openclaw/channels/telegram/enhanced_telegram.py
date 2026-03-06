@@ -65,6 +65,13 @@ class EnhancedTelegramChannel(TelegramChannel):
 
     async def start(self, config: dict[str, Any]) -> None:
         """Start with reconnection support."""
+        if self._running and self._app is not None:
+            logger.warning(
+                "[%s] Enhanced Telegram channel already running — ignoring duplicate start()",
+                self.id,
+            )
+            return
+
         self._config = config
         self._bot_token = config.get("botToken") or config.get("bot_token")
 

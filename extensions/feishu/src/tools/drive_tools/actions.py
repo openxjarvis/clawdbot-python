@@ -75,7 +75,10 @@ async def create_folder(client: Any, name: str, folder_token: str | None = None)
         except Exception:
             resolved_token = "0"
 
-    body = CreateFolderFileRequestBody.builder().name(name).folder_token(resolved_token or "0").build()
+    body_builder = CreateFolderFileRequestBody.builder().name(name)
+    if resolved_token:
+        body_builder = body_builder.folder_token(resolved_token)
+    body = body_builder.build()
     req = CreateFolderFileRequest.builder().request_body(body).build()
     resp = await loop.run_in_executor(None, lambda: client.drive.v1.file.create_folder(req))
     if not resp.success():

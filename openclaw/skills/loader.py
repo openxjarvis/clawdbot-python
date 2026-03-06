@@ -1,5 +1,11 @@
 """Skills loader — aligned with TypeScript openclaw/src/agents/skills/workspace.ts.
 
+CANONICAL implementation: ``openclaw.agents.skills``
+This module is the *standalone* (lightweight) loader kept for legacy/test consumers.
+New callers should import from ``openclaw.agents.skills`` or ``openclaw.skills``
+(which re-exports the canonical API).
+
+
 Skill directory precedence (lowest → highest):
   extra (config + plugins) < bundled < managed < agents-skills-personal
   < agents-skills-project < workspace

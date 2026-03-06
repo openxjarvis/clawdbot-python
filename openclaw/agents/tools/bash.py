@@ -1,13 +1,22 @@
 """
-Bash execution tool matching pi-mono's bash.ts
+Bash execution tool — matches openclaw/src/agents/bash-tools.exec.ts
 
-This module provides bash command execution with:
+Provides the full security pipeline before executing any command:
+  security=deny   → reject immediately
+  security=full   → run unconditionally
+  security=allowlist →
+    1. detect_command_obfuscation (16 patterns)
+    2. evaluate_shell_allowlist   (chain splitting + safeBins)
+    3. requires_exec_approval     (ask=on-miss / always)
+    4. request_exec_approval_via_socket  (UNIX socket ↔ UI/CLI)
+    5. on allow-always: persist pattern to exec-approvals.json
+    6. on deny/timeout → askFallback logic
+
+Also provides:
 - Output truncation (50KB/2000 lines)
 - Streaming updates via on_update callback
 - Cancellation support via signal
-- Pluggable operations for remote execution
-
-Matches pi-mono/packages/coding-agent/src/core/tools/bash.ts
+- Pluggable operations for remote execution (gateway / node / sandbox)
 """
 from __future__ import annotations
 
@@ -36,17 +45,36 @@ def create_bash_tool(
     command_prefix: str | None = None,
     timeout: int | None = None,
     working_dir: str | None = None,
+    exec_host: str | None = None,
+    exec_node_id: str | None = None,
+    # ── Security parameters (mirrors TS ExecToolConfig) ──────────────────────
+    exec_security: str | None = None,          # "deny" | "allowlist" | "full"
+    exec_ask: str | None = None,               # "off" | "on-miss" | "always"
+    exec_ask_fallback: str | None = None,      # "deny" | "allowlist" | "full"
+    exec_safe_bins: list[str] | None = None,   # bins allowed without allowlist entry
+    exec_agent_id: str | None = None,          # agent ID for per-agent allowlist lookup
+    exec_approval_timeout_ms: int = 120_000,   # approval socket timeout
 ) -> AgentToolBase:
     """
     Create a bash tool configured for a specific working directory.
-    
+
     Args:
         cwd: Current working directory for commands
-        operations: Bash operations implementation (defaults to local subprocess)
-        command_prefix: Optional prefix to prepend to commands (e.g., "shopt -s expand_aliases")
-        timeout: Default timeout in seconds for commands (can be overridden per-call via params)
+        operations: Bash operations implementation (overrides exec_host routing)
+        command_prefix: Optional prefix to prepend to commands
+        timeout: Default timeout in seconds
         working_dir: Alias for cwd (for backward compatibility)
-        
+        exec_host: Execution host — "gateway" (default), "node", or "sandbox".
+                   When "node", routes via NodeBashOperations to exec_node_id.
+                   When "sandbox", uses the injected operations (sandbox executor).
+        exec_node_id: Node ID to route to when exec_host="node".
+        exec_security: Security mode: "deny" | "allowlist" | "full" (default "deny")
+        exec_ask: Ask mode: "off" | "on-miss" | "always" (default "on-miss")
+        exec_ask_fallback: Fallback on approval timeout: "deny" | "allowlist" | "full"
+        exec_safe_bins: Extra safe-bin names (beyond defaults)
+        exec_agent_id: Agent ID for per-agent allowlist in exec-approvals.json
+        exec_approval_timeout_ms: Timeout for UNIX-socket approval request (ms)
+
     Returns:
         Configured BashTool instance
     """
@@ -57,10 +85,27 @@ def create_bash_tool(
     if cwd is None:
         cwd = _os.getcwd()
     default_timeout = timeout
-    ops = operations or DefaultBashOperations()
-    
+
+    # Resolve operations based on exec_host (if not explicitly provided)
+    if operations is None:
+        if exec_host == "node" and exec_node_id:
+            from .node_operations import NodeBashOperations
+            operations = NodeBashOperations(exec_node_id)
+        else:
+            # "gateway" (default) or "sandbox" — caller provides sandbox ops
+            operations = DefaultBashOperations()
+
+    ops = operations
     _cwd = cwd
     _default_timeout = default_timeout
+
+    # Resolved security config.
+    # None means "not configured" → no security gate (pi-mono / unit-test mode).
+    # Explicit "deny"/"allowlist"/"full" activates the security pipeline.
+    _security = exec_security  # may be None → skip pipeline
+    _ask = exec_ask or "on-miss"
+    _ask_fallback = exec_ask_fallback or "deny"
+    _agent_id = exec_agent_id
 
     class BashTool(AgentToolBase[dict, dict]):
         """Bash command execution tool"""
@@ -111,13 +156,139 @@ def create_bash_tool(
             signal: asyncio.Event | None = None,
             on_update: Callable[[AgentToolResult], None] | None = None,
         ) -> AgentToolResult[dict]:
-            """Execute bash command with streaming and truncation"""
-            
+            """Execute bash command with full security pipeline + streaming + truncation."""
+
             command = params["command"]
             timeout = params.get("timeout") or default_timeout
-            
+
             # Apply command prefix if configured
             resolved_command = f"{command_prefix}\n{command}" if command_prefix else command
+
+            # ── SECURITY PIPELINE (mirrors bash-tools.exec-host-gateway.ts) ──────
+            # Only engage when exec_security is explicitly configured.
+            # None means pi-mono / unconfigured mode — no security gate.
+
+            if _security is not None:
+                # Step 1: Hard deny — block all execution
+                if _security == "deny":
+                    raise Exception(
+                        "exec denied: security mode is 'deny'. "
+                        "Set tools.exec.security to 'allowlist' or 'full' to enable execution."
+                    )
+
+            # Step 2: Obfuscation detection (always, regardless of security mode)
+            if _security in ("allowlist", "full"):
+                try:
+                    from openclaw.infra.exec_obfuscation_detect import detect_command_obfuscation
+                    obfus = detect_command_obfuscation(resolved_command)
+                    if obfus.detected:
+                        raise Exception(
+                            f"exec denied: command obfuscation detected "
+                            f"({', '.join(obfus.matched_patterns)}). "
+                            f"Use plain commands to enable allowlist approval."
+                        )
+                except ImportError:
+                    pass
+
+            # Step 3: For allowlist mode, evaluate + approval flow
+            if _security is not None and _security == "allowlist":
+                from openclaw.infra.exec_approvals_file import (
+                    resolve_exec_approvals,
+                    requires_exec_approval,
+                    add_allowlist_entry,
+                    record_allowlist_use,
+                    request_exec_approval_via_socket,
+                )
+                from openclaw.infra.exec_approvals_allowlist import (
+                    evaluate_shell_allowlist,
+                    resolve_safe_bins,
+                    resolve_allow_always_patterns,
+                )
+
+                approvals_ctx = resolve_exec_approvals(_agent_id)
+                safe_bins = resolve_safe_bins(exec_safe_bins)
+
+                analysis = evaluate_shell_allowlist(
+                    command=resolved_command,
+                    allowlist=approvals_ctx["allowlist"],
+                    safe_bins=safe_bins,
+                    cwd=_cwd,
+                )
+
+                # If analysis failed and we cannot ask, deny immediately
+                if not analysis.analysis_ok and _ask == "off":
+                    raise Exception(
+                        "exec denied: command analysis failed (shell line-continuation or "
+                        "parse error) and ask=off."
+                    )
+
+                # If allowlist not satisfied and ask=off, deny without prompting
+                if not analysis.allowlist_satisfied and _ask == "off":
+                    raise Exception(
+                        "exec denied: command not in allowlist and ask=off. "
+                        "Add the command to exec-approvals.json or set ask=on-miss."
+                    )
+
+                needs_approval = requires_exec_approval(
+                    ask=_ask,
+                    security=_security,
+                    analysis_ok=analysis.analysis_ok,
+                    allowlist_satisfied=analysis.allowlist_satisfied,
+                )
+
+                if needs_approval:
+                    # Build request payload for socket approval
+                    request_payload = {
+                        "command": resolved_command,
+                        "cwd": _cwd,
+                        "host": exec_host or "gateway",
+                        "security": _security,
+                        "ask": _ask,
+                        "agentId": _agent_id,
+                    }
+                    socket_path = approvals_ctx.get("socketPath", "")
+                    token = approvals_ctx.get("token", "")
+
+                    decision = await request_exec_approval_via_socket(
+                        socket_path=socket_path,
+                        token=token,
+                        request=request_payload,
+                        timeout_ms=exec_approval_timeout_ms,
+                    )
+
+                    if decision is None:
+                        # Socket timeout → apply askFallback
+                        if _ask_fallback == "full":
+                            pass  # allow through
+                        elif _ask_fallback == "allowlist" and analysis.allowlist_satisfied:
+                            pass  # allow through since it was already satisfied
+                        else:
+                            raise Exception(
+                                f"exec denied: approval request timed out (ask_fallback={_ask_fallback}). "
+                                f"Start the approval server or change ask_fallback."
+                            )
+                    elif decision == "deny":
+                        raise Exception("exec denied: user rejected the command.")
+                    elif decision == "allow-always":
+                        # Persist resolved patterns to exec-approvals.json
+                        file = approvals_ctx["file"]
+                        for pattern in resolve_allow_always_patterns(
+                            analysis.segments, cwd=_cwd
+                        ):
+                            add_allowlist_entry(file, _agent_id, pattern)
+                    # "allow-once" → just run without persisting
+
+                # Record usage for matched allowlist entries
+                if analysis.allowlist_matches:
+                    try:
+                        file = approvals_ctx["file"]
+                        for entry in analysis.allowlist_matches:
+                            record_allowlist_use(file, _agent_id, entry, resolved_command)
+                    except Exception:
+                        pass
+
+            # Step 4: security=full → run without any checks (still past obfuscation check above)
+            # ── END SECURITY PIPELINE ─────────────────────────────────────────
             
             # Streaming output management
             # Keep a rolling buffer of the last chunk for tail truncation

@@ -24,7 +24,7 @@ TOOL_NAME_ALIASES: dict[str, str] = {
     "apply-patch": "apply_patch",
 }
 
-# Tool groups (mirrors TS TOOL_GROUPS)
+# Tool groups (mirrors TS TOOL_GROUPS / buildCoreToolGroupMap in tool-catalog.ts)
 TOOL_GROUPS: dict[str, list[str]] = {
     "group:memory": ["memory_search", "memory_get"],
     "group:web": ["web_search", "web_fetch"],
@@ -42,7 +42,10 @@ TOOL_GROUPS: dict[str, list[str]] = {
     "group:automation": ["cron", "gateway"],
     "group:messaging": ["message"],
     "group:nodes": ["nodes"],
+    "group:agents": ["agents_list"],          # TS: sectionId="agents"
+    "group:media": ["image", "tts"],          # TS: sectionId="media"
     "group:openclaw": [
+        # All tools with includeInOpenClawGroup=true in TS tool-catalog.ts
         "browser",
         "canvas",
         "nodes",
@@ -61,6 +64,7 @@ TOOL_GROUPS: dict[str, list[str]] = {
         "web_search",
         "web_fetch",
         "image",
+        "tts",           # TS includes tts in group:openclaw
     ],
 }
 
@@ -384,7 +388,11 @@ def filter_tools_by_policy(
     return [tool for tool in tools if matcher(tool.name)]
 
 
-# Owner-only tools that non-owners should not access
+# Owner-only tools at pi-mono coding-agent layer:
+# bash/exec (shell execution) + write-type tools + send_message require owner privilege.
+# This mirrors pi-mono/packages/coding-agent pi-tools.policy.ts owner-only defaults.
+# NOTE: openclaw-level admin tools (cron, gateway, whatsapp_login) are in
+#       openclaw.security.tool_policy.OWNER_ONLY_TOOL_NAMES, used by access-control middleware.
 _OWNER_ONLY_TOOLS: frozenset[str] = frozenset({"bash", "exec", "send_message", "write_file", "write"})
 
 # Profile definitions (what tools each profile includes)
@@ -669,7 +677,8 @@ def resolve_group_tool_policy(
 
 
 class ToolPolicy:
-    """Structured tool policy with profile, allow/deny/alsoAllow lists and per-provider overrides."""
+    """Structured tool policy with profile, allow/deny/alsoAllow lists, per-provider
+    and per-sender overrides (mirrors TS ToolPolicy + GroupToolPolicyBySenderConfig)."""
 
     def __init__(
         self,
@@ -678,12 +687,45 @@ class ToolPolicy:
         deny: list[str] | None = None,
         also_allow: list[str] | None = None,
         by_provider: dict[str, "ToolPolicy"] | None = None,
+        by_sender: dict[str, "ToolPolicy"] | None = None,
     ) -> None:
         self.profile = profile
         self.allow = allow
         self.deny = deny
         self.also_allow = also_allow  # alsoAllow: extends profile without replacing allow
         self.by_provider = by_provider or {}
+        self.by_sender = by_sender or {}  # sender_id -> ToolPolicy override
+
+
+def resolve_sender_tool_policy(
+    base_policy: ToolPolicy,
+    sender_id: str | None,
+) -> ToolPolicy:
+    """
+    Resolve per-sender tool policy override.
+
+    Mirrors TS GroupToolPolicyBySenderConfig lookup in resolveGroupToolPolicy():
+    - If sender_id matches a key in base_policy.by_sender, returns that ToolPolicy.
+    - Otherwise returns the base_policy unchanged.
+
+    Args:
+        base_policy: The resolved base ToolPolicy (global or group-level).
+        sender_id: Sender identifier (e.g. phone number, user ID, chat ID).
+
+    Returns:
+        Effective ToolPolicy for this sender.
+    """
+    if not sender_id or not base_policy.by_sender:
+        return base_policy
+    override = base_policy.by_sender.get(sender_id)
+    if override is None:
+        # Try case-insensitive lookup
+        sender_lower = sender_id.strip().lower()
+        override = next(
+            (v for k, v in base_policy.by_sender.items() if k.strip().lower() == sender_lower),
+            None,
+        )
+    return override if override is not None else base_policy
 
 
 class ToolPolicyResolver:
@@ -697,12 +739,17 @@ class ToolPolicyResolver:
         policy: ToolPolicy,
         provider: str | None = None,
         sender_is_owner: bool = False,
+        sender_id: str | None = None,
     ) -> list[str]:
         """Return the list of tool names allowed by the policy."""
         # Per-provider override
         effective_policy = policy
         if provider and provider in policy.by_provider:
             effective_policy = policy.by_provider[provider]
+
+        # Per-sender override (F4: GroupToolPolicyBySenderConfig)
+        if sender_id:
+            effective_policy = resolve_sender_tool_policy(effective_policy, sender_id)
 
         # Profile filter
         profile_tools = _PROFILE_TOOLS.get(effective_policy.profile)

@@ -111,6 +111,7 @@ class DiscordChannel(ChannelPlugin):
         metadata: dict[str, Any] | None = None,
         *,
         stream_chunks: list[str] | None = None,
+        buttons: list[list[dict]] | None = None,
     ) -> str:
         """Send a text reply.
 
@@ -164,6 +165,52 @@ class DiscordChannel(ChannelPlugin):
                 except Exception as exc:
                     logger.warning("[discord] Streaming send failed, falling back: %s", exc)
                     # Fall through to standard send
+
+        # Buttons path — send message with interactive View (discord.ui.View).
+        # Converts [[buttons:...]] directive data into Discord button components
+        # and routes clicks back to the agent as synthetic InboundMessages.
+        # Mirrors TS: send.components.ts sendDiscordComponentMessage()
+        if buttons:
+            from .components import build_discord_buttons_view
+            from .outbound import resolve_send_target
+
+            async def _on_click(callback_data: str, ctx: dict) -> None:
+                """Route button click to agent as synthetic InboundMessage."""
+                from ..base import InboundMessage
+                import time as _time
+                inbound = InboundMessage(
+                    channel_id=self.id,
+                    message_id=f"btn_{ctx.get('message_id', '')}_{int(_time.time() * 1000)}",
+                    sender_id=ctx.get("user_id", ""),
+                    sender_name=ctx.get("user_name", ""),
+                    chat_id=ctx.get("channel_id", target),
+                    chat_type="channel" if ctx.get("guild_id") else "direct",
+                    text=callback_data,
+                    timestamp=str(int(_time.time())),
+                    metadata={
+                        "type": "button_interaction",
+                        "discord_component": ctx,
+                    },
+                )
+                await self._handle_message(inbound)
+
+            view = build_discord_buttons_view(buttons, on_click=_on_click)
+            try:
+                channel_obj = await resolve_send_target(client, target)
+                reply_ref = None
+                if reply_to:
+                    import discord
+                    try:
+                        reply_msg = await channel_obj.fetch_message(int(reply_to))
+                        reply_ref = reply_msg
+                    except Exception:
+                        pass
+                full_text = f"{response_prefix}{text}" if response_prefix else text
+                msg = await channel_obj.send(full_text, view=view, reference=reply_ref)
+                return str(msg.id) if msg else ""
+            except Exception as exc:
+                logger.warning("[discord] send_text with buttons failed, falling back: %s", exc)
+                # Fall through to standard send without buttons
 
         # Standard synchronous send
         from .outbound import send_discord_text

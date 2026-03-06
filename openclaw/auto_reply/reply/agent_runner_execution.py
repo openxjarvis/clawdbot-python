@@ -106,6 +106,10 @@ async def run_agent_turn_with_fallback(
     run_id: str | None = None,
     session_key: str | None = None,
     typing_signaler: Any | None = None,  # TypingSignaler | None
+    stream_callback: Any | None = None,  # Callable[[str], None] | None — called with full accumulated text on each delta
+    status_reactions: Any | None = None,  # TelegramStatusReactions | None
+    reasoning_stream_callback: Any | None = None,  # Callable[[str], None] | None — called with reasoning text on each delta
+    reasoning_level: str = "off",  # "off" | "on" | "stream"
 ) -> tuple[str, bool]:
     """Execute an agent turn with automatic retry on transient errors.
 
@@ -139,23 +143,42 @@ async def run_agent_turn_with_fallback(
                 pass
 
         try:
-            async for event in runtime.run_turn(
-                session,
-                message,
-                tools=tools,
-                model=model,
-                system_prompt=system_prompt,
-                images=images,
-                run_id=run_id,
-                session_key=session_key,
-            ):
+            # Pass stream_callback into run_turn so PiAgentRuntime can call it
+            # in real-time as each text delta arrives from the queue consumer loop.
+            # PiAgentRuntime.run_turn() accepts stream_callback as a kwarg; other
+            # runtimes (MultiProviderRuntime) that don't support it will ignore
+            # the unknown kwarg only if they have **kwargs — for safety we wrap.
+            _rt_kwargs: dict = {
+                "tools": tools,
+                "model": model,
+                "system_prompt": system_prompt,
+                "images": images,
+                "run_id": run_id,
+                "session_key": session_key,
+            }
+            # Only pass stream_callback for real-time streaming when reasoning is off.
+            # When reasoning is on, text must be split first (done post-run below),
+            # so we cannot forward the raw accumulated text to the draft stream live.
+            if stream_callback is not None and reasoning_level == "off" and hasattr(runtime, "run_turn"):
+                import inspect as _inspect
+                try:
+                    _sig = _inspect.signature(runtime.run_turn)
+                    if "stream_callback" in _sig.parameters:
+                        _rt_kwargs["stream_callback"] = stream_callback
+                except Exception:
+                    pass
+
+            async for event in runtime.run_turn(session, message, **_rt_kwargs):
                 try:
                     evt_type = getattr(event, "type", "")
                     event_data: dict = {}
                     if hasattr(event, "data") and isinstance(event.data, dict):
                         event_data = event.data
 
-                    if evt_type in (EventType.TEXT, EventType.TEXT_DELTA, "text", "text_delta"):
+                    if evt_type in (
+                        EventType.TEXT, EventType.TEXT_DELTA, EventType.AGENT_TEXT,
+                        "text", "text_delta", "agent.text",
+                    ):
                         chunk = event_data.get("text") or event_data.get("delta") or ""
                         if isinstance(chunk, dict):
                             chunk = chunk.get("text", "")
@@ -168,11 +191,49 @@ async def run_agent_turn_with_fallback(
                                     await typing_signaler.signal_text_delta(str(chunk))
                                 except Exception:
                                     pass
-                    elif evt_type in (EventType.AGENT_TOOL_USE, "tool_use", "tool_call", "agent.tool_use"):
+                            # Stream preview callbacks — split text into answer and
+                            # reasoning lanes when reasoningLevel != "off".
+                            # Mirrors TS onPartialReply → ingestDraftLaneSegments().
+                            if reasoning_level != "off" and (
+                                stream_callback is not None or reasoning_stream_callback is not None
+                            ):
+                                try:
+                                    from openclaw.channels.telegram.reasoning import split_telegram_reasoning_text
+                                    _r_text, _a_text = split_telegram_reasoning_text(response_text)
+                                    if reasoning_stream_callback is not None and _r_text:
+                                        _r_result = reasoning_stream_callback(_r_text)
+                                        if asyncio.iscoroutine(_r_result):
+                                            asyncio.create_task(_r_result)
+                                    if stream_callback is not None and _a_text:
+                                        _a_result = stream_callback(_a_text)
+                                        if asyncio.iscoroutine(_a_result):
+                                            asyncio.create_task(_a_result)
+                                except Exception:
+                                    pass
+                            elif stream_callback is not None:
+                                try:
+                                    result = stream_callback(response_text)
+                                    # Support both sync and async callbacks
+                                    if asyncio.iscoroutine(result):
+                                        asyncio.create_task(result)
+                                except Exception:
+                                    pass
+                    elif evt_type in (
+                        EventType.AGENT_TOOL_USE, EventType.TOOL_EXECUTION_START,
+                        "tool_use", "tool_call", "agent.tool_use", "tool_execution_start",
+                    ):
                         # Tool execution started — keep typing indicator alive
                         if typing_signaler:
                             try:
                                 await typing_signaler.signal_tool_start()
+                            except Exception:
+                                pass
+                        # Update status reaction to show which tool is running.
+                        # Mirrors TS onToolStart: statusReactionController.setTool(payload.name).
+                        if status_reactions:
+                            try:
+                                tool_name = event_data.get("name", "") or event_data.get("tool_name", "") or ""
+                                await status_reactions.set_tool(str(tool_name))
                             except Exception:
                                 pass
                     elif evt_type in (EventType.ERROR, "error", "agent.error"):

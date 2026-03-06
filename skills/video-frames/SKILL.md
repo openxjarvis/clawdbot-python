@@ -1,38 +1,46 @@
 ---
 name: video-frames
-description: Extract frames from videos
-version: 1.0.0
-author: ClawdBot
-tags: [video, media]
-requires_bins: []
-requires_env: []
-requires_config: []
+description: Extract frames or short clips from videos using ffmpeg.
+homepage: https://ffmpeg.org
+metadata:
+  {
+    "openclaw":
+      {
+        "emoji": "🎞️",
+        "requires": { "bins": ["ffmpeg"] },
+        "install":
+          [
+            {
+              "id": "brew",
+              "kind": "brew",
+              "formula": "ffmpeg",
+              "bins": ["ffmpeg"],
+              "label": "Install ffmpeg (brew)",
+            },
+          ],
+      },
+  }
 ---
 
-# Video Frames
+# Video Frames (ffmpeg)
 
-Extract frames from videos
+Extract a single frame from a video, or create quick thumbnails for inspection.
 
-## Available Tools
+## Quick start
 
-This skill uses ClawdBot's standard tools:
-- **bash** - Execute commands
-- **read_file** - Read files
-- **write_file** - Write files  
-- **web_fetch** - Fetch web content
-- **web_search** - Search the web
+First frame:
 
-## Usage Examples
+```bash
+{baseDir}/scripts/frame.sh /path/to/video.mp4 --out /tmp/frame.jpg
+```
 
-User: "Help me with video frames"
-1. Assess what the user needs
-2. Use appropriate tools
-3. Provide helpful response
+At a timestamp:
 
-## Configuration
-
-Check documentation for specific setup requirements.
+```bash
+{baseDir}/scripts/frame.sh /path/to/video.mp4 --time 00:00:10 --out /tmp/frame-10s.jpg
+```
 
 ## Notes
 
-This skill requires integration with Video Frames service/application.
+- Prefer `--time` for “what is happening around here?”.
+- Use a `.jpg` for quick share; use `.png` for crisp UI frames.

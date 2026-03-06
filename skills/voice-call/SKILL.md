@@ -1,38 +1,45 @@
 ---
 name: voice-call
-description: Make and receive voice calls
-version: 1.0.0
-author: ClawdBot
-tags: [voice, telephony]
-requires_bins: []
-requires_env: []
-requires_config: []
+description: Start voice calls via the OpenClaw voice-call plugin.
+metadata:
+  {
+    "openclaw":
+      {
+        "emoji": "📞",
+        "skillKey": "voice-call",
+        "requires": { "config": ["plugins.entries.voice-call.enabled"] },
+      },
+  }
 ---
 
-# Voice Calls
+# Voice Call
 
-Make and receive voice calls
+Use the voice-call plugin to start or inspect calls (Twilio, Telnyx, Plivo, or mock).
 
-## Available Tools
+## CLI
 
-This skill uses ClawdBot's standard tools:
-- **bash** - Execute commands
-- **read_file** - Read files
-- **write_file** - Write files  
-- **web_fetch** - Fetch web content
-- **web_search** - Search the web
+```bash
+openclaw voicecall call --to "+15555550123" --message "Hello from OpenClaw"
+openclaw voicecall status --call-id <id>
+```
 
-## Usage Examples
+## Tool
 
-User: "Help me with voice calls"
-1. Assess what the user needs
-2. Use appropriate tools
-3. Provide helpful response
+Use `voice_call` for agent-initiated calls.
 
-## Configuration
+Actions:
 
-Check documentation for specific setup requirements.
+- `initiate_call` (message, to?, mode?)
+- `continue_call` (callId, message)
+- `speak_to_user` (callId, message)
+- `end_call` (callId)
+- `get_status` (callId)
 
-## Notes
+Notes:
 
-This skill requires integration with Voice Calls service/application.
+- Requires the voice-call plugin to be enabled.
+- Plugin config lives under `plugins.entries.voice-call.config`.
+- Twilio config: `provider: "twilio"` + `twilio.accountSid/authToken` + `fromNumber`.
+- Telnyx config: `provider: "telnyx"` + `telnyx.apiKey/connectionId` + `fromNumber`.
+- Plivo config: `provider: "plivo"` + `plivo.authId/authToken` + `fromNumber`.
+- Dev fallback: `provider: "mock"` (no network).

@@ -25,6 +25,8 @@ DEFAULT_GATEWAY_HTTP_TOOL_DENY: frozenset[str] = frozenset(
         "sessions_send",
         # Gateway control plane — prevents gateway reconfiguration via HTTP
         "gateway",
+        # Cron task management — privileged scheduling, must use WebSocket operator.admin
+        "cron",
         # Interactive setup — requires terminal QR scan, hangs on HTTP
         "whatsapp_login",
     ]

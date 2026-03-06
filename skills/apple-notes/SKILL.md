@@ -1,76 +1,77 @@
 ---
 name: apple-notes
-description: Apple Notes integration for macOS/iOS
-version: 1.0.0
-author: ClawdBot
-tags: [apple, notes, macos, ios]
-requires_bins: [osascript]
-requires_env: []
-requires_config: []
-os: [darwin]
+description: Manage Apple Notes via the `memo` CLI on macOS (create, view, edit, delete, search, move, and export notes). Use when a user asks OpenClaw to add a note, list notes, search notes, or manage note folders.
+homepage: https://github.com/antoniorodr/memo
+metadata:
+  {
+    "openclaw":
+      {
+        "emoji": "📝",
+        "os": ["darwin"],
+        "requires": { "bins": ["memo"] },
+        "install":
+          [
+            {
+              "id": "brew",
+              "kind": "brew",
+              "formula": "antoniorodr/memo/memo",
+              "bins": ["memo"],
+              "label": "Install memo via Homebrew",
+            },
+          ],
+      },
+  }
 ---
 
-# Apple Notes Integration
+# Apple Notes CLI
 
-Integrate with Apple Notes on macOS using AppleScript.
+Use `memo notes` to manage Apple Notes directly from the terminal. Create, view, edit, delete, search, move notes between folders, and export to HTML/Markdown.
 
-## Available Tools
+Setup
 
-- **bash**: Execute osascript commands
+- Install (Homebrew): `brew tap antoniorodr/memo && brew install antoniorodr/memo/memo`
+- Manual (uv): `uv pip install .` (after cloning the repo)
+- macOS-only; if prompted, grant Automation access to Notes.app.
 
-## AppleScript Commands
+View Notes
 
-### Create Note
-```applescript
-osascript -e 'tell application "Notes"
-    make new note at folder "Notes" with properties {name:"Title", body:"Content"}
-end tell'
-```
+- List all notes: `memo notes`
+- Filter by folder: `memo notes -f "Folder Name"`
+- Search notes (fuzzy): `memo notes -s "query"`
 
-### List Notes
-```applescript
-osascript -e 'tell application "Notes"
-    name of every note
-end tell'
-```
+Create Notes
 
-### Read Note
-```applescript
-osascript -e 'tell application "Notes"
-    get body of note "Note Title"
-end tell'
-```
+- Add a new note: `memo notes -a`
+  - Opens an interactive editor to compose the note.
+- Quick add with title: `memo notes -a "Note Title"`
 
-### Search Notes
-```applescript
-osascript -e 'tell application "Notes"
-    name of notes whose body contains "search term"
-end tell'
-```
+Edit Notes
 
-## Usage Examples
+- Edit existing note: `memo notes -e`
+  - Interactive selection of note to edit.
 
-User: "Create a note about the meeting"
-1. Format note title and content
-2. Execute osascript with bash tool
-3. Confirm creation
+Delete Notes
 
-User: "Show my recent notes"
-1. List notes with osascript
-2. Parse output
-3. Present formatted list
+- Delete a note: `memo notes -d`
+  - Interactive selection of note to delete.
 
-User: "Find notes containing 'project'"
-1. Search with osascript
-2. Parse matching notes
-3. Present results
+Move Notes
 
-## Platform
+- Move note to folder: `memo notes -m`
+  - Interactive selection of note and destination folder.
 
-**macOS only** - requires osascript (built-in on macOS)
+Export Notes
 
-## Limitations
+- Export to HTML/Markdown: `memo notes -ex`
+  - Exports selected note; uses Mistune for markdown processing.
 
-- Requires Notes.app to be installed
-- Cannot access password-protected notes
-- Formatting may be limited
+Limitations
+
+- Cannot edit notes containing images or attachments.
+- Interactive prompts may require terminal access.
+
+Notes
+
+- macOS-only.
+- Requires Apple Notes.app to be accessible.
+- For automation, grant permissions in System Settings > Privacy & Security > Automation.
