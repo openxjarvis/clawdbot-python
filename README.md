@@ -392,20 +392,23 @@ uv run openclaw pairing approve telegram <code>
 
 ---
 
-## Feishu (Lark) Setup
+## 飞书设置 / Feishu (Lark) Setup
 
-> **Requirement:** Feishu/Lark app with **Bot** capability enabled and **`im.message.receive_v1`** event subscribed.
+> 完整中英文说明见 [GUIDE.md — 飞书设置](GUIDE.md#飞书设置--feishu-setup)
+>
+> Full bilingual setup guide: [GUIDE.md — Feishu Setup](GUIDE.md#飞书设置--feishu-setup)
 
-### 1. Create a Feishu App
+**前提条件 / Prerequisites**
 
-1. Open [https://open.feishu.cn/app](https://open.feishu.cn/app) → **Create App** → **Custom App**
-2. In the app: **"Add Capability"** → enable **Bot**
-3. Under **"Event Subscriptions"** → add `im.message.receive_v1` (required for receiving messages)
-4. **Publish the app** (Version Management → Create Version → Release)
+| 步骤 | 说明 / Notes |
+|------|-------------|
+| ① 开启 Bot 能力 | 飞书开放平台 → 应用能力 → **机器人** |
+| ② 订阅消息事件 ⚠️ | 事件与回调 → 添加 **`im.message.receive_v1`**（缺少此步收不到消息）|
+| ③ 发布应用 | 版本管理 → 创建版本 → 发布上线 |
 
-### 2. Configure openclaw.json
+### 配置 / Configure
 
-Add the Feishu channel to `~/.openclaw/openclaw.json`:
+编辑 `~/.openclaw/openclaw.json` / Edit `~/.openclaw/openclaw.json`:
 
 ```json
 {
@@ -421,34 +424,36 @@ Add the Feishu channel to `~/.openclaw/openclaw.json`:
 }
 ```
 
-> **`dmPolicy` options:** `"pairing"` (default — users must pair first), `"open"` (anyone can chat), `"allowlist"` (explicit allowlist only).
+| `dmPolicy` | 说明 |
+|------------|------|
+| `"pairing"` | 新用户需配对审批（默认 / default） |
+| `"open"` | 任何人可直接对话 |
+| `"allowlist"` | 仅白名单用户 |
 
-### 3. Start and Pair
+### 启动与配对 / Start and Pair
 
 ```bash
 uv run openclaw start
 ```
 
-Once running, send any message to the bot in Feishu. With `dmPolicy: "pairing"`, the bot replies with a pairing code. Approve it from the CLI:
+给 Bot 发私信，Bot 会自动回复配对码。通过 CLI 审批 / Send a DM to the bot — it replies with a pairing code. Approve via CLI:
 
 ```bash
 uv run openclaw pairing list feishu
 uv run openclaw pairing approve feishu <code>
 ```
 
-After approval, the bot responds normally. To skip pairing entirely, set `"dmPolicy": "open"`.
+### 支持功能 / Features
 
-### Feishu Features
-
-| Feature | Status |
-|---------|--------|
-| DM (private chat) | ✅ Working |
-| Group chat (with @mention) | ✅ Working |
-| Streaming card responses | ✅ Working |
-| Message reactions (typing indicator) | ✅ Working |
-| Feishu Doc / Wiki tools | ✅ Working |
-| Feishu Bitable tools | ✅ Working |
-| Feishu Calendar tools | ✅ Working |
+| 功能 / Feature | 状态 |
+|----------------|------|
+| 私信 DM | ✅ |
+| 群聊 @mention | ✅ |
+| 流式卡片回复 Streaming card | ✅ |
+| Typing 指示器（emoji reaction）| ✅ |
+| 飞书文档 / Wiki | ✅ |
+| 多维表格 Bitable | ✅ |
+| 日历 Calendar | ✅ |
 
 ---
 
