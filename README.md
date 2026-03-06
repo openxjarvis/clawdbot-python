@@ -14,7 +14,7 @@
 
 ---
 
-⚠️ **下个版本目标** 下个版本将增加对飞书支持。New version will add channel with Feishu。
+✅ **v0.8.3 已支持 Telegram + 飞书 + Ollama** — Feishu (Lark) WebSocket 长连接、卡片流式输出、Pairing 配对全部可用。Telegram and Feishu channels are both production-ready in this release.
 
 ## Quick Start
 
