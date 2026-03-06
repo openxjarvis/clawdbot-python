@@ -82,3 +82,4 @@ tests/
 news_summary.md
 news_summary.txt
 video_project/
+*.backup
