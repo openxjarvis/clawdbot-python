@@ -74,6 +74,17 @@ generate_*.py
 
 # Runtime workspace state (agent sessions, memory, identity files)
 workspace/
+memory/
+IDENTITY.md
+MEMORY.md
+SOUL.md
+USER.md
+AGENTS.md
+HEARTBEAT.md
+BOOTSTRAP.md
+BOOT.md
+ShortVideo_Project/
+agent-main-*/
 
 # Tests — kept locally, not published
 tests/
