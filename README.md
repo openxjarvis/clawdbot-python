@@ -6,6 +6,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Tested: Telegram + Gemini](https://img.shields.io/badge/Tested-Telegram%20%2B%20Gemini-green.svg)](#status)
 [![Tested: Feishu + Gemini](https://img.shields.io/badge/Tested-Feishu%20%2B%20Gemini-green.svg)](#status)
+[![Guide](https://img.shields.io/badge/📖_完整使用指南-GUIDE.md-blue.svg)](GUIDE.md)
+
+---
+
+> 📖 **[→ 完整使用指南 / Full Setup & Config Guide](GUIDE.md)** — 安装、频道配置、权限设置、发文件、openclaw.json 全字段说明
 
 ---
 
