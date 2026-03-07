@@ -8,10 +8,11 @@
 2. [安装 / Installation](#安装--installation)
 3. [Telegram 设置 / Telegram Setup](#telegram-设置--telegram-setup)
 4. [飞书设置 / Feishu Setup](#飞书设置--feishu-setup)
-5. [本地模型 Ollama / Local Models](#本地模型-ollama--local-models)
-6. [切换 AI 模型 / Switching Models](#切换-ai-模型--switching-models)
-7. [Agent 工作区 / Agent Workspace](#agent-工作区--agent-workspace)
-8. [命令行参考 / CLI Reference](#命令行参考--cli-reference)
+5. [权限配置 / Permissions](#权限配置--permissions)
+6. [本地模型 Ollama / Local Models](#本地模型-ollama--local-models)
+7. [切换 AI 模型 / Switching Models](#切换-ai-模型--switching-models)
+8. [Agent 工作区 / Agent Workspace](#agent-工作区--agent-workspace)
+9. [命令行参考 / CLI Reference](#命令行参考--cli-reference)
 
 ---
 
@@ -327,6 +328,138 @@ uv run openclaw pairing approve feishu <code>
 | `feishu_urgent` | 加急消息 |
 | `feishu_reactions` | 消息表情 |
 | `feishu_perm_*` | 文档权限 |
+
+---
+
+## 权限配置 / Permissions
+
+> **重要：如果 Agent 说"我做不到某件事"，先检查权限配置，不一定是代码 bug。**
+>
+> **Important: If the agent says "I can't do X", check permissions first — it's usually a config issue, not a code bug.**
+
+OpenClaw 有多层独立的权限控制，分别管理不同能力：
+
+---
+
+### 1. 频道访问控制 / Channel Access — 谁能和 Bot 对话
+
+控制哪些用户可以与 Bot 互动。在 `~/.openclaw/openclaw.json` 中按频道配置：
+
+| 策略 / Policy | 行为 / Behavior |
+|---|---|
+| `pairing`（默认）| 新用户首次发消息后收到配对码，需通过 CLI 手动审批 |
+| `allowlist` | 只有预先加入白名单的用户才能对话 |
+| `open` | 任何人都能直接对话（不推荐在公网使用）|
+| `disabled` | 关闭所有私信访问 |
+
+```json
+{
+  "channels": {
+    "telegram": { "dmPolicy": "open" },
+    "feishu":   { "dmPolicy": "pairing" }
+  }
+}
+```
+
+**审批配对请求 / Approve pairing:**
+```bash
+uv run openclaw pairing list telegram
+uv run openclaw pairing approve telegram <code>
+```
+
+---
+
+### 2. Bash 执行权限 / Bash Execution — Agent 能运行哪些命令
+
+控制 Agent 是否可以通过 `bash` 工具执行 shell 命令。在 `~/.openclaw/openclaw.json` 中配置：
+
+```json
+{
+  "tools": {
+    "exec": {
+      "security": "full",
+      "ask": "on-miss",
+      "safe_bins": ["python", "ffmpeg", "git", "node", "convert"]
+    }
+  }
+}
+```
+
+| `security` 值 | 效果 |
+|---|---|
+| `deny`（默认）| Agent **完全不能运行 shell 命令**。适合只用文件操作的场景 |
+| `allowlist` | 只允许 `safe_bins` 列表中的程序运行 |
+| `full` | Agent 可运行任意命令（推荐在自己机器上使用）|
+
+| `ask` 值 | 效果 |
+|---|---|
+| `off` | 不询问，直接按 security 规则处理 |
+| `on-miss` | 当命令不在白名单时询问用户是否允许 |
+| `always` | 每次执行都询问 |
+
+> ⚠️ **注意：`exec.security` 只影响 `bash` 工具，与文件读写工具无关。**
+> Agent 始终可以使用 `write_file`、`edit`、`read_file` 等工具操作文件，不受此设置限制。
+
+**常见场景 / Common scenarios:**
+
+| 场景 | 推荐配置 |
+|---|---|
+| 个人使用，想要完整功能（生成视频/PPT/脚本等）| `security: "full"` |
+| 多人共用，限制可运行的程序 | `security: "allowlist"` + 填写 `safe_bins` |
+| 只用文件操作，不需要运行命令 | `security: "deny"`（默认）|
+
+---
+
+### 3. 飞书 API 权限 / Feishu App Scopes
+
+飞书工具依赖飞书开放平台的 API 权限（Scope）。**如果某个飞书工具报 "Access denied"，说明该 Scope 未开通，需要去飞书开发者后台申请。**
+
+在 [open.feishu.cn](https://open.feishu.cn/) → 你的应用 → 权限管理 中开启：
+
+| 权限 / Scope | 用途 |
+|---|---|
+| `im:message` | 读取消息（必须）|
+| `im:message:send_as_bot` | 发送消息（必须）|
+| `im:message.reaction:write` | Typing 动效（emoji reaction）|
+| `im:chat` | 群组操作 |
+| `contact:user.id:readonly` | 解析用户 ID |
+| `task:task:write` | 创建/更新任务 |
+| `task:task:writeonly` | 仅写入任务（task:task:write 的替代）|
+| `calendar:calendar.event:write` | 创建日历事件 |
+| `calendar:calendar` | 读取日历 |
+| `bitable:app` | 多维表格读写 |
+| `docx:document` | 飞书文档读写 |
+| `wiki:wiki` | Wiki 读写 |
+| `drive:drive` | 云空间文件管理 |
+
+> ⚠️ **开通权限后必须发布新版本应用才能生效。**
+> 在"版本管理"中创建新版本并发布，否则权限变更不会生效。
+
+---
+
+### 4. 文件写入权限 / File Write Access
+
+Agent 通过 `write_file`、`edit` 等内置工具写文件，这些工具**不受** `exec.security` 控制，始终可用。
+
+默认情况下 Agent 可以写入：
+- `~/.openclaw/workspace/` 及其子目录（推荐的工作目录）
+- 任意用户有权访问的路径（如桌面、Downloads 等）
+
+如需路径隔离，启用 Docker 沙箱（`tools.exec.sandbox`），Agent 只能写入容器内的 `/workspace` 目录。
+
+---
+
+### 权限问题速查表 / Quick Troubleshooting
+
+| 现象 | 原因 | 解决方法 |
+|---|---|---|
+| Agent 说"无法执行命令" | `exec.security: deny` | 改为 `allowlist` 或 `full` |
+| Agent 能写文件但不能运行脚本生成视频/PPT | `exec.security: deny` 阻止了 bash | 改为 `full` 或添加 `python`/`ffmpeg` 到 `safe_bins` |
+| 飞书任务工具报权限错误 | `task:task:write` 未开通 | 飞书控制台开启权限并发布新版本 |
+| 飞书日历工具失败 | `calendar:calendar.event:write` 未开通 | 同上 |
+| 新用户发消息没反应 | `dmPolicy: pairing` 等待审批 | `uv run openclaw pairing approve` 或改为 `open` |
+| Agent 运行了部分命令但某些命令报错 | `allowlist` 模式缺少该二进制 | 把对应程序加入 `safe_bins` |
+| 所有工具都不工作 | API Key 无效或 Quota 耗尽 | `uv run openclaw config show` 检查 Key，确认配额 |
 
 ---
 

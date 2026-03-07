@@ -142,16 +142,78 @@ Or edit `~/.openclaw/openclaw.json` directly:
 
 ---
 
-## Access Control
+## Permissions & Troubleshooting
 
-Configure the DM policy for each channel in `~/.openclaw/openclaw.json`:
+> **If the agent says it "can't do" something, the cause is usually a permission config — not a code bug.**
+
+OpenClaw has several independent permission layers. Check these before debugging code:
+
+### 1. Channel Access — Who can talk to the bot
+
+Configured per channel in `~/.openclaw/openclaw.json`:
 
 | Policy | Behavior |
 |---|---|
-| `pairing` (default) | New users must request and be approved |
+| `pairing` (default) | New users must request and be approved via CLI |
 | `allowlist` | Only pre-approved users can interact |
-| `open` | Any user can interact (use with caution) |
+| `open` | Any user can interact — use with caution |
 | `disabled` | No DM access |
+
+```json
+{ "channels": { "telegram": { "dmPolicy": "open" } } }
+```
+
+### 2. Bash Execution — What shell commands the agent can run
+
+Controlled by `tools.exec.security` in `~/.openclaw/openclaw.json`:
+
+| Setting | Effect |
+|---------|--------|
+| `deny` | Agent **cannot run any shell commands**. File writing still works. |
+| `allowlist` | Only binaries listed in `tools.exec.safe_bins` are allowed |
+| `full` | Agent can run any command (recommended for trusted environments) |
+
+```json
+{
+  "tools": {
+    "exec": {
+      "security": "full",
+      "ask": "on-miss",
+      "safe_bins": ["python", "ffmpeg", "git", "node"]
+    }
+  }
+}
+```
+
+> **Note:** `exec.security` only affects the `bash` tool. File read/write tools are always available regardless of this setting.
+
+### 3. Feishu App Scopes — What Feishu API features work
+
+If a Feishu tool fails with "Access denied" or "scope required", you need to enable that scope in the [Feishu Developer Console](https://open.feishu.cn/):
+
+| Scope | Required for |
+|-------|-------------|
+| `im:message`, `im:message:send_as_bot` | Basic messaging (required) |
+| `im:message.reaction:write` | Typing indicator reactions |
+| `task:task:write` | Creating / updating tasks |
+| `calendar:calendar.event:write` | Creating calendar events |
+| `bitable:app` | Bitable (spreadsheet) tools |
+| `docx:document`, `wiki:wiki` | Doc / Wiki read & write |
+| `drive:drive` | Cloud drive file access |
+
+After enabling new scopes, you must **publish a new app version** in the Feishu console for changes to take effect.
+
+### Common Permission Issues
+
+| Symptom | Likely Cause | Fix |
+|---------|-------------|-----|
+| Agent says "I cannot run commands" | `exec.security: deny` | Set to `allowlist` or `full` |
+| Agent can't generate files with scripts | `exec.security: deny` blocks bash | Agent can still use `write_file` for text; enable bash for scripts |
+| Feishu task/calendar tools fail | Missing API scope | Enable scope in Feishu console and republish |
+| Bot doesn't respond to new users | DM policy is `pairing` | Approve via `uv run openclaw pairing approve` or set `dmPolicy: open` |
+| Agent can write files but can't run Python | `exec.security: allowlist` missing `python` | Add `python` to `safe_bins` |
+
+See **[GUIDE.md](GUIDE.md)** for full configuration reference.
 
 ---
 
