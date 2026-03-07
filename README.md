@@ -6,11 +6,14 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Tested: Telegram + Gemini](https://img.shields.io/badge/Tested-Telegram%20%2B%20Gemini-green.svg)](#status)
 [![Tested: Feishu + Gemini](https://img.shields.io/badge/Tested-Feishu%20%2B%20Gemini-green.svg)](#status)
-[![Guide](https://img.shields.io/badge/📖_完整使用指南-GUIDE.md-blue.svg)](GUIDE.md)
+[![Guide (English)](https://img.shields.io/badge/📖_Guide-English-blue.svg)](GUIDE.md)
+[![指南 (中文)](https://img.shields.io/badge/📖_使用指南-中文-red.svg)](GUIDE_CN.md)
 
 ---
 
-> 📖 **[→ 完整使用指南 / Full Setup & Config Guide](GUIDE.md)** — 安装、频道配置、权限设置、发文件、openclaw.json 全字段说明
+> 📖 **Setup & Config Guide:** &nbsp; [English → GUIDE.md](GUIDE.md) &nbsp;·&nbsp; [中文 → GUIDE_CN.md](GUIDE_CN.md)
+>
+> 内容包括：安装、Telegram/飞书配置、权限设置、发文件排查、openclaw.json 全字段说明
 
 ---
 

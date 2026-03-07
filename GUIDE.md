@@ -1,43 +1,38 @@
 # OpenClaw Python — User Guide
 
-> Version 0.8.3
+> Version 0.8.3 · [中文版 → GUIDE_CN.md](GUIDE_CN.md)
 
-## 目录 / Table of Contents
+## Table of Contents
 
-1. [快速启动 / Quick Start](#快速启动--quick-start)
-2. [安装 / Installation](#安装--installation)
-3. [Telegram 设置 / Telegram Setup](#telegram-设置--telegram-setup)
-4. [飞书设置 / Feishu Setup](#飞书设置--feishu-setup)
-5. [权限配置 / Permissions](#权限配置--permissions)
-6. [往频道发文件 / Sending Files to Channels](#往频道发文件--sending-files-to-channels)
-7. [openclaw.json 完整配置参考](#openclaw-json-完整配置参考)
-8. [本地模型 Ollama / Local Models](#本地模型-ollama--local-models)
-9. [切换 AI 模型 / Switching Models](#切换-ai-模型--switching-models)
-10. [Agent 工作区 / Agent Workspace](#agent-工作区--agent-workspace)
-11. [命令行参考 / CLI Reference](#命令行参考--cli-reference)
+1. [Quick Start](#quick-start)
+2. [Installation](#installation)
+3. [Telegram Setup](#telegram-setup)
+4. [Feishu Setup](#feishu-setup)
+5. [Permissions](#permissions)
+6. [Sending Files to Channels](#sending-files-to-channels)
+7. [openclaw.json Full Config Reference](#openclaw-json-full-config-reference)
+8. [Local Models — Ollama](#local-models--ollama)
+9. [Switching Models](#switching-models)
+10. [Agent Workspace](#agent-workspace)
+11. [CLI Reference](#cli-reference)
 
 ---
 
-## 快速启动 / Quick Start
+## Quick Start
 
-### 第一步：安装依赖 / Step 1: Install Dependencies
+### Step 1: Install Dependencies
 
-**中文：** 确保已安装 Python 3.11+ 和 `uv` 包管理器。
-
-**English:** Make sure Python 3.11+ and `uv` are installed.
+Make sure Python 3.11+ and `uv` are installed.
 
 ```bash
-# 安装 uv / Install uv
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 ---
 
-### 第二步：克隆项目 / Step 2: Clone the Repos
+### Step 2: Clone the Repos
 
-**中文：** 本项目依赖 `pi-mono-python`，两个仓库必须在**同一父目录**下。
-
-**English:** This project requires `pi-mono-python`. Both repos must be cloned as **siblings** in the same parent directory.
+This project requires `pi-mono-python`. Both repos must be cloned as **siblings** in the same parent directory.
 
 ```bash
 mkdir my-workspace && cd my-workspace
@@ -47,123 +42,109 @@ cd openclaw-python
 uv sync
 ```
 
-目录结构应为 / Your directory layout should be:
+Your directory layout should be:
 
 ```
 my-workspace/
-├── openclaw-python/     ← 本项目 / this repo
-└── pi-mono-python/      ← 必须的依赖 / required sibling
+├── openclaw-python/     ← this repo
+└── pi-mono-python/      ← required sibling
 ```
 
 ---
 
-### 第三步：初始化配置 / Step 3: First-Time Setup
+### Step 3: First-Time Setup
 
-**中文：** 运行向导，交互式填写 API Key、频道配置等。**只需运行一次**（每个新环境）。
-
-**English:** Run the interactive wizard to set API keys and channel config. **Run once per environment.**
+Run the interactive wizard to set API keys and channel config. **Run once per environment.**
 
 ```bash
 uv run openclaw onboard
 ```
 
-向导会询问 / The wizard prompts for:
+The wizard prompts for:
 
-- LLM 提供商和 API Key（Gemini / OpenAI / Claude / Ollama）
-- 默认模型
-- Telegram / 飞书 频道配置
-- Gateway 端口（默认 `18789`）
-- 工作区和 Agent 人格初始化
+- LLM provider and API key (Gemini / OpenAI / Claude / Ollama)
+- Default model
+- Telegram / Feishu channel config
+- Gateway port (default `18789`)
+- Workspace and agent personality initialization
 
-> **提示：** 如已有 `.env` 文件，向导会自动检测并复用其中的 Key，无需手动填写。
->
 > **Tip:** If you have an existing `.env`, the wizard detects and reuses keys automatically.
 
 ---
 
-### 第四步：启动 / Step 4: Start
+### Step 4: Start
 
 ```bash
 uv run openclaw start
 ```
 
-**中文：** 这一条命令启动一切：Gateway 服务器 + 所有已配置的频道（Telegram、飞书等）。
+This single command starts everything: the Gateway server + all configured channels (Telegram, Feishu, etc.).
 
-**English:** This single command starts everything: the Gateway server + all configured channels (Telegram, Feishu, etc.).
-
-启动成功后日志会显示 / On successful startup, you'll see:
+On successful startup, you'll see:
 
 ```
 ✓ Gateway running on ws://127.0.0.1:18789
 ✓ ChannelManager: 2 channels running
 ```
 
-然后打开浏览器访问 Web 控制台 / Then open the Web UI in your browser:
-
-```
-http://localhost:18789
-```
+Then open the Web UI in your browser: `http://localhost:18789`
 
 ---
 
-### 第五步：发消息测试 / Step 5: Send a Message
+### Step 5: Send a Message
 
-- **Telegram：** 直接在 Telegram 里找到你的 Bot，发送任意消息
-- **飞书：** 在飞书里给 Bot 发私信，首次使用需完成 pairing（见下方配置说明）
-- **Web UI：** 直接在 `http://localhost:18789` 的界面聊天
+- **Telegram:** Find your bot in Telegram and send any message.
+- **Feishu:** Send a DM to the bot. First-time users must complete pairing (see Feishu Setup below).
+- **Web UI:** Chat directly at `http://localhost:18789`.
 
 ---
 
-### 常见问题 / Common Issues
+### Common Issues
 
-| 问题 / Issue | 原因 / Cause | 解法 / Fix |
+| Issue | Cause | Fix |
 |---|---|---|
-| 发消息没有反应 | Bot 未配对 / not paired | 查看 pairing 章节 |
-| 飞书没反应 | App 未启用 Bot 能力或未订阅事件 | 查看飞书配置章节 |
-| 端口冲突 | 已有进程占用 18789 | `uv run openclaw cleanup --ports 18789` |
-| API Key 无效 | Key 未填或填错 | `uv run openclaw config show` 检查 |
-| 每次关终端就停了 | 前台运行模式 | 用 `gateway install` 安装为系统服务 |
+| No response to messages | Bot not paired | See pairing section |
+| Feishu not responding | Bot capability not enabled or event not subscribed | See Feishu Setup |
+| Port conflict | 18789 already in use | `uv run openclaw cleanup --ports 18789` |
+| Invalid API key | Key missing or wrong | `uv run openclaw config show` to verify |
+| Stops when terminal closes | Running in foreground | Install as a system service with `gateway install` |
 
 ---
 
-### 后台运行（可选）/ Background Daemon (Optional)
+### Background Daemon (Optional)
 
-**中文：** 如需开机自启、关闭终端后继续运行：
-
-**English:** To keep running after closing the terminal or on reboot:
+To keep running after closing the terminal or on reboot:
 
 ```bash
-# 安装为系统服务（一次性）/ Install as system service (one-time)
+# Install as system service (one-time)
 uv run openclaw gateway install
 
-# 启动后台服务 / Start the daemon
+# Start the daemon
 uv run openclaw gateway start
 
-# 查看状态 / Check status
+# Check status
 uv run openclaw gateway status
 
-# 查看日志 / Tail logs
+# Tail logs
 uv run openclaw gateway logs
 
-# 停止 / Stop
+# Stop
 uv run openclaw gateway stop
 ```
 
-> **注意：** `gateway install` + `gateway start` 和 `openclaw start` 不能同时使用，否则两个进程会争抢同一端口。
->
 > **Note:** Don't run both `openclaw start` (foreground) and `gateway start` (daemon) at the same time — they'll conflict on the same port.
 
 ---
 
-## 安装 / Installation
+## Installation
 
-### 系统要求 / Prerequisites
+### Prerequisites
 
 - Python 3.11+
-- [uv](https://docs.astral.sh/uv/) 包管理器
-- （可选）Docker — 用于沙箱隔离执行
+- [uv](https://docs.astral.sh/uv/) package manager
+- (Optional) Docker — for sandboxed execution
 
-### 更新 / Updating
+### Updating
 
 ```bash
 cd openclaw-python
@@ -174,109 +155,105 @@ uv run openclaw start
 
 ---
 
-## Telegram 设置 / Telegram Setup
+## Telegram Setup
 
-### 1. 创建 Bot / Create a Bot
+### 1. Create a Bot
 
-1. 打开 Telegram，搜索 `@BotFather`
-2. 发送 `/newbot`，按提示填写名称
-3. 复制 token（格式：`123456789:ABCdef...`）
+1. Open Telegram and search for `@BotFather`
+2. Send `/newbot` and follow the prompts
+3. Copy the token (format: `123456789:ABCdef...`)
 
-### 2. 配置 Token / Configure Token
+### 2. Configure Token
 
-通过向导（推荐）/ Via wizard (recommended):
+Via wizard (recommended):
 ```bash
 uv run openclaw onboard
 ```
 
-或手动写入配置 / Or set directly:
+Or set directly:
 ```bash
 uv run openclaw config set channels.telegram.botToken "YOUR_BOT_TOKEN"
 ```
 
-### 3. 启动并测试 / Start and Test
+### 3. Start and Test
 
 ```bash
 uv run openclaw start
 ```
 
-在 Telegram 中给 Bot 发消息。
+Send a message to your bot in Telegram.
 
-### 4. Pairing（访问控制）/ Pairing (Access Control)
-
-默认策略是 `pairing`：新用户发消息时 Bot 会回复一个配对码，需要通过 CLI 审批。
+### 4. Pairing (Access Control)
 
 Default policy is `pairing`: new users get a pairing code when they first message the bot; approve via CLI:
 
 ```bash
-# 查看待审批请求 / List pending requests
+# List pending requests
 uv run openclaw pairing list telegram
 
-# 审批 / Approve
+# Approve
 uv run openclaw pairing approve telegram <code>
 ```
 
-**跳过配对（开放模式）/ Skip pairing (open mode):**
+**Skip pairing (open mode):**
 ```bash
 uv run openclaw config set channels.telegram.dmPolicy open
 ```
 
-### 5. Bot 内命令 / In-Chat Commands
+### 5. In-Chat Commands
 
-| 命令 | 功能 |
-|------|------|
-| `/reset` | 开启新会话 |
-| `/cron` | 查看定时任务 |
-| `/help` | 显示帮助 |
+| Command | Function |
+|---------|----------|
+| `/reset` | Start a new session |
+| `/cron` | View scheduled tasks |
+| `/help` | Show help |
 
 ---
 
-## 飞书设置 / Feishu Setup
+## Feishu Setup
 
-### 1. 创建飞书应用 / Create Feishu App
+### 1. Create a Feishu App
 
-1. 打开 [open.feishu.cn](https://open.feishu.cn/) → 创建应用 → **企业自建应用**
-2. 记录 **App ID** 和 **App Secret**
+1. Go to [open.feishu.cn](https://open.feishu.cn/) → Create App → **Enterprise Self-built App**
+2. Note down the **App ID** and **App Secret**
 
-### 2. 开启 Bot 能力 / Enable Bot Capability
+### 2. Enable Bot Capability
 
-应用管理 → **添加应用能力** → 选择 **机器人**
+App Management → **Add App Capability** → Select **Bot**
 
-### 3. 配置权限 / Configure Permissions
+### 3. Configure Permissions
 
-在"权限管理"中开启以下权限：
+Enable the following scopes in "Permission Management":
 
-| 权限 / Scope | 用途 / Purpose |
+| Scope | Purpose |
 |---|---|
-| `im:message` | 读取消息 |
-| `im:message:send_as_bot` | 发送消息 |
-| `im:message.reaction:write` | Typing 指示器（emoji reaction）|
-| `im:chat` | 群组管理 |
-| `contact:user.id:readonly` | 解析用户 ID |
+| `im:message` | Read messages |
+| `im:message:send_as_bot` | Send messages |
+| `im:message.reaction:write` | Typing indicator (emoji reaction) |
+| `im:chat` | Group management |
+| `contact:user.id:readonly` | Resolve user IDs |
 
-高级工具还需 / For advanced tools:
-- `bitable:app`, `drive:drive` — 多维表格 / Bitable
-- `docx:document`, `wiki:wiki` — 文档 / Docs
-- `calendar:calendar`, `calendar:calendar.event` — 日历
-- `task:task` — 任务
+For advanced tools:
+- `bitable:app`, `drive:drive` — Bitable (spreadsheets)
+- `docx:document`, `wiki:wiki` — Docs / Wiki
+- `calendar:calendar`, `calendar:calendar.event:write` — Calendar
+- `task:task:write` — Tasks
 
-### 4. 订阅消息事件 / Subscribe to Events
-
-**关键步骤，缺少此步飞书消息无法送达。**
+### 4. Subscribe to Message Events
 
 **Critical — without this, Feishu messages won't be delivered.**
 
-在"事件与回调" → 事件配置：
-- 连接方式选 **长连接（WebSocket）**，无需公网地址
-- 添加事件：`im.message.receive_v1`
+In "Event & Callbacks" → Event Config:
+- Connection type: **Persistent Connection (WebSocket)** — no public IP needed
+- Add event: `im.message.receive_v1`
 
-### 5. 发布应用 / Publish the App
+### 5. Publish the App
 
-版本管理 → 创建版本 → 申请上架 / 直接发布
+Version Management → Create Version → Submit for Release / Publish directly
 
-### 6. 配置 OpenClaw / Configure OpenClaw
+### 6. Configure OpenClaw
 
-编辑 `~/.openclaw/openclaw.json`：
+Edit `~/.openclaw/openclaw.json`:
 
 ```json
 {
@@ -292,67 +269,65 @@ uv run openclaw config set channels.telegram.dmPolicy open
 }
 ```
 
-或通过 CLI：
+Or via CLI:
 ```bash
 uv run openclaw config set channels.feishu.appId "cli_XXXXXXXXXXXXXXXX"
 uv run openclaw config set channels.feishu.appSecret "YOUR_APP_SECRET"
 ```
 
-### 7. 启动并配对 / Start and Pair
+### 7. Start and Pair
 
 ```bash
 uv run openclaw start
 ```
 
-给 Bot 发私信，Bot 会回复配对码。然后：
+Send a DM to your bot. It will reply with a pairing code. Then:
 
 ```bash
 uv run openclaw pairing list feishu
 uv run openclaw pairing approve feishu <code>
 ```
 
-**跳过配对 / Skip pairing:**
+**Skip pairing:**
 ```json
 "dmPolicy": "open"
 ```
 
-### 飞书工具一览 / Feishu Tools
+### Feishu Tools Overview
 
-| 工具 / Tool | 功能 / Function |
+| Tool | Function |
 |---|---|
-| `feishu_doc_*` | 飞书文档 创建/读取/更新 |
-| `feishu_wiki_*` | Wiki 空间搜索与管理 |
-| `feishu_drive_*` | 云空间文件管理 |
-| `feishu_bitable_*` | 多维表格（11 个精细操作）|
-| `feishu_task_*` | 任务管理（v2 API）|
-| `feishu_calendar_*` | 日历与日程 |
-| `feishu_chat_*` | 群组操作 |
-| `feishu_urgent` | 加急消息 |
-| `feishu_reactions` | 消息表情 |
-| `feishu_perm_*` | 文档权限 |
+| `feishu_doc_*` | Feishu Docs — create / read / update |
+| `feishu_wiki_*` | Wiki space search and management |
+| `feishu_drive_*` | Cloud drive file management |
+| `feishu_bitable_*` | Bitable — 11 fine-grained operations |
+| `feishu_task_*` | Task management (v2 API) |
+| `feishu_calendar_*` | Calendar and events |
+| `feishu_chat_*` | Group operations |
+| `feishu_urgent` | Urgent message push |
+| `feishu_reactions` | Message reactions |
+| `feishu_perm_*` | Document permissions |
 
 ---
 
-## 权限配置 / Permissions
+## Permissions
 
-> **重要：如果 Agent 说"我做不到某件事"，先检查权限配置，不一定是代码 bug。**
->
 > **Important: If the agent says "I can't do X", check permissions first — it's usually a config issue, not a code bug.**
 
-OpenClaw 有多层独立的权限控制，分别管理不同能力：
+OpenClaw has several independent permission layers, each controlling a different capability.
 
 ---
 
-### 1. 频道访问控制 / Channel Access — 谁能和 Bot 对话
+### 1. Channel Access — Who can talk to the bot
 
-控制哪些用户可以与 Bot 互动。在 `~/.openclaw/openclaw.json` 中按频道配置：
+Controls which users can interact with the bot. Configured per channel in `~/.openclaw/openclaw.json`:
 
-| 策略 / Policy | 行为 / Behavior |
+| Policy | Behavior |
 |---|---|
-| `pairing`（默认）| 新用户首次发消息后收到配对码，需通过 CLI 手动审批 |
-| `allowlist` | 只有预先加入白名单的用户才能对话 |
-| `open` | 任何人都能直接对话（不推荐在公网使用）|
-| `disabled` | 关闭所有私信访问 |
+| `pairing` (default) | New users receive a pairing code; must be approved via CLI |
+| `allowlist` | Only pre-approved users can interact |
+| `open` | Any user can interact — not recommended on public networks |
+| `disabled` | All DM access disabled |
 
 ```json
 {
@@ -363,7 +338,7 @@ OpenClaw 有多层独立的权限控制，分别管理不同能力：
 }
 ```
 
-**审批配对请求 / Approve pairing:**
+**Approve pairing:**
 ```bash
 uv run openclaw pairing list telegram
 uv run openclaw pairing approve telegram <code>
@@ -371,9 +346,9 @@ uv run openclaw pairing approve telegram <code>
 
 ---
 
-### 2. Bash 执行权限 / Bash Execution — Agent 能运行哪些命令
+### 2. Bash Execution — What shell commands the agent can run
 
-控制 Agent 是否可以通过 `bash` 工具执行 shell 命令。在 `~/.openclaw/openclaw.json` 中配置：
+Controls whether the agent can execute shell commands via the `bash` tool:
 
 ```json
 {
@@ -387,177 +362,174 @@ uv run openclaw pairing approve telegram <code>
 }
 ```
 
-| `security` 值 | 效果 |
+| `security` value | Effect |
 |---|---|
-| `deny`（默认）| Agent **完全不能运行 shell 命令**。适合只用文件操作的场景 |
-| `allowlist` | 只允许 `safe_bins` 列表中的程序运行 |
-| `full` | Agent 可运行任意命令（推荐在自己机器上使用）|
+| `deny` (default) | Agent **cannot run any shell commands**. File write tools still work. |
+| `allowlist` | Only binaries listed in `safe_bins` are allowed |
+| `full` | Agent can run any command — recommended for personal use |
 
-| `ask` 值 | 效果 |
+| `ask` value | Effect |
 |---|---|
-| `off` | 不询问，直接按 security 规则处理 |
-| `on-miss` | 当命令不在白名单时询问用户是否允许 |
-| `always` | 每次执行都询问 |
+| `off` | No prompting — follow security rules silently |
+| `on-miss` | Ask user when a command is not in the allowlist |
+| `always` | Ask before every command execution |
 
-> ⚠️ **注意：`exec.security` 只影响 `bash` 工具，与文件读写工具无关。**
-> Agent 始终可以使用 `write_file`、`edit`、`read_file` 等工具操作文件，不受此设置限制。
+> ⚠️ **Note: `exec.security` only affects the `bash` tool. File read/write tools (`write_file`, `edit`, `read_file`) are always available regardless of this setting.**
 
-**常见场景 / Common scenarios:**
+**Common scenarios:**
 
-| 场景 | 推荐配置 |
+| Scenario | Recommended config |
 |---|---|
-| 个人使用，想要完整功能（生成视频/PPT/脚本等）| `security: "full"` |
-| 多人共用，限制可运行的程序 | `security: "allowlist"` + 填写 `safe_bins` |
-| 只用文件操作，不需要运行命令 | `security: "deny"`（默认）|
+| Personal use — full features (video, PPT, scripts, etc.) | `security: "full"` |
+| Shared use — restrict which programs can run | `security: "allowlist"` + fill in `safe_bins` |
+| File operations only — no shell commands needed | `security: "deny"` (default) |
 
 ---
 
-### 3. 飞书 API 权限 / Feishu App Scopes
+### 3. Feishu API Scopes
 
-飞书工具依赖飞书开放平台的 API 权限（Scope）。**如果某个飞书工具报 "Access denied"，说明该 Scope 未开通，需要去飞书开发者后台申请。**
+Feishu tools depend on API scopes enabled in the Feishu Developer Console. **If a Feishu tool reports "Access denied", the required scope is not enabled — go to the console and add it.**
 
-在 [open.feishu.cn](https://open.feishu.cn/) → 你的应用 → 权限管理 中开启：
+Enable at [open.feishu.cn](https://open.feishu.cn/) → Your App → Permission Management:
 
-| 权限 / Scope | 用途 |
+| Scope | Required for |
 |---|---|
-| `im:message` | 读取消息（必须）|
-| `im:message:send_as_bot` | 发送消息（必须）|
-| `im:message.reaction:write` | Typing 动效（emoji reaction）|
-| `im:chat` | 群组操作 |
-| `contact:user.id:readonly` | 解析用户 ID |
-| `task:task:write` | 创建/更新任务 |
-| `task:task:writeonly` | 仅写入任务（task:task:write 的替代）|
-| `calendar:calendar.event:write` | 创建日历事件 |
-| `calendar:calendar` | 读取日历 |
-| `bitable:app` | 多维表格读写 |
-| `docx:document` | 飞书文档读写 |
-| `wiki:wiki` | Wiki 读写 |
-| `drive:drive` | 云空间文件管理 |
+| `im:message` | Reading messages (required) |
+| `im:message:send_as_bot` | Sending messages (required) |
+| `im:message.reaction:write` | Typing indicator (emoji reaction) |
+| `im:chat` | Group operations |
+| `contact:user.id:readonly` | Resolving user IDs |
+| `task:task:write` | Creating / updating tasks |
+| `task:task:writeonly` | Write-only tasks (alternative to above) |
+| `calendar:calendar.event:write` | Creating calendar events |
+| `calendar:calendar` | Reading calendar |
+| `bitable:app` | Bitable read / write |
+| `docx:document` | Feishu Docs read / write |
+| `wiki:wiki` | Wiki read / write |
+| `drive:drive` | Cloud drive file access |
 
-> ⚠️ **开通权限后必须发布新版本应用才能生效。**
-> 在"版本管理"中创建新版本并发布，否则权限变更不会生效。
-
----
-
-### 4. 文件写入权限 / File Write Access
-
-Agent 通过 `write_file`、`edit` 等内置工具写文件，这些工具**不受** `exec.security` 控制，始终可用。
-
-默认情况下 Agent 可以写入：
-- `~/.openclaw/workspace/` 及其子目录（推荐的工作目录）
-- 任意用户有权访问的路径（如桌面、Downloads 等）
-
-如需路径隔离，启用 Docker 沙箱（`tools.exec.sandbox`），Agent 只能写入容器内的 `/workspace` 目录。
+> ⚠️ **After enabling new scopes, you must publish a new app version for changes to take effect.** Go to Version Management, create a new version, and publish.
 
 ---
 
-### 权限问题速查表 / Quick Troubleshooting
+### 4. File Write Access
 
-| 现象 | 原因 | 解决方法 |
+The agent writes files using built-in tools (`write_file`, `edit`). These tools are **not affected** by `exec.security` and are always available.
+
+By default the agent can write to:
+- `~/.openclaw/workspace/` and subdirectories (recommended working directory)
+- Any path the OS user has permission to write
+
+For path isolation, enable Docker sandbox (`tools.exec.sandbox`) — the agent will be restricted to `/workspace` inside the container.
+
+---
+
+### Permission Quick Troubleshooting
+
+| Symptom | Cause | Fix |
 |---|---|---|
-| Agent 说"无法执行命令" | `exec.security: deny` | 改为 `allowlist` 或 `full` |
-| Agent 能写文件但不能运行脚本生成视频/PPT | `exec.security: deny` 阻止了 bash | 改为 `full` 或添加 `python`/`ffmpeg` 到 `safe_bins` |
-| 飞书任务工具报权限错误 | `task:task:write` 未开通 | 飞书控制台开启权限并发布新版本 |
-| 飞书日历工具失败 | `calendar:calendar.event:write` 未开通 | 同上 |
-| 新用户发消息没反应 | `dmPolicy: pairing` 等待审批 | `uv run openclaw pairing approve` 或改为 `open` |
-| Agent 运行了部分命令但某些命令报错 | `allowlist` 模式缺少该二进制 | 把对应程序加入 `safe_bins` |
-| 所有工具都不工作 | API Key 无效或 Quota 耗尽 | `uv run openclaw config show` 检查 Key，确认配额 |
+| Agent says "cannot execute commands" | `exec.security: deny` | Set to `allowlist` or `full` |
+| Agent writes files but can't run scripts | `exec.security: deny` blocks bash | Set to `full` or add `python`/`ffmpeg` to `safe_bins` |
+| Feishu task tool reports permission error | `task:task:write` not enabled | Enable scope in Feishu console and publish new version |
+| Feishu calendar tool fails | `calendar:calendar.event:write` not enabled | Same as above |
+| New users get no response | `dmPolicy: pairing` waiting for approval | Run `uv run openclaw pairing approve` or set `dmPolicy: open` |
+| Some bash commands work but others fail | `allowlist` mode missing that binary | Add the binary to `safe_bins` |
+| All tools stop working | Invalid API key or quota exhausted | `uv run openclaw config show` to check key; verify quota |
 
 ---
 
-## 往频道发文件 / Sending Files to Channels
+## Sending Files to Channels
 
-> **如果 Agent 声称发了文件但你没收到，或者说"发不了文件"，这里是完整的排查链路。**
+> **If the agent says it sent a file but you didn't receive it, or says "I can't send files", here is the complete diagnostic chain.**
 
-### 文件发送的完整流程
+### Complete File Delivery Flow
 
 ```
-Agent 输出文本
-  └── 包含 MEDIA: token  ←── 必须有这一行，否则文件永远不发送
-        └── _resolve_media_path()  ←── 解析路径
-              ├── HTTP/HTTPS URL → 直接使用
-              ├── 绝对路径存在 → 直接使用
-              └── 相对路径/文件名 → 在这些目录里搜索：
+Agent outputs text
+  └── Contains a MEDIA: token  ←── Required — without this line, no file is ever sent
+        └── _resolve_media_path()  ←── Path resolution
+              ├── HTTP/HTTPS URL → used as-is
+              ├── Absolute path exists → used as-is
+              └── Relative path / filename → searched in these directories:
                     /tmp/openclaw/
                     ~/.openclaw/media/
                     ~/.openclaw/agents/
                     ~/.openclaw/workspace/
                     ~/.openclaw/sandboxes/
-                    {session_workspace}/   ←── 本次对话的工作目录
-        └── send_media()  ←── 实际发送
-              ├── 本地文件 → 检查是否存在 → 检查是否超过 50 MB
-              └── HTTP URL → 直接转发给 Telegram/飞书 API
+                    {session_workspace}/   ←── current conversation's working directory
+        └── send_media()  ←── actual delivery
+              ├── Local file → check exists → check ≤ 50 MB
+              └── HTTP URL → forwarded directly to Telegram / Feishu API
 ```
 
-### 发不了文件的常见原因
+### Common Causes of File Delivery Failure
 
-#### 原因 1：exec.security = deny（最常见）
+#### Cause 1: exec.security = deny (most common)
 
-`bash` 工具被禁用，Agent **无法运行脚本生成文件**（ffmpeg、python 脚本、pptx 生成器等）。
+The `bash` tool is disabled — the agent **cannot run scripts to generate files** (ffmpeg, Python scripts, pptx generators, etc.).
 
-Agent 可以用 `write_file` 直接写文本内容，但不能调用外部程序。
+The agent can use `write_file` to create text content, but cannot invoke external programs.
 
-**解决：** 把 `tools.exec.security` 改为 `full` 或 `allowlist`：
+**Fix:** Set `tools.exec.security` to `full` or `allowlist`:
 ```json
 { "tools": { "exec": { "security": "full" } } }
 ```
 
-#### 原因 2：Agent 没有输出 MEDIA: token
+#### Cause 2: No MEDIA: token in the agent's reply
 
-Agent 可能只说了"我已经生成了文件"，但没有在回复里写 `MEDIA:/path/to/file`。
-没有 `MEDIA:` 行，文件永远不会发送，只有文字。
+The agent may have said "I generated the file" but did not include `MEDIA:/path/to/file` in its reply. Without a `MEDIA:` line, the file is never sent — only text is delivered.
 
-**诊断：** 查看 Agent 的原始回复，确认有没有 `MEDIA:` 开头的行。
+**Diagnose:** Check the agent's raw reply for a `MEDIA:` line.
 
-#### 原因 3：文件路径不存在
+#### Cause 3: File path does not exist
 
-Agent 写了 `MEDIA:/some/path/file.pptx`，但那个路径的文件不存在（可能写入了别的地方）。
+The agent wrote `MEDIA:/some/path/file.pptx` but the file doesn't exist at that path (possibly written elsewhere).
 
-系统搜索路径包括：
+The system searches these directories:
 - `/tmp/openclaw/`
 - `~/.openclaw/media/`
 - `~/.openclaw/workspace/`
-- `{session_workspace}/`（本次对话专属目录）
+- `{session_workspace}/` (per-conversation directory)
 
-**解决：** 确认 Agent 写入和 MEDIA: 引用的是同一个路径。最佳实践：Agent 使用 `session workspace` 目录（系统每轮自动注入到 system prompt 里）。
+**Fix:** Verify the agent's write path and MEDIA: reference point to the same location. Best practice: the agent should use the session workspace directory (automatically injected into the system prompt each turn).
 
-#### 原因 4：文件超过 50 MB（Telegram 限制）
+#### Cause 4: File exceeds 50 MB (Telegram limit)
 
-Telegram Bot API 限制单文件最大 50 MB。超过后 `send_media` 会报错。
+The Telegram Bot API has a 50 MB hard limit per file. `send_media` will raise an error if exceeded.
 
-**解决：**
-- 压缩文件（降分辨率/码率）
-- 上传到网盘，发分享链接
-- 通过 Telegram 官方客户端手动发送大文件
+**Fix:**
+- Compress the file (reduce resolution / bitrate)
+- Upload to cloud storage and share a link
+- Send large files manually via the Telegram desktop/mobile client
 
-#### 原因 5：chat_id 不正确
+#### Cause 5: Missing or incorrect chat_id
 
-Agent 不知道当前对话的 Telegram chat_id，发送目标错误或为空。
+The agent doesn't know the Telegram chat_id for the current conversation, causing delivery to the wrong target.
 
-**解决：** 系统每轮会在 system prompt 里注入 `chat_id`（`## Inbound Meta` 块），Agent 应使用该 ID。如果仍有问题，重启 openclaw 让 session 重新初始化。
+**Fix:** The system injects `chat_id` into the system prompt each turn (in the `## Inbound Meta` block). The agent should use that ID. If the issue persists, restart openclaw to reinitialize the session.
 
-### 速查表
+### Quick Reference
 
-| 现象 | 原因 | 解决 |
+| Symptom | Cause | Fix |
 |------|------|------|
-| Agent 说"生成了"但没收到文件 | 没有 MEDIA: token | 要求 Agent 在回复里加 `MEDIA:/path` |
-| Agent 说"无法生成文件" | `exec.security: deny` | 改为 `full` 或 `allowlist` |
-| 收到错误消息"File not found" | 路径写错或文件未创建 | 检查 Agent 写入路径与 MEDIA: 路径是否一致 |
-| 收到错误消息"File too large" | 超过 50 MB | 压缩文件或改用链接 |
-| 能收到文字但从不发文件 | `MEDIA:` 格式不对 | 必须是独立一行，格式：`MEDIA:/absolute/path` |
+| Agent says "generated it" but file not received | No MEDIA: token | Ask agent to include `MEDIA:/path` in its reply |
+| Agent says "cannot generate files" | `exec.security: deny` | Set to `full` or `allowlist` |
+| Error: "File not found" | Wrong path or file was never created | Verify agent write path matches MEDIA: reference |
+| Error: "File too large" | Exceeds 50 MB | Compress or share via link |
+| Text arrives but files never do | Wrong `MEDIA:` format | Must be a standalone line: `MEDIA:/absolute/path` |
 
 ---
 
-## openclaw.json 完整配置参考
+## openclaw.json Full Config Reference
 
-配置文件位置：`~/.openclaw/openclaw.json`
+Config file location: `~/.openclaw/openclaw.json`
 
-查看当前配置：`uv run openclaw config show`
-修改某项：`uv run openclaw config set <key> <value>`
+View current config: `uv run openclaw config show`
+Modify a field: `uv run openclaw config set <key> <value>`
 
 ---
 
-### `agent` — 默认 Agent 配置
+### `agent` — Default agent settings
 
 ```json
 "agent": {
@@ -568,16 +540,16 @@ Agent 不知道当前对话的 Telegram chat_id，发送目标错误或为空。
 }
 ```
 
-| 字段 | 说明 | 默认值 |
+| Field | Description | Default |
 |------|------|--------|
-| `model` | 默认 LLM 模型 ID | — |
-| `verbose` | 是否输出详细调试日志 | `false` |
-| `maxHistoryTurns` | 保留多少轮历史记录发给模型 | `50` |
-| `maxHistoryShare` | 历史记录最多占 context 的比例 | `0.5` |
+| `model` | Default LLM model ID | — |
+| `verbose` | Enable verbose debug logging | `false` |
+| `maxHistoryTurns` | Number of history turns sent to the model | `50` |
+| `maxHistoryShare` | Max fraction of context window for history | `0.5` |
 
 ---
 
-### `gateway` — 服务器设置
+### `gateway` — Server settings
 
 ```json
 "gateway": {
@@ -592,18 +564,18 @@ Agent 不知道当前对话的 Telegram chat_id，发送目标错误或为空。
 }
 ```
 
-| 字段 | 说明 | 常用值 |
+| Field | Description | Common values |
 |------|------|--------|
-| `port` | 监听端口 | `18789` |
-| `bind` | 绑定地址 | `loopback`（仅本机）/ `0.0.0.0`（公网，需谨慎）|
-| `mode` | 部署模式 | `local` |
-| `auth.mode` | 认证方式 | `token` / `none` |
-| `auth.token` | 访问令牌（mode=token 时必填）| 随机字符串 |
-| `enable_web_ui` | 是否开启 Web 控制台 | `true` |
+| `port` | Listening port | `18789` |
+| `bind` | Bind address | `loopback` (local only) / `0.0.0.0` (public — use with caution) |
+| `mode` | Deployment mode | `local` |
+| `auth.mode` | Authentication method | `token` / `none` |
+| `auth.token` | Access token (required when mode=token) | random string |
+| `enable_web_ui` | Enable Web Control UI | `true` |
 
 ---
 
-### `agents` — 多 Agent 与会话策略
+### `agents` — Multi-agent and session settings
 
 ```json
 "agents": {
@@ -630,18 +602,18 @@ Agent 不知道当前对话的 Telegram chat_id，发送目标错误或为空。
 }
 ```
 
-| 字段 | 说明 |
+| Field | Description |
 |------|------|
-| `model.primary` | 主模型 |
-| `model.fallbacks` | 主模型失败时按顺序尝试的备用模型列表 |
-| `compaction.enabled` | 是否自动压缩历史记录（超出 token 限制时）|
-| `compaction.mode` | `safeguard`=保留最近的 / `aggressive`=更激进压缩 |
-| `maxConcurrent` | 同时处理的最大并发请求数 |
-| `subagents.maxSpawnDepth` | 子 Agent 最大嵌套深度（防止无限递归）|
+| `model.primary` | Primary model |
+| `model.fallbacks` | Fallback models tried in order when the primary fails |
+| `compaction.enabled` | Auto-compact history when approaching the token limit |
+| `compaction.mode` | `safeguard` = keep recent turns / `aggressive` = more aggressive compression |
+| `maxConcurrent` | Maximum concurrent requests handled simultaneously |
+| `subagents.maxSpawnDepth` | Max sub-agent nesting depth (prevents infinite recursion) |
 
 ---
 
-### `channels` — 消息频道
+### `channels` — Messaging channels
 
 #### Telegram
 
@@ -657,15 +629,15 @@ Agent 不知道当前对话的 Telegram chat_id，发送目标错误或为空。
 }
 ```
 
-| 字段 | 说明 | 可选值 |
+| Field | Description | Options |
 |------|------|--------|
-| `enabled` | 是否启用 | `true` / `false` |
-| `botToken` | BotFather 给的 token | — |
-| `dmPolicy` | 私信访问策略 | `pairing`（默认）/ `allowlist` / `open` / `disabled` |
-| `groupPolicy` | 群组访问策略 | `allowlist`（默认）/ `open` / `disabled` |
-| `streamMode` | 流式输出模式 | `partial`（边生成边发）/ `full`（完整后发）|
+| `enabled` | Enable this channel | `true` / `false` |
+| `botToken` | Token from BotFather | — |
+| `dmPolicy` | DM access policy | `pairing` (default) / `allowlist` / `open` / `disabled` |
+| `groupPolicy` | Group access policy | `allowlist` (default) / `open` / `disabled` |
+| `streamMode` | Streaming output mode | `partial` (stream as generated) / `full` (send after complete) |
 
-#### 飞书 Feishu
+#### Feishu
 
 ```json
 "channels": {
@@ -679,15 +651,15 @@ Agent 不知道当前对话的 Telegram chat_id，发送目标错误或为空。
 }
 ```
 
-| 字段 | 说明 |
+| Field | Description |
 |------|------|
-| `appId` / `appSecret` | 飞书开放平台的应用凭证 |
-| `useWebSocket` | 使用长连接（推荐，无需公网地址）|
-| `dmPolicy` | 私信访问策略（同 Telegram）|
+| `appId` / `appSecret` | Feishu Developer Console credentials |
+| `useWebSocket` | Use persistent WebSocket connection (recommended — no public IP needed) |
+| `dmPolicy` | DM access policy (same as Telegram) |
 
 ---
 
-### `tools` — 工具与执行权限
+### `tools` — Tool and execution permissions
 
 ```json
 "tools": {
@@ -706,21 +678,21 @@ Agent 不知道当前对话的 Telegram chat_id，发送目标错误或为空。
 }
 ```
 
-| 字段 | 说明 | 可选值 |
+| Field | Description | Options |
 |------|------|--------|
-| `profile` | 工具集 profile | `full`（所有工具）/ `minimal`（精简）|
-| `exec.security` | Bash 执行安全模式 | `deny` / `allowlist` / `full` |
-| `exec.ask` | 命令不被允许时的行为 | `off` / `on-miss`（询问）/ `always` |
-| `exec.ask_fallback` | 用户未响应询问时的处理 | `deny` / `allow` |
-| `exec.safe_bins` | allowlist 模式下允许的程序列表 | `["python","ffmpeg","git",...]` |
-| `exec.timeout_sec` | bash 命令超时秒数 | `120` |
-| `apply_patch.workspace_only` | patch 工具是否只能修改 workspace 内的文件 | `true` / `false` |
+| `profile` | Tool set profile | `full` (all tools) / `minimal` (reduced set) |
+| `exec.security` | Bash execution security mode | `deny` / `allowlist` / `full` |
+| `exec.ask` | Behavior when a command is not permitted | `off` / `on-miss` (ask) / `always` |
+| `exec.ask_fallback` | Action when user doesn't respond to ask | `deny` / `allow` |
+| `exec.safe_bins` | Allowed programs in allowlist mode | `["python","ffmpeg","git",...]` |
+| `exec.timeout_sec` | Bash command timeout in seconds | `120` |
+| `apply_patch.workspace_only` | Restrict patch tool to workspace files only | `true` / `false` |
 
-> **关键：** `exec.security: "deny"` 是最常见的"Agent 无法生成文件"的原因。如需 Agent 运行脚本（生成 PPT、视频、音频等），改为 `full` 或 `allowlist`。
+> **Key:** `exec.security: "deny"` is the most common reason the agent "can't generate files". If you need the agent to run scripts (PPT, video, audio generation), set this to `full` or `allowlist`.
 
 ---
 
-### `session` — 会话隔离策略
+### `session` — Session isolation strategy
 
 ```json
 "session": {
@@ -728,17 +700,17 @@ Agent 不知道当前对话的 Telegram chat_id，发送目标错误或为空。
 }
 ```
 
-| `dmScope` 值 | 效果 |
+| `dmScope` value | Effect |
 |---|---|
-| `main`（默认）| 所有频道（Telegram、飞书）的私信共享同一个 main 会话和记忆 |
-| `channel` | 每个频道的私信独立会话（互不影响）|
-| `user` | 按用户 ID 隔离会话 |
+| `main` (default) | All channels (Telegram, Feishu) share one main session and memory |
+| `channel` | Each channel has its own independent session |
+| `user` | Sessions isolated by user ID |
 
-> **说明：** `dmScope: "main"` 意味着你在 Telegram 说的话和在飞书说的话 Agent 都记得，像同一个对话。改为 `channel` 则两边互不干扰。
+> **Note:** `dmScope: "main"` means the agent remembers what you said on both Telegram and Feishu — like one continuous conversation. Switch to `channel` to keep them completely separate.
 
 ---
 
-### `messages` — 消息行为
+### `messages` — Message behavior
 
 ```json
 "messages": {
@@ -746,13 +718,13 @@ Agent 不知道当前对话的 Telegram chat_id，发送目标错误或为空。
 }
 ```
 
-| 字段 | 说明 | 可选值 |
+| Field | Description | Options |
 |------|------|--------|
-| `ack_reaction_scope` | 何时用 emoji reaction 表示"已收到" | `all` / `group-mentions` / `none` |
+| `ack_reaction_scope` | When to use emoji reactions as acknowledgement | `all` / `group-mentions` / `none` |
 
 ---
 
-### `commands` — 原生命令
+### `commands` — Native bot commands
 
 ```json
 "commands": {
@@ -761,14 +733,14 @@ Agent 不知道当前对话的 Telegram chat_id，发送目标错误或为空。
 }
 ```
 
-| 字段 | 说明 | 可选值 |
+| Field | Description | Options |
 |------|------|--------|
-| `native` | 是否注册 `/reset`、`/help` 等原生 Bot 命令 | `auto` / `on` / `off` |
-| `native_skills` | 是否将 Skills 注册为 Bot 命令 | `auto` / `on` / `off` |
+| `native` | Register native bot commands (`/reset`, `/help`, etc.) | `auto` / `on` / `off` |
+| `native_skills` | Register skills as bot commands | `auto` / `on` / `off` |
 
 ---
 
-### `hooks` — 内部钩子
+### `hooks` — Internal hooks
 
 ```json
 "hooks": {
@@ -776,13 +748,13 @@ Agent 不知道当前对话的 Telegram chat_id，发送目标错误或为空。
 }
 ```
 
-内部钩子用于 Agent 自动注册工作区 hooks（workspace 下的 `hooks/` 目录）。一般不需要修改。
+Internal hooks let the agent auto-register workspace hooks (from the `hooks/` directory in the workspace). Generally no modification needed.
 
 ---
 
-### 常用配置片段 / Common Config Snippets
+### Common Config Snippets
 
-**开放访问（个人使用）：**
+**Open access (personal use):**
 ```json
 {
   "channels": {
@@ -795,7 +767,7 @@ Agent 不知道当前对话的 Telegram chat_id，发送目标错误或为空。
 }
 ```
 
-**允许生成文件但限制危险命令：**
+**Allow file generation but restrict dangerous commands:**
 ```json
 {
   "tools": {
@@ -808,14 +780,14 @@ Agent 不知道当前对话的 Telegram chat_id，发送目标错误或为空。
 }
 ```
 
-**多频道独立会话：**
+**Independent sessions per channel:**
 ```json
 {
   "session": { "dmScope": "channel" }
 }
 ```
 
-**飞书和 Telegram 共享记忆（默认行为）：**
+**Shared memory across Feishu and Telegram (default):**
 ```json
 {
   "session": { "dmScope": "main" }
@@ -824,32 +796,30 @@ Agent 不知道当前对话的 Telegram chat_id，发送目标错误或为空。
 
 ---
 
-## 本地模型 Ollama / Local Models
+## Local Models — Ollama
 
-**中文：** 无需外部 API，在本地运行 Llama、DeepSeek、Qwen 等模型。
+Run Llama, DeepSeek, Qwen, and more locally — no external API needed.
 
-**English:** Run Llama, DeepSeek, Qwen, and more locally — no external API needed.
-
-### 安装 Ollama / Install Ollama
+### Install Ollama
 
 ```bash
 # macOS
 brew install ollama
 ollama serve
 
-# 下载模型 / Pull models
+# Pull models
 ollama pull llama3.3
 ollama pull deepseek-coder
 ollama pull qwen2.5:14b
 ```
 
-### 配置 / Configure
+### Configure
 
 ```bash
 uv run openclaw models set ollama/llama3.3
 ```
 
-或写入配置 / Or in `~/.openclaw/openclaw.json`:
+Or in `~/.openclaw/openclaw.json`:
 ```json
 {
   "agent": {
@@ -859,180 +829,179 @@ uv run openclaw models set ollama/llama3.3
 }
 ```
 
-> **远程 Ollama / Remote Ollama:** 在 `.env` 中设置 `OLLAMA_BASE_URL=http://your-server:11434`
+> **Remote Ollama:** Set `OLLAMA_BASE_URL=http://your-server:11434` in `.env`
 
 ---
 
-## 切换 AI 模型 / Switching Models
+## Switching Models
 
 ```bash
-# 查看当前模型 / Show current model
+# Show current model
 uv run openclaw models status
 
-# 切换模型 / Switch model
+# Switch model
 uv run openclaw models set google/gemini-2.5-pro-preview
-uv run openclaw models set anthropic/claude-opus-4-5
+uv run openclaw models set anthropic/claude-3-5-sonnet
 uv run openclaw models set openai/gpt-4o
 uv run openclaw models set ollama/llama3.3
 
-# 设置备用模型（主模型失败时自动切换）/ Set fallback
+# Set fallback (auto-switch when primary fails)
 uv run openclaw models fallbacks add google/gemini-2.5-flash
 ```
 
-**常用模型 ID / Common Model IDs:**
+**Common Model IDs:**
 
-| 模型 | ID |
+| Model | ID |
 |------|-----|
 | Gemini 2.5 Pro | `google/gemini-2.5-pro-preview` |
-| Gemini Flash | `google/gemini-2.5-flash` |
-| Claude Opus 4.5 | `anthropic/claude-opus-4-5` |
+| Gemini 2.5 Flash | `google/gemini-2.5-flash` |
+| Claude 3.5 Sonnet | `anthropic/claude-3-5-sonnet` |
 | GPT-4o | `openai/gpt-4o` |
-| Llama 3.3 (本地) | `ollama/llama3.3` |
-| DeepSeek Coder (本地) | `ollama/deepseek-coder` |
+| Llama 3.3 (local) | `ollama/llama3.3` |
+| DeepSeek Coder (local) | `ollama/deepseek-coder` |
 
 ---
 
-## Agent 工作区 / Agent Workspace
-
-所有 Agent 生成的文件保存在 `~/.openclaw/workspace/`，这是 Agent 的专属工作目录，类似用户的 home 文件夹。
+## Agent Workspace
 
 All agent-generated files live in `~/.openclaw/workspace/` — the agent's home directory, never inside the project source.
 
-### 目录结构 / Directory Layout
+### Directory Layout
 
 ```
 ~/.openclaw/
-├── openclaw.json           # 主配置文件 / Main config
+├── openclaw.json           # Main config
 ├── agents/main/
-│   ├── agent/              # API Key profiles（权限 0600）
-│   └── sessions/           # 会话记录 (.jsonl)
-├── credentials/            # OAuth token、pairing 状态
-├── cron/                   # 定时任务定义与执行历史
-├── delivery-queue/         # 出站消息预写日志
-├── feishu/dedup/           # 飞书消息去重
-├── identity/               # 设备身份与 auth token
-├── logs/                   # Gateway 日志
-├── media/                  # 媒体文件
-├── sandboxes/              # 沙箱工作区（Docker 隔离）
-├── telegram/               # Telegram offset 和 sticker 缓存
-└── workspace/              # Agent 工作目录（共享，flat）
+│   ├── agent/              # API key profiles (permissions 0600)
+│   └── sessions/           # Session history (.jsonl)
+├── credentials/            # OAuth tokens, pairing state
+├── cron/                   # Scheduled task definitions and history
+├── delivery-queue/         # Outbound message write-ahead log
+├── feishu/dedup/           # Feishu message deduplication
+├── identity/               # Device identity and auth token
+├── logs/                   # Gateway logs
+├── media/                  # Media files (TTL-cleaned)
+├── sandboxes/              # Sandbox workspace (Docker isolation)
+├── telegram/               # Telegram offset and sticker cache
+└── workspace/              # Agent working directory
     ├── .git/
-    ├── AGENTS.md           # Agent 操作指令
-    ├── SOUL.md             # Agent 人格
-    └── (agent files...)
+    ├── AGENTS.md           # Agent operating instructions
+    ├── SOUL.md             # Agent personality
+    └── {session-id}/       # Per-conversation subdirectory
+        ├── downloads/      # Files to send to user
+        ├── output/         # Generated content
+        └── tmp/            # Scratch files
 ```
 
 ```bash
-# 查看实际路径 / Show actual paths
+# Show actual paths
 uv run openclaw directory
 ```
 
 ---
 
-## 命令行参考 / CLI Reference
-
-所有命令都以 `uv run openclaw` 为前缀。加 `--help` 查看详细选项。
+## CLI Reference
 
 All commands are prefixed with `uv run openclaw`. Add `--help` for full options.
 
-### 核心 / Core
+### Core
 
-| 命令 | 说明 |
-|------|------|
-| `start` | 启动 Gateway + 所有频道（前台）|
-| `onboard` | 首次初始化向导 |
-| `doctor` | 系统诊断 |
-| `version` | 显示版本 |
-| `tui` | 终端交互界面 |
-| `cleanup` | 清理端口和僵尸进程 |
+| Command | Description |
+|---------|----------|
+| `start` | Start Gateway + all channels (foreground) |
+| `onboard` | First-time setup wizard |
+| `doctor` | System diagnostics |
+| `version` | Show version |
+| `tui` | Terminal UI |
+| `cleanup` | Clean up ports and zombie processes |
 
-### Gateway 管理 / Gateway Management
+### Gateway Management
 
-| 命令 | 说明 |
-|------|------|
-| `gateway run` | 仅启动 Gateway（前台）|
-| `gateway install` | 安装为系统服务（一次性）|
-| `gateway start` | 启动后台服务 |
-| `gateway stop` | 停止后台服务 |
-| `gateway restart` | 重启后台服务 |
-| `gateway status` | 查看后台服务状态 |
-| `gateway logs` | 查看日志 |
-| `gateway uninstall` | 卸载系统服务 |
+| Command | Description |
+|---------|----------|
+| `gateway run` | Start Gateway only (foreground) |
+| `gateway install` | Install as system service (one-time) |
+| `gateway start` | Start background daemon |
+| `gateway stop` | Stop background daemon |
+| `gateway restart` | Restart background daemon |
+| `gateway status` | Check daemon status |
+| `gateway logs` | Tail daemon logs |
+| `gateway uninstall` | Uninstall system service |
 
-### 配置 / Configuration
+### Configuration
 
-| 命令 | 说明 |
-|------|------|
-| `config show` | 显示完整配置 |
-| `config get <key>` | 获取某个配置项 |
-| `config set <key> <value>` | 设置配置项 |
-| `config unset <key>` | 删除配置项 |
-| `directory` | 显示所有状态目录路径 |
+| Command | Description |
+|---------|----------|
+| `config show` | Display full config |
+| `config get <key>` | Get a config value |
+| `config set <key> <value>` | Set a config value |
+| `config unset <key>` | Delete a config value |
+| `directory` | Show all state directory paths |
 
-### 模型 / Models
+### Models
 
-| 命令 | 说明 |
-|------|------|
-| `models status` | 显示当前模型配置 |
-| `models set <model>` | 切换默认模型 |
-| `models fallbacks list` | 列出备用模型 |
-| `models fallbacks add <model>` | 添加备用模型 |
-| `models fallbacks remove <model>` | 移除备用模型 |
+| Command | Description |
+|---------|----------|
+| `models status` | Show current model config |
+| `models set <model>` | Switch default model |
+| `models fallbacks list` | List fallback models |
+| `models fallbacks add <model>` | Add a fallback model |
+| `models fallbacks remove <model>` | Remove a fallback model |
 
-### 频道与 Pairing / Channels & Pairing
+### Channels & Pairing
 
-| 命令 | 说明 |
-|------|------|
-| `channels list` | 列出所有频道 |
-| `channels status` | 显示连接状态 |
-| `pairing list <channel>` | 列出待审批配对请求 |
-| `pairing approve <channel> <code>` | 批准配对 |
-| `pairing deny <channel> <code>` | 拒绝配对 |
-| `pairing clear <channel>` | 清除所有配对请求 |
-| `pairing allowlist <channel>` | 查看白名单 |
+| Command | Description |
+|---------|----------|
+| `channels list` | List all channels |
+| `channels status` | Show connection status |
+| `pairing list <channel>` | List pending pairing requests |
+| `pairing approve <channel> <code>` | Approve a pairing request |
+| `pairing deny <channel> <code>` | Deny a pairing request |
+| `pairing clear <channel>` | Clear all pairing requests |
+| `pairing allowlist <channel>` | View allowlist |
 
-### 定时任务 / Cron
+### Cron
 
-| 命令 | 说明 |
-|------|------|
-| `cron list` | 列出所有定时任务 |
-| `cron add` | 添加定时任务（交互）|
-| `cron run <job-id>` | 立即执行某个任务 |
-| `cron remove <job-id>` | 删除任务 |
-| `cron enable <job-id>` | 启用任务 |
-| `cron disable <job-id>` | 禁用任务 |
+| Command | Description |
+|---------|----------|
+| `cron list` | List all scheduled tasks |
+| `cron add` | Add a task (interactive) |
+| `cron run <job-id>` | Run a task immediately |
+| `cron remove <job-id>` | Delete a task |
+| `cron enable <job-id>` | Enable a task |
+| `cron disable <job-id>` | Disable a task |
 
-**示例 / Example:**
+**Example:**
 ```bash
-# 每天早 9 点发日报 / Daily briefing at 9am
+# Daily briefing at 9am
 uv run openclaw cron add --name "Morning Briefing" --schedule "0 9 * * *"
 ```
 
-### Agent 与会话 / Agent & Sessions
+### Agent & Sessions
 
-| 命令 | 说明 |
-|------|------|
-| `agent run` | 通过 Gateway 运行一次 Agent |
-| `message send <channel> <target>` | 向频道发送消息 |
-| `memory search <query>` | 搜索 Agent 记忆 |
-| `memory rebuild` | 重建记忆索引 |
+| Command | Description |
+|---------|----------|
+| `agent run` | Run agent once via Gateway |
+| `message send <channel> <target>` | Send a message to a channel |
+| `memory search <query>` | Search agent memory |
+| `memory rebuild` | Rebuild memory index |
 
-### 技能与工具 / Skills & Tools
+### Skills & Tools
 
-| 命令 | 说明 |
-|------|------|
-| `skills list` | 列出所有技能 |
-| `skills refresh` | 刷新技能缓存 |
-| `tools list` | 列出所有工具 |
-| `plugins list` | 列出已加载插件 |
+| Command | Description |
+|---------|----------|
+| `skills list` | List all skills |
+| `skills refresh` | Refresh skill cache |
+| `tools list` | List all tools |
+| `plugins list` | List loaded plugins |
 
-### 维护 / Maintenance
+### Maintenance
 
-| 命令 | 说明 |
-|------|------|
-| `logs tail` | 实时查看日志 |
-| `logs clear` | 清空日志文件 |
-| `cleanup` | 清理进程和端口 |
-| `cleanup --kill-all` | 强制终止所有 openclaw 进程 |
-| `cleanup --ports 18789` | 释放指定端口 |
-| `system heartbeat` | 触发心跳检查 |
+| Command | Description |
+|---------|----------|
+| `logs tail` | Tail logs in real time |
+| `logs clear` | Clear log files |
+| `cleanup` | Clean up processes and ports |
+| `cleanup --kill-all` | Force kill all openclaw processes |
+| `cleanup --ports 18789` | Release a specific port |
+| `system heartbeat` | Trigger a heartbeat check |
