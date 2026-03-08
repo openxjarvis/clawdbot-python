@@ -36,12 +36,13 @@
 A self-hosted AI gateway that connects your messaging channels to LLMs:
 
 - **Feishu (Lark)** — Full feature support: WebSocket real-time connection, streaming card output, media (image/file/voice), reactions, pairing, multi-account, Bitable, Wiki, Doc tools
-- **Telegram** — Fully operational with robust polling (conflict-free restart logic, health monitor, update deduplication)
+- **Telegram** — Fully operational with robust polling (conflict-free restart logic, health monitor, streaming progress, queue control)
 - **Other channels** — Discord, Slack, WhatsApp, Signal, IRC (code complete, runtime verification in progress)
-- **LLM providers** — Gemini, Claude, GPT, DeepSeek, Grok, Ollama (local)
+- **LLM providers** — Gemini, Claude, GPT, DeepSeek, Ollama (local), AWS Bedrock
 - **Web UI** — Chat, session management, config at `http://localhost:18789`
-- **Cron scheduler** — Autonomous scheduled tasks
+- **Cron scheduler** — Autonomous scheduled tasks with flexible timing
 - **Sub-agents** — Spawn, registry, thread binding, Docker sandbox
+- **Permission presets** — Quick security level switching (Relaxed/Trusted/Standard/Strict)
 
 ---
 
@@ -117,6 +118,9 @@ my-workspace/
 - Health monitor with `get_me()` checks every 60s
 - Update offset persistence across restarts
 - Deduplication for all update types
+- **Streaming progress** — DMs show reasoning steps; groups show live preview bubble
+- **Queue control** — `/stop` to abort, `/queue` to change behavior (interrupt/steer/followup/collect)
+- **3-minute auto-timeout** — Prevents stuck runs
 
 ---
 
@@ -195,6 +199,8 @@ Controlled by `tools.exec.security` in `~/.openclaw/openclaw.json`:
 
 > **Note:** `exec.security` only affects the `bash` tool. File read/write tools are always available regardless of this setting.
 
+**Quick preset switching:** Use `uv run openclaw security preset` to instantly switch between Relaxed/Trusted/Standard/Strict permission levels (covers execution + inbound + outbound settings).
+
 ### 3. Feishu App Scopes — What Feishu API features work
 
 If a Feishu tool fails with "Access denied" or "scope required", you need to enable that scope in the [Feishu Developer Console](https://open.feishu.cn/):
@@ -220,6 +226,9 @@ After enabling new scopes, you must **publish a new app version** in the Feishu 
 | Feishu task/calendar tools fail | Missing API scope | Enable scope in Feishu console and republish |
 | Bot doesn't respond to new users | DM policy is `pairing` | Approve via `uv run openclaw pairing approve` or set `dmPolicy: open` |
 | Agent can write files but can't run Python | `exec.security: allowlist` missing `python` | Add `python` to `safe_bins` |
+| Bot stuck / unresponsive after complex task | Agent run looping or timed out | Send `/stop` (auto-timeout after 3 min) |
+
+**Quick fix:** Run `uv run openclaw security preset` to see current permission level and switch to a preset (Trusted recommended for personal use).
 
 See **[GUIDE.md](GUIDE.md)** for full configuration reference.
 

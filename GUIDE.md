@@ -108,6 +108,8 @@ Then open the Web UI in your browser: `http://localhost:18789`
 | Port conflict | 18789 already in use | `uv run openclaw cleanup --ports 18789` |
 | Invalid API key | Key missing or wrong | `uv run openclaw config show` to verify |
 | Stops when terminal closes | Running in foreground | Install as a system service with `gateway install` |
+| Bot stuck / no response after a complex task | Agent run looping or timed out | Send `/stop` in chat (Telegram); runs auto-timeout after 3 minutes |
+| Messages queued but never processed | Previous run still active | Send `/stop` or wait for the 3-minute timeout |
 
 ---
 
@@ -200,13 +202,21 @@ uv run openclaw pairing approve telegram <code>
 uv run openclaw config set channels.telegram.dmPolicy open
 ```
 
-### 5. In-Chat Commands
+### 5. Streaming Progress (DMs)
+
+In **private DMs**, the bot sends a separate visible message for each reasoning step before calling a tool, so you can follow what it's doing in real time. In **group chats**, a live preview bubble updates as the agent works, and the final message replaces it seamlessly.
+
+### 6. In-Chat Commands
 
 | Command | Function |
 |---------|----------|
 | `/reset` | Start a new session |
+| `/stop` | Abort the currently running agent task and clear the queue |
+| `/queue <mode>` | Change message queue behavior: `interrupt` (new message cancels current), `steer` (inject mid-run), `followup` (queue — default), `collect` |
 | `/cron` | View scheduled tasks |
 | `/help` | Show help |
+
+> **When to use `/stop`:** If the bot seems stuck or unresponsive after a complex request, `/stop` immediately aborts the running task and lets the next message start fresh. Agent runs also auto-timeout after **3 minutes**.
 
 ---
 
@@ -302,7 +312,7 @@ uv run openclaw pairing approve feishu <code>
 | `feishu_drive_*` | Cloud drive file management |
 | `feishu_bitable_*` | Bitable — 11 fine-grained operations |
 | `feishu_task_*` | Task management (v2 API) |
-| `feishu_calendar_*` | Calendar and events |
+| `feishu_calendar_*` | Calendar and events (see note below) |
 | `feishu_chat_*` | Group operations |
 | `feishu_urgent` | Urgent message push |
 | `feishu_reactions` | Message reactions |
@@ -421,6 +431,44 @@ By default the agent can write to:
 - Any path the OS user has permission to write
 
 For path isolation, enable Docker sandbox (`tools.exec.sandbox`) — the agent will be restricted to `/workspace` inside the container.
+
+---
+
+### 5. Permission Presets — Quick Level Switching
+
+Instead of editing individual JSON fields, use the built-in preset system to switch between four pre-defined permission levels in one command.
+
+Each preset covers **all three permission dimensions** — execution, inbound (入站), and outbound (出站):
+
+| # | Preset | exec.security | dmPolicy | groupPolicy | allowWithinProvider | allowAcrossProviders |
+|---|---|---|---|---|---|---|
+| 1 | **Relaxed** | `full` | `open` | `open` | `true` | `true` |
+| 2 | **Trusted** ← **recommended** | `full` | `pairing` | `allowlist` | `true` | `false` |
+| 3 | **Standard** | `allowlist` | `pairing` | `allowlist` | `true` | `false` |
+| 4 | **Strict** | `deny` | `pairing` | `disabled` | `false` | `false` |
+
+**Why Trusted is the recommended default:** Full agent capability with pairing keeps the bot playable and flexible, while still requiring user approval. Group chats are allowlist-only (not open), and the agent can message other chats within the same channel but not across providers.
+
+**Standard safe_bins:** `python`, `pip`, `uv`, `ffmpeg`, `git`, `node`, `npm`, `convert`
+
+**CLI commands:**
+
+```bash
+# Check current level (shows inbound + outbound settings)
+uv run openclaw security status
+
+# Interactive menu to switch level
+uv run openclaw security preset
+
+# Switch directly (no prompts)
+uv run openclaw security preset trusted --yes
+
+# JSON output (for scripting)
+uv run openclaw security status --json
+```
+
+> Presets apply `exec.security`, `safe_bins`, `dmPolicy`, `groupPolicy`, and `tools.message.crossContext` to all configured channels at once.
+> After applying, restart OpenClaw: `uv run openclaw start`
 
 ---
 
@@ -674,6 +722,12 @@ Modify a field: `uv run openclaw config set <key> <value>`
       "enabled": true,
       "workspace_only": true
     }
+  },
+  "message": {
+    "crossContext": {
+      "allowWithinProvider": true,
+      "allowAcrossProviders": false
+    }
   }
 }
 ```
@@ -687,8 +741,12 @@ Modify a field: `uv run openclaw config set <key> <value>`
 | `exec.safe_bins` | Allowed programs in allowlist mode | `["python","ffmpeg","git",...]` |
 | `exec.timeout_sec` | Bash command timeout in seconds | `120` |
 | `apply_patch.workspace_only` | Restrict patch tool to workspace files only | `true` / `false` |
+| `message.crossContext.allowWithinProvider` | Allow agent to send messages to other chats within the same channel (e.g., Telegram → other Telegram chats) | `true` (default) / `false` |
+| `message.crossContext.allowAcrossProviders` | Allow agent to send messages to a different channel provider (e.g., Telegram session → Discord) | `false` (default) / `true` |
 
 > **Key:** `exec.security: "deny"` is the most common reason the agent "can't generate files". If you need the agent to run scripts (PPT, video, audio generation), set this to `full` or `allowlist`.
+
+> **Shortcut:** Use `uv run openclaw security preset` to switch all permission settings (including inbound and outbound) at once instead of editing JSON manually. See [Permission Presets](#5-permission-presets--quick-level-switching).
 
 ---
 
@@ -696,17 +754,18 @@ Modify a field: `uv run openclaw config set <key> <value>`
 
 ```json
 "session": {
-  "dmScope": "main"
+  "dmScope": "per-channel-peer"
 }
 ```
 
 | `dmScope` value | Effect |
 |---|---|
-| `main` (default) | All channels (Telegram, Feishu) share one main session and memory |
-| `channel` | Each channel has its own independent session |
-| `user` | Sessions isolated by user ID |
+| `per-channel-peer` **(default)** | Each `(channel, user)` pair gets its own independent session — natural chat-bot behavior |
+| `per-peer` | Sessions isolated by user ID across all channels (Telegram + Feishu share a session for the same user) |
+| `per-account-channel-peer` | Sessions isolated by `(account, channel, user)` — useful when running multiple bot accounts |
+| `main` | All DMs across all channels share one single session |
 
-> **Note:** `dmScope: "main"` means the agent remembers what you said on both Telegram and Feishu — like one continuous conversation. Switch to `channel` to keep them completely separate.
+> **Tip:** The default `per-channel-peer` means your Telegram conversation and Feishu conversation are fully independent. Set to `per-peer` if you want the agent to remember context across both channels for the same user.
 
 ---
 
@@ -914,6 +973,17 @@ All commands are prefixed with `uv run openclaw`. Add `--help` for full options.
 | `version` | Show version |
 | `tui` | Terminal UI |
 | `cleanup` | Clean up ports and zombie processes |
+
+### Status
+
+| Command | Description |
+|---------|----------|
+| `status` | Live overview: gateway latency, channel states (OK/WARN/OFF), sessions, uptime |
+| `status --json` | Same data as machine-readable JSON (gateway, agent, channels, sessions) |
+| `status --all` | Full diagnosis: config path, agent list, gateway log tail, channel detail |
+| `status --deep` | Probe all channels (adds live health check per channel) |
+| `status health` | Quick reachability check — gateway uptime, connections, latency |
+| `status sessions` | List stored conversation sessions with age, kind, and model |
 
 ### Gateway Management
 
