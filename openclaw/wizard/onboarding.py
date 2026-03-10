@@ -174,6 +174,7 @@ async def run_onboarding_wizard(
             print("QuickStart mode: Using existing configuration as base")
             # Convert dict to ClawdbotConfig object
             claw_config = ClawdbotConfig(**existing_config_dict) if existing_config_dict else ClawdbotConfig()
+            # NOTE: QuickStart will preserve old model config until provider auth step updates it
         else:
             action = _prompt_config_action()
             if action == "reset":
@@ -213,6 +214,24 @@ async def run_onboarding_wizard(
             auth_choice in ("skip", None) or
             auth_choice == "custom-api-key"  # Custom provider already selected model
         )
+        
+        # IMPORTANT: For kimi-code-api-key in QuickStart, auto-set model without prompting
+        if auth_choice == "kimi-code-api-key" and mode == "quickstart":
+            # Auto-set kimi-coding/k2p5 for QuickStart + Kimi Code
+            if not claw_config.agents:
+                from openclaw.config.schema import AgentsConfig
+                claw_config.agents = AgentsConfig()
+            if not claw_config.agents.defaults:
+                from openclaw.config.schema import AgentDefaults
+                claw_config.agents.defaults = AgentDefaults()
+            if not claw_config.agent:
+                from openclaw.config.schema import AgentConfig
+                claw_config.agent = AgentConfig()
+            
+            claw_config.agents.defaults.model = "kimi-coding/k2p5"
+            claw_config.agent.model = "kimi-coding/k2p5"
+            print(f"\n✓ Auto-selected model: kimi-coding/k2p5 (Kimi Code default)")
+            skip_model_selection = True
         
         if not skip_model_selection:
             from .model_picker import prompt_default_model
@@ -1152,12 +1171,12 @@ _PROVIDER_MODELS: dict[str, list[tuple[str, str]]] = {
         ("google/gemini-2.5-flash",       "Gemini 2.5 Flash"),
     ],
     "moonshot": [
-        ("moonshot/kimi-k2.5",     "Kimi k2.5           (recommended)"),
-        ("moonshot/moonshot-v1-128k", "Moonshot v1 128k"),
-        ("moonshot/moonshot-v1-32k",  "Moonshot v1 32k"),
+        ("kimi-coding/k2p5",       "Kimi Coding k2p5    (recommended, Anthropic API)"),
+        ("moonshot/moonshot-v1-8k", "Moonshot v1 8k      (standard API)"),
+        ("moonshot/kimi-k2.5",     "Kimi k2.5           (legacy, standard API)"),
     ],
     "kimi-coding": [
-        ("kimi-coding/k2p5",       "Kimi Code k2.5      (code specialist)"),
+        ("kimi-coding/k2p5",       "Kimi Code k2p5      (code specialist)"),
     ],
     "xai": [
         ("xai/grok-4",             "Grok 4              (recommended)"),

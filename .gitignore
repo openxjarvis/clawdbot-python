@@ -4,18 +4,14 @@ __pycache__/
 *$py.class
 *.so
 .Python
-*.egg-info/
-build/
-# Python package build output (not the web UI dist)
-/dist/
-openclaw/web/ui-src/node_modules/
-# Source maps are large debug artifacts — exclude from repo
-*.js.map
+env/
+venv/
+ENV/
+.venv/
 
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
+# uv
+.venv/
+uv.lock
 
 # IDE
 .vscode/
@@ -24,73 +20,25 @@ htmlcov/
 *.swo
 *~
 
-# Environment
-.env
-.venv
-venv/
-ENV/
-
-# OpenClaw runtime
-.openclaw/
-*.db
-*.sqlite
-*.sqlite3
-
-# Temporary
-*.tmp
-*.temp
+# Project specific
 *.log
-test_*.py
-!tests/test_*.py
-
-# macOS
 .DS_Store
+.env
+.env.local
 
-# Terminal output
-terminals/
-
-# Documentation (temporary files)
-docs/
-examples/
-
-# Documentation (temporary files)
-docs/
-
-# Documentation (not committed)
-docs/
-*.log
-*.pyc
-__pycache__/
+# Tests
 .pytest_cache/
 .coverage
 htmlcov/
 
-# Local backup files (never commit)
-.backup_local_files/
+# Temp files
+*.tmp
+*.bak
+temp/
+tmp/
 
-# Agent-generated output — belongs in ~/.openclaw/workspace/, not the project root
-*.csv
-generate_*.py
+# Archives (don't push to remote)
+docs/archive/
 
-# Runtime workspace state (agent sessions, memory, identity files)
-workspace/
-memory/
-IDENTITY.md
-MEMORY.md
-SOUL.md
-USER.md
-AGENTS.md
-HEARTBEAT.md
-BOOTSTRAP.md
-BOOT.md
-ShortVideo_Project/
-agent-main-*/
-
-# Tests — kept locally, not published
+# Tests (don't push to remote)
 tests/
-
-# Temporary output files
-news_summary.md
-news_summary.txt
-video_project/
-*.backup

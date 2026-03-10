@@ -65,7 +65,7 @@ async def apply_auth_choice_moonshot(
         if auth_choice == "kimi-code-api-key":
             print("\nKimi Code API Key Configuration")
             print("-" * 60)
-            print("Get your API key from: https://kimi.moonshot.cn/subscription")
+            print("Get your API key at: https://www.kimi.com/code/en")
             api_key = input("\nEnter your Kimi Code API key: ").strip()
         elif auth_choice == "moonshot-api-key-cn":
             print("\nKimi API Key Configuration (.cn)")
@@ -84,14 +84,15 @@ async def apply_auth_choice_moonshot(
     # Save to auth-profiles.json
     try:
         from ...config.auth_profiles import set_api_key
-        profile_id = "kimi-code" if auth_choice == "kimi-code-api-key" else "moonshot"
+        # IMPORTANT: Use "kimi-coding" (not "kimi-code") to match runtime.py provider routing
+        profile_id = "kimi-coding" if auth_choice == "kimi-code-api-key" else "moonshot"
         set_api_key(profile_id, api_key)
         print(f"✓ Kimi API key saved")
     except Exception as e:
         print(f"Warning: Could not save to auth-profiles.json: {e}")
     
-    # Model selection moved to main onboarding flow (prompt_default_model)
-    # Just ensure the config structures exist
+    # Set default model for Kimi Coding (aligned with TS)
+    # Kimi Code API uses kimi-coding/k2p5 by default
     if set_default_model:
         from ...config.schema import AgentsConfig, AgentDefaults, AgentConfig
         
@@ -101,5 +102,12 @@ async def apply_auth_choice_moonshot(
             config.agents.defaults = AgentDefaults()
         if not config.agent:
             config.agent = AgentConfig()
+        
+        # Set kimi-coding/k2p5 as default for Kimi Code API
+        if auth_choice == "kimi-code-api-key":
+            default_model = "kimi-coding/k2p5"
+            config.agents.defaults.model = default_model
+            config.agent.model = default_model
+            print(f"✓ Default model set to: {default_model}")
     
     return ApplyAuthChoiceResult(config=config)

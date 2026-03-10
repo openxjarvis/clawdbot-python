@@ -28,14 +28,6 @@ def run(
         import signal
         from ..gateway.bootstrap import GatewayBootstrap
 
-        # Load .env files at startup — mirrors TS index.ts: loadDotEnv({ quiet: true })
-        # Priority: CWD .env → ~/.openclaw/.env (neither overrides already-set vars)
-        try:
-            from ..infra.dotenv import load_dot_env
-            load_dot_env(quiet=True)
-        except Exception:
-            pass
-
         level = logging.DEBUG if verbose else logging.INFO
         logging.basicConfig(level=level, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 

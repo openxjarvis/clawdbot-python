@@ -4,7 +4,10 @@ Implements full interactive flow:
 - Status display (eligible, missing, unsupported OS, blocked)
 - Multi-select install via questionary.checkbox
 - API Key configuration for skills with primaryEnv
-- QuickStart mode supports basic API Key config
+- Always asks "Configure skills now?" regardless of mode (matches TS behavior)
+
+Aligned with TypeScript behavior: setupSkills() always prompts the user,
+no special handling for QuickStart vs Advanced modes.
 """
 from __future__ import annotations
 
@@ -182,35 +185,7 @@ async def setup_skills(
     )
     print()
 
-    # QuickStart: minimal flow - still offer API Key config
-    if mode == "quickstart":
-        # QuickStart: prompt for basic API Key config only
-        needs_env = [s for s in missing if s.get("primaryEnv") and (s.get("missing", {}).get("env") or [])]
-        if needs_env:
-            try:
-                for skill in needs_env:
-                    primary = skill.get("primaryEnv")
-                    if not primary:
-                        continue
-                    wants = prompter.confirm(
-                        f"Set {primary} for {skill.get('name', '')}?",
-                        default=False,
-                    )
-                    if wants:
-                        value = prompter.text(
-                            f"Enter {primary}",
-                            default="",
-                        )
-                        if value and value.strip():
-                            cfg = _upsert_skill_entry(cfg, skill.get("skillKey", skill["name"]), {"apiKey": value.strip()})
-                            print(f"  ✓ {primary} saved for {skill.get('name', '')}")
-            except prompter.WizardCancelledError:
-                pass
-        else:
-            print("\n⚡ QuickStart: No skills need API keys. Run 'openclaw skills install' later to add skills.")
-        return {"installed": [], "configured": bool(needs_env), "config": cfg, "skipped": len(needs_env) == 0}
-
-    # Advanced: full flow
+    # Ask user if they want to configure skills (same behavior for all modes)
     try:
         should_configure = prompter.confirm(
             "Configure skills now? (recommended)",
@@ -222,7 +197,7 @@ async def setup_skills(
     if not should_configure:
         return {"installed": [], "config": cfg, "skipped": True}
 
-    # Multi-select install
+    # Multi-select install (unified for QuickStart and Advanced)
     installable = [
         s for s in missing
         if (s.get("install") or []) and (s.get("missing", {}).get("bins") or [])
@@ -243,9 +218,12 @@ async def setup_skills(
             ],
         ]
 
+        # Customize message based on mode
+        message = "Install missing skill dependencies"
+
         try:
             selected = prompter.checkbox(
-                "Install missing skill dependencies (Space to select, Enter to confirm)",
+                message,
                 choices=choices,
             )
         except prompter.WizardCancelledError:
@@ -291,7 +269,7 @@ async def setup_skills(
                 if result.get("stderr"):
                     print(f"     {result['stderr'][:200]}")
 
-    # API Key configuration for missing env
+    # API Key configuration for missing env (unified for both modes)
     for skill in missing:
         primary = skill.get("primaryEnv")
         missing_env = skill.get("missing", {}).get("env") or []
@@ -310,7 +288,9 @@ async def setup_skills(
         except prompter.WizardCancelledError:
             break
 
+    # Summary
     print(f"\n✅ Skills setup complete. Installed: {len(installed)}")
+    
     return {"installed": installed, "count": len(installed), "config": cfg}
 
 

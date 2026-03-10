@@ -20,6 +20,7 @@ Mirrors how attempt.ts calls streamSimple() from @pi-ai.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any, AsyncIterator
 
@@ -46,10 +47,102 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Model resolution
+# Provider configuration for forward-compatibility
 # ---------------------------------------------------------------------------
 
-# Fallback models ordered by preference
+# OpenAI-compatible providers that can be dynamically created
+# Mirrors TypeScript resolveForwardCompatModel logic
+OPENAI_COMPATIBLE_PROVIDERS = {
+    "moonshot", "kimi-coding", "kimi",
+    "deepseek", "groq", "mistral", "xai",
+    "together", "openrouter", "huggingface",
+    "cerebras", "zai", "zhipu",
+    "minimax", "minimax-cn", "qwen",
+    "xiaomi", "volcengine", "byteplus", "synthetic",
+}
+
+# Provider base URLs (aligned with runtime.py and TypeScript)
+PROVIDER_BASE_URLS = {
+    "moonshot": "https://api.moonshot.ai/v1",
+    "kimi-coding": "https://api.kimi.com/coding/",  # ✅ With trailing slash (per TS)
+    "kimi": "https://api.kimi.com/coding/",           # ✅ With trailing slash
+    "deepseek": "https://api.deepseek.com",
+    "groq": "https://api.groq.com/openai/v1",
+    "mistral": "https://api.mistral.ai/v1",
+    "xai": "https://api.x.ai/v1",
+    "together": "https://api.together.xyz/v1",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "huggingface": "https://api-inference.huggingface.co/models",
+    "cerebras": "https://api.cerebras.ai/v1",
+    "zai": "https://api.z.ai/api/coding/paas/v4",
+    "zhipu": "https://open.bigmodel.cn/api/paas/v4",
+    "minimax": "https://api.minimax.io/anthropic",
+    "minimax-cn": "https://api.minimaxi.com/anthropic",
+    "qwen": "https://portal.qwen.ai/v1",
+    "xiaomi": "https://api.xiaomimimo.com/anthropic",
+    "volcengine": "https://ark.cn-beijing.volces.com/api/v3",
+    "byteplus": "https://ark-us-east-1.bytepluses.com/api/v3",
+    "synthetic": "https://api.synthetic.ai/v1",
+}
+
+# Provider API key environment variables
+PROVIDER_API_KEY_ENV_VARS = {
+    "google": ["GOOGLE_API_KEY", "GEMINI_API_KEY"],
+    "anthropic": ["ANTHROPIC_API_KEY"],
+    "openai": ["OPENAI_API_KEY"],
+    "moonshot": ["MOONSHOT_API_KEY", "KIMI_CODE_API_KEY"],
+    "kimi-coding": ["KIMI_API_KEY", "KIMI_CODE_API_KEY"],
+    "kimi": ["KIMI_API_KEY", "KIMI_CODE_API_KEY"],
+    "deepseek": ["DEEPSEEK_API_KEY"],
+    "groq": ["GROQ_API_KEY"],
+    "mistral": ["MISTRAL_API_KEY"],
+    "xai": ["XAI_API_KEY"],
+    "together": ["TOGETHER_API_KEY"],
+    "openrouter": ["OPENROUTER_API_KEY"],
+    "huggingface": ["HUGGINGFACE_API_KEY", "HF_API_KEY", "HF_TOKEN"],
+    "cerebras": ["CEREBRAS_API_KEY"],
+    "zai": ["ZAI_API_KEY", "ZHIPU_API_KEY"],
+    "zhipu": ["ZHIPU_API_KEY", "ZAI_API_KEY"],
+    "minimax": ["MINIMAX_API_KEY"],
+    "minimax-cn": ["MINIMAX_CN_API_KEY"],
+    "qwen": ["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
+    "xiaomi": ["XIAOMI_API_KEY"],
+    "volcengine": ["VOLCANO_ENGINE_API_KEY", "VOLCENGINE_API_KEY"],
+    "byteplus": ["BYTEPLUS_API_KEY"],
+    "synthetic": ["SYNTHETIC_API_KEY"],
+    "ollama": ["OLLAMA_API_KEY"],
+}
+
+
+def _has_api_key(provider: str) -> bool:
+    """Check if an API key exists for the given provider."""
+    env_vars = PROVIDER_API_KEY_ENV_VARS.get(provider, [f"{provider.upper()}_API_KEY"])
+    return any(os.getenv(var) for var in env_vars)
+
+
+def _create_forward_compat_model(provider: str, model_id: str) -> Model:
+    """Create a forward-compatible Model for OpenAI-compatible providers.
+    
+    Mirrors TypeScript resolveForwardCompatModel in pi-embedded-runner/model.ts.
+    This allows using providers/models not in the static registry.
+    """
+    base_url = PROVIDER_BASE_URLS.get(provider)
+    if not base_url:
+        raise ValueError(f"Unknown provider {provider!r} for forward-compat model creation")
+    
+    # Create a minimal Model object that pi_ai can use
+    # The actual API call will use the base_url and provider's API key
+    return Model(
+        provider=provider,
+        id=model_id,
+        name=f"{provider}/{model_id}",
+        input=["text"],  # Assume text input; models can override
+        api="openai-completions",  # OpenAI-compatible
+        base_url=base_url,  # Required by pi_ai.Model
+    )
+
+
+# Fallback models ordered by preference (only if they have API keys)
 _FALLBACK_MODEL_PAIRS = [
     ("google", "gemini-2.0-flash"),
     ("anthropic", "claude-3-5-sonnet-20241022"),
@@ -60,8 +153,12 @@ _FALLBACK_MODEL_PAIRS = [
 def _resolve_model(model_str: str) -> Model:
     """Resolve a 'provider/model-id' string to a pi_ai Model object.
 
-    Falls back to gemini-2.0-flash if the requested model is not in the
-    registry (e.g. a model added after this build).
+    Resolution order:
+    1. Try to get from pi_ai registry (built-in models)
+    2. For OpenAI-compatible providers, create forward-compat model
+    3. Fall back to available models with API keys
+    
+    Mirrors TypeScript model resolution in openclaw/src/agents/pi-embedded-runner/model.ts
     """
     if "/" in model_str:
         provider, model_id = model_str.split("/", 1)
@@ -72,22 +169,69 @@ def _resolve_model(model_str: str) -> Model:
             provider, model_id = "google", model_str
         elif "claude" in lower or "haiku" in lower or "sonnet" in lower or "opus" in lower:
             provider, model_id = "anthropic", model_str
+        elif "kimi" in lower or "moonshot" in lower:
+            provider, model_id = "moonshot", model_str
         else:
             provider, model_id = "openai", model_str
 
+    # Normalize provider ID (mirrors model_selection.normalize_provider_id)
+    provider_normalized = provider.lower().replace("_", "-")
+    if provider_normalized == "google-gemini":
+        provider_normalized = "google"
+    elif provider_normalized in ("z.ai", "zhipu-ai"):
+        provider_normalized = "zai"
+
+    # 1. Try to get from pi_ai registry
     try:
-        return get_model(provider, model_id)
+        model = get_model(provider_normalized, model_id)
+        if model is not None:
+            return model
     except KeyError:
         pass
 
-    # Try fallbacks
-    for fp, fid in _FALLBACK_MODEL_PAIRS:
+    # 2. For OpenAI-compatible providers, create forward-compat model
+    if provider_normalized in OPENAI_COMPATIBLE_PROVIDERS:
         try:
+            logger.info(
+                f"Creating forward-compat model for {provider_normalized}/{model_id}"
+            )
+            model = _create_forward_compat_model(provider_normalized, model_id)
+            # Warn if no API key found, but still return the model
+            # (key might be provided later via auth-profiles.json)
+            if not _has_api_key(provider_normalized):
+                logger.warning(
+                    f"Model {model_str!r} created but no API key found for provider {provider_normalized!r}. "
+                    f"Set {', '.join(PROVIDER_API_KEY_ENV_VARS.get(provider_normalized, []))} in environment."
+                )
+            return model
+        except Exception as e:
+            logger.warning(f"Failed to create forward-compat model: {e}")
+
+    # 3. Try fallbacks (only if they have API keys)
+    for fp, fid in _FALLBACK_MODEL_PAIRS:
+        if not _has_api_key(fp):
+            continue
+        try:
+            logger.warning(
+                f"Model {model_str!r} not available, falling back to {fp}/{fid}"
+            )
             return get_model(fp, fid)
         except KeyError:
             continue
 
-    raise ValueError(f"Could not resolve any model for {model_str!r}")
+    # No model found
+    available_providers = [p for p in ["google", "anthropic", "openai"] if _has_api_key(p)]
+    if available_providers:
+        error_msg = (
+            f"Could not resolve model {model_str!r}. "
+            f"Available providers with API keys: {', '.join(available_providers)}"
+        )
+    else:
+        error_msg = (
+            f"Could not resolve model {model_str!r} and no API keys found for fallback providers. "
+            f"Please set API keys in environment (e.g., GOOGLE_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY)"
+        )
+    raise ValueError(error_msg)
 
 
 # ---------------------------------------------------------------------------

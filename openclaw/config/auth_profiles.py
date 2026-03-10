@@ -179,10 +179,26 @@ def set_api_key(
 # ---------------------------------------------------------------------------
 
 _PROVIDER_ENV_VARS: dict[str, list[str]] = {
-    "google":    ["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+    "google":    ["GOOGLE_API_KEY", "GEMINI_API_KEY"],
     "anthropic": ["ANTHROPIC_API_KEY"],
     "openai":    ["OPENAI_API_KEY"],
+    "moonshot":  ["MOONSHOT_API_KEY", "KIMI_CODE_API_KEY"],
+    "kimi-coding": ["KIMI_API_KEY", "KIMI_CODE_API_KEY"],
+    "kimi":      ["KIMI_API_KEY", "KIMI_CODE_API_KEY"],
+    "deepseek":  ["DEEPSEEK_API_KEY"],
+    "groq":      ["GROQ_API_KEY"],
+    "mistral":   ["MISTRAL_API_KEY"],
+    "xai":       ["XAI_API_KEY"],
+    "together":  ["TOGETHER_API_KEY"],
     "openrouter": ["OPENROUTER_API_KEY"],
+    "huggingface": ["HUGGINGFACE_API_KEY", "HF_API_KEY", "HF_TOKEN"],
+    "cerebras":  ["CEREBRAS_API_KEY"],
+    "zai":       ["ZAI_API_KEY", "ZHIPU_API_KEY"],
+    "zhipu":     ["ZHIPU_API_KEY", "ZAI_API_KEY"],
+    "minimax":   ["MINIMAX_API_KEY"],
+    "minimax-cn": ["MINIMAX_CN_API_KEY"],
+    "qwen":      ["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
+    "ollama":    ["OLLAMA_API_KEY"],
 }
 
 

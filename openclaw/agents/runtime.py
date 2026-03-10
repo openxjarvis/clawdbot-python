@@ -312,7 +312,8 @@ class MultiProviderRuntime:
             return OpenAIProvider(provider_name_override="xai", **kwargs)
 
         if provider_name in ("zai", "zhipu"):
-            kwargs["base_url"] = kwargs.get("base_url") or "https://open.bigmodel.cn/api/paas/v4"
+            # ZAI coding API (aligned with TS)
+            kwargs["base_url"] = kwargs.get("base_url") or "https://api.z.ai/api/coding/paas/v4"
             kwargs["api_key"] = kwargs.get("api_key") or os.getenv("ZAI_API_KEY") or os.getenv("ZHIPU_API_KEY")
             return OpenAIProvider(provider_name_override="zai", **kwargs)
 
@@ -331,10 +332,21 @@ class MultiProviderRuntime:
             kwargs["api_key"] = kwargs.get("api_key") or os.getenv("MISTRAL_API_KEY")
             return OpenAIProvider(provider_name_override="mistral", **kwargs)
 
-        if provider_name in ("moonshot", "kimi-coding", "kimi"):
-            kwargs["base_url"] = kwargs.get("base_url") or "https://api.moonshot.cn/v1"
-            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("MOONSHOT_API_KEY")
+        if provider_name == "moonshot":
+            # Standard Moonshot API (international endpoint by default)
+            # For China endpoint, set baseUrl: "https://api.moonshot.cn/v1" in openclaw.json
+            kwargs["base_url"] = kwargs.get("base_url") or "https://api.moonshot.ai/v1"
+            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("MOONSHOT_API_KEY") or os.getenv("KIMI_CODE_API_KEY")
             return OpenAIProvider(provider_name_override="moonshot", **kwargs)
+
+        if provider_name in ("kimi-coding", "kimi"):
+            # Kimi Coding API uses Anthropic Messages API format (aligned with TS)
+            # TS: src/agents/models-config.providers.ts buildKimiCodingProvider()
+            # base_url: "https://api.kimi.com/coding/" (with trailing slash per TS)
+            # api: "anthropic-messages"
+            kwargs["base_url"] = kwargs.get("base_url") or "https://api.kimi.com/coding/"
+            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("KIMI_API_KEY") or os.getenv("KIMI_CODE_API_KEY")
+            return AnthropicProvider(provider_name_override="kimi-coding", **kwargs)
 
         if provider_name == "together":
             kwargs["base_url"] = kwargs.get("base_url") or "https://api.together.xyz/v1"
@@ -347,8 +359,8 @@ class MultiProviderRuntime:
             return OpenAIProvider(provider_name_override="openrouter", **kwargs)
 
         if provider_name == "huggingface":
-            kwargs["base_url"] = kwargs.get("base_url") or "https://api-inference.huggingface.co/v1"
-            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("HUGGINGFACE_API_KEY") or os.getenv("HF_API_KEY")
+            kwargs["base_url"] = kwargs.get("base_url") or "https://api-inference.huggingface.co/models"
+            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("HUGGINGFACE_API_KEY") or os.getenv("HF_API_KEY") or os.getenv("HF_TOKEN")
             return OpenAIProvider(provider_name_override="huggingface", **kwargs)
 
         if provider_name == "cerebras":
@@ -356,15 +368,79 @@ class MultiProviderRuntime:
             kwargs["api_key"] = kwargs.get("api_key") or os.getenv("CEREBRAS_API_KEY")
             return OpenAIProvider(provider_name_override="cerebras", **kwargs)
 
+        # ── Chinese AI providers ───────────────────────────────────────────
+
+        if provider_name == "minimax":
+            # MiniMax (uses Anthropic Messages API - aligned with TS)
+            # TS: src/agents/models-config.providers.ts buildMinimaxProvider()
+            # api: "anthropic-messages", authHeader: true (uses Authorization: Bearer)
+            kwargs["base_url"] = kwargs.get("base_url") or "https://api.minimax.io/anthropic"
+            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("MINIMAX_API_KEY")
+            return AnthropicProvider(provider_name_override="minimax", **kwargs)
+
+        if provider_name == "minimax-cn":
+            # MiniMax China (uses Anthropic Messages API - aligned with TS)
+            # TS: src/agents/models-config.providers.ts buildMinimaxPortalProvider()
+            # api: "anthropic-messages", authHeader: true
+            kwargs["base_url"] = kwargs.get("base_url") or "https://api.minimaxi.com/anthropic"
+            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("MINIMAX_CN_API_KEY")
+            return AnthropicProvider(provider_name_override="minimax-cn", **kwargs)
+
         if provider_name in ("opencode", "opencode-zen"):
             kwargs["base_url"] = kwargs.get("base_url") or os.getenv("OPENCODE_BASE_URL", "https://api.opencode.ai/v1")
             kwargs["api_key"] = kwargs.get("api_key") or os.getenv("OPENCODE_API_KEY")
             return OpenAIProvider(provider_name_override="opencode", **kwargs)
 
         if provider_name in ("qwen-portal", "qwen"):
-            kwargs["base_url"] = kwargs.get("base_url") or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+            kwargs["base_url"] = kwargs.get("base_url") or "https://portal.qwen.ai/v1"
             kwargs["api_key"] = kwargs.get("api_key") or os.getenv("DASHSCOPE_API_KEY") or os.getenv("QWEN_API_KEY")
             return OpenAIProvider(provider_name_override="qwen", **kwargs)
+
+        if provider_name == "xiaomi":
+            # Xiaomi MiMo (uses Anthropic Messages API - aligned with TS)
+            # TS: src/agents/models-config.providers.ts buildXiaomiProvider()
+            # api: "anthropic-messages"
+            kwargs["base_url"] = kwargs.get("base_url") or "https://api.xiaomimimo.com/anthropic"
+            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("XIAOMI_API_KEY")
+            return AnthropicProvider(provider_name_override="xiaomi", **kwargs)
+
+        if provider_name in ("volcengine", "doubao"):
+            # Volcengine Doubao (uses OpenAI Completions API - aligned with TS)
+            # TS: src/agents/models-config.providers.ts buildDoubaoProvider()
+            # api: "openai-completions"
+            kwargs["base_url"] = kwargs.get("base_url") or "https://ark.cn-beijing.volces.com/api/v3"
+            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("VOLCANO_ENGINE_API_KEY") or os.getenv("VOLCENGINE_API_KEY")
+            return OpenAIProvider(provider_name_override="volcengine", **kwargs)
+
+        if provider_name in ("volcengine-plan", "doubao-coding"):
+            # Volcengine Doubao Coding (uses OpenAI Completions API - aligned with TS)
+            # TS: src/agents/models-config.providers.ts buildDoubaoCodingProvider()
+            kwargs["base_url"] = kwargs.get("base_url") or "https://ark.cn-beijing.volces.com/api/v3/chat/completions/coding"
+            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("VOLCANO_ENGINE_API_KEY") or os.getenv("VOLCENGINE_API_KEY")
+            return OpenAIProvider(provider_name_override="volcengine-plan", **kwargs)
+
+        if provider_name == "byteplus":
+            # BytePlus (uses OpenAI Completions API - aligned with TS)
+            # TS: src/agents/models-config.providers.ts buildBytePlusProvider()
+            # api: "openai-completions"
+            kwargs["base_url"] = kwargs.get("base_url") or "https://ark-us-east-1.bytepluses.com/api/v3"
+            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("BYTEPLUS_API_KEY")
+            return OpenAIProvider(provider_name_override="byteplus", **kwargs)
+
+        if provider_name in ("byteplus-plan", "byteplus-coding"):
+            # BytePlus Coding (uses OpenAI Completions API - aligned with TS)
+            # TS: src/agents/models-config.providers.ts buildBytePlusCodingProvider()
+            kwargs["base_url"] = kwargs.get("base_url") or "https://ark-us-east-1.bytepluses.com/api/v3/chat/completions/coding"
+            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("BYTEPLUS_API_KEY")
+            return OpenAIProvider(provider_name_override="byteplus-plan", **kwargs)
+
+        if provider_name == "synthetic":
+            # Synthetic (uses Anthropic Messages API - aligned with TS)
+            # TS: src/agents/models-config.providers.ts buildSyntheticProvider()
+            # api: "anthropic-messages"
+            kwargs["base_url"] = kwargs.get("base_url") or "https://api.synthetic.ai/v1"
+            kwargs["api_key"] = kwargs.get("api_key") or os.getenv("SYNTHETIC_API_KEY")
+            return AnthropicProvider(provider_name_override="synthetic", **kwargs)
 
         if provider_name in ("lmstudio", "openai-compatible", "custom"):
             return OpenAIProvider(**kwargs)

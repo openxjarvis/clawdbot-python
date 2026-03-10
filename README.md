@@ -48,14 +48,14 @@ A self-hosted AI gateway that connects your messaging channels to LLMs:
 Full parity with TypeScript version, supporting multiple authentication methods:
 
 - **Mainstream AI:** Anthropic (Claude), OpenAI, Google Gemini, xAI (Grok), Mistral AI
-- **Chinese Services:** MiniMax, Moonshot (Kimi), Z.AI (GLM), Qwen, Qianfan (Baidu), Volcengine, BytePlus, Xiaomi
+- **Chinese Services:** Kimi Coding (k2p5), MiniMax, Moonshot, Z.AI (GLM), Qwen, Qianfan (Baidu), Volcengine, BytePlus, Xiaomi
 - **Aggregators & Proxies:** OpenRouter, LiteLLM, Kilo Gateway, Vercel AI Gateway, Cloudflare AI Gateway, OpenCode Zen, Synthetic
 - **Self-Hosted & Open Source:** vLLM, Together AI, Hugging Face, Venice AI
 - **Custom Providers:** Any OpenAI/Anthropic-compatible endpoint
 
 **Authentication:** API Keys (fully supported), OAuth/Portal flows (partial support)
 
-**UI:** Two-level grouped selection UI aligned with TypeScript version
+**Streaming:** Full Anthropic Messages API streaming support with proper event handling
 
 📖 **See [Provider Configuration Guide](docs/providers.md) for complete details**
 

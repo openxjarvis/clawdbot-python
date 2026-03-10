@@ -266,10 +266,33 @@ class PiAgentRuntime:
                 logger.warning(f"Failed to load limited history: {e}")
                 history_messages = []
 
+            # Create auth storage and load API keys from auth-profiles.json
+            from pi_coding_agent.core.auth_storage import AuthStorage
+            auth_storage = AuthStorage()
+            
+            # Load API keys from openclaw auth-profiles.json into pi_coding_agent
+            # Use set_runtime_api_key() for in-memory override (aligned with TypeScript)
+            try:
+                from openclaw.config.auth_profiles import load_auth_profile_store
+                auth_store = load_auth_profile_store()
+                profiles = auth_store.get("profiles", {})
+                
+                for profile_id, profile_data in profiles.items():
+                    if profile_data.get("type") == "api_key":
+                        provider = profile_data.get("provider")
+                        key = profile_data.get("key")
+                        if provider and key:
+                            # Use runtime override (in-memory, not persisted to disk)
+                            auth_storage.set_runtime_api_key(provider, key)
+                            logger.debug(f"Loaded API key for provider: {provider}")
+            except Exception as e:
+                logger.warning(f"Failed to load API keys from auth-profiles.json: {e}")
+
             pi_session = PiAgentSession(
                 cwd=self.cwd,
                 model=model,
                 session_id=session_id,
+                auth_storage=auth_storage,  # ✅ Pass auth_storage
             )
             
             # Install tool result context guard (preemptive protection)

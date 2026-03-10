@@ -21,6 +21,16 @@ app = typer.Typer(
 console = Console()
 
 
+@app.callback(invoke_without_command=True)
+def main_callback(ctx: typer.Context):
+    """
+    Common initialization for all commands.
+    Load environment variables from .env files (matches TypeScript behavior).
+    """
+    from ..infra.dotenv import load_dot_env
+    load_dot_env(quiet=True)
+
+
 @app.command()
 def start(
     port: int = typer.Option(18789, "--port", "-p", help="WebSocket port for gateway"),
@@ -36,19 +46,6 @@ def start(
         "Starting full-featured server...",
         border_style="cyan"
     ))
-    
-    # Load .env file before checking environment variables
-    from dotenv import load_dotenv
-    from pathlib import Path
-    env_path = Path.cwd() / ".env"
-    if env_path.exists():
-        load_dotenv(env_path)
-    else:
-        # Try workspace root
-        workspace_root = Path(__file__).parent.parent.parent
-        env_path = workspace_root / ".env"
-        if env_path.exists():
-            load_dotenv(env_path)
     
     # Check configuration (matches TS gateway-cli/run.ts behavior)
     # Verify config exists and gateway.mode is local
