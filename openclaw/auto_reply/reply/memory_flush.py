@@ -47,6 +47,7 @@ DEFAULT_MEMORY_FLUSH_SYSTEM_PROMPT = " ".join([
 class MemoryFlushSettings:
     enabled: bool = False
     soft_threshold_tokens: int = DEFAULT_MEMORY_FLUSH_SOFT_TOKENS
+    force_flush_transcript_bytes: int | None = None  # mirrors TS forceFlushTranscriptBytes
     prompt: str = DEFAULT_MEMORY_FLUSH_PROMPT
     system_prompt: str = DEFAULT_MEMORY_FLUSH_SYSTEM_PROMPT
 
@@ -118,12 +119,16 @@ def resolve_memory_flush_settings(cfg: dict | None, agent_cfg: dict | None) -> M
 
     enabled = bool(mf_raw.get("enabled", False))
     threshold = int(mf_raw.get("softThresholdTokens", DEFAULT_MEMORY_FLUSH_SOFT_TOKENS))
+    force_bytes = mf_raw.get("forceFlushTranscriptBytes")
+    if force_bytes is not None:
+        force_bytes = int(force_bytes)
     prompt = str(mf_raw.get("prompt", DEFAULT_MEMORY_FLUSH_PROMPT))
     sys_prompt = str(mf_raw.get("systemPrompt", DEFAULT_MEMORY_FLUSH_SYSTEM_PROMPT))
 
     return MemoryFlushSettings(
         enabled=enabled,
         soft_threshold_tokens=threshold,
+        force_flush_transcript_bytes=force_bytes,
         prompt=prompt,
         system_prompt=sys_prompt,
     )

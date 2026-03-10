@@ -196,6 +196,19 @@ class ImageTool(AgentTool):
 
             return result
 
+        except FileNotFoundError as e:
+            logger.error(f"Image analysis error: {e}", exc_info=True)
+            return ToolResult(
+                success=False,
+                content="",
+                error=(
+                    f"{e}. "
+                    "If the image was sent by the user, it is available in your vision context — "
+                    "you can analyze it directly without calling this tool. "
+                    "Alternatively, check the `incoming/` folder in the session workspace for "
+                    "the materialized image file."
+                ),
+            )
         except Exception as e:
             logger.error(f"Image analysis error: {e}", exc_info=True)
             return ToolResult(success=False, content="", error=str(e))

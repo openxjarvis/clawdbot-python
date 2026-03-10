@@ -66,7 +66,8 @@ class SlackOnboardingAdapter(ChannelOnboardingAdapter):
         
         slack_config["enabled"] = True
         slack_config["token"] = token
-        slack_config["dmPolicy"] = "off"  # Start with off
+        slack_config["dmPolicy"] = "pairing"  # Default: pairing (aligns with TS)
+        slack_config["groupPolicy"] = "allowlist"  # Default: allowlist (aligns with TS)
         
         channels["slack"] = slack_config
         config["channels"] = channels

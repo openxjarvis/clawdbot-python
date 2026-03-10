@@ -21,8 +21,11 @@ from typing import Any, Callable, Awaitable
 
 logger = logging.getLogger(__name__)
 
-# Agent run timeout — mirrors TS resolveAgentTimeoutMs default
-DEFAULT_AGENT_TIMEOUT_MS = 10 * 60 * 1000  # 10 minutes
+# Agent run timeout. TS default is 600s (10 min) but 3 minutes is more
+# practical for interactive Telegram/Feishu sessions: it unblocks the followup
+# queue faster when an agent run gets stuck (e.g. model hallucinating tool work
+# that never completes). Complex tasks should set a higher timeout via config.
+DEFAULT_AGENT_TIMEOUT_MS = 3 * 60 * 1000  # 3 minutes
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +72,11 @@ class ReplyContext:
     reasoning_level: str = "off"
     reasoning_stream_callback: Callable[[str], None] | None = None
     reasoning_draft_stream: Any | None = None
+    # Block reply dispatcher — sends each text block (before a tool call) as a
+    # separate visible message. Mirrors TS sendBlockReply in reply-dispatcher.ts.
+    # Enabled for Telegram DMs and Feishu thread replies where intermediate steps
+    # should appear as individual messages rather than a single streaming preview.
+    block_send_fn: Callable[[str], Awaitable[None]] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -256,24 +264,137 @@ async def _run_agent_now(ctx: ReplyContext) -> None:
                     except Exception:
                         pass
             else:
-                # TelegramDraftStream (or other preview stream) — delete the preview
-                # bubble so the final formatted message arrives cleanly.
+                # TelegramDraftStream lifecycle - mirrors TS lane-delivery.ts finalization.
+                # Try to finalize the preview message by editing it to the final text.
+                # If successful, skip _deliver_response to avoid duplicate messages.
+                # Mirrors TS: canFinalizeDraftPreviewDirectly + tryUpdatePreviewForLane.
+                _can_try_finalize = False
                 try:
-                    if hasattr(ctx.draft_stream, "clear"):
-                        await ctx.draft_stream.clear()
-                except Exception as _ds_exc:
-                    logger.debug("draft_stream.clear() failed (non-fatal): %s", _ds_exc)
+                    # Check if we can finalize via editing the preview:
+                    # - Must be message transport (groups) with an active preview message
+                    # - Text must fit within Telegram's 4096 char limit
+                    # - No media attachments (media requires new message)
+                    # - No buttons (buttons require separate handling)
+                    _is_msg_transport = (
+                        hasattr(ctx.draft_stream, "is_draft_transport")
+                        and not ctx.draft_stream.is_draft_transport()
+                        and ctx.draft_stream.message_id() is not None
+                    )
+                    _text_ok = response_text and len(response_text) <= 4096
+                    _no_media = not (
+                        getattr(ctx, "media_urls", None) or
+                        getattr(ctx, "media_url", None)
+                    )
+                    # Check for buttons in response_text directives
+                    _has_buttons = False
+                    if _text_ok:
+                        try:
+                            from openclaw.auto_reply.directive_tags import parse_inline_directives
+                            _dir = parse_inline_directives(response_text, strip_reply_tags=False)
+                            _has_buttons = bool(_dir.buttons)
+                        except Exception:
+                            pass
+                    
+                    _can_try_finalize = (
+                        _is_msg_transport and _text_ok and _no_media and not _has_buttons
+                    )
+                except Exception as _check_exc:
+                    logger.debug("Error checking finalize conditions: %s", _check_exc)
+                
+                if _can_try_finalize:
+                    # Try to edit the preview message to the final text.
+                    # Mirrors TS: lane.stream.update(text) + flushDraftLane + stopDraftLane.
+                    try:
+                        # Update with final text and flush
+                        ctx.draft_stream.update(response_text)
+                        await ctx.draft_stream.stop()
+                        
+                        # Check if the final text was successfully delivered
+                        # Mirrors TS: finalTextAlreadyDelivered check via previewRevision
+                        _last_sent = getattr(ctx.draft_stream, "_last_sent_text", "")
+                        _final_trimmed = response_text.rstrip()
+                        if _last_sent == _final_trimmed:
+                            # Preview was successfully finalized — skip _deliver_response.
+                            # Mirrors TS: return "preview-finalized"
+                            _skip_deliver = True
+                            logger.debug(
+                                "Telegram: finalized preview as final message (len=%d)",
+                                len(_final_trimmed),
+                            )
+                        else:
+                            logger.debug(
+                                "Telegram: preview finalization incomplete, will send new message"
+                            )
+                    except Exception as _fin_exc:
+                        logger.debug(
+                            "Telegram: preview finalization failed, will send new message: %s",
+                            _fin_exc,
+                        )
+                
+                # Fallback: clear the preview if finalization didn't work
+                if not _skip_deliver:
+                    _should_clear = True
+                    try:
+                        # Draft transport (DMs): clear() is a no-op (just sets _stopped=True).
+                        # Message transport (groups): if finalization failed, clear the preview
+                        # so we don't leave a stale message visible.
+                        if hasattr(ctx.draft_stream, "is_draft_transport"):
+                            _is_draft = ctx.draft_stream.is_draft_transport()
+                            if not _is_draft:
+                                # Message transport — only clear if we didn't try finalization
+                                # (if we tried and failed, preview is already stopped)
+                                if not _can_try_finalize:
+                                    _should_clear = True
+                                else:
+                                    # Finalization was tried but didn't complete — stop but don't clear
+                                    # to avoid blank gap before new message arrives
+                                    _should_clear = False
+                                    ctx.draft_stream._stopped = True
+                            else:
+                                # Draft transport — always safe to clear (no-op)
+                                _should_clear = True
+                    except Exception:
+                        _should_clear = True
+                    
+                    if _should_clear:
+                        try:
+                            if hasattr(ctx.draft_stream, "clear"):
+                                await ctx.draft_stream.clear()
+                        except Exception as _ds_exc:
+                            logger.debug("draft_stream.clear() failed (non-fatal): %s", _ds_exc)
 
         # --- Reasoning lane cleanup ---
-        # Stop the reasoning draft stream and strip reasoning blocks from the
-        # answer text so the final reply contains only the visible answer.
-        # Mirrors TS lane cleanup in the finally block of dispatchTelegramMessage.
+        # For "stream" mode: stop the reasoning draft stream (flushes any
+        # remaining text to Telegram) and strip reasoning blocks from the
+        # answer so the final reply contains only the visible answer.
+        # For "on" mode: extract reasoning text and send it as a SEPARATE
+        # message BEFORE the answer — this is the key difference vs "stream"
+        # (which shows reasoning live) and "off" (which strips it silently).
+        # Mirrors TS dispatchTelegramMessage lane cleanup + "on" mode delivery.
         if ctx.reasoning_level != "off" and response_text:
-            from openclaw.channels.telegram.reasoning import strip_reasoning_from_text
-            response_text = strip_reasoning_from_text(response_text) or response_text
+            from openclaw.channels.telegram.reasoning import split_telegram_reasoning_text
+            _r_text, _a_text = split_telegram_reasoning_text(response_text)
+            if ctx.reasoning_level == "on" and _r_text and not _skip_deliver:
+                # "on" mode: send reasoning as a separate message before the answer.
+                # Wrap in a blockquote so it's visually distinct.
+                # Mirrors TS: reasoning delivered as its own message block before answer.
+                _reasoning_msg = f"💭 <i>Thinking:</i>\n<blockquote>{_r_text}</blockquote>"
+                try:
+                    from openclaw.channels.telegram.formatter import markdown_to_html, wrap_file_references_in_html
+                    _reasoning_msg = f"💭 <i>Thinking:</i>\n<blockquote>{wrap_file_references_in_html(markdown_to_html(_r_text))}</blockquote>"
+                except Exception:
+                    pass
+                try:
+                    await ctx.channel_send(_reasoning_msg, ctx.chat_target)
+                except Exception as _re_exc:
+                    logger.debug("_run_agent_now: failed to send reasoning message: %s", _re_exc)
+            response_text = _a_text or response_text
+
         if ctx.reasoning_draft_stream is not None:
             try:
                 if hasattr(ctx.reasoning_draft_stream, "stop"):
+                    # stop() flushes any remaining streamed reasoning text to Telegram.
+                    # Must be awaited BEFORE _deliver_response to preserve ordering.
                     await ctx.reasoning_draft_stream.stop()
             except Exception:
                 pass
@@ -345,7 +466,7 @@ async def _cleanup_draft_stream_on_abort(ctx: "ReplyContext") -> None:
                 except Exception:
                     pass
         else:
-            # Telegram: clear the preview bubble
+            # Telegram: clear the preview bubble on abort/error (always clean up on abort)
             if hasattr(ctx.draft_stream, "clear"):
                 try:
                     await ctx.draft_stream.clear()
@@ -388,6 +509,7 @@ async def _execute_agent_turn(
         status_reactions=ctx.status_reactions,
         reasoning_stream_callback=ctx.reasoning_stream_callback,
         reasoning_level=ctx.reasoning_level,
+        block_send_fn=ctx.block_send_fn,
     )
 
 
@@ -416,11 +538,34 @@ def _get_local_media_roots(session_workspace: str | None = None) -> list["Path"]
     return roots
 
 
+def _is_path_under_allowed_roots(resolved: "Path", session_workspace: str | None) -> bool:
+    """Return True if *resolved* (symlinks already expanded) is inside an allowed media root.
+
+    Mirrors TS assertLocalMediaAllowed() in src/web/media.ts — prevents an agent from
+    exfiltrating arbitrary host files (e.g. /etc/passwd) via a MEDIA: token.
+    """
+    import os
+    from pathlib import Path
+
+    resolved_str = str(resolved)
+    for root in _get_local_media_roots(session_workspace):
+        try:
+            root_real = root.resolve()
+        except Exception:
+            continue
+        root_str = str(root_real)
+        # Path must be strictly under (or equal to) an allowed root.
+        if resolved_str == root_str or resolved_str.startswith(root_str + os.sep):
+            return True
+    return False
+
+
 def _resolve_media_path(raw_url: str, session_workspace: str | None = None) -> str:
     """Resolve a raw media URL/path to an existing absolute path.
 
     1. HTTP(S) / file:// URLs → returned as-is.
-    2. Absolute paths that exist → returned as-is.
+    2. Absolute paths that exist AND are inside an allowed media root → returned as-is.
+       Paths outside allowed roots are rejected (path-traversal / exfiltration guard).
     3. Otherwise: search local media roots for the filename (TS alignment).
     Returns the resolved path, or the original string if nothing is found.
     """
@@ -431,7 +576,14 @@ def _resolve_media_path(raw_url: str, session_workspace: str | None = None) -> s
 
     p = Path(raw_url).expanduser()
     if p.is_absolute() and p.exists():
-        return str(p)
+        # Resolve symlinks before the containment check (prevents symlink bypass).
+        real_p = p.resolve()
+        if _is_path_under_allowed_roots(real_p, session_workspace):
+            return str(p)
+        logger.warning(
+            "MEDIA: blocked absolute path outside allowed workspace roots: %s", raw_url
+        )
+        return raw_url  # caller will skip non-existent / non-URL entries
 
     for root in _get_local_media_roots(session_workspace):
         # Try full relative path first (e.g. "presentations/file.pptx" under workspace)
@@ -465,6 +617,14 @@ async def _deliver_response(
         return
 
     try:
+        # DEBUG: Log raw response before any processing to help diagnose media delivery issues
+        logger.info("[DELIVER-DEBUG] Raw response length: %d chars", len(response_text))
+        if "MEDIA:" in response_text.upper():
+            logger.info("[DELIVER-DEBUG] Found MEDIA token in raw response")
+        if "![" in response_text or "](file://" in response_text:
+            logger.info("[DELIVER-DEBUG] Found Markdown image/link syntax in response - this will NOT send files!")
+            logger.info("[DELIVER-DEBUG] Response preview: %s", response_text[:800])
+        
         # Parse [[buttons:...]] directive before splitting media
         directive_result = parse_inline_directives(response_text, strip_reply_tags=True)
         buttons = directive_result.buttons  # list[list[dict]] | None
@@ -472,6 +632,12 @@ async def _deliver_response(
         cleaned_text = directive_result.text if directive_result.text else response_text
 
         media_result = split_media_from_output(cleaned_text)
+        logger.info(
+            "Media parse result: text=%s chars, media_url=%s, media_urls=%s",
+            len(media_result.text) if media_result.text else 0,
+            media_result.media_url[:100] if media_result.media_url else None,
+            [u[:100] for u in (media_result.media_urls or [])] if media_result.media_urls else None,
+        )
         display_text = media_result.text if media_result.text is not None else cleaned_text
 
         if display_text:
@@ -483,19 +649,67 @@ async def _deliver_response(
             )
 
         # Send media files
+        # Deduplicate media URLs to prevent sending the same file multiple times
+        # (can happen when MEDIA tokens accumulate in session history)
         session_workspace: str | None = getattr(ctx, "session_workspace", None)
-        for media_url in ([media_result.media_url] if media_result.media_url else []) + (media_result.media_urls or []):
+        all_media_urls = ([media_result.media_url] if media_result.media_url else []) + (media_result.media_urls or [])
+        
+        # Normalize and deduplicate paths before sending
+        # This handles cases where the same file is referenced with different paths
+        # (e.g., relative vs absolute, or with/without ./ prefix)
+        from pathlib import Path
+        seen_normalized = set()
+        unique_media_urls = []
+        for url in all_media_urls:
+            if not url:
+                continue
+            # Normalize the path: resolve relative paths and remove redundant components
+            try:
+                if not url.startswith(("http://", "https://")):
+                    # Local file - normalize path
+                    normalized = str(Path(url).expanduser().resolve())
+                else:
+                    # Remote URL - use as-is
+                    normalized = url
+                
+                if normalized not in seen_normalized:
+                    seen_normalized.add(normalized)
+                    unique_media_urls.append(url)  # Keep original URL for delivery
+            except Exception:
+                # If normalization fails, still try to dedupe by string
+                if url not in seen_normalized:
+                    seen_normalized.add(url)
+                    unique_media_urls.append(url)
+        
+        if len(unique_media_urls) < len(all_media_urls):
+            logger.info("[DELIVER-DEBUG] Deduped %d media URLs to %d unique URLs", len(all_media_urls), len(unique_media_urls))
+        
+        for media_url in unique_media_urls:
             if not media_url:
                 continue
             try:
                 media_url = _resolve_media_path(media_url, session_workspace)
-                from openclaw.media.mime import detect_mime, MediaKind, media_kind_from_mime
+                from openclaw.media.mime import detect_mime, MediaKind, media_kind_from_mime, is_gif_media
                 mime = detect_mime(media_url)
                 kind = media_kind_from_mime(mime)
+                # GIF auto-detection: if MIME didn't identify it but filename ends in .gif,
+                # override to ANIMATION — mirrors TS isGifMedia() in send.ts
+                if kind == MediaKind.IMAGE and is_gif_media(mime, media_url):
+                    kind = MediaKind.ANIMATION
                 media_type = kind.value if kind != MediaKind.UNKNOWN else "document"
                 await ctx.channel_send(None, ctx.chat_target, media_url=media_url, media_type=media_type)
             except Exception as me:
                 logger.error("Failed to send media %s: %s", media_url, me)
+                # Notify user so they don't see silent failure (mirrors TS delivery error handling)
+                try:
+                    import os
+                    fname = os.path.basename(media_url) if media_url else "file"
+                    await ctx.channel_send(
+                        f"⚠️ Failed to send file `{fname}`: {me}",
+                        ctx.chat_target,
+                    )
+                except Exception:
+                    pass
 
     except Exception as exc:
         logger.error("_deliver_response error: %s", exc, exc_info=True)

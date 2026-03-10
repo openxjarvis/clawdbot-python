@@ -12,10 +12,11 @@ logger = logging.getLogger(__name__)
 class TTSTool(AgentTool):
     """Convert text to speech using OpenAI or ElevenLabs"""
 
-    def __init__(self):
+    def __init__(self, workspace_root: Path | None = None):
         super().__init__()
         self.name = "tts"
         self.description = "Convert text to speech and save as audio file"
+        self.workspace_root = workspace_root
 
     def get_schema(self) -> dict[str, Any]:
         return {
@@ -24,7 +25,7 @@ class TTSTool(AgentTool):
                 "text": {"type": "string", "description": "Text to convert to speech"},
                 "output_path": {
                     "type": "string",
-                    "description": "Output file path",
+                    "description": "Output file path (relative to workspace)",
                     "default": "output.mp3",
                 },
                 "provider": {
@@ -53,20 +54,30 @@ class TTSTool(AgentTool):
 
         if not text:
             return ToolResult(success=False, content="", error="text required")
+        
+        # Resolve output path relative to workspace if available
+        if self.workspace_root:
+            output_file = Path(self.workspace_root) / output_path
+        else:
+            output_file = Path(output_path).expanduser()
 
         try:
             if provider == "openai":
-                return await self._openai_tts(text, output_path, voice, model)
+                return await self._openai_tts(text, output_file, voice, model)
             elif provider == "elevenlabs":
-                return await self._elevenlabs_tts(text, output_path, voice)
+                return await self._elevenlabs_tts(text, output_file, voice)
             else:
                 return ToolResult(success=False, content="", error=f"Unknown provider: {provider}")
 
         except Exception as e:
             logger.error(f"TTS error: {e}", exc_info=True)
-            return ToolResult(success=False, content="", error=str(e))
+            return ToolResult(
+                success=False,
+                content="",
+                error=f"TTS failed: {str(e)}. Please check your API key and try again."
+            )
 
-    async def _openai_tts(self, text: str, output_path: str, voice: str, model: str) -> ToolResult:
+    async def _openai_tts(self, text: str, output_file: Path, voice: str, model: str) -> ToolResult:
         """Generate speech using OpenAI TTS"""
         try:
             import os
@@ -75,23 +86,31 @@ class TTSTool(AgentTool):
 
             api_key = os.getenv("OPENAI_API_KEY")
             if not api_key:
-                return ToolResult(success=False, content="", error="OPENAI_API_KEY not set")
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error="OPENAI_API_KEY not set. Please configure your OpenAI API key first."
+                )
 
             client = AsyncOpenAI(api_key=api_key)
+
+            # Ensure output directory exists
+            output_file.parent.mkdir(parents=True, exist_ok=True)
 
             response = await client.audio.speech.create(model=model, voice=voice, input=text)
 
             # Save to file
-            output_file = Path(output_path).expanduser()
-            output_file.parent.mkdir(parents=True, exist_ok=True)
-
             response.stream_to_file(str(output_file))
+            
+            # Return with MEDIA: prefix for delivery
+            # Use absolute path to ensure file can be found
+            result_content = f"MEDIA:{output_file.absolute()}\nSpeech generated successfully using {voice} voice."
 
             return ToolResult(
                 success=True,
-                content=f"Speech saved to {output_path}",
+                content=result_content,
                 metadata={
-                    "output_path": str(output_file),
+                    "output_path": str(output_file.absolute()),
                     "provider": "openai",
                     "voice": voice,
                     "model": model,
@@ -99,11 +118,20 @@ class TTSTool(AgentTool):
             )
 
         except ImportError:
-            return ToolResult(success=False, content="", error="openai package not installed")
+            return ToolResult(
+                success=False,
+                content="",
+                error="openai package not installed. Install with: pip install openai"
+            )
         except Exception as e:
-            return ToolResult(success=False, content="", error=str(e))
+            logger.error(f"OpenAI TTS error: {e}", exc_info=True)
+            return ToolResult(
+                success=False,
+                content="",
+                error=f"OpenAI TTS failed: {str(e)}"
+            )
 
-    async def _elevenlabs_tts(self, text: str, output_path: str, voice: str) -> ToolResult:
+    async def _elevenlabs_tts(self, text: str, output_file: Path, voice: str) -> ToolResult:
         """Generate speech using ElevenLabs"""
         try:
             import os
@@ -113,24 +141,32 @@ class TTSTool(AgentTool):
 
             api_key = os.getenv("ELEVENLABS_API_KEY")
             if not api_key:
-                return ToolResult(success=False, content="", error="ELEVENLABS_API_KEY not set")
+                return ToolResult(
+                    success=False,
+                    content="",
+                    error="ELEVENLABS_API_KEY not set. Please configure your ElevenLabs API key first."
+                )
 
             client = ElevenLabs(api_key=api_key)
 
             # Generate speech
             audio = client.generate(text=text, voice=voice, model="eleven_monolingual_v1")
 
-            # Save to file
-            output_file = Path(output_path).expanduser()
+            # Ensure output directory exists
             output_file.parent.mkdir(parents=True, exist_ok=True)
 
+            # Save to file
             save(audio, str(output_file))
+            
+            # Return with MEDIA: prefix for delivery
+            # Use absolute path to ensure file can be found
+            result_content = f"MEDIA:{output_file.absolute()}\nSpeech generated successfully using {voice} voice."
 
             return ToolResult(
                 success=True,
-                content=f"Speech saved to {output_path}",
+                content=result_content,
                 metadata={
-                    "output_path": str(output_file),
+                    "output_path": str(output_file.absolute()),
                     "provider": "elevenlabs",
                     "voice": voice,
                 },
@@ -143,4 +179,9 @@ class TTSTool(AgentTool):
                 error="elevenlabs package not installed. Install with: pip install elevenlabs",
             )
         except Exception as e:
-            return ToolResult(success=False, content="", error=str(e))
+            logger.error(f"ElevenLabs TTS error: {e}", exc_info=True)
+            return ToolResult(
+                success=False,
+                content="",
+                error=f"ElevenLabs TTS failed: {str(e)}"
+            )

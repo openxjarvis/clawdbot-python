@@ -207,16 +207,27 @@ def normalize_verbose_level(raw: Optional[str]) -> Optional[str]:
 
 
 def normalize_elevated_level(raw: Optional[str]) -> Optional[str]:
-    """Normalize elevated level value."""
+    """Normalize elevated level value.
+
+    Mirrors TS normalizeElevatedLevel() in src/auto-reply/thinking.ts:
+      on/true/yes/1       → "on"  (alias for "ask")
+      off/false/no/0      → "off"
+      ask/prompt          → "ask"
+      full/auto/auto-approve → "full"
+    """
     if not raw:
         return None
-    
+
     lower = raw.lower()
     if lower in ("on", "true", "1", "yes"):
         return "on"
     elif lower in ("off", "false", "0", "no"):
         return "off"
-    
+    elif lower in ("ask", "prompt"):
+        return "ask"
+    elif lower in ("full", "auto", "auto-approve"):
+        return "full"
+
     return raw
 
 

@@ -18,6 +18,7 @@ class MediaKind(str, Enum):
     """Media kind enum"""
     IMAGE = "image"
     VIDEO = "video"
+    ANIMATION = "animation"  # GIF / mp4-animation — maps to Telegram send_animation
     AUDIO = "audio"
     DOCUMENT = "document"
     UNKNOWN = "unknown"
@@ -174,7 +175,11 @@ def media_kind_from_mime(content_type: Optional[str]) -> MediaKind:
 
     content_type_lower = content_type.lower().split(";")[0].strip()
 
-    if content_type_lower.startswith("image/"):
+    # GIF images → ANIMATION so callers dispatch to send_animation, not send_photo.
+    # Mirrors TS isGifMedia() in send.ts selecting sendAnimation over sendPhoto.
+    if content_type_lower == "image/gif":
+        return MediaKind.ANIMATION
+    elif content_type_lower.startswith("image/"):
         return MediaKind.IMAGE
     elif content_type_lower.startswith("video/"):
         return MediaKind.VIDEO

@@ -335,7 +335,7 @@ def _resolve_account(account_id: str, raw: dict[str, Any], top: dict[str, Any]) 
         enabled=merged.get("enabled", True),
         name=merged.get("name"),
         dm=_parse_dm(merged),
-        group_policy=merged.get("groupPolicy") or merged.get("group_policy", "open"),
+        group_policy=merged.get("groupPolicy") or merged.get("group_policy", "allowlist"),
         guilds={k: _parse_guild_entry(v) for k, v in guilds_raw.items() if isinstance(v, dict)},
         allow_bots=merged.get("allowBots", merged.get("allow_bots", False)),
         dangerously_allow_name_matching=merged.get("dangerouslyAllowNameMatching", merged.get("dangerously_allow_name_matching", False)),

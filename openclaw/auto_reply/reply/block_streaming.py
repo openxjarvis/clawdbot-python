@@ -38,22 +38,41 @@ DEFAULT_BLOCK_STREAM_COALESCE_IDLE_MS = 1000
 # ---------------------------------------------------------------------------
 
 @dataclass
-class BlockStreamingConfig:
-    enabled: bool = False
+class BlockStreamingChunkConfig:
+    """Configuration for block chunking.
+    
+    Mirrors TS BlockStreamingChunkConfig.
+    """
     min_chars: int = DEFAULT_BLOCK_STREAM_MIN
     max_chars: int = DEFAULT_BLOCK_STREAM_MAX
     break_preference: str = "paragraph"  # "paragraph" | "newline" | "sentence"
-    flush_on_paragraph: bool = False
-    coalesce_idle_ms: int = DEFAULT_BLOCK_STREAM_COALESCE_IDLE_MS
 
 
 @dataclass
-class BlockStreamingCoalescing:
+class BlockStreamingCoalesceConfig:
+    """Configuration for block coalescing.
+    
+    Mirrors TS BlockStreamingCoalesceConfig.
+    """
     min_chars: int = DEFAULT_BLOCK_STREAM_MIN
     max_chars: int = DEFAULT_BLOCK_STREAM_MAX
     idle_ms: int = DEFAULT_BLOCK_STREAM_COALESCE_IDLE_MS
     joiner: str = "\n"
     flush_on_enqueue: bool = False
+
+
+@dataclass
+class BlockStreamingConfig:
+    """Complete block streaming configuration.
+    
+    Mirrors TS resolvedBlockStreaming logic from get-reply-directives.ts.
+    """
+    enabled: bool = False
+    break_preference: str = "text_end"  # "text_end" | "message_end"
+    chunk_config: BlockStreamingChunkConfig | None = None
+    coalesce_config: BlockStreamingCoalesceConfig | None = None
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +89,7 @@ class BlockReplyCoalescer:
 
     def __init__(
         self,
-        config: BlockStreamingCoalescing,
+        config: BlockStreamingCoalesceConfig,
         on_flush: Callable[[str], Awaitable[None]],
     ) -> None:
         self._cfg = config
@@ -181,12 +200,19 @@ class BlockStreamingPipeline:
         cfg: BlockStreamingConfig,
         on_block: Callable[[str], Awaitable[None]],
     ) -> None:
-        coalesce_cfg = BlockStreamingCoalescing(
-            min_chars=cfg.min_chars,
-            max_chars=cfg.max_chars,
-            idle_ms=cfg.coalesce_idle_ms,
-            flush_on_enqueue=cfg.flush_on_paragraph or cfg.break_preference == "paragraph",
-        )
+        # Use provided coalesce_config or create from chunk_config
+        if cfg.coalesce_config:
+            coalesce_cfg = cfg.coalesce_config
+        elif cfg.chunk_config:
+            coalesce_cfg = BlockStreamingCoalesceConfig(
+                min_chars=cfg.chunk_config.min_chars,
+                max_chars=cfg.chunk_config.max_chars,
+                idle_ms=DEFAULT_BLOCK_STREAM_COALESCE_IDLE_MS,
+                flush_on_enqueue=cfg.chunk_config.break_preference == "paragraph",
+            )
+        else:
+            coalesce_cfg = BlockStreamingCoalesceConfig()
+        
         self._coalescer = BlockReplyCoalescer(coalesce_cfg, on_block)
         self._enabled = cfg.enabled
         self._block_count = 0
@@ -215,38 +241,90 @@ def resolve_block_streaming_config(
     cfg: dict | None,
     channel: str | None = None,
     account_id: str | None = None,
+    disable_block_streaming: bool | None = None,
 ) -> BlockStreamingConfig:
-    """Resolve BlockStreamingConfig from the OpenClaw config dict."""
+    """Resolve BlockStreamingConfig from the OpenClaw config dict.
+    
+    Mirrors TS get-reply-directives.ts L358-372 logic:
+    - opts?.disableBlockStreaming takes precedence
+    - Then agentCfg?.blockStreamingDefault
+    - Channel-specific telegram.blockStreaming overrides for Telegram
+    """
     cfg = cfg or {}
     agents = cfg.get("agents", {}).get("defaults", {})
-    bs_raw = agents.get("blockStreaming") or {}
-
-    if not bs_raw.get("enabled", False):
+    
+    # Step 1: Determine if block streaming is enabled
+    # Mirrors TS resolvedBlockStreaming logic
+    if disable_block_streaming is True:
         return BlockStreamingConfig(enabled=False)
-
-    # Per-channel coalesce overrides
-    if channel:
-        channel_cfg = (cfg.get(channel.lower()) or {})
+    
+    if disable_block_streaming is False:
+        enabled = True
+    else:
+        # Check agents.defaults.blockStreamingDefault
+        enabled = agents.get("blockStreamingDefault") == "on"
+    
+    # Step 2: For Telegram, check channel-specific blockStreaming override
+    # Mirrors TS bot-message-dispatch.ts L171-174
+    if channel and channel.lower() == "telegram":
+        channel_cfg = cfg.get("telegram", {})
         if account_id:
-            account_cfg = channel_cfg.get("accounts", {}).get(account_id, {})
-            coalesce = account_cfg.get("blockStreamingCoalesce") or channel_cfg.get("blockStreamingCoalesce")
-        else:
-            coalesce = channel_cfg.get("blockStreamingCoalesce")
-        if coalesce:
-            return BlockStreamingConfig(
-                enabled=True,
-                min_chars=int(coalesce.get("minChars", DEFAULT_BLOCK_STREAM_MIN)),
-                max_chars=int(coalesce.get("maxChars", DEFAULT_BLOCK_STREAM_MAX)),
-                break_preference=coalesce.get("breakPreference", "paragraph"),
-                flush_on_paragraph=bool(coalesce.get("flushOnParagraph", False)),
-                coalesce_idle_ms=int(coalesce.get("idleMs", DEFAULT_BLOCK_STREAM_COALESCE_IDLE_MS)),
-            )
-
+            # Find account-specific config
+            accounts = channel_cfg.get("accounts", [])
+            for acc in accounts:
+                if acc.get("accountId") == account_id:
+                    # telegram.blockStreaming: boolean | undefined
+                    acc_bs = acc.get("blockStreaming")
+                    if isinstance(acc_bs, bool):
+                        enabled = acc_bs
+                    break
+    
+    if not enabled:
+        return BlockStreamingConfig(enabled=False)
+    
+    # Step 3: Resolve chunk and coalesce configs
+    # blockStreamingBreak: "text_end" | "message_end"
+    break_preference = agents.get("blockStreamingBreak", "text_end")
+    
+    # blockStreamingChunk
+    chunk_raw = agents.get("blockStreamingChunk")
+    chunk_config = None
+    if chunk_raw:
+        chunk_config = BlockStreamingChunkConfig(
+            min_chars=int(chunk_raw.get("minChars", DEFAULT_BLOCK_STREAM_MIN)),
+            max_chars=int(chunk_raw.get("maxChars", DEFAULT_BLOCK_STREAM_MAX)),
+            break_preference=chunk_raw.get("breakPreference", "paragraph"),
+        )
+    
+    # blockStreamingCoalesce — check channel-specific first, then global
+    coalesce_raw = None
+    if channel and channel.lower() == "telegram":
+        channel_cfg = cfg.get("telegram", {})
+        if account_id:
+            accounts = channel_cfg.get("accounts", [])
+            for acc in accounts:
+                if acc.get("accountId") == account_id:
+                    coalesce_raw = acc.get("blockStreamingCoalesce")
+                    break
+        if not coalesce_raw:
+            coalesce_raw = channel_cfg.get("blockStreamingCoalesce")
+    
+    if not coalesce_raw:
+        coalesce_raw = agents.get("blockStreamingCoalesce")
+    
+    coalesce_config = None
+    if coalesce_raw:
+        coalesce_config = BlockStreamingCoalesceConfig(
+            min_chars=int(coalesce_raw.get("minChars", DEFAULT_BLOCK_STREAM_MIN)),
+            max_chars=int(coalesce_raw.get("maxChars", DEFAULT_BLOCK_STREAM_MAX)),
+            idle_ms=int(coalesce_raw.get("idleMs", DEFAULT_BLOCK_STREAM_COALESCE_IDLE_MS)),
+            joiner=coalesce_raw.get("joiner", "\n"),
+            flush_on_enqueue=bool(coalesce_raw.get("flushOnEnqueue", False)),
+        )
+    
     return BlockStreamingConfig(
         enabled=True,
-        min_chars=int(bs_raw.get("minChars", DEFAULT_BLOCK_STREAM_MIN)),
-        max_chars=int(bs_raw.get("maxChars", DEFAULT_BLOCK_STREAM_MAX)),
-        break_preference=bs_raw.get("breakPreference", "paragraph"),
-        flush_on_paragraph=bool(bs_raw.get("flushOnParagraph", False)),
-        coalesce_idle_ms=DEFAULT_BLOCK_STREAM_COALESCE_IDLE_MS,
+        break_preference=break_preference,
+        chunk_config=chunk_config,
+        coalesce_config=coalesce_config,
     )

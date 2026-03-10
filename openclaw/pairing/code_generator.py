@@ -62,13 +62,17 @@ def validate_pairing_code(code: str) -> bool:
 
 
 def normalize_pairing_code(code: str) -> str:
+    """Normalize pairing code for comparison.
+
+    - Uppercases all characters.
+    - Maps 'S' → '5': both characters are in the alphabet but look identical
+      in most terminal fonts.  Users frequently type '5' when the generated
+      code contains 'S' (and vice-versa).  Mapping both to '5' makes the
+      comparison tolerant of this common transcription error without reducing
+      the effective code space.
+
+    The same normalization is applied to both the user-supplied code and the
+    stored code inside approve_channel_pairing_code(), so the match is always
+    symmetric.
     """
-    Normalize pairing code (uppercase)
-    
-    Args:
-        code: Code to normalize
-        
-    Returns:
-        Normalized code
-    """
-    return code.upper()
+    return code.upper().replace("S", "5")

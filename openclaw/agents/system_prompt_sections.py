@@ -591,21 +591,22 @@ def build_exec_capabilities_section(
             "}",
             "```",
             "",
-            "3. Generate output path:",
-            "   - Format: ~/.openclaw/workspace/session-{id}/presentations/{Title}_{YYYYMMDD_HHMMSS}.pptx",
-            "   - Example: ~/.openclaw/workspace/session-123/presentations/AI_Intro_20260208_143022.pptx",
+            "3. Generate output path using YOUR SESSION WORKSPACE (from `## Session Workspace` in your prompt):",
+            "   - Format: {SESSION_WORKSPACE}/presentations/{Title}_{YYYYMMDD_HHMMSS}.pptx",
+            "   - The session workspace path is injected into your system prompt each turn — use it!",
             "",
             "4. CRITICAL: Use bash tool to run generation command (NOT write_file):",
             "   Tool: bash",
             "   Command:",
             "```bash",
-            "mkdir -p ~/.openclaw/workspace/session-{id}/presentations && \\",
+            "SESSION_WS=\"<your session workspace path>\"",
+            "mkdir -p \"$SESSION_WS/presentations\" && \\",
             "cat > /tmp/ppt_config.json << 'EOF'",
             "{...json config...}",
             "EOF",
             "python skills/powerpoint/scripts/generate_ppt.py \\",
             "  --config /tmp/ppt_config.json \\",
-            "  --output ~/.openclaw/workspace/session-{id}/presentations/Title_20260208_143022.pptx",
+            "  --output \"$SESSION_WS/presentations/Title_$(date +%Y%m%d_%H%M%S).pptx\"",
             "```",
             "",
             "5. After generation succeeds, output a MEDIA: token on its own line so the system",
@@ -617,18 +618,19 @@ def build_exec_capabilities_section(
             "   to be sent. Without it, only text is delivered — the file is never attached.",
             "   The path must be absolute (starting with /) or use ~ for home directory.",
             "",
-            "**Example Full Command:**",
+            "**Example Full Command (replace SESSION_WS with your actual session workspace):**",
             "```bash",
+            "SESSION_WS=\"~/.openclaw/workspace/agent-main-main-XXXXX\"",
             "cat > /tmp/ppt_config.json << 'EOF'",
             "{\"title\": \"AI Introduction\", \"slides\": [{\"layout\": \"title\", \"title\": \"AI\", \"subtitle\": \"Overview\"}]}",
             "EOF",
+            "mkdir -p \"$SESSION_WS/presentations\"",
             "python skills/powerpoint/scripts/generate_ppt.py \\",
             "  --config /tmp/ppt_config.json \\",
-            "  --output presentations/AI_20260208.pptx \\",
-            "  --workspace ~/.openclaw/workspace/session-123",
+            "  --output \"$SESSION_WS/presentations/AI_$(date +%Y%m%d_%H%M%S).pptx\"",
             "```",
             "",
-            "**Remember:** Use relative paths for --output and include --workspace!",
+            "**Remember:** Always use the Session Workspace path from your system prompt — never scatter files into workspace root!",
         ])
     elif security == "allowlist":
         safe_bins_str = ", ".join(safe_bins[:10])
@@ -647,6 +649,45 @@ def build_exec_capabilities_section(
             "- Suggest manual execution or use other available tools",
         ])
     
+    parts.append("")
+    return parts
+
+
+def build_elevated_section(
+    elevated_config: dict | None = None,
+    current_level: str | None = None,
+) -> list[str]:
+    """Build the Elevated Exec section for non-sandbox (gateway) contexts.
+
+    Mirrors the elevated block injected by TS reply-elevated.ts / get-reply-run.ts
+    into every turn's system prompt when elevated mode is available for the session.
+
+    Args:
+        elevated_config: The ``tools.elevated`` config dict (``enabled``, ``allowFrom``).
+        current_level: The session's current ``elevatedLevel`` value (from SessionEntry).
+    """
+    if not elevated_config or not elevated_config.get("enabled"):
+        return []
+
+    parts = [
+        "## Elevated Exec",
+        "Elevated exec mode is available for authorised users in this session.",
+        "Use /elevated on|off|ask|full to toggle (or embed inline in a message).",
+        "  on/ask — each host command requires per-command approval.",
+        "  full   — host commands are auto-approved (most permissive).",
+        "  off    — elevated mode disabled.",
+    ]
+
+    if current_level and current_level != "off":
+        level_desc = (
+            "ask (per-command approval required)"
+            if current_level in ("ask", "on")
+            else "full (auto-approve all host commands)"
+        )
+        parts.append(f"Current elevated level for this session: {level_desc}.")
+    else:
+        parts.append("Current elevated level: off.")
+
     parts.append("")
     return parts
 

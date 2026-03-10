@@ -165,13 +165,14 @@ async def run_non_interactive_onboarding(
     elif gateway_auth == "password":
         config.gateway.auth = {"mode": "password"}
 
-    # Configure channels
+    # Configure channels — align with TS Zod defaults: dmPolicy="pairing", groupPolicy="allowlist"
     if telegram_token:
         config.channels = {
             "telegram": {
                 "enabled": True,
                 "botToken": telegram_token,
-                "dmPolicy": "pairing"
+                "dmPolicy": "pairing",
+                "groupPolicy": "allowlist",
             }
         }
 

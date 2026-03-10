@@ -122,8 +122,11 @@ def parse_inline_directives(
             buttons = parsed_rows
         clean_text = re.sub(buttons_pattern, '', clean_text, flags=re.IGNORECASE)
 
-    # Clean up extra whitespace
-    clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+    # Clean up extra whitespace while preserving newlines for MEDIA: token parsing
+    # CRITICAL: Do NOT replace newlines - split_media_from_output needs line structure
+    clean_text = re.sub(r'[ \t]+', ' ', clean_text)  # Compress spaces/tabs only
+    clean_text = re.sub(r'\n{3,}', '\n\n', clean_text)  # Max 2 consecutive newlines
+    clean_text = clean_text.strip()
     
     return DirectiveParseResult(
         text=clean_text,

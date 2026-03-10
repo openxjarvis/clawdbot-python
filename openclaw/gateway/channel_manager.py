@@ -357,7 +357,11 @@ class ChannelManager:
 
         logger.info("ChannelManager initialized")
 
-    def _build_system_prompt_with_bootstrap(self, base_prompt: str | None = None) -> str:
+    def _build_system_prompt_with_bootstrap(
+        self,
+        base_prompt: str | None = None,
+        channel_id: str | None = None,
+    ) -> str:
         """
         Build complete system prompt with bootstrap files injected.
         
@@ -366,6 +370,9 @@ class ChannelManager:
         
         Args:
             base_prompt: Base system prompt (if any)
+            channel_id: The real inbound channel (e.g. "telegram", "feishu").
+                        Passed to build_system_prompt_params so runtime_channel
+                        is set correctly (mirrors TS attempt.ts runtimeChannel).
             
         Returns:
             Complete system prompt with bootstrap files
@@ -412,11 +419,30 @@ class ChannelManager:
                 workspace_dir=self.workspace_dir,
                 runtime={
                     "agent_id": "main",
-                    "channel": "gateway",
+                    # Use the real channel when known (e.g. "telegram", "feishu"),
+                    # otherwise fall back to "gateway" for startup/preview builds.
+                    # Mirrors TS attempt.ts: runtimeChannel = normalizeMessageChannel(params.messageChannel).
+                    "channel": channel_id or "gateway",
                     "model": model_name,
                     "default_model": model_name,
                 }
             )
+
+            # Resolve elevated config for system prompt injection
+            _elevated_cfg: dict | None = None
+            try:
+                _tools_cfg = (_cfg.tools if _cfg and _cfg.tools else None)
+                _elevated_obj = _tools_cfg.elevated if _tools_cfg else None
+                if _elevated_obj:
+                    _elevated_cfg = {
+                        "enabled": _elevated_obj.enabled,
+                        "allowFrom": (
+                            [{"provider": e.provider, "senders": list(e.senders)}
+                             for e in (_elevated_obj.allow_from or [])]
+                        ),
+                    }
+            except Exception:
+                pass
 
             # Build complete system prompt with resolved parameters
             system_prompt = build_agent_system_prompt(
@@ -429,6 +455,8 @@ class ChannelManager:
                     bf for bf in bootstrap_files
                     if "(File" not in bf.content
                 ]) if bootstrap_files else None,
+                elevated_config=_elevated_cfg,
+                # current_elevated_level is per-session; inject at turn time below
             )
 
             logger.info(f"Built system prompt with bootstrap files ({len(system_prompt)} chars)")
@@ -1214,6 +1242,20 @@ class ChannelManager:
                 session_key = _route.session_key
                 main_session_key = _route.main_session_key
 
+                # Feishu broadcast override: if metadata carries a specific broadcast
+                # agent_id + session_key, use those instead of the routed values.
+                # Mirrors TS buildBroadcastSessionKey + broadcast dispatch in feishu/bot.ts.
+                _bcast_agent_id = (message.metadata or {}).get("feishu_broadcast_agent_id")
+                _bcast_session_key = (message.metadata or {}).get("feishu_broadcast_session_key")
+                if _bcast_agent_id:
+                    agent_id = str(_bcast_agent_id)
+                    if _bcast_session_key:
+                        session_key = str(_bcast_session_key)
+                    else:
+                        # Reconstruct session key with the target agent ID prefix
+                        from openclaw.channels.feishu.bot import build_broadcast_session_key as _bsk
+                        session_key = _bsk(session_key, _route.agent_id, agent_id)
+
                 # Fail-closed guard (mirrors TS): if this is a named (non-default)
                 # account and no binding matched, drop rather than using default agent.
                 # "default" account always passes — only explicitly-named accounts
@@ -1347,6 +1389,91 @@ class ChannelManager:
                 # Use BodyForAgent (properly formatted with sender metadata for groups)
                 message_text = ctx.BodyForAgent or ctx.Body
 
+                # ---------------------------------------------------------------
+                # Universal /new and /reset detection — mirrors TS initSessionState.
+                # Covers Feishu, Discord, Slack, and any channel whose native
+                # command handlers pass /new through as plain text.
+                # (Telegram native command handlers already dispatch
+                # BARE_SESSION_RESET_PROMPT directly, so they never reach here
+                # with message_text="/new".)
+                # ---------------------------------------------------------------
+                import re as _re_mod
+                _RESET_CMD_RE = _re_mod.compile(r"^/(new|reset)(?:\s+([\s\S]*))?$", _re_mod.IGNORECASE)
+                _reset_match = _RESET_CMD_RE.match(message_text.strip()) if message_text else None
+                _reset_triggered = False
+                if _reset_match:
+                    _reset_reason = "new" if (_reset_match.group(1) or "").lower() == "new" else "reset"
+                    _post_reset_body = (_reset_match.group(2) or "").strip()
+                    try:
+                        from openclaw.gateway.api.sessions_methods import SessionsResetMethod
+                        from openclaw.gateway.handlers import BARE_SESSION_RESET_PROMPT
+                        _rm = SessionsResetMethod()
+                        _reset_result = await _rm.execute(
+                            connection=None,
+                            params={"key": session_key, "reason": _reset_reason, "archiveTranscript": True},
+                        )
+                        _reset_triggered = True
+                        # Refresh session after reset
+                        if _session_mgr:
+                            session = _session_mgr.get_or_create_session_by_key(session_key)
+
+                        # Mirrors TS sendResetSessionNotice / buildResetSessionNoticeText
+                        _notice_model = ""
+                        try:
+                            _notice_model = (getattr(runtime, "model_str", "") or "")
+                        except Exception:
+                            pass
+                        _notice_text = f"✅ New session started · model: {_notice_model}" if _notice_model else "✅ New session started"
+                        try:
+                            await channel.send_text(
+                                target=str(message.chat_id),
+                                text=_notice_text,
+                            )
+                        except Exception:
+                            pass
+
+                        # Replace message body with BARE_SESSION_RESET_PROMPT (or post-reset args)
+                        message_text = _post_reset_body if _post_reset_body else BARE_SESSION_RESET_PROMPT
+                        logger.info("[%s] /new or /reset detected — session reset, sending greeting prompt", channel_id)
+                    except Exception as _reset_err:
+                        logger.warning("[%s] Universal reset failed: %s", channel_id, _reset_err)
+
+                # ---------------------------------------------------------------
+                # isFirstTurnInSession — mirrors TS:
+                #   const isFirstTurnInSession = isNewSession || !currentSystemSent;
+                # On first turn after a session reset (systemSent=False), rebuild the
+                # system prompt from disk so SOUL.md / USER.md / MEMORY.md are fresh.
+                # Mirrors TS resolveBootstrapContextForRun + clearBootstrapSnapshot.
+                # ---------------------------------------------------------------
+                _is_first_turn = False
+                try:
+                    _se = _session_mgr.get_session_entry(session_key) if _session_mgr else None
+                    _system_sent = getattr(_se, "systemSent", None) if _se else None
+                    _is_first_turn = (_system_sent is False) or _reset_triggered
+                except Exception:
+                    _is_first_turn = _reset_triggered
+
+                # Check bootstrap stale flag (set by SessionsResetMethod)
+                from openclaw.agents.bootstrap_cache import consume_bootstrap_stale
+                _bootstrap_stale = consume_bootstrap_stale(session_key)
+                _is_first_turn = _is_first_turn or _bootstrap_stale
+
+                # Per-first-turn bootstrap rebuild — reads workspace files fresh from disk.
+                # This ensures SOUL.md / USER.md / MEMORY.md changes are picked up after /new.
+                _fresh_system_prompt: str | None = None
+                if _is_first_turn:
+                    try:
+                        _fresh_system_prompt = self._build_system_prompt_with_bootstrap(channel_id=channel_id)
+                        logger.info("[%s] Rebuilt system prompt from disk on first turn (session reset)", channel_id)
+                        # Mark systemSent=True so subsequent turns use cached prompt
+                        if _session_mgr:
+                            try:
+                                _session_mgr.update_session_meta_preserve_activity(session_key, {"systemSent": True})
+                            except Exception:
+                                pass
+                    except Exception as _bsp_err:
+                        logger.warning("[%s] bootstrap rebuild failed: %s", channel_id, _bsp_err)
+
                 logger.info(f"[{channel_id}] Starting dispatch with {len(self.tools)} tools")
 
                 from openclaw.auto_reply.reply.typing import create_typing_controller
@@ -1450,6 +1577,11 @@ class ChannelManager:
                 _reasoning_draft = None
                 _reasoning_callback = None
 
+                # block_send_fn — sends each agent reasoning block (text before a tool
+                # call) as a separate visible message. Mirrors TS sendBlockReply.
+                # Enabled for Telegram DMs and Feishu thread replies.
+                _block_send_fn = None
+
                 if hasattr(channel, "_app") and channel._app is not None:
                     # Telegram channel
                     try:
@@ -1470,6 +1602,65 @@ class ChannelManager:
                         logger.debug("Failed to create TelegramDraftStream: %s", _ds_err)
                         _draft_stream = None
                         _stream_callback = None
+
+                    # Block reply configuration — mirrors TS bot-message-dispatch.ts L169-184
+                    # and dispatch-from-config.ts L326 (shouldSendToolSummaries).
+                    # Decision logic:
+                    # 1. Resolve block streaming config from agents.defaults.blockStreamingDefault
+                    #    and telegram.blockStreaming (account-level override)
+                    # 2. Check shouldSendToolSummaries: only enable if NOT group chat
+                    #    and NOT native command source
+                    try:
+                        from openclaw.auto_reply.reply.block_streaming import resolve_block_streaming_config
+                        
+                        _block_cfg = resolve_block_streaming_config(
+                            cfg=_cfg,
+                            channel="telegram",
+                            account_id=message.account_id,
+                        )
+                        
+                        # Mirrors TS: const shouldSendToolSummaries = 
+                        #   ctx.ChatType !== "group" && ctx.CommandSource !== "native"
+                        _should_send_tool_summaries = (
+                            getattr(message, "chat_type", "") != "group"
+                            and getattr(message, "command_source", "") != "native"
+                        )
+                        
+                        if _block_cfg.enabled and _should_send_tool_summaries:
+                            _tg_chat_id_for_block = int(message.chat_id)
+                            # Tracks whether the first block has been sent — used to add a
+                            # human-like delay between consecutive blocks (mirrors TS getHumanDelay).
+                            _block_sent_flags = [False]
+
+                            async def _tg_block_send(
+                                text: str,
+                                _cid=_tg_chat_id_for_block,
+                                _flags=_block_sent_flags,
+                            ) -> None:
+                                import random as _random
+                                try:
+                                    if _flags[0]:
+                                        # Human-like delay between consecutive block messages.
+                                        # Mirrors TS getHumanDelay() / human-delay.ts (800–2500ms).
+                                        _delay_s = _random.uniform(0.8, 2.5)
+                                        await asyncio.sleep(_delay_s)
+                                    _flags[0] = True
+                                    await channel.send_text(
+                                        target=str(_cid),
+                                        text=text,
+                                    )
+                                    # Reset the draft stream so the NEXT text segment starts
+                                    # a fresh streaming preview, rather than editing the
+                                    # preview that corresponds to the just-sent block message.
+                                    # Mirrors TS forceNewMessage() called after onAssistantMessageStart.
+                                    if _draft_stream is not None and hasattr(_draft_stream, "force_new_message"):
+                                        _draft_stream.force_new_message()
+                                except Exception as _e:
+                                    logger.debug("[telegram] block_send_fn error: %s", _e)
+
+                            _block_send_fn = _tg_block_send
+                    except Exception as _block_cfg_err:
+                        logger.debug("Failed to resolve block streaming config: %s", _block_cfg_err)
 
                     # Reasoning lane — second TelegramDraftStream for <think> content.
                     # Mirrors TS reasoning-lane-coordinator.ts + lane-delivery.ts.
@@ -1567,6 +1758,18 @@ class ChannelManager:
                             if _feishu_account:
                                 _feishu_client = _cfc(_feishu_account)
                                 _is_p2p = getattr(message, "chat_type", "") == "direct"
+
+                                # Detect Feishu topic-thread context: messages inside a thread
+                                # carry thread_id in metadata. CardKit streaming is not supported
+                                # in topic threads — we fall back to block reply messages instead.
+                                _feishu_thread_id = None
+                                if message.metadata:
+                                    _feishu_thread_id = (
+                                        message.metadata.get("thread_id")
+                                        or message.metadata.get("root_id")
+                                    )
+                                _feishu_thread_reply = bool(_feishu_thread_id)
+
                                 _feishu_dispatcher = _cfrd(
                                     _feishu_client,
                                     _feishu_account,
@@ -1574,17 +1777,49 @@ class ChannelManager:
                                     is_p2p=_is_p2p,
                                     reply_to_message_id=str(message.message_id) if message.message_id else None,
                                     message_timestamp=_time_module.time(),
+                                    thread_reply=_feishu_thread_reply,
+                                    root_id=_feishu_thread_id,
+                                    session_workspace=session_workspace,
                                 )
                                 # Start typing indicator immediately (emoji reaction on inbound msg)
                                 await _feishu_dispatcher.start_typing()
-                                # Start streaming card — creates a CardKit card with streaming_mode:true
-                                # and sends it as an interactive message. Falls back silently if
-                                # CardKit is not available or streaming is disabled in config.
-                                streaming_ok = await _feishu_dispatcher.start_streaming()
-                                _draft_stream = _feishu_dispatcher
-                                if streaming_ok:
-                                    # Wire incremental updates: each text_delta feeds into the card
-                                    _stream_callback = _feishu_dispatcher.stream_update
+
+                                if _feishu_thread_reply:
+                                    # Thread reply mode: CardKit not supported. Wire block_send_fn
+                                    # so each agent reasoning step is sent as a plain message.
+                                    # This mirrors TS sending intermediate blocks in DM mode.
+                                    _draft_stream = _feishu_dispatcher
+                                    _feishu_disp_ref = _feishu_dispatcher
+
+                                    async def _feishu_thread_block_send(text: str, _d=_feishu_disp_ref) -> None:
+                                        try:
+                                            await _d.send_block(text)
+                                        except Exception as _fe:
+                                            logger.debug("[feishu] thread block_send_fn error: %s", _fe)
+
+                                    _block_send_fn = _feishu_thread_block_send
+                                else:
+                                    # Start streaming card — creates a CardKit card with streaming_mode:true
+                                    # and sends it as an interactive message.
+                                    streaming_ok = await _feishu_dispatcher.start_streaming()
+                                    _draft_stream = _feishu_dispatcher
+                                    if streaming_ok:
+                                        # Wire incremental updates: each text_delta feeds into the card
+                                        _stream_callback = _feishu_dispatcher.stream_update
+                                    else:
+                                        # CardKit streaming failed — log a helpful warning so the
+                                        # issue is diagnosable. Common causes: missing cardkit:card
+                                        # scope, CardKit API not enabled for the app, or domain mismatch.
+                                        if getattr(_feishu_dispatcher, "streaming_enabled", False):
+                                            logger.warning(
+                                                "[feishu] CardKit streaming start failed for account '%s'. "
+                                                "Falling back to non-streaming delivery. "
+                                                "Check that the 'cardkit:card' scope is enabled in your "
+                                                "Feishu app console (Developer Platform → Permissions → "
+                                                "Search 'cardkit'). The '⏳ Thinking...' card will not "
+                                                "appear until streaming is working.",
+                                                getattr(_feishu_account, "account_id", "unknown"),
+                                            )
                     except Exception as _fs_err:
                         logger.debug("Failed to create FeishuReplyDispatcher: %s", _fs_err)
                         _feishu_dispatcher = None
@@ -1662,19 +1897,172 @@ class ChannelManager:
                 # (steer / enqueue-followup / interrupt / run-now)
                 from openclaw.auto_reply.reply.agent_runner import ReplyContext, run_prepared_reply
 
-                # Prepend MEDIA reply hint when inbound images are present.
+                # Materialize inbound images to the session workspace so the LLM
+                # gets real, stable file paths it can reference when calling tools.
+                # Without this, models may hallucinate UUID paths that don't exist.
+                # Mirrors TS resolveInboundMedia() which saves images before dispatch.
+                inbound_image_paths: list[str] = []
+                if inbound_images and session_workspace:
+                    try:
+                        import base64 as _b64
+                        from pathlib import Path as _Path
+                        _incoming_dir = _Path(session_workspace) / "incoming"
+                        _incoming_dir.mkdir(parents=True, exist_ok=True)
+                        for _img_idx, _img_data_url in enumerate(inbound_images):
+                            if isinstance(_img_data_url, str) and _img_data_url.startswith("data:"):
+                                try:
+                                    _header, _data_str = _img_data_url.split(",", 1)
+                                    _mime = _header.split(";")[0].split(":", 1)[1]
+                                    _ext = {"image/jpeg": ".jpg", "image/png": ".png",
+                                            "image/gif": ".gif", "image/webp": ".webp"}.get(_mime, ".jpg")
+                                    _fname = f"image_{message.message_id}_{_img_idx}{_ext}"
+                                    _dest = _incoming_dir / _fname
+                                    _dest.write_bytes(_b64.b64decode(_data_str))
+                                    inbound_image_paths.append(str(_dest))
+                                    logger.debug("Materialized inbound image to %s", _dest)
+                                except Exception as _me:
+                                    logger.debug("Could not materialize inbound image %d: %s", _img_idx, _me)
+                    except Exception as _mat_exc:
+                        logger.debug("Inbound image materialization skipped: %s", _mat_exc)
+
+                # Build MEDIA reply hint when inbound media is present.
                 # Mirrors TS get-reply-run.ts mediaReplyHint (line 368-372):
-                # agents learn the safe MEDIA: path convention before replying.
+                # "To send an image back, prefer the message tool (media/path/filePath). If you must inline, use MEDIA:..."
+                # This hint is added to the USER MESSAGE (not system prompt) to guide LLM output.
                 effective_message_text = message_text
+                _media_reply_hint = None
+                
                 if inbound_images:
-                    _media_reply_hint = (
-                        "To send an image back, prefer the message tool. "
-                        "If you must inline, use MEDIA:https://example.com/image.jpg "
-                        "or a safe relative path like MEDIA:./image.jpg. "
-                        "Avoid absolute paths (MEDIA:/...) and ~ paths — they are blocked for security. "
-                        "Keep caption in the text body."
+                    if inbound_image_paths:
+                        # Tell the LLM the exact paths — prevents hallucinated UUID paths.
+                        _path_list = ", ".join(f"`{p}`" for p in inbound_image_paths)
+                        _media_note = f"[Inbound image(s) saved to: {_path_list}]"
+                        _media_reply_hint = (
+                            "The image is also visible in your vision context — "
+                            "you do NOT need to call image_analyze unless you want a separate model's view."
+                        )
+                    else:
+                        _media_note = "[Inbound image(s) received]"
+                        _media_reply_hint = (
+                            "The image is visible in your vision context — "
+                            "you do NOT need to call image_analyze."
+                        )
+                    
+                    # Add generic file sending hint (applies to ALL files, not just images)
+                    _media_reply_hint += (
+                        "\n\n**To send a file back (image/video/document):**\n"
+                        "1. **Best**: Use the `message` tool with `media` parameter\n"
+                        "2. **Alternative**: Output `MEDIA:` line in your response:\n"
+                        "   - Remote: `MEDIA:https://example.com/image.jpg` (spaces ok, quote if needed)\n"
+                        "   - Relative: `MEDIA:./image.jpg` or `MEDIA:image.jpg`\n"
+                        "   - **Avoid**: Absolute paths like `MEDIA:/Users/...` (blocked for security)\n"
+                        "   - **Avoid**: Tilde paths like `MEDIA:~/...` (blocked)\n"
+                        "Keep caption text in the text body, not in the MEDIA line."
                     )
-                    effective_message_text = f"{_media_reply_hint}\n{message_text}".strip()
+                    effective_message_text = f"{_media_note}\n{_media_reply_hint}\n\n{message_text}".strip()
+                
+                elif not inbound_images:
+                    # No inbound media, but still provide hint for OUTPUT file delivery
+                    # This ensures the LLM knows how to send generated/downloaded files
+                    _media_reply_hint = (
+                        "💡 **File Delivery Tip**: To send files to the user:\n"
+                        "- **Best**: Use `message` tool with `media` parameter\n"
+                        "- **Alternative**: Output a line starting with `MEDIA:` followed by the file path:\n"
+                        "  Examples:\n"
+                        "  • `MEDIA:https://example.com/cat.jpg` (remote URL)\n"
+                        "  • `MEDIA:./nature_sample.mp4` (relative path in workspace)\n"
+                        "  • `MEDIA:presentations/demo.pptx` (relative path)\n"
+                        "  ⚠️ Avoid absolute paths (MEDIA:/...) and ~ paths — blocked for security\n"
+                        "Keep your caption/description in the regular text, not in the MEDIA line."
+                    )
+                    effective_message_text = f"{_media_reply_hint}\n\n{message_text}".strip()
+
+                # Build per-turn system prompt with inbound meta injected.
+                # Mirrors TS get-reply-run.ts buildInboundMetaSystemPrompt(sessionCtx)
+                # which is passed as extraSystemPromptParts[0] every turn, ensuring
+                # the agent always has chat_id, channel, chat_type in its context.
+                # On first turn after reset, use freshly-rebuilt prompt from disk.
+                _base_system_prompt = _fresh_system_prompt if _fresh_system_prompt else self.system_prompt
+                try:
+                    from openclaw.auto_reply.inbound_meta import build_inbound_meta_system_prompt as _build_meta
+                    _inbound_meta = _build_meta(ctx)
+                    _turn_system_prompt = (_base_system_prompt or "") + "\n\n" + _inbound_meta
+                except Exception:
+                    _turn_system_prompt = _base_system_prompt
+
+                # Inject the actual session workspace path per-turn so the agent
+                # always knows the real subdirectory to write files into.
+                # Resolves the TODO in system_prompt.py:
+                #   "Future: Add session_workspace parameter and use resolve_session_workspace_dir()"
+                if session_workspace:
+                    _ws_note = (
+                        "\n\n## Session Workspace\n"
+                        f"Your **session workspace** for this conversation is: `{session_workspace}`\n"
+                        "Save all generated files, downloads, and outputs **inside this directory** "
+                        "(e.g. `{session_workspace}/report.pdf`, `{session_workspace}/output.mp4`).\n"
+                        "Do NOT scatter files into the parent workspace root."
+                    ).replace("{session_workspace}", session_workspace)
+                    _turn_system_prompt = (_turn_system_prompt or "") + _ws_note
+
+                # Inject per-turn channel note so the agent always knows which channel
+                # it is responding in and can use MEDIA: tokens / message tool correctly.
+                # Mirrors TS attempt.ts runtimeChannel injection into system prompt params.
+                _channel_note = (
+                    f"\n\n## Current Channel\n"
+                    f"You are responding via **{channel_id}** (chat_id: `{message.chat_id}`).\n"
+                    f"To deliver a file to the user, place a `MEDIA:` token on its own line "
+                    f"anywhere in your reply (e.g. `MEDIA:/abs/path/file.pdf` or "
+                    f"`MEDIA:https://example.com/image.jpg`). "
+                    f"Do NOT write markdown download links or say you cannot send — use MEDIA: directly."
+                )
+                _turn_system_prompt = (_turn_system_prompt or "") + _channel_note
+
+                # Inject per-turn elevated level into system prompt so the model
+                # always knows the current elevated state (mirrors TS per-turn injection
+                # in get-reply-run.ts extraSystemPromptParts).
+                try:
+                    _session_entry = session or {}
+                    _cur_elevated = (
+                        _session_entry.get("elevatedLevel")
+                        if isinstance(_session_entry, dict)
+                        else getattr(_session_entry, "elevatedLevel", None)
+                    )
+                    if _cur_elevated and _cur_elevated != "off":
+                        _level_desc = (
+                            "ask (per-command approval required)"
+                            if _cur_elevated in ("ask", "on")
+                            else "full (auto-approve all host commands)"
+                        )
+                        _elevated_note = (
+                            f"\n\n## Elevated Exec — Current Level\n"
+                            f"Elevated exec is active for this session: **{_level_desc}**.\n"
+                            "Use /elevated off to disable."
+                        )
+                        _turn_system_prompt = (_turn_system_prompt or "") + _elevated_note
+                except Exception:
+                    pass
+
+                # Build a per-dispatch tool list where MessageTool is replaced with a
+                # channel-context-bound copy so the agent can call message(action=sendAttachment)
+                # without needing to specify the channel explicitly.
+                # Mirrors TS createMessageTool({ currentChannelProvider, currentChannelId })
+                # called fresh per-dispatch in attempt.ts.
+                _dispatch_tools = self.tools
+                try:
+                    from openclaw.agents.tools.channel_actions import create_message_tool as _cmt, MessageTool as _MT
+                    _existing_msg_tool = next((t for t in self.tools if isinstance(t, _MT)), None)
+                    if _existing_msg_tool is not None:
+                        _bound_msg_tool = _cmt(
+                            channel_registry=_existing_msg_tool.channel_registry,
+                            current_channel_provider=channel_id,
+                            current_channel_id=str(message.chat_id),
+                        )
+                        _dispatch_tools = [
+                            _bound_msg_tool if isinstance(t, _MT) else t
+                            for t in self.tools
+                        ]
+                except Exception as _mte:
+                    logger.debug("Per-dispatch MessageTool binding failed: %s", _mte)
 
                 reply_ctx = ReplyContext(
                     session_id=session_id_for_run,
@@ -1682,14 +2070,14 @@ class ChannelManager:
                     message_text=effective_message_text,
                     runtime=runtime,
                     session=session,
-                    tools=self.tools,
+                    tools=_dispatch_tools,
                     channel_send=_channel_send,
                     chat_target=message.chat_id,
                     channel_id=channel_id,
                     reply_to_id=message.message_id,
                     queue_settings=_queue_settings,
                     images=inbound_images,
-                    system_prompt=self.system_prompt,
+                    system_prompt=_turn_system_prompt,
                     originating_channel=channel_id,
                     originating_to=message.chat_id,
                     session_workspace=session_workspace,
@@ -1701,6 +2089,7 @@ class ChannelManager:
                     reasoning_level=_reasoning_level,
                     reasoning_stream_callback=_reasoning_callback,
                     reasoning_draft_stream=_reasoning_draft,
+                    block_send_fn=_block_send_fn,
                 )
 
                 # Fire-and-forget: handler returns immediately.

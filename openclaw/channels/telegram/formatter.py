@@ -5,6 +5,50 @@ import re
 from dataclasses import dataclass
 from typing import List
 
+# ---------------------------------------------------------------------------
+# File reference TLD protection
+# ---------------------------------------------------------------------------
+# These file extensions look like country-code TLDs to Telegram, causing it to
+# generate unwanted domain-registrar link previews for things like README.md.
+# Mirrors TS FILE_EXTENSIONS_WITH_TLD in src/telegram/format.ts.
+FILE_EXTENSIONS_WITH_TLD: frozenset[str] = frozenset([
+    "md",   # Markdown (Moldova) — very common in repos
+    "go",   # Go language (Equatorial Guinea)
+    "py",   # Python (Paraguay)
+    "pl",   # Perl (Poland)
+    "sh",   # Shell (Saint Helena)
+    "am",   # Automake (Armenia)
+    "at",   # Assembly (Austria)
+    "be",   # Backend (Belgium)
+    "cc",   # C++ source (Cocos Islands)
+    "rs",   # Rust (Serbia)
+    "rb",   # Ruby (???)
+    "ts",   # TypeScript (???)
+])
+
+_TLD_FILE_RE = re.compile(
+    r'\b([\w\-/][\w\-./]*\.(?:' + '|'.join(sorted(FILE_EXTENSIONS_WITH_TLD)) + r'))\b',
+    re.IGNORECASE,
+)
+
+
+def wrap_file_references_in_html(html: str) -> str:
+    """Wrap bare filename.ext references in <code> tags to prevent Telegram
+    from treating common file extensions as TLDs and generating link previews.
+
+    Only wraps text that is not already inside a <code> or <pre> block.
+    Mirrors TS wrapFileReferencesInHtml() in src/telegram/format.ts.
+    """
+    # Split on already-code-formatted blocks; only wrap outside those blocks.
+    parts = re.split(r'(<(?:code|pre)[^>]*>.*?</(?:code|pre)>)', html, flags=re.DOTALL)
+    result: List[str] = []
+    for part in parts:
+        if re.match(r'<(?:code|pre)', part, re.IGNORECASE):
+            result.append(part)  # already formatted — leave as-is
+        else:
+            result.append(_TLD_FILE_RE.sub(lambda m: f"<code>{m.group(0)}</code>", part))
+    return "".join(result)
+
 
 def escape_html(text: str) -> str:
     """Escape HTML special characters for safe use in Telegram HTML messages."""
@@ -39,6 +83,8 @@ def markdown_to_telegram_chunks(
     Convert Markdown text to a list of Telegram-ready HTML chunks.
 
     Each chunk fits within *limit* characters of the HTML output.
+    File references with TLD-like extensions (.md, .go, .py, .sh, etc.) are
+    wrapped in <code> to prevent Telegram from treating them as domain links.
 
     Args:
         text: Markdown input text.
@@ -47,7 +93,7 @@ def markdown_to_telegram_chunks(
     Returns:
         List of TelegramChunk objects.
     """
-    html = markdown_to_html(text)
+    html = wrap_file_references_in_html(markdown_to_html(text))
     raw_chunks = chunk_message(html, max_length=limit)
     return [
         TelegramChunk(html=c, plain=re.sub(r"<[^>]+>", "", c), length=len(c))

@@ -28,7 +28,8 @@ class HookStatusEntry:
     """Status information for a hook."""
     
     name: str
-    source: str
+    description: str = ""
+    source: str = ""
     emoji: str | None = None
     events: list[str] = field(default_factory=list)
     eligible: bool = False
@@ -77,6 +78,7 @@ def build_workspace_hook_status(
         # Build status entry
         status = HookStatusEntry(
             name=entry.hook.name,
+            description=entry.hook.description or "",
             source=entry.hook.source,
             emoji=entry.metadata.emoji if entry.metadata else None,
             events=entry.metadata.events if entry.metadata else [],

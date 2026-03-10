@@ -13,6 +13,7 @@ import asyncio
 import io
 import logging
 import os
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -23,6 +24,34 @@ logger = logging.getLogger(__name__)
 
 _MAX_DEFAULT_MB = 30.0
 _AUDIO_EXTENSIONS = {".opus", ".ogg", ".mp3", ".m4a", ".aac", ".wav"}
+
+# ---------------------------------------------------------------------------
+# Filename sanitization for upload
+# ---------------------------------------------------------------------------
+_ASCII_ONLY_RE = re.compile(r'^[\x20-\x7E]+$')
+
+
+def sanitize_file_name_for_upload(filename: str) -> str:
+    """RFC-5987 encode non-ASCII filenames for Feishu multipart upload.
+
+    Feishu's Content-Disposition header requires ASCII-safe filenames.
+    Non-ASCII characters (Chinese, Japanese, emoji, etc.) silently cause the
+    upload to fail or produce a garbled filename on the server side.
+
+    Applies RFC-5987 percent-encoding via urllib.parse.quote, matching the
+    special-char escaping from the HTTP spec.
+
+    Mirrors TS sanitizeFileNameForUpload() in extensions/feishu/src/media.ts.
+    """
+    if _ASCII_ONLY_RE.match(filename):
+        return filename
+    from urllib.parse import quote
+    return (
+        quote(filename, safe="")
+        .replace("'", "%27")
+        .replace("(", "%28")
+        .replace(")", "%29")
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +205,9 @@ async def upload_file(
 
     ext = Path(filename).suffix.lower()
     if ext in _AUDIO_EXTENSIONS:
-        file_type = "opus" if ext in {".opus", ".ogg"} else "mp4"
+        # All audio files use file_type="opus" for Feishu upload
+        # This includes MP3, WAV, M4A, OGG, and OPUS formats
+        file_type = "opus"
     elif ext in {".mp4", ".mov", ".avi", ".mkv"}:
         file_type = "mp4"
     elif ext == ".pdf":
@@ -192,10 +223,13 @@ async def upload_file(
 
     try:
         file_obj = io.BytesIO(data)
+        # Sanitize filename: RFC-5987 encode non-ASCII chars that would silently
+        # fail Feishu's multipart upload Content-Disposition header.
+        safe_filename = sanitize_file_name_for_upload(filename)
         builder = (
             CreateFileRequestBody.builder()
             .file_type(file_type)
-            .file_name(filename)
+            .file_name(safe_filename)
             .file(file_obj)
         )
         if duration and file_type in {"opus", "mp4"}:
@@ -248,6 +282,8 @@ async def send_media_feishu(
     Returns sent message_id or None.
     Mirrors TS sendMediaFeishu().
     """
+    logger.info(f"[feishu media] send_media_feishu: filename={filename}, media_type={media_type}, data_size={len(data)} bytes")
+    
     from lark_oapi.api.im.v1 import (
         CreateMessageRequest, CreateMessageRequestBody,
         ReplyMessageRequest, ReplyMessageRequestBody,
@@ -258,38 +294,59 @@ async def send_media_feishu(
     is_audio = media_type == "audio" or ext in _AUDIO_EXTENSIONS
     is_video = media_type == "video" or ext in {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
+    logger.info(f"[feishu media] Determined: is_audio={is_audio}, is_video={is_video}, ext={ext}")
+
+    # Duration is required for audio and video files by Feishu API
+    # Default to 10 seconds if not provided (should ideally extract from file metadata)
+    duration_ms = 0
+    if is_video or is_audio:
+        duration_ms = 10000  # 10 seconds default
+
     if media_type == "image":
+        logger.info(f"[feishu media] Uploading as image")
         key = await upload_image(client, data)
         if not key:
+            logger.error(f"[feishu media] Failed to upload image")
             return None
         content_dict = {"image_key": key}
         msg_type = "image"
     elif is_audio:
-        key = await upload_file(client, data, filename)
+        # All audio files (MP3, M4A, WAV, OPUS, OGG, etc.) use msg_type="audio"
+        # This is required by Feishu API to display audio player
+        # Only opus files use duration parameter
+        logger.info(f"[feishu media] Uploading as audio (msg_type=audio), duration={duration_ms}ms")
+        key = await upload_file(client, data, filename, duration=duration_ms)
         if not key:
+            logger.error(f"[feishu media] Failed to upload audio")
             return None
         content_dict = {"file_key": key}
         msg_type = "audio"
-    elif is_video:
-        # Use msg_type="media" for inline video playback in Feishu
-        key = await upload_file(client, data, filename)
-        if not key:
-            return None
-        content_dict = {"file_key": key}
-        msg_type = "media"
     else:
-        key = await upload_file(client, data, filename)
+        # Everything else (video, PPT, PDF, DOC, etc.) uses msg_type="file"
+        # CRITICAL FIX: Videos use msg_type="file" (not "media")
+        # This aligns with TS version and Feishu API documentation
+        # See: openclaw/extensions/feishu/src/media.ts:470-472
+        if is_video:
+            logger.info(f"[feishu media] Uploading as video (msg_type=file), duration={duration_ms}ms")
+            key = await upload_file(client, data, filename, duration=duration_ms)
+        else:
+            logger.info(f"[feishu media] Uploading as file (document/other)")
+            key = await upload_file(client, data, filename, duration=0)
+        
         if not key:
+            logger.error(f"[feishu media] Failed to upload {'video' if is_video else 'file'}")
             return None
         content_dict = {"file_key": key}
         msg_type = "file"
 
+    logger.info(f"[feishu media] Upload complete: key={key}, msg_type={msg_type}")
     content_str = json.dumps(content_dict)
 
     loop = asyncio.get_running_loop()
 
     try:
         if reply_to_message_id:
+            logger.info(f"[feishu media] Sending as reply to message_id={reply_to_message_id}")
             request = (
                 ReplyMessageRequest.builder()
                 .message_id(reply_to_message_id)
@@ -307,6 +364,7 @@ async def send_media_feishu(
                 lambda: client.im.v1.message.reply(request),
             )
         else:
+            logger.info(f"[feishu media] Sending as new message to {receive_id} (type={receive_id_type})")
             request = (
                 CreateMessageRequest.builder()
                 .receive_id_type(receive_id_type)
@@ -326,14 +384,16 @@ async def send_media_feishu(
 
         if not response.success():
             logger.warning(
-                "[feishu] Failed to send media: code=%s msg=%s", response.code, response.msg
+                "[feishu media] Failed to send media: code=%s msg=%s", response.code, response.msg
             )
             return None
 
-        return response.data.message_id if response.data else None
+        msg_id = response.data.message_id if response.data else None
+        logger.info(f"[feishu media] Message sent successfully: message_id={msg_id}")
+        return msg_id
 
     except Exception as e:
-        logger.warning("[feishu] Exception sending media: %s", e)
+        logger.warning("[feishu media] Exception sending media: %s", e, exc_info=True)
         return None
 
 
@@ -342,12 +402,17 @@ async def send_media_feishu(
 # ---------------------------------------------------------------------------
 
 def get_msg_type_for_file(filename: str) -> str:
-    """Return the Feishu msg_type appropriate for a given filename."""
+    """Return the Feishu msg_type appropriate for a given filename.
+    
+    Mirrors TS media.ts logic:
+    - Images use "image"
+    - Opus/OGG audio uses "audio"  
+    - Everything else (including video, PPT, PDF) uses "file"
+    """
     ext = Path(filename).suffix.lower()
     if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
         return "image"
-    if ext in _AUDIO_EXTENSIONS:
+    if ext in {".opus", ".ogg"}:
         return "audio"
-    if ext in {".mp4", ".mov", ".avi", ".mkv", ".webm"}:
-        return "media"
+    # Video, documents, and everything else use "file"
     return "file"

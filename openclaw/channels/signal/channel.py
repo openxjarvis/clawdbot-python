@@ -79,6 +79,21 @@ class SignalChannel(ChannelPlugin):
             or _DEFAULT_BASE_URL
         ).rstrip("/")
 
+        # Policy config — mirrors TS resolveAllowlistProviderRuntimeGroupPolicy for Signal
+        # TS: Signal uses configuredFallbackPolicy="allowlist" (fail-closed for groups)
+        self._dm_policy: str = config.get("dmPolicy") or config.get("dm_policy") or "pairing"
+        self._allow_from: list[str] = [
+            str(x) for x in (config.get("allowFrom") or config.get("allow_from") or [])
+        ]
+        self._group_policy: str = (
+            config.get("groupPolicy") or config.get("group_policy") or "allowlist"
+        )
+        self._group_allow_from: list[str] = [
+            str(x) for x in (
+                config.get("groupAllowFrom") or config.get("group_allow_from") or []
+            )
+        ]
+
         logger.info(f"[signal] Starting channel for {self._account} at {self._base_url}")
 
         # Verify API is reachable
@@ -194,6 +209,28 @@ class SignalChannel(ChannelPlugin):
         else:
             chat_id = source
             chat_type = "direct"
+
+        # --- Inbound policy gating (mirrors TS resolveAllowlistProviderRuntimeGroupPolicy) ---
+        if chat_type == "group":
+            group_policy = getattr(self, "_group_policy", "allowlist")
+            if group_policy == "disabled":
+                logger.debug("[signal] Group %s blocked by groupPolicy=disabled", chat_id)
+                return
+            if group_policy == "allowlist":
+                group_allow_from = getattr(self, "_group_allow_from", [])
+                if "*" not in group_allow_from and chat_id not in group_allow_from:
+                    logger.debug("[signal] Group %s not in groupAllowFrom", chat_id)
+                    return
+        else:
+            dm_policy = getattr(self, "_dm_policy", "pairing")
+            if dm_policy == "disabled":
+                logger.debug("[signal] DM from %s blocked by dmPolicy=disabled", source)
+                return
+            if dm_policy in ("pairing", "allowlist"):
+                allow_from = getattr(self, "_allow_from", [])
+                if "*" not in allow_from and source not in allow_from:
+                    logger.debug("[signal] DM from %s not in allowFrom (policy=%s)", source, dm_policy)
+                    return
 
         # Handle reactions
         reaction_info = data_msg.get("reaction")

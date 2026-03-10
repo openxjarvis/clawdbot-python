@@ -234,7 +234,7 @@ async def run_feishu_calendar(
     # ------------------------------------------------------------------
     elif action == "create_event":
         from lark_oapi.api.calendar.v4 import (
-            CreateCalendarEventRequest, CreateCalendarEventRequestBody,
+            CreateCalendarEventRequest,
             CalendarEvent, TimeInfo,
         )
 
@@ -268,11 +268,7 @@ async def run_feishu_calendar(
                 CreateCalendarEventRequest.builder()
                 .calendar_id(calendar_id)
                 .user_id_type("open_id")
-                .request_body(
-                    CreateCalendarEventRequestBody.builder()
-                    .event(evt_builder.build())
-                    .build()
-                )
+                .request_body(evt_builder.build())
                 .build()
             )
             response = await loop.run_in_executor(

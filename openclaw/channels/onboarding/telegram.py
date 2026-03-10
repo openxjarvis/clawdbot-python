@@ -66,7 +66,8 @@ class TelegramOnboardingAdapter(ChannelOnboardingAdapter):
         
         telegram_config["enabled"] = True
         telegram_config["token"] = token
-        telegram_config["dmPolicy"] = "off"  # Start with off, configure later
+        telegram_config["dmPolicy"] = "pairing"  # Default: pairing (aligns with TS)
+        telegram_config["groupPolicy"] = "allowlist"  # Default: allowlist (aligns with TS)
         
         channels["telegram"] = telegram_config
         config["channels"] = channels

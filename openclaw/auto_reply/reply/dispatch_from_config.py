@@ -416,7 +416,7 @@ async def dispatch_reply_from_config(
             await _route_reply_to_channel(tts_p, originating_channel, originating_to, session_key, cfg)
         else:
             result.counts["block"] += 1
-            await dispatcher.send_block_reply(tts_p.text or "")
+            await dispatcher.send_block_reply(tts_p)
 
     async def on_tool_result(payload: ReplyPayload) -> None:
         if not should_send_tool_summaries:

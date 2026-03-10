@@ -60,8 +60,17 @@ def _normalize_media_source(raw: str) -> str:
         /path/to/file.pptx 这是今日新闻 PPT。
     We detect this by finding the last file-extension boundary and trimming
     anything after it when the remaining suffix contains non-path characters.
+    
+    Additionally, removes markdown-style backslash escaping from file paths
+    (e.g., Nature\_Slideshow.pptx → Nature_Slideshow.pptx).
     """
     raw = raw.strip().strip("'\"")
+    
+    # Remove markdown-style backslash escaping (e.g., \_ → _, \- → -)
+    # This fixes the bug where agent outputs "Nature\_Slideshow.pptx"
+    # which becomes a non-existent file "Nature\\_Slideshow.pptx"
+    raw = raw.replace(r'\_', '_').replace(r'\-', '-').replace(r'\ ', ' ')
+    
     if raw.startswith("~"):
         raw = str(Path(raw).expanduser())
 

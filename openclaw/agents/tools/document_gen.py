@@ -148,7 +148,7 @@ class PPTGeneratorTool(AgentTool):
 
             return ToolResult(
                 success=True,
-                content=f"✅ Created presentation: {filename}\n\nPath: {file_path}\n\nSlides: {len(slides_data)}",
+                content=f"MEDIA:{file_path}\n✅ Created presentation: {filename} ({len(slides_data)} slides)",
                 metadata={
                     "path": str(file_path),
                     "filename": filename,
@@ -271,7 +271,7 @@ class PDFGeneratorTool(AgentTool):
 
             return ToolResult(
                 success=True,
-                content=f"✅ Created PDF: {filename}\n\nPath: {file_path}",
+                content=f"MEDIA:{file_path}\n✅ Created PDF: {filename}",
                 metadata={
                     "path": str(file_path),
                     "filename": filename,

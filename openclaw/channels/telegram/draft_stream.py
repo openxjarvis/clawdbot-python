@@ -103,6 +103,8 @@ class TelegramDraftStream:
 
         # Shared state
         self._last_sent_text = ""
+        self._last_delivered_text = ""  # Mirrors TS lastDeliveredText
+        self._preview_revision = 0  # Mirrors TS previewRevision counter
         self._stopped = False
         self._is_final = False
 
@@ -207,7 +209,20 @@ class TelegramDraftStream:
         self._stream_message_id = None
         self._draft_id = _allocate_draft_id()
         self._last_sent_text = ""
+        self._last_delivered_text = ""
         self._pending_text = ""
+    
+    def preview_revision(self) -> int:
+        """Return the number of successful preview updates.
+        Mirrors TS TelegramDraftStream.previewRevision().
+        """
+        return self._preview_revision
+    
+    def last_delivered_text(self) -> str:
+        """Return the last successfully delivered text.
+        Mirrors TS TelegramDraftStream.lastDeliveredText().
+        """
+        return self._last_delivered_text
 
     # ------------------------------------------------------------------
     # Internal throttle + loop
@@ -262,6 +277,12 @@ class TelegramDraftStream:
                 # Hard failure — re-queue text so caller can inspect, then abort
                 self._pending_text = text
                 return
+            
+            # Increment revision counter on successful send
+            # Mirrors TS: previewRevision += 1 in sendOrEditStreamMessage
+            if result is True:
+                self._preview_revision += 1
+                self._last_delivered_text = text.rstrip()
 
             self._last_sent_at = time.time()
             if not self._pending_text:
@@ -304,9 +325,10 @@ class TelegramDraftStream:
 
         self._last_sent_text = trimmed
 
-        # Convert markdown → Telegram HTML (mirrors TS renderTelegramHtmlText)
-        from openclaw.channels.telegram.formatter import markdown_to_html
-        html_text = markdown_to_html(trimmed)
+        # Convert markdown → Telegram HTML with file-reference TLD protection.
+        # Mirrors TS renderTelegramHtmlText + wrapFileReferencesInHtml() in format.ts.
+        from openclaw.channels.telegram.formatter import markdown_to_html, wrap_file_references_in_html
+        html_text = wrap_file_references_in_html(markdown_to_html(trimmed))
 
         try:
             if self._use_draft_transport:

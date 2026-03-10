@@ -354,14 +354,14 @@ def resolve_agent_route(
     bindings = _get_evaluated_bindings(cfg, channel_norm, account_id_norm)
 
     # Get dmScope and identityLinks from config
-    dm_scope = "main"
+    dm_scope = "per-channel-peer"
     identity_links = None
     if hasattr(cfg, "session") and cfg.session:  # type: ignore[union-attr]
-        dm_scope = getattr(cfg.session, "dmScope", "main") or "main"  # type: ignore[union-attr]
+        dm_scope = getattr(cfg.session, "dmScope", "per-channel-peer") or "per-channel-peer"  # type: ignore[union-attr]
         identity_links = getattr(cfg.session, "identityLinks", None)  # type: ignore[union-attr]
     elif isinstance(cfg, dict):
         session = cfg.get("session") or {}
-        dm_scope = session.get("dmScope", "main") or "main"
+        dm_scope = session.get("dmScope", "per-channel-peer") or "per-channel-peer"
         identity_links = session.get("identityLinks")
 
     def choose(agent_id: str, matched_by: str) -> ResolvedAgentRoute:

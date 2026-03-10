@@ -1,79 +1,124 @@
-"""Hooks setup during onboarding - aligned with TypeScript onboard-hooks.ts"""
+"""Hooks setup during onboarding - aligned with TypeScript onboard-hooks.ts
+
+Implements full interactive flow:
+- Status display
+- Multi-select enable via questionary.checkbox
+- Saves enabled hooks to config
+"""
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
-async def setup_hooks(workspace_dir: Optional[Path] = None, mode: str = "quickstart") -> dict:
-    """Setup internal hooks during onboarding
-    
-    Args:
-        workspace_dir: Workspace directory path
-        mode: "quickstart" or "advanced"
-        
-    Returns:
-        Dict with hooks setup info
+async def setup_hooks(
+    workspace_dir: Path | None = None,
+    config: dict | None = None,
+    mode: str = "quickstart",
+) -> dict[str, Any]:
     """
+    Setup internal hooks during onboarding (aligned with TS setupInternalHooks).
+
+    Args:
+        workspace_dir: Workspace directory (default: ~/.openclaw/workspace)
+        config: Current config dict (will be updated with enabled hooks)
+        mode: "quickstart" or "advanced"
+
+    Returns:
+        Dict with configured, enabled, config (updated config to save)
+    """
+    from openclaw.hooks.hooks_status import build_workspace_hook_status
+    from . import prompter
+
+    ws = workspace_dir or (Path.home() / ".openclaw" / "workspace")
+    cfg = dict(config) if config else {}
+
     print("\n" + "=" * 60)
     print("🪝 HOOKS SETUP")
     print("=" * 60)
-    
+
+    prompter.note(
+        "Hooks let you automate actions when agent commands are issued.\n"
+        "Example: Save session context to memory when you issue /new or /reset.\n\n"
+        "Learn more: https://docs.openclaw.ai/automation/hooks",
+        title="Hooks",
+    )
+    print()
+
+    report = build_workspace_hook_status(str(ws), config=cfg)
+    eligible_hooks = [h for h in report.hooks if h.eligible]
+
+    if not eligible_hooks:
+        prompter.note(
+            "No eligible hooks found. You can configure hooks later in your config.",
+            title="No Hooks Available",
+        )
+        return {"configured": False, "enabled": [], "config": cfg}
+
+    # QuickStart: use defaults, skip interactive
     if mode == "quickstart":
-        print("\n⚡ QuickStart mode: Using default hooks configuration")
-        # Configure session memory hooks on /new
-        hooks_config = {
-            "session_memory": {
-                "enabled": True,
-                "trigger": "/new",
-                "action": "save_context"
-            }
+        # Enable common defaults
+        default_hooks = ["session-memory", "boot-md", "command-logger"]
+        entries = cfg.get("hooks", {}).get("internal", {}).get("entries", {}) or {}
+        entries = dict(entries)
+        for name in default_hooks:
+            if any(h.name == name for h in eligible_hooks):
+                entries[name] = {"enabled": True}
+        cfg.setdefault("hooks", {})["internal"] = {
+            "enabled": True,
+            "entries": entries,
         }
-        print("✅ Default hooks configured")
-        return {"configured": True, "hooks": hooks_config}
-    
-    # Advanced mode
-    print("\n🔧 Advanced hooks configuration:")
-    print("  1. Session memory hooks (save context on /new)")
-    print("  2. Custom webhook endpoints")
-    print("  3. Event listeners")
-    
-    response = input("\n❓ Configure hooks now? [Y/n]: ").strip().lower()
-    if response in ["n", "no"]:
-        print("⏭️  Skipping hooks setup")
-        return {"configured": False, "skipped": True}
-    
-    # Session memory hooks
-    print("\n📝 Session Memory Hooks:")
-    print("  Save conversation context when starting new session")
-    
-    enable_memory = input("  Enable? [Y/n]: ").strip().lower()
-    if enable_memory not in ["n", "no"]:
-        hooks_config = {
-            "session_memory": {
-                "enabled": True,
-                "trigger": "/new",
-                "action": "save_context"
+        print("⚡ QuickStart: Default hooks configured (session-memory, boot-md, command-logger)")
+        return {"configured": True, "enabled": list(entries.keys()), "config": cfg}
+
+    # Advanced: multiselect
+    choices = [
+        {"name": "Skip for now", "value": "__skip__", "description": ""},
+        *[
+            {
+                "name": f"{h.emoji or '🔗'} {h.name}",
+                "value": h.name,
+                "description": h.description or "",
             }
-        }
-        print("  ✅ Session memory hooks enabled")
-    else:
-        hooks_config = {}
-    
-    # Custom hooks directory
-    if workspace_dir:
-        hooks_dir = workspace_dir / "hooks"
-        if not hooks_dir.exists():
-            create_dir = input(f"\n  Create hooks directory at {hooks_dir}? [y/N]: ").strip().lower()
-            if create_dir in ["y", "yes"]:
-                hooks_dir.mkdir(parents=True, exist_ok=True)
-                print(f"  ✅ Created {hooks_dir}")
-    
-    print("\n✅ Hooks configured successfully")
-    return {"configured": True, "hooks": hooks_config}
+            for h in eligible_hooks
+        ],
+    ]
+
+    try:
+        selected = prompter.checkbox(
+            "Enable hooks? (Space to select, Enter to confirm)",
+            choices=choices,
+        )
+    except prompter.WizardCancelledError:
+        return {"configured": False, "enabled": [], "config": cfg}
+
+    to_enable = [n for n in selected if n != "__skip__"]
+    if not to_enable:
+        return {"configured": False, "enabled": [], "config": cfg}
+
+    # Merge into config
+    entries = dict(cfg.get("hooks", {}).get("internal", {}).get("entries", {}) or {})
+    for name in to_enable:
+        entries[name] = {"enabled": True}
+
+    cfg.setdefault("hooks", {})["internal"] = {
+        "enabled": True,
+        "entries": entries,
+    }
+
+    prompter.note(
+        f"Enabled {len(to_enable)} hook{'s' if len(to_enable) != 1 else ''}: {', '.join(to_enable)}\n\n"
+        "You can manage hooks later with:\n"
+        "  uv run openclaw hooks list\n"
+        "  uv run openclaw hooks enable <name>\n"
+        "  uv run openclaw hooks disable <name>",
+        title="Hooks Configured",
+    )
+
+    return {"configured": True, "enabled": to_enable, "config": cfg}
 
 
 __all__ = ["setup_hooks"]

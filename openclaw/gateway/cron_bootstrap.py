@@ -698,6 +698,19 @@ def _extract_delivery_targets(
         if not sk_peer:
             continue
 
+        # Skip test/dummy chat IDs (单个数字通常是测试数据)
+        # Real Telegram chat IDs are typically large integers (6+ digits) or negative supergroup IDs
+        if sk_channel == "telegram":
+            try:
+                chat_id_num = int(sk_peer)
+                # Skip small test IDs (1-999) that are likely from test sessions
+                if 0 < abs(chat_id_num) < 1000:
+                    logger.debug(f"cron: skipping test chat_id={sk_peer} from session {sk}")
+                    continue
+            except ValueError:
+                # Non-numeric peer ID, allow it (e.g., @username)
+                pass
+
         key = (sk_channel, sk_peer)
         if key not in seen:
             seen.add(key)

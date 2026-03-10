@@ -78,6 +78,41 @@ _RECOVERABLE_ERROR_NAMES = frozenset({
     "RequestError", "FetchError",
 })
 
+
+# ---------------------------------------------------------------------------
+# Safe reply_to converter — mirrors TS cbq_ guard
+# ---------------------------------------------------------------------------
+
+def _safe_reply_to(reply_to: str | int | None) -> int | None:
+    """Convert reply_to to int, returning None for non-numeric values like 'cbq_...' IDs.
+
+    Callback queries produce synthetic IDs prefixed with 'cbq_' which are not
+    valid Telegram message IDs and must not be passed to reply_to_message_id.
+    Mirrors TS cbq_ handling in bot-handlers.ts.
+    """
+    if reply_to is None:
+        return None
+    if isinstance(reply_to, int):
+        return reply_to
+    try:
+        return int(reply_to)
+    except (ValueError, TypeError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# sendChatAction 401 circuit breaker — mirrors TS sendchataction-401-backoff.ts
+# ---------------------------------------------------------------------------
+
+_SEND_CHAT_ACTION_401_MAX_FAILURES = 10  # suspend after N consecutive 401s
+_SEND_CHAT_ACTION_401_BACKOFF_INITIAL = 1.0   # seconds
+_SEND_CHAT_ACTION_401_BACKOFF_MAX = 300.0     # 5 minutes
+_SEND_CHAT_ACTION_401_BACKOFF_FACTOR = 2.0
+_SEND_CHAT_ACTION_401_JITTER = 0.10           # ±10%
+
+# Per-account state: {account_key: {"failures": int, "suspended_until": float}}
+_send_chat_action_backoff: dict[str, dict] = {}
+
 _RECOVERABLE_MSG_FRAGMENTS = (
     "network error", "socket hang up", "timeout", "econnreset",
     "undici", "fetch failed", "ETIMEDOUT", "ECONNREFUSED",
@@ -735,15 +770,75 @@ class TelegramChannel(ChannelPlugin):
                         failures = 0
                         self._schedule_polling_restart(reason="health-check-failure")
 
-    async def send_typing(self, target: str, message_id: str | None = None) -> None:
-        """Send a 'typing…' chat action to show the bot is processing."""
+    async def send_typing(
+        self,
+        target: str,
+        message_id: str | None = None,
+        message_thread_id: int | None = None,
+    ) -> None:
+        """Send a 'typing…' chat action to show the bot is processing.
+
+        Implements a 401 circuit breaker — mirrors TS sendchataction-401-backoff.ts.
+        After 10 consecutive 401 Unauthorized responses the action is suspended to
+        prevent Telegram from deleting the bot for repeated bad-auth requests.
+        The counter resets on each successful call.
+        """
         if not self._app:
             return
+
+        import math
+        import random
+        import time
+
+        account_key = self._account_id or "default"
+        state = _send_chat_action_backoff.setdefault(account_key, {"failures": 0, "suspended_until": 0.0})
+
+        # Circuit breaker: check suspension window
+        now = time.monotonic()
+        if state["failures"] >= _SEND_CHAT_ACTION_401_MAX_FAILURES:
+            if now < state["suspended_until"]:
+                return  # silently skip — bot is suspended
+            # Suspension window expired; try again cautiously
+            logger.info("send_typing 401 suspension window expired for account %s, retrying", account_key)
+
         try:
             chat_id = int(target) if str(target).lstrip("-").isdigit() else target
-            await self._app.bot.send_chat_action(chat_id=chat_id, action="typing")
+            _typing_kwargs: dict[str, Any] = {"chat_id": chat_id, "action": "typing"}
+            if message_thread_id is not None:
+                _typing_kwargs["message_thread_id"] = message_thread_id
+            await self._app.bot.send_chat_action(**_typing_kwargs)
+            # Success — reset circuit breaker
+            if state["failures"] > 0:
+                logger.info("send_typing recovered for account %s (was %d failures)", account_key, state["failures"])
+            state["failures"] = 0
+            state["suspended_until"] = 0.0
         except Exception as exc:
-            logger.debug("send_typing failed for %s: %s", target, exc)
+            exc_str = str(exc)
+            is_401 = "401" in exc_str or "Unauthorized" in exc_str.lower()
+            if is_401:
+                state["failures"] += 1
+                n = state["failures"]
+                # Exponential backoff with jitter
+                delay = min(
+                    _SEND_CHAT_ACTION_401_BACKOFF_INITIAL * (_SEND_CHAT_ACTION_401_BACKOFF_FACTOR ** (n - 1)),
+                    _SEND_CHAT_ACTION_401_BACKOFF_MAX,
+                )
+                jitter = delay * _SEND_CHAT_ACTION_401_JITTER * (2 * random.random() - 1)
+                state["suspended_until"] = time.monotonic() + delay + jitter
+                if n >= _SEND_CHAT_ACTION_401_MAX_FAILURES:
+                    logger.critical(
+                        "send_typing: %d consecutive 401 Unauthorized errors for account %s. "
+                        "sendChatAction suspended — check bot token validity. "
+                        "Mirrors TS sendchataction-401-backoff.ts suspension logic.",
+                        n, account_key,
+                    )
+                else:
+                    logger.warning(
+                        "send_typing 401 for account %s (failure %d/%d), backoff %.1fs",
+                        account_key, n, _SEND_CHAT_ACTION_401_MAX_FAILURES, delay,
+                    )
+            else:
+                logger.debug("send_typing failed for %s: %s", target, exc)
 
     def _fire_message_sent_hook(
         self,
@@ -862,31 +957,60 @@ class TelegramChannel(ChannelPlugin):
             from openclaw.channels.telegram.formatter import markdown_to_html
             html_text = markdown_to_html(text)
 
-            try:
-                message = await self._app.bot.send_message(
+            # Use modern link_preview_options (Bot API 7.0+) instead of deprecated
+            # disable_web_page_preview — mirrors TS send.ts link_preview_options usage.
+            from telegram import LinkPreviewOptions as _LPO
+            _link_preview_opts = _LPO(is_disabled=not self._link_preview)
+
+            async def _send_msg(extra_kwargs: dict) -> Any:
+                """Inner helper — retried with/without thread_id on 'thread not found'."""
+                return await self._app.bot.send_message(
                     chat_id=chat_id,
-                    text=html_text,
-                    reply_to_message_id=int(reply_to) if reply_to else None,
-                    parse_mode="HTML",
+                    text=extra_kwargs.pop("text"),
+                    reply_to_message_id=_safe_reply_to(reply_to),
+                    parse_mode=extra_kwargs.pop("parse_mode", None),
                     reply_markup=reply_markup,
-                    **thread_kwargs,
+                    link_preview_options=_link_preview_opts,
+                    **extra_kwargs,
                 )
+
+            try:
+                message = await _send_msg({
+                    "text": html_text,
+                    "parse_mode": "HTML",
+                    **thread_kwargs,
+                })
             except Exception as html_error:
                 _err_str = str(html_error).lower()
                 # Re-raise immediately on "chat not found" — retrying with plain text
                 # won't help and masks the root cause diagnostic.
                 if "chat not found" in _err_str:
                     raise
-                logger.debug(f"HTML parse error, retrying as plain text: {html_error}")
-                import re as _re
-                plain_text = _re.sub(r"<[^>]+>", "", html_text)
-                message = await self._app.bot.send_message(
-                    chat_id=chat_id,
-                    text=plain_text,
-                    reply_to_message_id=int(reply_to) if reply_to else None,
-                    reply_markup=reply_markup,
-                    **thread_kwargs,
-                )
+                # Thread-not-found: retry without message_thread_id — mirrors TS
+                # withTelegramThreadFallback() in send.ts.
+                if "message thread not found" in _err_str and thread_kwargs:
+                    logger.debug("send_text: message thread not found, retrying without thread_id")
+                    try:
+                        message = await _send_msg({"text": html_text, "parse_mode": "HTML"})
+                    except Exception:
+                        import re as _re
+                        plain_text = _re.sub(r"<[^>]+>", "", html_text)
+                        message = await _send_msg({"text": plain_text})
+                else:
+                    logger.debug(f"HTML parse error, retrying as plain text: {html_error}")
+                    import re as _re
+                    plain_text = _re.sub(r"<[^>]+>", "", html_text)
+                    try:
+                        message = await _send_msg({
+                            "text": plain_text,
+                            **thread_kwargs,
+                        })
+                    except Exception as plain_err:
+                        if "message thread not found" in str(plain_err).lower() and thread_kwargs:
+                            logger.debug("send_text: thread not found on plain retry, dropping thread_id")
+                            message = await _send_msg({"text": plain_text})
+                        else:
+                            raise
 
             # Record sent message for reaction tracking
             record_sent_message(chat_id, message.message_id)
@@ -959,12 +1083,14 @@ class TelegramChannel(ChannelPlugin):
         resolved_chat_id = int(target) if target and str(target).lstrip("-").isdigit() else target
 
         try:
+            from openclaw.channels.telegram.formatter import markdown_to_html
+            html_caption = markdown_to_html(caption) if caption else None
             message = await self._app.bot.send_photo(
                 chat_id=resolved_chat_id,
                 photo=photo,
-                caption=caption,
-                parse_mode="Markdown" if caption else None,
-                reply_to_message_id=int(reply_to) if reply_to else None,
+                caption=html_caption,
+                parse_mode="HTML" if html_caption else None,
+                reply_to_message_id=_safe_reply_to(reply_to),
                 reply_markup=keyboard,
             )
 
@@ -987,12 +1113,14 @@ class TelegramChannel(ChannelPlugin):
         chat_id = int(target) if str(target).lstrip("-").isdigit() else target
 
         try:
+            from openclaw.channels.telegram.formatter import markdown_to_html
+            html_caption = markdown_to_html(caption) if caption else None
             message = await self._app.bot.send_video(
                 chat_id=chat_id,
                 video=video,
-                caption=caption,
-                parse_mode="Markdown" if caption else None,
-                reply_to_message_id=int(reply_to) if reply_to else None,
+                caption=html_caption,
+                parse_mode="HTML" if html_caption else None,
+                reply_to_message_id=_safe_reply_to(reply_to),
                 reply_markup=keyboard
             )
 
@@ -1015,12 +1143,14 @@ class TelegramChannel(ChannelPlugin):
         chat_id = int(target) if str(target).lstrip("-").isdigit() else target
 
         try:
+            from openclaw.channels.telegram.formatter import markdown_to_html
+            html_caption = markdown_to_html(caption) if caption else None
             message = await self._app.bot.send_document(
                 chat_id=chat_id,
                 document=document,
-                caption=caption,
-                parse_mode="Markdown" if caption else None,
-                reply_to_message_id=int(reply_to) if reply_to else None,
+                caption=html_caption,
+                parse_mode="HTML" if html_caption else None,
+                reply_to_message_id=_safe_reply_to(reply_to),
                 reply_markup=keyboard
             )
 
@@ -1043,12 +1173,14 @@ class TelegramChannel(ChannelPlugin):
         chat_id = int(target) if str(target).lstrip("-").isdigit() else target
 
         try:
+            from openclaw.channels.telegram.formatter import markdown_to_html
+            html_caption = markdown_to_html(caption) if caption else None
             message = await self._app.bot.send_audio(
                 chat_id=chat_id,
                 audio=audio,
-                caption=caption,
-                parse_mode="Markdown" if caption else None,
-                reply_to_message_id=int(reply_to) if reply_to else None
+                caption=html_caption,
+                parse_mode="HTML" if html_caption else None,
+                reply_to_message_id=_safe_reply_to(reply_to)
             )
 
             # Record sent message for reaction tracking
@@ -1074,7 +1206,7 @@ class TelegramChannel(ChannelPlugin):
                 chat_id=chat_id,
                 latitude=latitude,
                 longitude=longitude,
-                reply_to_message_id=int(reply_to) if reply_to else None
+                reply_to_message_id=_safe_reply_to(reply_to)
             )
 
             # Record sent message for reaction tracking
@@ -1101,7 +1233,7 @@ class TelegramChannel(ChannelPlugin):
                 question=question,
                 options=options,
                 is_anonymous=is_anonymous,
-                reply_to_message_id=int(reply_to) if reply_to else None
+                reply_to_message_id=_safe_reply_to(reply_to)
             )
 
             # Record sent message for reaction tracking
@@ -1126,7 +1258,7 @@ class TelegramChannel(ChannelPlugin):
             message = await self._app.bot.send_dice(
                 chat_id=chat_id,
                 emoji=emoji,
-                reply_to_message_id=int(reply_to) if reply_to else None
+                reply_to_message_id=_safe_reply_to(reply_to)
             )
 
             # Record sent message for reaction tracking
@@ -1144,11 +1276,15 @@ class TelegramChannel(ChannelPlugin):
         media_type: str,
         caption: str | None = None,
         reply_to: str | None = None,
+        message_thread_id: int | None = None,
+        silent: bool = False,
+        buttons: Any | None = None,
     ) -> str:
         """Send media message — mirrors TS delivery.ts deliverReplies().
 
-        Supports: photo, video, animation (GIF), audio, voice, document.
-        Caption longer than 1024 chars is split into a follow-up text message.
+        Supports: photo, video, animation (GIF), audio, voice, document, video_note.
+        Caption longer than 1024 chars: media sent captionless, full text follows as a
+        separate message (mirrors TS splitTelegramCaption behavior).
         Accepts both local file paths and HTTP URLs.
         """
         if not self._app:
@@ -1157,14 +1293,30 @@ class TelegramChannel(ChannelPlugin):
         from pathlib import Path
 
         chat_id = int(target) if str(target).lstrip("-").isdigit() else target
-        reply_id = int(reply_to) if reply_to else None
+        reply_id = _safe_reply_to(reply_to)
 
-        # Caption splitting — Telegram limit is 1024 chars for media captions
-        _CAPTION_LIMIT = 1024
-        overflow_text: str | None = None
-        if caption and len(caption) > _CAPTION_LIMIT:
-            overflow_text = caption[_CAPTION_LIMIT:]
-            caption = caption[:_CAPTION_LIMIT]
+        # Thread kwargs for forum supergroups — mirrors TS buildTelegramThreadReplyParams()
+        thread_kwargs: dict[str, Any] = {}
+        if message_thread_id is not None:
+            thread_kwargs["message_thread_id"] = message_thread_id
+
+        # Convert caption to HTML — mirrors TS always-HTML approach in send.ts.
+        from openclaw.channels.telegram.formatter import markdown_to_html as _md2html
+        html_caption = _md2html(caption) if caption else None
+
+        # Caption splitting — mirrors TS splitTelegramCaption():
+        # if caption > 1024 chars, send media captionless and route full text
+        # as a follow-up message (avoids mid-sentence HTML truncation).
+        from openclaw.telegram.caption import split_telegram_caption
+        _cap_split = split_telegram_caption(html_caption)
+        html_caption = _cap_split["caption"]         # None when too long
+        overflow_text: str | None = _cap_split["follow_up_text"]  # full text as follow-up
+
+        # Build inline keyboard markup for media (e.g. buttons on follow-up text)
+        reply_markup = None
+        if buttons:
+            from openclaw.channels.telegram.keyboard import build_inline_keyboard
+            reply_markup = build_inline_keyboard(buttons)
 
         # Telegram Bot API hard limit for uploads via the public API
         _TELEGRAM_MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
@@ -1198,95 +1350,142 @@ class TelegramChannel(ChannelPlugin):
                     "is resolved against the session workspace before calling send_media."
                 )
 
+        # Common kwargs shared across all media sub-calls
+        _common: dict[str, Any] = {
+            "chat_id": chat_id,
+            "reply_to_message_id": reply_id,
+            "disable_notification": silent,
+            "write_timeout": write_timeout,
+            **thread_kwargs,
+        }
+
         try:
             if media_type == "photo":
                 msg = await self._app.bot.send_photo(
-                    chat_id=chat_id,
                     photo=media_source,
-                    caption=caption,
-                    parse_mode="Markdown" if caption else None,
-                    reply_to_message_id=reply_id,
-                    write_timeout=write_timeout,
+                    caption=html_caption,
+                    parse_mode="HTML" if html_caption else None,
+                    **_common,
                 )
             elif media_type == "video":
                 msg = await self._app.bot.send_video(
-                    chat_id=chat_id,
                     video=media_source,
-                    caption=caption,
-                    parse_mode="Markdown" if caption else None,
-                    reply_to_message_id=reply_id,
-                    write_timeout=write_timeout,
+                    caption=html_caption,
+                    parse_mode="HTML" if html_caption else None,
+                    **_common,
                 )
-            elif media_type == "animation":
+            elif media_type in ("animation", "gif"):
                 msg = await self._app.bot.send_animation(
-                    chat_id=chat_id,
                     animation=media_source,
-                    caption=caption,
-                    parse_mode="Markdown" if caption else None,
-                    reply_to_message_id=reply_id,
-                    write_timeout=write_timeout,
+                    caption=html_caption,
+                    parse_mode="HTML" if html_caption else None,
+                    **_common,
+                )
+            elif media_type == "video_note":
+                # Circular video note — no caption support in Telegram API
+                msg = await self._app.bot.send_video_note(
+                    video_note=media_source,
+                    **_common,
                 )
             elif media_type == "voice":
                 try:
                     msg = await self._app.bot.send_voice(
-                        chat_id=chat_id,
                         voice=media_source,
-                        caption=caption,
-                        parse_mode="Markdown" if caption else None,
-                        reply_to_message_id=reply_id,
-                        write_timeout=write_timeout,
+                        caption=html_caption,
+                        parse_mode="HTML" if html_caption else None,
+                        **_common,
                     )
                 except Exception as voice_err:
                     logger.warning("send_voice failed (%s), falling back to document", voice_err)
                     # Re-open if file was closed by failed send
                     if is_local_file:
-                        file_path = Path(media_url).expanduser()
-                        media_source = open(file_path, "rb")  # noqa: WPS515
+                        file_path_obj = Path(media_url).expanduser()
+                        media_source = open(file_path_obj, "rb")  # noqa: WPS515
                     msg = await self._app.bot.send_document(
-                        chat_id=chat_id,
                         document=media_source,
-                        caption=caption,
-                        parse_mode="Markdown" if caption else None,
-                        reply_to_message_id=reply_id,
-                        write_timeout=write_timeout,
+                        caption=html_caption,
+                        parse_mode="HTML" if html_caption else None,
+                        **_common,
                     )
-            elif media_type in ("audio",):
+            elif media_type == "audio":
                 msg = await self._app.bot.send_audio(
-                    chat_id=chat_id,
                     audio=media_source,
-                    caption=caption,
-                    parse_mode="Markdown" if caption else None,
-                    reply_to_message_id=reply_id,
-                    write_timeout=write_timeout,
+                    caption=html_caption,
+                    parse_mode="HTML" if html_caption else None,
+                    **_common,
                 )
             else:
                 # Default: send as document (covers pptx, pdf, zip, etc.)
                 msg = await self._app.bot.send_document(
-                    chat_id=chat_id,
                     document=media_source,
-                    caption=caption,
-                    parse_mode="Markdown" if caption else None,
-                    reply_to_message_id=reply_id,
-                    write_timeout=write_timeout,
+                    caption=html_caption,
+                    parse_mode="HTML" if html_caption else None,
+                    **_common,
                 )
 
             # Record sent message for reaction tracking
             record_sent_message(chat_id, msg.message_id)
 
-            # Send overflow caption as a follow-up text message
+            # Send overflow text as follow-up — mirrors TS sendPendingFollowUpText():
+            # route reply_markup (buttons) to this message, not the media, so the
+            # keyboard is actionable. Also forwards thread_id and reply context.
             if overflow_text:
-                overflow_msg = await self._app.bot.send_message(
-                    chat_id=chat_id,
-                    text=overflow_text,
-                    parse_mode="Markdown",
-                )
-                # Record overflow message too
-                record_sent_message(chat_id, overflow_msg.message_id)
+                try:
+                    overflow_msg = await self._app.bot.send_message(
+                        chat_id=chat_id,
+                        text=overflow_text,
+                        parse_mode="HTML",
+                        reply_to_message_id=reply_id,
+                        reply_markup=reply_markup,
+                        disable_notification=silent,
+                        **thread_kwargs,
+                    )
+                    record_sent_message(chat_id, overflow_msg.message_id)
+                except Exception as ov_err:
+                    logger.warning("Failed to send overflow text after media: %s", ov_err)
 
             return str(msg.message_id)
         finally:
             if is_local_file and hasattr(media_source, "close"):
                 media_source.close()
+
+    async def send_media_group(
+        self,
+        target: str,
+        media_urls: list[str],
+        caption: str | None = None,
+        reply_to: str | None = None,
+        message_thread_id: int | None = None,
+        silent: bool = False,
+    ) -> list[str]:
+        """Send an album (2–10 photos/videos/docs) as a single grouped Telegram message.
+
+        Wraps telegram_media.send_media_group() which handles InputMedia construction,
+        MIME detection, and the sendMediaGroup API call.
+        Returns list of sent message IDs (empty list on failure).
+        """
+        if not self._app:
+            raise RuntimeError("Telegram channel not started")
+
+        from openclaw.channels.telegram.telegram_media import send_media_group as _send_mg
+
+        chat_id = int(target) if str(target).lstrip("-").isdigit() else target
+        result = await _send_mg(
+            bot=self._app.bot,
+            chat_id=chat_id,
+            media_urls=media_urls,
+            caption=caption,
+            thread_id=message_thread_id,
+        )
+        msg_ids: list[str] = []
+        if isinstance(result, dict):
+            for mid in result.get("message_ids", []):
+                msg_ids.append(str(mid))
+                try:
+                    record_sent_message(chat_id, int(mid))
+                except Exception:
+                    pass
+        return msg_ids
 
     def set_command_executor(self, session_manager, agent_runtime) -> None:
         """Set up command executor with session manager and agent runtime"""
@@ -1384,13 +1583,75 @@ class TelegramChannel(ChannelPlugin):
             write_telegram_update_offset(self._account_id, update.update_id)
 
         try:
-            # Download file from Telegram and encode as base64 data URL
-            # Mirrors TS delivery.ts resolveMedia() download logic
-            tg_file = await context.bot.get_file(file_id)
-            file_bytes = await tg_file.download_as_bytearray()
-            file_size = len(file_bytes)
-
+            # Download file from Telegram with retry — mirrors TS resolveTelegramFileWithRetry.
+            # 3 attempts, 1-4s backoff; non-retryable for file-too-big (>20 MB).
+            import asyncio as _asyncio
             import base64
+
+            _GETFILE_MAX_ATTEMPTS = 3
+            _GETFILE_RETRY_BASE = 1.0
+            _GETFILE_RETRY_MAX = 4.0
+            _GETFILE_TOO_BIG_HINT = "file is too big"   # Telegram API message
+
+            file_bytes: bytearray | None = None
+            _last_getfile_err: Exception | None = None
+            for _attempt in range(_GETFILE_MAX_ATTEMPTS):
+                try:
+                    tg_file = await context.bot.get_file(file_id)
+                    file_bytes = await tg_file.download_as_bytearray()
+                    _last_getfile_err = None
+                    break
+                except Exception as _gfe:
+                    _last_getfile_err = _gfe
+                    _gfe_str = str(_gfe).lower()
+                    if _GETFILE_TOO_BIG_HINT in _gfe_str or "file_too_large" in _gfe_str:
+                        logger.warning(
+                            "get_file: file too big for Telegram Bot API (%s) — not retrying",
+                            file_name,
+                        )
+                        break  # non-retryable
+                    if _attempt < _GETFILE_MAX_ATTEMPTS - 1:
+                        _delay = min(_GETFILE_RETRY_BASE * (2 ** _attempt), _GETFILE_RETRY_MAX)
+                        logger.warning(
+                            "get_file attempt %d/%d failed (%s), retrying in %.1fs",
+                            _attempt + 1, _GETFILE_MAX_ATTEMPTS, _gfe, _delay,
+                        )
+                        await _asyncio.sleep(_delay)
+
+            if file_bytes is None:
+                # All retries exhausted — deliver placeholder text so agent still gets the event
+                logger.error(
+                    "get_file failed after %d attempts for %s: %s — sending placeholder",
+                    _GETFILE_MAX_ATTEMPTS, file_name, _last_getfile_err,
+                )
+                _placeholder_text = (
+                    caption
+                    if caption
+                    else f"[User sent a {media_type}: {file_name} — file download failed: {_last_getfile_err}]"
+                )
+                _inbound_placeholder = InboundMessage(
+                    channel_id=self.id,
+                    message_id=str(message.message_id),
+                    sender_id=str(sender.id) if sender else "unknown",
+                    sender_name=(
+                        " ".join(filter(None, [
+                            getattr(sender, "first_name", ""),
+                            getattr(sender, "last_name", ""),
+                        ])).strip() or str(getattr(sender, "id", "unknown"))
+                    ) if sender else "unknown",
+                    chat_id=str(chat.id),
+                    chat_type=(
+                        "group" if chat.type in ("group", "supergroup") else
+                        "channel" if chat.type == "channel" else "direct"
+                    ),
+                    text=_placeholder_text,
+                    timestamp=message.date.isoformat() if message.date else None,
+                )
+                if self._message_handler:
+                    await self._message_handler(_inbound_placeholder)
+                return
+
+            file_size = len(file_bytes)
             b64_content = base64.b64encode(bytes(file_bytes)).decode()
 
             # Determine attachment type bucket
@@ -1698,84 +1959,93 @@ class TelegramChannel(ChannelPlugin):
         )
 
     async def _handle_new_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /new command - start new conversation"""
-        user_id = update.effective_user.id
+        """Handle /new command — aligned with TS bot-native-commands.ts.
 
-        # Create inline keyboard for confirmation
-        keyboard = [
-            [
-                InlineKeyboardButton("✅ Confirm", callback_data="new_confirm"),
-                InlineKeyboardButton("❌ Cancel", callback_data="new_cancel")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-
-        await update.message.reply_text(
-            "🆕 *Start New Conversation*\n\n"
-            "This will clear the current conversation history.\n"
-            "Are you sure you want to continue?",
-            parse_mode="Markdown",
-            reply_markup=reply_markup
-        )
+        Resets the session and dispatches BARE_SESSION_RESET_PROMPT so the agent
+        greets the user fresh in its configured persona (identical to typing /new
+        as a plain text message through the gateway path).
+        """
+        await self._do_session_reset(update, reason="new")
 
     async def _handle_reset_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /reset command - reset session (clear transcript)"""
+        """Handle /reset command — same behavior as /new."""
+        await self._do_session_reset(update, reason="reset")
+
+    async def _do_session_reset(self, update: Update, reason: str = "new") -> None:
+        """Shared implementation for /new and /reset native commands.
+
+        Mirrors the TS flow:
+        1. sessions.reset  → new session ID, archive transcript, systemSent=False
+        2. Send ✅ notice  → mirrors sendResetSessionNotice / buildResetSessionNoticeText
+        3. Dispatch BARE_SESSION_RESET_PROMPT as synthetic InboundMessage so the agent
+           runs a greeting turn (same as the handlers.py / channel_manager gateway path).
+        """
+        from openclaw.gateway.api.sessions_methods import SessionsResetMethod
+        from openclaw.gateway.handlers import BARE_SESSION_RESET_PROMPT
+
+        chat = update.effective_chat
+        sender = update.effective_user
+        if not chat or not sender:
+            return
+
+        chat_id = chat.id
+        chat_type_raw = chat.type
+
+        # Resolve canonical session key (mirrors _handle_reset_command logic)
+        if chat_type_raw == "private":
+            session_key = f"telegram:{self.id}:dm:main:{chat_id}"
+            inbound_chat_type = "direct"
+        else:
+            session_key = f"telegram:{self.id}:group:{chat_id}"
+            inbound_chat_type = "group"
+
+        logger.info("[%s] %s command from %s, session_key=%s", self.id, reason, sender.id, session_key)
+
         try:
-            # Build session key from chat info
-            chat_id = update.effective_chat.id
-            chat_type = update.effective_chat.type
-
-            # Construct session key matching gateway format
-            # Format: {channel}:{account_id}:{scope}:{id}
-            if chat_type == "private":
-                session_key = f"telegram:{self.id}:dm:main:{chat_id}"
-            else:
-                session_key = f"telegram:{self.id}:group:{chat_id}"
-
-            logger.info(f"[{self.id}] Reset requested for session: {session_key}")
-
-            # Call gateway sessions.reset method
-            try:
-                from openclaw.gateway.api.sessions_methods import SessionsResetMethod
-
-                reset_method = SessionsResetMethod()
-                result = await reset_method.execute(
-                    connection=None,
-                    params={
-                        "key": session_key,
-                        "archiveTranscript": True  # Archive old transcript
-                    }
-                )
-
-                if result.get("ok"):
-                    new_session_id = result.get("sessionId", "unknown")
-                    message = (
-                        "✅ **Conversation Reset**\n\n"
-                        "Your conversation history has been cleared!\n"
-                        f"🆔 New session: `{new_session_id[:8]}...`\n\n"
-                        "We can start fresh now! 🎉"
-                    )
-                    logger.info(f"[{self.id}] Session reset successful: {new_session_id}")
-                else:
-                    message = "⚠️ **Reset Partial**\n\nSession was reset, but something went wrong."
-                    logger.warning(f"[{self.id}] Session reset returned non-ok result")
-
-            except Exception as reset_err:
-                logger.error(f"[{self.id}] Failed to reset session via API: {reset_err}")
-                message = (
-                    "⚠️ **Reset Failed**\n\n"
-                    "Unable to reset session. Please try again or contact support.\n"
-                    f"Error: `{str(reset_err)[:100]}`"
-                )
-
-            await update.message.reply_text(message, parse_mode="Markdown")
-
-        except Exception as e:
-            logger.error(f"[{self.id}] Error handling reset command: {e}")
-            await update.message.reply_text(
-                "❌ **Error**\n\nFailed to process reset command.",
-                parse_mode="Markdown"
+            reset_method = SessionsResetMethod()
+            result = await reset_method.execute(
+                connection=None,
+                params={"key": session_key, "reason": reason, "archiveTranscript": True},
             )
+        except Exception as exc:
+            logger.error("[%s] Session reset failed: %s", self.id, exc)
+            if update.message:
+                await update.message.reply_text(
+                    f"❌ Reset failed: {str(exc)[:120]}",
+                    parse_mode=None,
+                )
+            return
+
+        if not result.get("ok"):
+            logger.warning("[%s] sessions.reset returned non-ok for %s", self.id, session_key)
+
+        # Build ✅ notice — mirrors buildResetSessionNoticeText in get-reply-run.ts
+        model_label = (self._config or {}).get("model", "unknown") if self._config else "unknown"
+        notice_text = f"✅ New session started · model: {model_label}"
+        if update.message:
+            await update.message.reply_text(notice_text, parse_mode=None)
+
+        # Dispatch BARE_SESSION_RESET_PROMPT as a synthetic message so the agent
+        # reads workspace files and greets the user in its configured persona.
+        now_iso = datetime.now(UTC).isoformat()
+        inbound = InboundMessage(
+            channel_id=self.id,
+            message_id=f"reset_{reason}_{chat_id}_{int(datetime.now(UTC).timestamp() * 1000)}",
+            sender_id=str(sender.id),
+            sender_name=sender.full_name or sender.username or str(sender.id),
+            chat_id=str(chat_id),
+            chat_type=inbound_chat_type,
+            text=BARE_SESSION_RESET_PROMPT,
+            timestamp=now_iso,
+            account_id=self._account_id or None,
+            metadata={
+                "username": sender.username,
+                "chat_title": chat.title,
+                "is_reset": True,
+                "reset_reason": reason,
+            },
+        )
+        await self._handle_message(inbound)
 
     async def _handle_status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /status command"""
@@ -2115,11 +2385,11 @@ class TelegramChannel(ChannelPlugin):
         chat_id = str(chat.id)
         group_cfg = self._resolve_group_config(chat_id)
 
-        # Resolve effective policy (per-group override → account default → "open")
+        # Resolve effective policy (per-group override → account default → "allowlist")
         group_policy = (
             group_cfg.get("groupPolicy")
             or self._config.get("groupPolicy")
-            or "open"
+            or "allowlist"
         )
 
         if group_policy == "disabled":

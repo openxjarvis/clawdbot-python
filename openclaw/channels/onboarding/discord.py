@@ -66,7 +66,8 @@ class DiscordOnboardingAdapter(ChannelOnboardingAdapter):
         
         discord_config["enabled"] = True
         discord_config["token"] = token
-        discord_config["dmPolicy"] = "off"  # Start with off
+        discord_config["dmPolicy"] = "pairing"  # Default: pairing (aligns with TS)
+        discord_config["groupPolicy"] = "allowlist"  # Default: allowlist (aligns with TS)
         
         channels["discord"] = discord_config
         config["channels"] = channels

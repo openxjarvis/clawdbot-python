@@ -1,5 +1,7 @@
 """Security and permissions commands"""
 
+from typing import Optional
+
 import typer
 from rich.console import Console
 
@@ -9,8 +11,180 @@ security_app = typer.Typer(help="Security and permissions")
 
 @security_app.command("status")
 def status(json_output: bool = typer.Option(False, "--json", help="Output JSON")):
-    """Show security status"""
-    console.print("[yellow]⚠[/yellow]  Security status not yet implemented")
+    """Show current permission level and security settings"""
+    from ..config.loader import load_config
+    from ..wizard.permission_presets import detect_preset_level, PRESETS, PRESET_ORDER
+
+    try:
+        config = load_config()
+    except Exception as e:
+        console.print(f"[red]Error loading config:[/red] {e}")
+        raise typer.Exit(1)
+
+    exec_cfg = config.tools.exec if (config.tools and config.tools.exec) else None
+    security = exec_cfg.security if exec_cfg else "deny"
+    safe_bins = exec_cfg.safe_bins if exec_cfg else []
+    ask = exec_cfg.ask if exec_cfg else "on-miss"
+
+    channels = config.channels
+    channel_policies: dict[str, dict] = {}
+    if channels:
+        for attr in ("telegram", "feishu", "discord", "whatsapp", "slack"):
+            ch = getattr(channels, attr, None)
+            if ch and getattr(ch, "enabled", False):
+                dm = getattr(ch, "dmPolicy", None) or getattr(ch, "dm_policy", "pairing") or "pairing"
+                gp = getattr(ch, "groupPolicy", None) or getattr(ch, "group_policy", "allowlist") or "allowlist"
+                channel_policies[attr] = {"dmPolicy": dm, "groupPolicy": gp}
+
+    # Outbound crossContext settings
+    msg_cfg = config.tools.message if (config.tools and config.tools.message) else None
+    cc = msg_cfg.cross_context if msg_cfg else None
+    allow_within = cc.allow_within_provider if (cc and cc.allow_within_provider is not None) else True
+    allow_across = cc.allow_across_providers if (cc and cc.allow_across_providers is not None) else False
+
+    current_preset = detect_preset_level(config)
+
+    if json_output:
+        import json
+        print(json.dumps({
+            "preset": current_preset,
+            "exec_security": security,
+            "exec_ask": ask,
+            "safe_bins": safe_bins,
+            "channel_policies": channel_policies,
+            "outbound": {
+                "allowWithinProvider": allow_within,
+                "allowAcrossProviders": allow_across,
+            },
+        }, indent=2))
+        return
+
+    # Rich display
+    console.print()
+    if current_preset:
+        p = PRESETS[current_preset]
+        idx = PRESET_ORDER.index(current_preset) + 1
+        console.print(
+            f"[bold green]Permission level:[/bold green] "
+            f"[bold]{idx}. {p['label']}[/bold]  — {p['tagline']}"
+        )
+    else:
+        console.print("[bold yellow]Permission level:[/bold yellow] custom (does not match any preset)")
+
+    console.print()
+    console.print("[bold]Execution:[/bold]")
+    console.print(f"  [cyan]exec.security[/cyan]  : [bold]{security}[/bold]")
+    console.print(f"  [cyan]exec.ask[/cyan]       : {ask}")
+    if safe_bins:
+        console.print(f"  [cyan]safe_bins[/cyan]      : {', '.join(safe_bins)}")
+
+    if channel_policies:
+        console.print()
+        console.print("[bold]Inbound (入站):[/bold]")
+        for ch_name, policies in channel_policies.items():
+            console.print(f"  [cyan]{ch_name}.dmPolicy[/cyan]   : {policies['dmPolicy']}")
+            console.print(f"  [cyan]{ch_name}.groupPolicy[/cyan]: {policies['groupPolicy']}")
+
+    console.print()
+    console.print("[bold]Outbound (出站):[/bold]")
+    console.print(f"  [cyan]message.crossContext.allowWithinProvider[/cyan] : [bold]{allow_within}[/bold]")
+    console.print(f"  [cyan]message.crossContext.allowAcrossProviders[/cyan]: [bold]{allow_across}[/bold]")
+
+    console.print()
+    console.print(
+        "Change level: [bold]uv run openclaw security preset[/bold]  "
+        "or  [bold]openclaw security preset <level>[/bold]"
+    )
+    console.print()
+
+
+@security_app.command("preset")
+def preset(
+    level: Optional[str] = typer.Argument(
+        None,
+        help="Permission level: relaxed | trusted | standard | strict",
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+):
+    """Set the permission level (relaxed / trusted / standard / strict)
+
+    Run without arguments for an interactive menu.
+    """
+    from ..config.loader import load_config, save_config
+    from ..wizard.permission_presets import (
+        display_presets_menu, detect_preset_level, apply_preset,
+        PRESET_ORDER, PRESETS, DEFAULT_PRESET,
+    )
+
+    try:
+        config = load_config()
+    except Exception as e:
+        console.print(f"[red]Error loading config:[/red] {e}")
+        raise typer.Exit(1)
+
+    current = detect_preset_level(config)
+
+    # If no level given, show interactive menu
+    if level is None:
+        display_presets_menu(current)
+        default_key = current or DEFAULT_PRESET
+        default_num = PRESET_ORDER.index(default_key) + 1
+        while True:
+            raw = input(
+                f"Select [1-{len(PRESET_ORDER)}] (default {default_num} = {PRESETS[default_key]['label']}): "
+            ).strip()
+            if not raw:
+                level = default_key
+                break
+            if raw.isdigit() and 1 <= int(raw) <= len(PRESET_ORDER):
+                level = PRESET_ORDER[int(raw) - 1]
+                break
+            if raw.lower() in PRESET_ORDER:
+                level = raw.lower()
+                break
+            console.print(f"  [red]Invalid.[/red] Enter 1–{len(PRESET_ORDER)} or a preset name.")
+    else:
+        level = level.lower()
+        if level not in PRESET_ORDER:
+            console.print(
+                f"[red]Unknown preset:[/red] {level!r}. "
+                f"Choose from: {', '.join(PRESET_ORDER)}"
+            )
+            raise typer.Exit(1)
+
+    if level == current and not yes:
+        console.print(f"[green]✓[/green] Already set to [bold]{PRESETS[level]['label']}[/bold] — no changes needed.")
+        raise typer.Exit(0)
+
+    p = PRESETS[level]
+    console.print()
+    console.print(f"[bold]Applying: {p['label']}[/bold]  — {p['tagline']}")
+    console.print()
+    console.print("  [bold]Execution:[/bold]")
+    console.print(f"    exec.security → [bold]{p['exec_security']}[/bold]")
+    if p["safe_bins"]:
+        console.print(f"    safe_bins     → {', '.join(p['safe_bins'])}")
+    console.print()
+    console.print("  [bold]Inbound (入站):[/bold]")
+    console.print(f"    dmPolicy      → [bold]{p['dm_policy']}[/bold]")
+    console.print(f"    groupPolicy   → [bold]{p['group_policy']}[/bold]")
+    console.print()
+    console.print("  [bold]Outbound (出站):[/bold]")
+    console.print(f"    allowWithinProvider  → [bold]{p['allow_within_provider']}[/bold]")
+    console.print(f"    allowAcrossProviders → [bold]{p['allow_across_providers']}[/bold]")
+    console.print()
+
+    if not yes:
+        confirm = input("Apply these changes? [Y/n]: ").strip().lower()
+        if confirm not in ("", "y", "yes"):
+            console.print("[yellow]Cancelled.[/yellow]")
+            raise typer.Exit(0)
+
+    config = apply_preset(config, level)
+    save_config(config)
+    console.print(f"[green]✓[/green] Permission level set to [bold]{p['label']}[/bold].")
+    console.print("  Restart openclaw for changes to take effect: [bold]uv run openclaw start[/bold]")
+    console.print()
 
 
 @security_app.command("audit")

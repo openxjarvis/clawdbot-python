@@ -5,6 +5,10 @@ Matches TypeScript openclaw/src/wizard/onboarding.ts
 """
 from __future__ import annotations
 
+# Apply nest_asyncio to allow questionary to work in async contexts
+import nest_asyncio
+nest_asyncio.apply()
+
 import json
 import logging
 import secrets
@@ -27,6 +31,45 @@ from .onboard_skills import setup_skills
 from .onboard_finalize import finalize_onboarding
 
 logger = logging.getLogger(__name__)
+
+
+def _config_to_dict(config: "ClawdbotConfig") -> dict:
+    """Convert ClawdbotConfig to dict for skills/hooks setup."""
+    if hasattr(config, "model_dump"):
+        return config.model_dump(exclude_none=True)
+    if isinstance(config, dict):
+        return dict(config)
+    return {}
+
+
+def _merge_config_from_dict(config: "ClawdbotConfig", d: dict) -> None:
+    """Merge skills/hooks from dict back into ClawdbotConfig (in-place)."""
+    if not d:
+        return
+    if "skills" in d and d["skills"]:
+        from openclaw.config.schema import SkillsConfig
+        skills_cfg = d["skills"]
+        if isinstance(skills_cfg, dict):
+            if config.skills is None:
+                config.skills = SkillsConfig()
+            entries = skills_cfg.get("entries") or {}
+            if entries:
+                config.skills.entries = {**(config.skills.entries or {}), **entries}
+            install = skills_cfg.get("install")
+            if install:
+                config.skills.install = {**(config.skills.install or {}), **install}
+    if "hooks" in d and d["hooks"]:
+        from openclaw.config.schema import HooksConfig, InternalHooksConfig
+        hooks_cfg = d["hooks"]
+        if isinstance(hooks_cfg, dict):
+            internal = hooks_cfg.get("internal") or {}
+            if internal and isinstance(internal, dict):
+                if config.hooks is None:
+                    config.hooks = HooksConfig(internal=InternalHooksConfig(enabled=True, entries={}))
+                entries = internal.get("entries") or {}
+                if entries and config.hooks.internal:
+                    config.hooks.internal.entries = {**(config.hooks.internal.entries or {}), **entries}
+                    config.hooks.internal.enabled = internal.get("enabled", True)
 
 
 async def check_gateway_health(port: int = 18789, token: Optional[str] = None) -> dict:
@@ -149,57 +192,183 @@ async def run_onboarding_wizard(
         claw_config = ClawdbotConfig()
     
     # Step 4: Provider configuration
-    provider_config = await _configure_provider(mode)
+    # Note: _configure_provider now directly modifies claw_config via handler chain
+    provider_config = await _configure_provider(mode, claw_config)
     if provider_config:
-        model_value = provider_config.get("model", "claude-sonnet-4")
-        # Write to agents.defaults.model — the canonical path read by bootstrap.py
-        if not claw_config.agents:
-            from openclaw.config.schema import AgentsConfig
-            claw_config.agents = AgentsConfig()
-        if not claw_config.agents.defaults:
-            from openclaw.config.schema import AgentDefaults
-            claw_config.agents.defaults = AgentDefaults()
-        claw_config.agents.defaults.model = model_value
-        # Keep legacy agent.model in sync (string only — strip fallbacks wrapper)
-        if not claw_config.agent:
-            claw_config.agent = AgentConfig()
-        primary_str = model_value if isinstance(model_value, str) else (
-            model_value.get("primary", "") if isinstance(model_value, dict) else str(model_value)
-        )
-        claw_config.agent.model = primary_str
-
-        # Write models.providers block for Ollama and Custom providers
+        # Config already updated by handlers, just extract provider info
+        # The model is already written to agents.defaults.model by handlers
         _provider_name = provider_config.get("provider")
-        if _provider_name == "ollama":
-            if not claw_config.models:
-                claw_config.models = ModelsConfig()
-            claw_config.models.providers = claw_config.models.providers or {}
-            claw_config.models.providers["ollama"] = {
-                "baseUrl": provider_config["base_url"],
-                "api": "ollama",
-                "apiKey": provider_config.get("api_key", "ollama-local"),
-                "models": provider_config.get("discovered_models", []),
-            }
-        elif _provider_name not in ("anthropic", "openai", "gemini", None):
-            # Custom provider: write models.providers.<id>
-            pid = _provider_name
-            if not claw_config.models:
-                claw_config.models = ModelsConfig()
-            claw_config.models.providers = claw_config.models.providers or {}
-            provider_entry: dict = {
-                "baseUrl": provider_config["base_url"],
-                "api": provider_config.get("api", "openai-completions"),
-                "models": [provider_config["model_definition"]],
-            }
-            if provider_config.get("api_key"):
-                provider_entry["apiKey"] = provider_config["api_key"]
-            claw_config.models.providers[pid] = provider_entry
-            # Write alias to agents.defaults.models if provided
-            if provider_config.get("alias"):
-                alias_ref = provider_config["model"]  # "<pid>/<model_id>"
-                if not claw_config.agents.defaults.models:
-                    claw_config.agents.defaults.models = {}
-                claw_config.agents.defaults.models[alias_ref] = {"alias": provider_config["alias"]}
+        
+        # No need to re-write model here - handlers already did it
+        # Just handle any special provider-specific config that wasn't in the original code path
+    
+    # Step 4.5: Interactive model selection (NEW - aligns with TS onboarding)
+    # After provider auth is set up, let user choose the specific model
+    # IMPORTANT: This step should ALWAYS run after provider config (unless skipped)
+    if provider_config and not non_interactive:
+        auth_choice = provider_config.get("auth_choice")
+        
+        # Skip model selection only for these specific cases
+        skip_model_selection = (
+            auth_choice in ("skip", None) or
+            auth_choice == "custom-api-key"  # Custom provider already selected model
+        )
+        
+        if not skip_model_selection:
+            from .model_picker import prompt_default_model
+            
+            print("\n" + "-" * 80)
+            print("Model Selection")
+            print("-" * 80)
+            print("\nChoose which model to use by default.")
+            
+            # Extract provider name from auth_choice
+            # auth_choice can be like "kimi-code-api-key", "moonshot-api-key", "apiKey", etc.
+            # We need to map it to the provider name used in _PROVIDER_MODELS
+            provider_name = None
+            if auth_choice:
+                # Common mappings
+                if "moonshot" in auth_choice or "kimi" in auth_choice:
+                    provider_name = "moonshot"
+                elif "anthropic" in auth_choice or auth_choice == "apiKey":
+                    provider_name = "anthropic"
+                elif "openai" in auth_choice:
+                    provider_name = "openai"
+                elif "gemini" in auth_choice or "google" in auth_choice:
+                    provider_name = "google"
+                elif "xai" in auth_choice:
+                    provider_name = "xai"
+                elif "mistral" in auth_choice:
+                    provider_name = "mistral"
+                elif "qianfan" in auth_choice:
+                    provider_name = "qianfan"
+                elif "zai" in auth_choice:
+                    provider_name = "zai"
+                elif "xiaomi" in auth_choice:
+                    provider_name = "xiaomi"
+                elif "openrouter" in auth_choice:
+                    provider_name = "openrouter"
+                elif "huggingface" in auth_choice:
+                    provider_name = "huggingface"
+                elif "together" in auth_choice:
+                    provider_name = "together"
+                elif "litellm" in auth_choice:
+                    provider_name = "litellm"
+                elif "venice" in auth_choice:
+                    provider_name = "venice"
+                elif "synthetic" in auth_choice:
+                    provider_name = "synthetic"
+                elif "volcengine" in auth_choice:
+                    provider_name = "volcengine"
+                elif "byteplus" in auth_choice:
+                    provider_name = "byteplus"
+                elif "ollama" in auth_choice:
+                    provider_name = "ollama"
+            
+            try:
+                model_result = await prompt_default_model(
+                    config=claw_config,
+                    allow_keep=False,  # No existing model to keep in fresh onboarding
+                    include_manual=True,
+                    include_vllm=(mode == "advanced"),
+                    preferred_provider=provider_name,
+                    message="Select default model:",
+                )
+                
+                if model_result.get("model"):
+                    selected_model = model_result["model"]
+                    
+                    # Update config with selected model
+                    if not claw_config.agents:
+                        from openclaw.config.schema import AgentsConfig
+                        claw_config.agents = AgentsConfig()
+                    if not claw_config.agents.defaults:
+                        from openclaw.config.schema import AgentDefaults
+                        claw_config.agents.defaults = AgentDefaults()
+                    
+                    claw_config.agents.defaults.model = selected_model
+                    
+                    # Also update legacy agent.model
+                    if not claw_config.agent:
+                        from openclaw.config.schema import AgentConfig
+                        claw_config.agent = AgentConfig()
+                    
+                    # Extract model name (strip provider prefix if present)
+                    model_name = selected_model.split("/")[1] if "/" in selected_model else selected_model
+                    claw_config.agent.model = model_name
+                    
+                    print(f"✓ Default model set to {selected_model}")
+                    
+                    # Step 4.6: Fallback models (optional, 循环添加)
+                    fallback_models = []
+                    max_fallbacks = 3
+                    
+                    while len(fallback_models) < max_fallbacks:
+                        try:
+                            count_msg = f" (already have {len(fallback_models)})" if fallback_models else ""
+                            add_fallback = prompter.confirm(
+                                f"Add fallback model?{count_msg}",
+                                default=False
+                            )
+                        except Exception:
+                            add_fb = input(f"\nAdd fallback model?{count_msg} [y/N]: ").strip().lower()
+                            add_fallback = (add_fb == "y")
+                        
+                        if not add_fallback:
+                            break
+                        
+                        # 选择 fallback model（不过滤 provider，允许跨 provider）
+                        try:
+                            excluded_models = [selected_model] + fallback_models
+                            fallback_result = await prompt_default_model(
+                                config=claw_config,
+                                allow_keep=False,
+                                include_manual=True,
+                                include_vllm=False,
+                                preferred_provider=None,  # 允许所有 providers
+                                message=f"Select fallback model #{len(fallback_models) + 1}:",
+                                exclude_models=excluded_models,
+                            )
+                            
+                            if fallback_result.get("model"):
+                                fb_model = fallback_result["model"]
+                                
+                                # Check if provider is configured, prompt to configure if not
+                                from .fallback_provider_config import ensure_fallback_provider_configured
+                                provider_configured = await ensure_fallback_provider_configured(
+                                    config=claw_config,
+                                    model_id=fb_model,
+                                    interactive=True
+                                )
+                                
+                                if provider_configured:
+                                    fallback_models.append(fb_model)
+                                    print(f"✓ Added fallback: {fb_model}")
+                                else:
+                                    print(f"⚠️  Skipped fallback: {fb_model} (provider not configured)")
+                            else:
+                                # User cancelled or kept current
+                                break
+                        except Exception as e:
+                            logger.warning(f"Fallback model selection failed: {e}")
+                            break
+                    
+                    # 更新配置：如果有 fallback，使用 primary + fallbacks 格式
+                    if fallback_models:
+                        from openclaw.config.schema import ModelConfig
+                        claw_config.agents.defaults.model = ModelConfig(
+                            primary=selected_model,
+                            fallbacks=fallback_models
+                        )
+                        print(f"\n✓ Model configuration:")
+                        print(f"  Primary: {selected_model}")
+                        print(f"  Fallbacks: {', '.join(fallback_models)}")
+                    # 否则保持单模型字符串格式
+                    else:
+                        claw_config.agents.defaults.model = selected_model
+            except Exception as e:
+                logger.error(f"Model selection failed: {e}", exc_info=True)
+                print("⚠️  Could not complete model selection. Using provider default.")
     
     # Step 5: Agent configuration
     if mode == "advanced":
@@ -259,6 +428,13 @@ async def run_onboarding_wizard(
                 FeishuChannelConfig.model_validate(fs) if isinstance(fs, dict) else fs
             )
     
+    # Step 7.8: Permission level
+    if not non_interactive:
+        chosen_preset = await _configure_permissions(mode, claw_config)
+        if chosen_preset:
+            from .permission_presets import apply_preset
+            claw_config = apply_preset(claw_config, chosen_preset)
+
     # Step 7.5: Collect user information for workspace
     user_info = {}
     if not non_interactive and (mode == "advanced" or mode == "quickstart"):
@@ -268,10 +444,20 @@ async def run_onboarding_wizard(
         print("\nLet's personalize your experience.")
         
         # User name
-        user_name = input("\nWhat's your name? [Optional, press Enter to skip]: ").strip()
+        try:
+            user_name = text("What's your name? (Optional)", default="")
+        except Exception:
+            user_name = input("\nWhat's your name? [Optional, press Enter to skip]: ").strip()
+        
         if user_name:
             user_info["name"] = user_name
-            user_info["what_to_call_them"] = input(f"How should the agent address you? [{user_name}]: ").strip() or user_name
+            try:
+                user_info["what_to_call_them"] = text(
+                    f"How should the agent address you?",
+                    default=user_name
+                )
+            except Exception:
+                user_info["what_to_call_them"] = input(f"How should the agent address you? [{user_name}]: ").strip() or user_name
         
         # Timezone
         import datetime
@@ -281,17 +467,35 @@ async def run_onboarding_wizard(
         except Exception:
             tz_str = "UTC"
         
-        user_timezone = input(f"Your timezone? [{tz_str}]: ").strip() or tz_str
+        try:
+            user_timezone = text("Your timezone?", default=tz_str)
+        except Exception:
+            user_timezone = input(f"Your timezone? [{tz_str}]: ").strip() or tz_str
         user_info["timezone"] = user_timezone
         
         # Agent personality preference
-        print("\nWhat kind of agent personality do you prefer?")
-        print("  1. Professional - Formal and focused")
-        print("  2. Friendly - Warm and conversational")
-        print("  3. Concise - Brief and to the point")
-        print("  4. Custom - I'll configure it later")
+        personality_choices = [
+            {"name": "1. Professional - Formal and focused", "value": "1"},
+            {"name": "2. Friendly - Warm and conversational", "value": "2"},
+            {"name": "3. Concise - Brief and to the point", "value": "3"},
+            {"name": "4. Custom - I'll configure it later", "value": "4"},
+        ]
         
-        personality_choice = input("\nSelect [2]: ").strip() or "2"
+        try:
+            from .prompter import select
+            personality_choice = select(
+                "What kind of agent personality do you prefer?",
+                choices=personality_choices,
+                default="2"
+            )
+        except Exception:
+            print("\nWhat kind of agent personality do you prefer?")
+            print("  1. Professional - Formal and focused")
+            print("  2. Friendly - Warm and conversational")
+            print("  3. Concise - Brief and to the point")
+            print("  4. Custom - I'll configure it later")
+            personality_choice = input("\nSelect [2]: ").strip() or "2"
+        
         personality_map = {
             "1": "professional",
             "2": "friendly",
@@ -324,10 +528,17 @@ async def run_onboarding_wizard(
             print("✓ Discord configured")
     print("-" * 80)
     
-    save_choice = input("\nSave this configuration? [Y/n]: ").strip().lower()
-    if save_choice == "n":
-        print("Configuration not saved. Exiting...")
-        return {"completed": False, "skipped": True, "reason": "User chose not to save"}
+    try:
+        from .prompter import confirm
+        save_choice = confirm("Save this configuration?", default=True)
+        if not save_choice:
+            print("Configuration not saved. Exiting...")
+            return {"completed": False, "skipped": True, "reason": "User chose not to save"}
+    except Exception:
+        save_choice = input("\nSave this configuration? [Y/n]: ").strip().lower()
+        if save_choice == "n":
+            print("Configuration not saved. Exiting...")
+            return {"completed": False, "skipped": True, "reason": "User chose not to save"}
     
     # Add TS-aligned configuration fields
     from datetime import datetime, timezone
@@ -502,6 +713,41 @@ async def run_onboarding_wizard(
             print("⚠ Could not auto-populate workspace files")
             print(f"  You can manually edit files in: {ws_dir if 'ws_dir' in locals() else workspace_dir}")
     
+    # Step 9.4: Ensure workspace exists, then configure skills and hooks (after workspace init)
+    ws_dir = workspace_dir or (Path.home() / ".openclaw" / "workspace")
+    hooks_result: dict = {}
+    skills_result: dict = {}
+    try:
+        from ..agents.ensure_workspace import ensure_agent_workspace
+        ensure_agent_workspace(
+            workspace_dir=ws_dir,
+            ensure_bootstrap_files=True,
+            skip_bootstrap=False,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to ensure workspace: {e}")
+    
+    # Skills and hooks setup (TS order: after workspace, before finalize)
+    try:
+        cfg_dict = _config_to_dict(claw_config)
+        hooks_result = await setup_hooks(workspace_dir=ws_dir, config=cfg_dict, mode=mode)
+        skills_result = await setup_skills(workspace_dir=ws_dir, config=cfg_dict, mode=mode)
+        
+        # Merge skills/hooks config updates back into claw_config
+        if skills_result.get("config"):
+            _merge_config_from_dict(claw_config, skills_result["config"])
+        if hooks_result.get("config"):
+            _merge_config_from_dict(claw_config, hooks_result["config"])
+        
+        if skills_result.get("config") or hooks_result.get("config"):
+            try:
+                save_config(claw_config)
+                print("✓ Skills/hooks configuration saved!")
+            except Exception as e:
+                logger.warning(f"Failed to save skills/hooks config: {e}")
+    except Exception as e:
+        logger.warning(f"Skills/hooks setup failed: {e}")
+    
     # Step 9.5: Install Gateway service (if requested)
     gateway_installed = False
     gateway_running = False
@@ -533,7 +779,21 @@ async def run_onboarding_wizard(
                     action = "R"  # Auto-restart in non-interactive/quickstart
                     print("Gateway service already installed. Restarting...")
                 else:
-                    action = input("\nGateway service already installed. [R]estart / Re[i]nstall / [S]kip? [R]: ").strip().upper() or "R"
+                    action_choices = [
+                        {"name": "Restart - Restart the existing service", "value": "R"},
+                        {"name": "Reinstall - Remove and reinstall", "value": "I"},
+                        {"name": "Skip - Keep as is", "value": "S"},
+                    ]
+                    
+                    try:
+                        from .prompter import select
+                        action = select(
+                            "Gateway service already installed:",
+                            choices=action_choices,
+                            default="R"
+                        )
+                    except Exception:
+                        action = input("\nGateway service already installed. [R]estart / Re[i]nstall / [S]kip? [R]: ").strip().upper() or "R"
                 
                 if action == "S":
                     print("Skipping Gateway service installation")
@@ -609,14 +869,23 @@ async def run_onboarding_wizard(
     
     # Step 9.7: UI selection prompt (optional, for advanced mode)
     if not skip_ui and gateway_running and mode == "advanced" and not non_interactive:
-        print("\n" + "~" * 60)
-        print("How would you like to start?")
-        print("~" * 60)
-        print("  1. Open Web UI (recommended)")
-        print("  2. Start interactive chat")
-        print("  3. Do this later")
+        ui_choices = [
+            {"name": "1. Open Web UI (recommended)", "value": "1"},
+            {"name": "2. Start interactive chat", "value": "2"},
+            {"name": "3. Do this later", "value": "3"},
+        ]
         
-        choice = input("\nSelect option [1]: ").strip() or "1"
+        try:
+            from .prompter import select
+            choice = select("How would you like to start?", choices=ui_choices, default="1")
+        except Exception:
+            print("\n" + "~" * 60)
+            print("How would you like to start?")
+            print("~" * 60)
+            print("  1. Open Web UI (recommended)")
+            print("  2. Start interactive chat")
+            print("  3. Do this later")
+            choice = input("\nSelect option [1]: ").strip() or "1"
         
         if choice == "1":
             import webbrowser
@@ -737,9 +1006,7 @@ async def run_onboarding_wizard(
     
     print("\n" + "=" * 80 + "\n")
     
-    # Step 11: staged onboarding modules (TS-style decomposition)
-    hooks_result = await setup_hooks(workspace_dir=workspace_dir, mode=mode)
-    skills_result = await setup_skills(mode=mode)
+    # Step 11: Finalize (skills/hooks already done in Step 9.4)
     finalize_result = await finalize_onboarding(mode=mode, skip_ui=skip_ui)
 
     logger.info("Onboarding wizard complete")
@@ -776,38 +1043,71 @@ Please ensure:
 This is experimental software. Use at your own risk.
 """)
     
-    confirm = input("Do you understand and accept these risks? [y/N]: ").strip().lower()
-    return confirm == "y"
+    try:
+        from . import prompter
+        confirmed = prompter.confirm(
+            "Do you understand and accept these risks?",
+            default=False,
+        )
+        return confirmed
+    except Exception:
+        # Fallback to text input
+        confirm = input("Do you understand and accept these risks? [y/N]: ").strip().lower()
+        return confirm == "y"
 
 
 def _select_mode() -> str:
-    """Select onboarding mode"""
+    """Select onboarding mode using interactive UI"""
+    from . import prompter
+    
     print("\n" + "-" * 80)
     print("Onboarding Mode")
     print("-" * 80)
     print("\nChoose your setup mode:")
-    print("  1. QuickStart  - Fast setup with recommended settings (5 min)")
-    print("  2. Advanced    - Customize everything (15 min)")
     
-    choice = input("\nSelect mode [1]: ").strip()
-    
-    if choice == "2":
-        print("\n✓ Advanced mode selected")
-        return "advanced"
-    else:
-        print("\n✓ QuickStart mode selected")
+    try:
+        choice = prompter.select(
+            "Select mode:",
+            choices=[
+                {
+                    "name": "QuickStart - Fast setup with recommended settings (5 min)",
+                    "value": "quickstart",
+                },
+                {
+                    "name": "Advanced - Customize everything (15 min)",
+                    "value": "advanced",
+                },
+            ],
+        )
+        print(f"\n✓ {choice.title()} mode selected")
+        return choice
+    except prompter.WizardCancelledError:
+        print("\n✓ QuickStart mode selected (default)")
         return "quickstart"
 
 
 def _prompt_config_action() -> str:
-    """Prompt for action on existing config"""
+    """Prompt for action on existing config using interactive UI"""
+    from . import prompter
+    
     print("\nWhat would you like to do with existing configuration?")
-    print("  1. Keep    - Use existing configuration")
-    print("  2. Modify  - Update specific settings")
-    print("  3. Reset   - Start fresh")
     
-    choice = input("\nSelect action [2]: ").strip()
+    try:
+        choice = prompter.select(
+            "Select action:",
+            choices=[
+                {"name": "Keep - Use existing configuration", "value": "keep"},
+                {"name": "Modify - Update specific settings", "value": "modify"},
+                {"name": "Reset - Start fresh", "value": "reset"},
+            ],
+        )
+        return choice
+    except prompter.WizardCancelledError:
+        return "modify"  # Default to modify
+    except prompter.WizardCancelledError:
+        return "modify"  # Default to modify
     
+    # Old fallback code (should not reach here)
     if choice == "1":
         return "keep"
     elif choice == "3":
@@ -819,34 +1119,93 @@ def _prompt_config_action() -> str:
 # Per-provider model menus (curated short-list, mirrors TS model catalog).
 # Format: (model_id, display_hint)
 _PROVIDER_MODELS: dict[str, list[tuple[str, str]]] = {
+    # Aligned with TypeScript version defaults
     "anthropic": [
-        ("anthropic/claude-sonnet-4",           "Claude Sonnet 4         (recommended)"),
-        ("anthropic/claude-opus-4-5",           "Claude Opus 4.5         (most capable)"),
-        ("anthropic/claude-3-7-sonnet-20250219", "Claude 3.7 Sonnet       (new reasoning)"),
-        ("anthropic/claude-3-5-haiku-20241022", "Claude 3.5 Haiku        (fast / cheap)"),
+        ("anthropic/claude-sonnet-4-6",         "Claude Sonnet 4.6       (recommended)"),
+        ("anthropic/claude-opus-4-6",           "Claude Opus 4.6         (most capable)"),
+        ("anthropic/claude-opus-4-5",           "Claude Opus 4.5"),
+        ("anthropic/claude-3-7-sonnet-20250219", "Claude 3.7 Sonnet       (reasoning)"),
+        ("anthropic/claude-3-5-haiku-20241022", "Claude 3.5 Haiku        (fast/cheap)"),
         ("anthropic/claude-opus-4-0",           "Claude Opus 4.0         (reasoning)"),
-        ("anthropic/claude-haiku-4-5",          "Claude Haiku 4.5        (reasoning)"),
+        ("anthropic/claude-haiku-4-5",          "Claude Haiku 4.5"),
     ],
     "openai": [
-        ("openai/gpt-4o",       "GPT-4o           (recommended)"),
-        ("openai/gpt-5.2",      "GPT-5.2          (reasoning)"),
-        ("openai/gpt-5-mini",   "GPT-5 Mini       (reasoning)"),
-        ("openai/gpt-4o-mini",  "GPT-4o Mini      (fast / cheap)"),
-        ("openai/o3-mini",      "o3-mini          (reasoning)"),
-        ("openai/gpt-5.3-codex", "GPT-5.3 Codex   (code specialist)"),
+        ("openai/gpt-5.1-codex", "GPT-5.1 Codex    (recommended)"),
+        ("openai/gpt-4o",        "GPT-4o"),
+        ("openai/gpt-5.2",       "GPT-5.2          (reasoning)"),
+        ("openai/gpt-5-mini",    "GPT-5 Mini       (reasoning)"),
+        ("openai/gpt-4o-mini",   "GPT-4o Mini      (fast/cheap)"),
+        ("openai/o3-mini",       "o3-mini          (reasoning)"),
+        ("openai/gpt-5.3-codex", "GPT-5.3 Codex    (code specialist)"),
     ],
-    "gemini": [
-        ("google/gemini-3-pro-preview",  "Gemini 3 Pro        (recommended)"),
-        ("google/gemini-2.5-pro",        "Gemini 2.5 Pro      (reasoning)"),
+    "google": [
+        ("google/gemini-3-pro-preview",   "Gemini 3 Pro        (recommended)"),
+        ("google/gemini-2.5-pro",         "Gemini 2.5 Pro      (reasoning)"),
         ("google/gemini-3-flash-preview", "Gemini 3 Flash      (reasoning)"),
-        ("google/gemini-2.5-flash",      "Gemini 2.5 Flash    (reasoning)"),
-        ("google/gemini-2.0-flash",      "Gemini 2.0 Flash    (fast)"),
-        ("google/gemini-2.0-flash-lite", "Gemini 2.0 Flash Lite (cheap)"),
+        ("google/gemini-2.5-flash",       "Gemini 2.5 Flash"),
+        ("google/gemini-2.0-flash",       "Gemini 2.0 Flash    (fast)"),
+        ("google/gemini-2.0-flash-lite",  "Gemini 2.0 Flash Lite (cheap)"),
+    ],
+    "gemini": [  # Alias for google
+        ("google/gemini-3-pro-preview",   "Gemini 3 Pro        (recommended)"),
+        ("google/gemini-2.5-pro",         "Gemini 2.5 Pro      (reasoning)"),
+        ("google/gemini-2.5-flash",       "Gemini 2.5 Flash"),
+    ],
+    "moonshot": [
+        ("moonshot/kimi-k2.5",     "Kimi k2.5           (recommended)"),
+        ("moonshot/moonshot-v1-128k", "Moonshot v1 128k"),
+        ("moonshot/moonshot-v1-32k",  "Moonshot v1 32k"),
+    ],
+    "kimi-coding": [
+        ("kimi-coding/k2p5",       "Kimi Code k2.5      (code specialist)"),
+    ],
+    "xai": [
+        ("xai/grok-4",             "Grok 4              (recommended)"),
+        ("xai/grok-3",             "Grok 3"),
+        ("xai/grok-4-1-fast",      "Grok 4.1 Fast"),
+    ],
+    "mistral": [
+        ("mistral/mistral-large-latest", "Mistral Large       (recommended)"),
+        ("mistral/mistral-small-latest", "Mistral Small       (fast/cheap)"),
+    ],
+    "qianfan": [
+        ("qianfan/deepseek-v3.2",  "DeepSeek v3.2       (recommended)"),
+    ],
+    "zai": [
+        ("zai/glm-5",              "GLM-5               (recommended)"),
+    ],
+    "xiaomi": [
+        ("xiaomi/mimo-v2-flash",   "Mimo v2 Flash       (recommended)"),
+    ],
+    "openrouter": [
+        ("openrouter/auto",        "Auto (OpenRouter picks best)"),
+    ],
+    "huggingface": [
+        ("huggingface/deepseek-ai/DeepSeek-R1", "DeepSeek R1  (recommended)"),
+    ],
+    "together": [
+        ("together/moonshotai/Kimi-K2.5", "Kimi K2.5     (recommended)"),
+    ],
+    "litellm": [
+        ("litellm/claude-opus-4-6", "Claude Opus 4.6    (recommended)"),
+    ],
+    "venice": [
+        ("venice/llama-3.3-70b",   "Llama 3.3 70B       (recommended)"),
+    ],
+    "synthetic": [
+        ("synthetic/hf:MiniMaxAI/MiniMax-M2.5", "MiniMax M2.5 (recommended)"),
+    ],
+    "volcengine": [
+        ("volcengine/doubao-seed-1-8-251228", "Doubao Seed 1.8"),
+    ],
+    "byteplus": [
+        ("byteplus/seed-1-8-251228", "Seed 1.8"),
     ],
     "ollama": [
-        ("ollama/llama3",    "Llama 3"),
-        ("ollama/mistral",   "Mistral"),
-        ("ollama/codellama", "CodeLlama"),
+        ("ollama/llama3",          "Llama 3"),
+        ("ollama/mistral",         "Mistral"),
+        ("ollama/codellama",       "CodeLlama"),
+        ("ollama/deepseek-r1",     "DeepSeek R1"),
     ],
 }
 
@@ -918,21 +1277,31 @@ async def _pick_model(provider: str, exclude: list[str] | None = None) -> str | 
     if not options:
         return None
 
-    print()
+    # Build choices for questionary
+    choices = []
     for i, (mid, hint) in enumerate(options, 1):
-        default_tag = "  ← default" if i == 1 else ""
-        print(f"  {i}. {hint}{default_tag}")
-
-    raw = input(f"\nSelect model [1]: ").strip()
-    if not raw:
-        return options[0][0]
+        default_tag = " (default)" if i == 1 else ""
+        choices.append({"name": f"{i}. {hint}{default_tag}", "value": mid})
+    
     try:
-        idx = int(raw) - 1
-        if 0 <= idx < len(options):
-            return options[idx][0]
-    except ValueError:
-        pass
-    return options[0][0]
+        from .prompter import select
+        return select("Select model:", choices=choices, default=options[0][0])
+    except Exception:
+        print()
+        for i, (mid, hint) in enumerate(options, 1):
+            default_tag = "  ← default" if i == 1 else ""
+            print(f"  {i}. {hint}{default_tag}")
+
+        raw = input(f"\nSelect model [1]: ").strip()
+        if not raw:
+            return options[0][0]
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(options):
+                return options[idx][0]
+        except ValueError:
+            pass
+        return options[0][0]
 
 
 async def _configure_ollama() -> dict:
@@ -949,7 +1318,11 @@ async def _configure_ollama() -> dict:
     import httpx
 
     # --- 1. Prompt base URL ---
-    raw_url = input("\nOllama server URL [http://127.0.0.1:11434]: ").strip()
+    try:
+        from .prompter import text
+        raw_url = text("Ollama server URL:", default="http://127.0.0.1:11434")
+    except Exception:
+        raw_url = input("\nOllama server URL [http://127.0.0.1:11434]: ").strip()
     base_url = raw_url.rstrip("/").rstrip("/v1").rstrip("/") if raw_url else "http://127.0.0.1:11434"
     # Ensure no /v1 suffix (native Ollama API lives at /api/*, not /v1/*)
     if base_url.endswith("/v1"):
@@ -1024,21 +1397,37 @@ async def _configure_ollama() -> dict:
     # --- 3. Model selection ---
     model_id: str
     if discovered_models:
-        raw = input(f"\nSelect model [1]: ").strip()
-        if not raw:
-            model_id = discovered_models[0]["id"]
-        else:
-            try:
-                idx = int(raw) - 1
-                if 0 <= idx < len(discovered_models):
-                    model_id = discovered_models[idx]["id"]
-                else:
-                    model_id = discovered_models[0]["id"]
-            except ValueError:
-                # User typed a name directly
-                model_id = raw
+        # Build choices for questionary
+        choices = []
+        for i, m in enumerate(discovered_models, 1):
+            ctx_k = m["contextWindow"] // 1024
+            default_tag = " (default)" if i == 1 else ""
+            choices.append({"name": f"{i}. {m['name']} (ctx {ctx_k}k){default_tag}", "value": m["id"]})
+        
+        try:
+            from .prompter import select
+            model_id = select("Select Ollama model:", choices=choices, default=discovered_models[0]["id"])
+        except Exception:
+            raw = input(f"\nSelect model [1]: ").strip()
+            if not raw:
+                model_id = discovered_models[0]["id"]
+            else:
+                try:
+                    idx = int(raw) - 1
+                    if 0 <= idx < len(discovered_models):
+                        model_id = discovered_models[idx]["id"]
+                    else:
+                        model_id = discovered_models[0]["id"]
+                except ValueError:
+                    # User typed a name directly
+                    model_id = raw
     else:
-        raw = input("Enter model name (e.g. llama3, mistral): ").strip()
+        # Manual entry
+        try:
+            from .prompter import text
+            raw = text("Enter model name (e.g. llama3, mistral):", default="llama3")
+        except Exception:
+            raw = input("Enter model name (e.g. llama3, mistral): ").strip()
         model_id = raw if raw else "llama3"
         discovered_models = [{
             "id": model_id,
@@ -1051,7 +1440,11 @@ async def _configure_ollama() -> dict:
         }]
 
     # --- 4. Optional API key (for secured Ollama instances) ---
-    raw_key = input("\nAPI Key [leave blank if not secured]: ").strip()
+    try:
+        from .prompter import text
+        raw_key = text("API Key (leave blank if not secured):", default="")
+    except Exception:
+        raw_key = input("\nAPI Key [leave blank if not secured]: ").strip()
     api_key = raw_key if raw_key else "ollama-local"
 
     return {
@@ -1091,7 +1484,11 @@ async def _configure_custom_provider() -> dict:
 
     # --- 1. API Base URL ---
     while True:
-        raw_url = input(f"\nAPI Base URL [{_DEFAULT_URL}]: ").strip()
+        try:
+            from .prompter import text
+            raw_url = text("API Base URL:", default=_DEFAULT_URL)
+        except Exception:
+            raw_url = input(f"\nAPI Base URL [{_DEFAULT_URL}]: ").strip()
         base_url = raw_url if raw_url else _DEFAULT_URL
         base_url = base_url.rstrip("/")
         try:
@@ -1103,21 +1500,39 @@ async def _configure_custom_provider() -> dict:
             print("  Invalid URL. Please enter a full URL including scheme, e.g. http://127.0.0.1:11434/v1")
 
     # Optional API key
-    raw_key = input("API Key (leave blank if not required): ").strip()
+    try:
+        from .prompter import text
+        raw_key = text("API Key (leave blank if not required):", default="")
+    except Exception:
+        raw_key = input("API Key (leave blank if not required): ").strip()
     api_key: Optional[str] = raw_key if raw_key else None
 
     # --- 2. Compatibility ---
-    print("\nEndpoint compatibility:")
-    print("  1. OpenAI-compatible  (uses /chat/completions)")
-    print("  2. Anthropic-compatible  (uses /messages)")
-    print("  3. Unknown — detect automatically")
-    compat_choice = input("\nSelect [1]: ").strip() or "1"
-    compat_map = {"1": "openai", "2": "anthropic", "3": "unknown"}
-    compatibility = compat_map.get(compat_choice, "openai")  # "openai" | "anthropic" | "unknown"
+    compat_choices = [
+        {"name": "1. OpenAI-compatible (uses /chat/completions)", "value": "openai"},
+        {"name": "2. Anthropic-compatible (uses /messages)", "value": "anthropic"},
+        {"name": "3. Unknown — detect automatically", "value": "unknown"},
+    ]
+    
+    try:
+        from .prompter import select
+        compatibility = select("Endpoint compatibility:", choices=compat_choices, default="openai")
+    except Exception:
+        print("\nEndpoint compatibility:")
+        print("  1. OpenAI-compatible  (uses /chat/completions)")
+        print("  2. Anthropic-compatible  (uses /messages)")
+        print("  3. Unknown — detect automatically")
+        compat_choice = input("\nSelect [1]: ").strip() or "1"
+        compat_map = {"1": "openai", "2": "anthropic", "3": "unknown"}
+        compatibility = compat_map.get(compat_choice, "openai")
 
     # --- 3. Model ID ---
     while True:
-        model_id = input('\nModel ID (e.g. llama3, claude-3-7-sonnet): ').strip()
+        try:
+            from .prompter import text
+            model_id = text("Model ID (e.g. llama3, claude-3-7-sonnet):")
+        except Exception:
+            model_id = input('\nModel ID (e.g. llama3, claude-3-7-sonnet): ').strip()
         if model_id:
             break
         print("  Model ID is required.")
@@ -1182,19 +1597,39 @@ async def _configure_custom_provider() -> dict:
             break
         else:
             print("  Could not verify endpoint.")
-            print("\nWhat would you like to change?")
-            print("  1. Change base URL")
-            print("  2. Change model")
-            print("  3. Change base URL and model")
-            print("  4. Skip verification (use as-is)")
-            fix_choice = input("Select [4]: ").strip() or "4"
+            
+            fix_choices = [
+                {"name": "1. Change base URL", "value": "1"},
+                {"name": "2. Change model", "value": "2"},
+                {"name": "3. Change base URL and model", "value": "3"},
+                {"name": "4. Skip verification (use as-is)", "value": "4"},
+            ]
+            
+            try:
+                from .prompter import select
+                fix_choice = select("What would you like to change?", choices=fix_choices, default="4")
+            except Exception:
+                print("\nWhat would you like to change?")
+                print("  1. Change base URL")
+                print("  2. Change model")
+                print("  3. Change base URL and model")
+                print("  4. Skip verification (use as-is)")
+                fix_choice = input("Select [4]: ").strip() or "4"
 
             if fix_choice == "1" or fix_choice == "3":
-                raw_url = input(f"New base URL [{base_url}]: ").strip()
+                try:
+                    from .prompter import text
+                    raw_url = text("New base URL:", default=base_url)
+                except Exception:
+                    raw_url = input(f"New base URL [{base_url}]: ").strip()
                 if raw_url:
                     base_url = raw_url.rstrip("/")
             if fix_choice == "2" or fix_choice == "3":
-                new_model = input(f"New model ID [{model_id}]: ").strip()
+                try:
+                    from .prompter import text
+                    new_model = text("New model ID:", default=model_id)
+                except Exception:
+                    new_model = input(f"New model ID [{model_id}]: ").strip()
                 if new_model:
                     model_id = new_model
             if fix_choice == "4":
@@ -1203,11 +1638,19 @@ async def _configure_custom_provider() -> dict:
 
     # --- 5. Endpoint ID ---
     default_pid = _derive_custom_provider_id(base_url)
-    raw_pid = input(f"\nEndpoint ID [{default_pid}]: ").strip()
+    try:
+        from .prompter import text
+        raw_pid = text("Endpoint ID:", default=default_pid)
+    except Exception:
+        raw_pid = input(f"\nEndpoint ID [{default_pid}]: ").strip()
     provider_id = raw_pid if raw_pid else default_pid
 
     # --- 6. Model alias ---
-    raw_alias = input('Model alias (optional, e.g. local, ollama): ').strip()
+    try:
+        from .prompter import text
+        raw_alias = text("Model alias (optional, e.g. local, ollama):", default="")
+    except Exception:
+        raw_alias = input('Model alias (optional, e.g. local, ollama): ').strip()
     alias: Optional[str] = raw_alias if raw_alias else None
 
     model_definition = {
@@ -1231,83 +1674,308 @@ async def _configure_custom_provider() -> dict:
     }
 
 
-async def _configure_provider(mode: str) -> Optional[dict]:
-    """Configure LLM provider"""
+async def _configure_permissions(mode: str, config: "ClawdbotConfig") -> Optional[str]:
+    """Ask user to choose a permission preset. Returns the chosen preset key or None."""
+    from .permission_presets import (
+        display_presets_menu, detect_preset_level, PRESET_ORDER, DEFAULT_PRESET, PRESETS
+    )
+
     print("\n" + "-" * 80)
-    print("Provider Configuration")
+    print("Permission Level")
     print("-" * 80)
+    print("\nThis controls what the agent is allowed to do on your machine and who can")
+    print("talk to the bot. You can always change this later with:")
+    print("  uv run openclaw security preset\n")
 
-    if mode == "quickstart":
-        # QuickStart: Check environment variables first
-        providers = ["anthropic", "openai", "gemini"]
-        for provider in providers:
-            if check_env_api_key(provider):
-                print(f"\n✓ Found {provider.title()} API key in environment")
-                use_it = input(f"Use {provider.title()}? [Y/n]: ").strip().lower()
-                if use_it != "n":
-                    # Still let the user pick a specific model
-                    print(f"\nSelect {provider.title()} model:")
-                    primary = await _pick_model(provider) or _PROVIDER_MODELS[provider][0][0]
-                    model_value = await _ask_fallbacks(provider, primary)
-                    return {"provider": provider, "model": model_value}
+    current = detect_preset_level(config)
+    display_presets_menu(current)
 
-    # Prompt for provider
-    print("\nSelect your LLM provider:")
-    print("  1. Anthropic (Claude)  - Recommended")
-    print("  2. OpenAI (GPT-4)")
-    print("  3. Google (Gemini)")
-    print("  4. Ollama (Local)")
-    print("  5. Custom Provider (OpenAI/Anthropic compatible)")
-
-    choice = input("\nSelect provider [1]: ").strip()
-
-    provider_map = {
-        "1": "anthropic",
-        "2": "openai",
-        "3": "gemini",
-        "4": "ollama",
-        "5": "custom",
-    }
-    provider = provider_map.get(choice, "anthropic")
-
-    if provider == "ollama":
-        return await _configure_ollama()
-    elif provider == "custom":
-        return await _configure_custom_provider()
+    # Build default: standard for quickstart/fresh, keep current for advanced
+    if mode == "advanced" and current:
+        default_key = current
     else:
-        # Cloud providers: configure auth (API key)
+        default_key = DEFAULT_PRESET
+
+    default_num = PRESET_ORDER.index(default_key) + 1
+
+    def _safe_input(prompt: str) -> str:
+        """Wrap input() so StopIteration (exhausted mock) becomes EOFError.
+
+        PEP 479 converts StopIteration raised inside a coroutine to RuntimeError
+        before any except clause can catch it.  By catching it in a plain function
+        and re-raising as EOFError we keep the async frame clean.
+        """
         try:
-            configure_auth(provider)
-            print(f"\n✓ {provider.title()} configured")
-        except Exception as e:
-            print(f"\n✗ Failed to configure {provider}: {e}")
-            return None
+            return input(prompt)
+        except StopIteration:
+            raise EOFError("non-interactive")
 
-        # Select primary model
-        print(f"\nSelect primary model for {provider.title()}:")
-        primary = await _pick_model(provider) or _PROVIDER_MODELS.get(provider, [("",)])[0][0]
+    while True:
+        try:
+            from .prompter import select
+            # Build choices for questionary
+            choices = []
+            for i, key in enumerate(PRESET_ORDER, 1):
+                preset = PRESETS[key]
+                is_default = (key == default_key)
+                name = f"{i}. {preset['label']} - {preset['tagline']}"
+                if is_default:
+                    name += " (default)"
+                choices.append({"name": name, "value": key})
+            
+            # Use questionary select
+            chosen = select(
+                "Select permission level:",
+                choices=choices,
+                default=default_key
+            )
+            print(f"✓ Selected: {PRESETS[chosen]['label']}  — {PRESETS[chosen]['tagline']}")
+            return chosen
+        except Exception:
+            # Fallback to input()
+            try:
+                raw = _safe_input(f"Select [1-{len(PRESET_ORDER)}] (default {default_num} = {PRESETS[default_key]['label']}): ").strip()
+            except EOFError:
+                # Non-interactive / test environment — use the default silently
+                print(f"✓ Using: {PRESETS[default_key]['label']} (default)")
+                return default_key
+            if not raw:
+                print(f"✓ Using: {PRESETS[default_key]['label']}")
+                return default_key
+            if raw.isdigit() and 1 <= int(raw) <= len(PRESET_ORDER):
+                chosen = PRESET_ORDER[int(raw) - 1]
+                print(f"✓ Selected: {PRESETS[chosen]['label']}  — {PRESETS[chosen]['tagline']}")
+                return chosen
+            # Also accept the name directly
+            if raw.lower() in PRESET_ORDER:
+                chosen = raw.lower()
+                print(f"✓ Selected: {PRESETS[chosen]['label']}  — {PRESETS[chosen]['tagline']}")
+                return chosen
+            print(f"  Invalid choice. Enter a number 1–{len(PRESET_ORDER)} or a preset name.")
 
-        model_value = await _ask_fallbacks(provider, primary)
-        return {"provider": provider, "model": model_value}
+
+async def _configure_provider(mode: str, claw_config: "ClawdbotConfig") -> Optional[dict]:
+    """Configure LLM provider (aligned with TS)
+    
+    Uses new handler chain architecture for 25+ providers.
+    Mirrors openclaw/src/wizard/onboarding.ts _configure_provider logic.
+    
+    Args:
+        mode: Onboarding mode ("quickstart" or "advanced")
+        claw_config: Current configuration object
+        
+    Returns:
+        Dict with provider info or None if skipped
+    """
+    # Import new auth choice infrastructure
+    from .auth_choice_prompt import prompt_auth_choice_grouped
+    from .auth_handlers.base import apply_auth_choice_chain
+    from .auth_handlers.anthropic import apply_auth_choice_anthropic
+    from .auth_handlers.openai import apply_auth_choice_openai
+    from .auth_handlers.google import apply_auth_choice_google
+    from .auth_handlers.api_providers import apply_auth_choice_api_providers
+    from .auth_handlers.minimax import apply_auth_choice_minimax
+    from .auth_handlers.moonshot import apply_auth_choice_moonshot
+    from .auth_handlers.zai import apply_auth_choice_zai
+    from .auth_handlers.oauth import apply_auth_choice_oauth
+    from .auth_handlers.vllm import apply_auth_choice_vllm
+    from .auth_handlers.custom import apply_auth_choice_custom
+    from .auth_handlers.github_copilot import (
+        apply_auth_choice_github_copilot,
+        apply_auth_choice_copilot_proxy,
+    )
+    
+    # QuickStart: Check environment variables for common providers
+    if mode == "quickstart":
+        from .auth import check_env_api_key
+        
+        # Check for Anthropic, OpenAI, Google keys in environment
+        for provider_name in ["anthropic", "openai", "gemini"]:
+            if check_env_api_key(provider_name):
+                print(f"\n✓ Found {provider_name.title()} API key in environment")
+                try:
+                    from .prompter import confirm
+                    use_it = confirm(f"Use {provider_name.title()}?", default=True)
+                    if not use_it:
+                        continue
+                except Exception:
+                    use_it = input(f"Use {provider_name.title()}? [Y/n]: ").strip().lower()
+                    if use_it == "n":
+                        continue
+                
+                # Map provider name to auth_choice
+                auth_choice_map = {
+                    "anthropic": "apiKey",
+                    "openai": "openai-api-key",
+                    "gemini": "gemini-api-key",
+                }
+                auth_choice = auth_choice_map[provider_name]
+                
+                # Apply auth choice using handler chain
+                handlers = [
+                    apply_auth_choice_anthropic,
+                    apply_auth_choice_openai,
+                    apply_auth_choice_google,
+                ]
+                
+                result = await apply_auth_choice_chain(
+                    handlers=handlers,
+                    auth_choice=auth_choice,
+                    config=claw_config,
+                    set_default_model=True,
+                    opts={},
+                )
+                
+                # NOTE: Model selection moved to Step 4.5 (prompt_default_model)
+                # No need to check or modify model_value here
+                
+                return {
+                    "provider": auth_choice,
+                    "model": None,  # Will be set in Step 4.5
+                    "auth_choice": auth_choice,
+                }
+    
+    # Prompt for auth choice using grouped selection UI
+    auth_choice = await prompt_auth_choice_grouped(include_skip=True)
+    
+    if auth_choice == "skip":
+        return None
+    
+    # Handler chain (aligned with TS order)
+    handlers = [
+        apply_auth_choice_anthropic,
+        apply_auth_choice_vllm,
+        apply_auth_choice_openai,
+        apply_auth_choice_oauth,
+        apply_auth_choice_api_providers,  # Handles 20+ simple API key providers
+        apply_auth_choice_minimax,
+        apply_auth_choice_moonshot,
+        apply_auth_choice_zai,
+        apply_auth_choice_github_copilot,
+        apply_auth_choice_google,
+        apply_auth_choice_copilot_proxy,
+        apply_auth_choice_custom,
+    ]
+    
+    # Apply auth choice using handler chain
+    result = await apply_auth_choice_chain(
+        handlers=handlers,
+        auth_choice=auth_choice,
+        config=claw_config,
+        set_default_model=True,
+        opts={},
+    )
+    
+    # Get model value from config (may be pre-existing from config file)
+    model_value = result.config.agents.defaults.model if result.config.agents and result.config.agents.defaults else None
+    
+    # NOTE: Removed _ask_fallbacks() call here
+    # Fallback/model selection is now handled uniformly in Step 4.5 (prompt_default_model)
+    # This ensures consistent UX across all providers and auth methods
+    
+    return {
+        "provider": auth_choice,
+        "model": model_value,  # May be None or pre-existing value
+        "auth_choice": auth_choice,
+    }
+
+
+_FALLBACK_PROVIDER_ORDER = ["anthropic", "openai", "gemini", "ollama"]
+
+
+async def _pick_fallback_model(exclude: list[str]) -> str | None:
+    """Show a cross-provider model picker for fallback selection.
+
+    - First asks which provider (defaults to same, but all are available).
+    - Supports "Enter custom model name" entry for any provider/model string.
+    - Returns a model id like "anthropic/claude-3-5-haiku-20241022" or None.
+
+    Mirrors TS promptDefaultModel() which shows all providers + manual entry.
+    """
+    providers_display = [
+        ("anthropic", "Anthropic (Claude)"),
+        ("openai",    "OpenAI (GPT)"),
+        ("gemini",    "Google (Gemini)"),
+        ("ollama",    "Ollama (local)"),
+        ("custom",    "Enter custom model name"),
+    ]
+
+    print()
+    # Build questionary choices
+    choices = []
+    for i, (provider, label) in enumerate(providers_display, 1):
+        choices.append({"name": f"{i}. {label}", "value": provider})
+    
+    try:
+        from .prompter import select, text
+        chosen_provider = select("Select provider:", choices=choices, default=providers_display[0][0])
+    except Exception:
+        for i, (_, label) in enumerate(providers_display, 1):
+            print(f"  {i}. {label}")
+        raw = input(f"\nSelect provider [1]: ").strip()
+        if not raw:
+            idx = 0
+        else:
+            try:
+                idx = int(raw) - 1
+                if not (0 <= idx < len(providers_display)):
+                    idx = 0
+            except ValueError:
+                idx = 0
+        chosen_provider, _ = providers_display[idx]
+
+    if chosen_provider == "custom":
+        try:
+            model_str = text("Enter model id (e.g. anthropic/claude-3-5-haiku-20241022):")
+            if not model_str:
+                return None
+        except Exception:
+            model_str = input("Enter model id (e.g. anthropic/claude-3-5-haiku-20241022): ").strip()
+            if not model_str:
+                return None
+        return model_str
+
+    model = await _pick_model(chosen_provider, exclude=exclude)
+    return model
 
 
 async def _ask_fallbacks(provider: str, primary: str) -> str | dict:
     """Ask if the user wants fallback models. Returns a string (no fallbacks)
-    or a dict {primary, fallbacks} suitable for agents.defaults.model."""
-    add_fb = input("\nAdd fallback models? [y/N]: ").strip().lower()
-    if add_fb != "y":
+    or a dict {primary, fallbacks} suitable for agents.defaults.model.
+
+    Supports cross-provider fallbacks and custom model name entry,
+    mirroring TS promptDefaultModel() + applyModelFallbacksFromSelection().
+    """
+    try:
+        from .prompter import confirm
+        add_fb = confirm("Add fallback models?", default=False)
+    except Exception:
+        add_fb = input("\nAdd fallback models? [y/N]: ").strip().lower() == "y"
+    
+    if not add_fb:
         return primary
 
     fallbacks: list[str] = []
-    print("\nSelect fallback models (shown in priority order). Enter 'done' to finish.")
+    print(
+        "\nSelect fallback models (shown in priority order, up to 3). "
+        "You can choose from any provider.\n"
+        "Enter 'done' or leave blank to finish."
+    )
     while len(fallbacks) < 3:
-        print(f"\nFallback #{len(fallbacks) + 1} for {provider.title()}:")
-        chosen = await _pick_model(provider, exclude=[primary] + fallbacks)
-        if chosen is None:
+        print(f"\nFallback #{len(fallbacks) + 1}:  (primary: {primary})")
+        chosen = await _pick_fallback_model(exclude=[primary] + fallbacks)
+        if not chosen:
             break
         fallbacks.append(chosen)
-        another = input("Add another fallback? [y/N]: ").strip().lower()
-        if another != "y":
+        print(f"  ✓ Added: {chosen}")
+        if len(fallbacks) >= 3:
+            break
+        try:
+            from .prompter import confirm
+            another = confirm("Add another fallback?", default=False)
+        except Exception:
+            another = input("Add another fallback? [y/N]: ").strip().lower() == "y"
+        if not another:
             break
 
     if not fallbacks:
@@ -1337,22 +2005,36 @@ async def _configure_gateway(mode: str) -> Optional[dict]:
         config["port"] = 18789
         print(f"\nUsing default port: {config['port']}")
     else:
-        port_input = input("\nGateway port [18789]: ").strip()
-        config["port"] = int(port_input) if port_input else 18789
+        try:
+            from .prompter import text
+            port_input = text("Gateway port:", default="18789")
+            config["port"] = int(port_input) if port_input else 18789
+        except Exception:
+            port_input = input("\nGateway port [18789]: ").strip()
+            config["port"] = int(port_input) if port_input else 18789
     
     # Bind mode
     if mode == "quickstart":
         config["bind"] = "loopback"
         print("Using loopback mode (local access only)")
     else:
-        print("\nBind mode:")
-        print("  1. loopback  - Local access only (recommended)")
-        print("  2. lan       - LAN access")
-        print("  3. auto      - Auto-detect")
+        bind_choices = [
+            {"name": "1. loopback - Local access only (recommended)", "value": "loopback"},
+            {"name": "2. lan - LAN access", "value": "lan"},
+            {"name": "3. auto - Auto-detect", "value": "auto"},
+        ]
         
-        bind_choice = input("\nSelect bind mode [1]: ").strip()
-        bind_map = {"1": "loopback", "2": "lan", "3": "auto"}
-        config["bind"] = bind_map.get(bind_choice, "loopback")
+        try:
+            from .prompter import select
+            config["bind"] = select("Bind mode:", choices=bind_choices, default="loopback")
+        except Exception:
+            print("\nBind mode:")
+            print("  1. loopback  - Local access only (recommended)")
+            print("  2. lan       - LAN access")
+            print("  3. auto      - Auto-detect")
+            bind_choice = input("\nSelect bind mode [1]: ").strip()
+            bind_map = {"1": "loopback", "2": "lan", "3": "auto"}
+            config["bind"] = bind_map.get(bind_choice, "loopback")
     
     # Authentication
     if mode == "quickstart":
@@ -1360,15 +2042,28 @@ async def _configure_gateway(mode: str) -> Optional[dict]:
         config["auth_token"] = secrets.token_urlsafe(32)
         print("\n✓ Generated authentication token")
     else:
-        print("\nAuthentication:")
-        print("  1. Token     - Random token (recommended)")
-        print("  2. Password  - Custom password")
-        print("  3. None      - No authentication (local only)")
+        auth_choices = [
+            {"name": "1. Token - Random token (recommended)", "value": "1"},
+            {"name": "2. Password - Custom password", "value": "2"},
+            {"name": "3. None - No authentication (local only)", "value": "3"},
+        ]
         
-        auth_choice = input("\nSelect auth mode [1]: ").strip()
+        try:
+            from .prompter import select, password as prompt_password
+            auth_choice = select("Authentication:", choices=auth_choices, default="1")
+        except Exception:
+            print("\nAuthentication:")
+            print("  1. Token     - Random token (recommended)")
+            print("  2. Password  - Custom password")
+            print("  3. None      - No authentication (local only)")
+            auth_choice = input("\nSelect auth mode [1]: ").strip() or "1"
         
         if auth_choice == "2":
-            password = input("Enter password: ").strip()
+            try:
+                from .prompter import password as prompt_password
+                password = prompt_password("Enter password:")
+            except Exception:
+                password = input("Enter password: ").strip()
             if password:
                 config["auth_password"] = password
         elif auth_choice == "3":
@@ -1380,59 +2075,120 @@ async def _configure_gateway(mode: str) -> Optional[dict]:
     return config
 
 
+_CHANNEL_MENU: list[tuple[str, str]] = [
+    ("telegram",  "Telegram"),
+    ("discord",   "Discord"),
+    ("feishu",    "Feishu / Lark"),
+    ("whatsapp",  "WhatsApp"),
+]
+
+
 async def _configure_channels(mode: str) -> Optional[dict]:
-    """Configure channels"""
+    """Configure one or more channels sequentially.
+
+    After finishing each channel the user is asked "Add another channel?",
+    mirroring the TS wizard which loops until the user declines or all
+    channels have been configured.
+    """
     print("\n" + "-" * 80)
     print("Channels Configuration")
     print("-" * 80)
-    
+
     if mode == "quickstart":
-        setup_channels = input("\nConfigure channels now? [y/N]: ").strip().lower()
-        if setup_channels != "y":
+        try:
+            from .prompter import confirm
+            setup_channels = confirm("Configure channels now?", default=False)
+        except Exception:
+            setup_channels = input("\nConfigure channels now? [y/N]: ").strip().lower() == "y"
+        
+        if not setup_channels:
             print("Skipping channels. You can configure them later with:")
             print("  $ openclaw configure channels")
             return None
-    
-    channels_config = {}
-    
-    print("\nWhich channels would you like to configure?")
-    print("  1. Telegram")
-    print("  2. Discord")
-    print("  3. Feishu / Lark")
-    print("  4. WhatsApp")
-    print("  5. Skip")
-    
-    choice = input("\nSelect channel [5]: ").strip()
-    
-    if choice == "1":
+
+    channels_config: dict = {}
+
+    while True:
+        # Build the menu, marking already-configured channels
+        available = [
+            (key, label)
+            for key, label in _CHANNEL_MENU
+            if key not in channels_config
+        ]
+        if not available:
+            print("\n✓ All supported channels have been configured.")
+            break
+
+        configured_str = (
+            f"  (already configured: {', '.join(channels_config)})" if channels_config else ""
+        )
+        print(f"\nWhich channel would you like to configure?{configured_str}")
+        for i, (_, label) in enumerate(available, 1):
+            print(f"  {i}. {label}")
+        print(f"  {len(available) + 1}. Done / Skip")
+
+        # Build choices for questionary
+        choices = []
+        for i, (key, label) in enumerate(available, 1):
+            choices.append({"name": f"{i}. {label}", "value": key})
+        choices.append({"name": f"{len(available) + 1}. Done / Skip", "value": "done"})
+        
+        try:
+            from .prompter import select
+            key = select(
+                "Select channel:",
+                choices=choices,
+                default="done" if channels_config else available[0][0]
+            )
+            if key == "done":
+                break
+            # Find label for the chosen key
+            label = next((l for k, l in available if k == key), key)
+        except Exception:
+            raw = input(f"\nSelect [{'1' if not channels_config else str(len(available) + 1)}]: ").strip()
+            if not raw:
+                choice_idx = 0 if not channels_config else len(available)  # default: first or Done
+            else:
+                try:
+                    choice_idx = int(raw) - 1
+                except ValueError:
+                    choice_idx = len(available)  # treat invalid as Done
+
+            if choice_idx < 0 or choice_idx >= len(available):
+                # "Done" selected or out-of-range
+                break
+
+            key, label = available[choice_idx]
         print("\n" + "~" * 60)
-        print("Configuring Telegram")
+        print(f"Configuring {label}")
         print("~" * 60)
-        telegram_config = configure_telegram_enhanced()
-        if telegram_config:
-            channels_config["telegram"] = telegram_config
-    elif choice == "2":
-        print("\n" + "~" * 60)
-        print("Configuring Discord")
-        print("~" * 60)
-        discord_config = configure_discord_enhanced()
-        if discord_config:
-            channels_config["discord"] = discord_config
-    elif choice == "3":
-        print("\n" + "~" * 60)
-        print("Configuring Feishu / Lark")
-        print("~" * 60)
-        feishu_config = configure_feishu_enhanced()
-        if feishu_config:
-            channels_config["feishu"] = feishu_config
-    elif choice == "4":
-        print("\n" + "~" * 60)
-        print("Configuring WhatsApp")
-        print("~" * 60)
-        whatsapp_config = configure_whatsapp_enhanced()
-        if whatsapp_config:
-            channels_config["whatsapp"] = whatsapp_config
-    
+
+        cfg = None
+        if key == "telegram":
+            cfg = configure_telegram_enhanced()
+        elif key == "discord":
+            cfg = configure_discord_enhanced()
+        elif key == "feishu":
+            cfg = configure_feishu_enhanced()
+        elif key == "whatsapp":
+            cfg = configure_whatsapp_enhanced()
+
+        if cfg:
+            channels_config[key] = cfg
+            print(f"\n✓ {label} configured.")
+
+        # Ask about another channel only if there are more to configure
+        remaining = [k for k, _ in _CHANNEL_MENU if k not in channels_config]
+        if not remaining:
+            break
+        try:
+            from .prompter import confirm
+            another = confirm("Configure another channel?", default=False)
+        except Exception:
+            another = input("\nConfigure another channel? [y/N]: ").strip().lower() == "y"
+        if not another:
+            break
+
     return channels_config if channels_config else None
 
 

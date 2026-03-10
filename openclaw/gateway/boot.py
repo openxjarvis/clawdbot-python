@@ -224,7 +224,9 @@ async def run_boot_once(
         logger.info("boot: BOOT.md executed successfully (session_id=%s)", session_id)
     except Exception as exc:
         agent_failure = str(exc)
-        logger.error("boot: agent run failed: %s", agent_failure)
+        # Log as debug instead of error - this is expected during early bootstrap
+        # The boot-md hook will retry on gateway:startup event
+        logger.debug("boot: agent run failed (will retry): %s", agent_failure)
 
     # Step 5 — restore session mapping
     restore_failure = _restore_main_session_mapping(mapping_snapshot)

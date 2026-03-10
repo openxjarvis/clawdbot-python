@@ -47,6 +47,7 @@ from .system_prompt_sections import (
     build_reaction_guidance_section,
     build_reasoning_format_section,
     build_reply_tags_section,
+    build_elevated_section,
     build_runtime_section,
     build_safety_section,
     build_sandbox_section,
@@ -90,6 +91,8 @@ def build_agent_system_prompt(
     message_tool_hints: list[str] | None = None,
     message_channel_options: str = "telegram|discord|slack|signal",
     has_gateway: bool = True,
+    elevated_config: dict | None = None,
+    current_elevated_level: str | None = None,
 ) -> str:
     """
     Build the agent system prompt.
@@ -222,6 +225,11 @@ def build_agent_system_prompt(
 
     # ── 13. Sandbox ──────────────────────────────────────────────────
     lines.extend(build_sandbox_section(sandbox_info))
+
+    # ── 13.3. Elevated Exec (non-sandbox gateway mode) ───────────────
+    # Only inject when not in sandbox mode (sandbox section already handles it).
+    if not (sandbox_info and sandbox_info.get("enabled")):
+        lines.extend(build_elevated_section(elevated_config, current_elevated_level))
 
     # ── 13.5. Exec Capabilities ──────────────────────────────────────
     # Add exec capabilities section to inform agent about bash tool abilities

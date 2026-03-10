@@ -161,41 +161,54 @@ async def handle_stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Stop current agent run - /stop"""
     if not update.effective_user or not update.message:
         return
-    
+
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    
+
     try:
-        # Get runtime from application context
-        runtime = context.application.bot_data.get("agent_runtime")
-        if not runtime:
-            await update.message.reply_text(
-                "⚠️ Agent runtime not available. Command cannot be executed.",
-                parse_mode="Markdown"
-            )
-            return
-        
-        # Build session key
-        session_key = f"agent:main:telegram:{chat_id}"
-        
-        # Stop/abort current run if method exists
-        if hasattr(runtime, "abort_run"):
-            await runtime.abort_run(session_key)
+        from openclaw.agents.pi_embedded import (
+            ACTIVE_EMBEDDED_RUNS,
+            abort_embedded_pi_run,
+        )
+        from openclaw.auto_reply.reply.queue import clear_session_queues
+
+        # Find any active run whose session_key contains this telegram chat_id.
+        # The registry is keyed by session_id (UUID); each handle stores the
+        # session_key string e.g. "agent:main:telegram:direct:8366053063".
+        chat_id_str = str(chat_id)
+        matched_session_ids: list[str] = []
+        matched_session_keys: list[str] = []
+
+        for sid, handle in list(ACTIVE_EMBEDDED_RUNS.items()):
+            if chat_id_str in (handle.session_key or ""):
+                matched_session_ids.append(sid)
+                if handle.session_key:
+                    matched_session_keys.append(handle.session_key)
+
+        aborted = len(matched_session_ids) > 0
+        for sid in matched_session_ids:
+            abort_embedded_pi_run(sid)
+
+        # Also drain any queued followups for this session
+        if matched_session_keys:
+            clear_session_queues(matched_session_keys)
+
+        if aborted:
             await update.message.reply_text(
                 t_user("commands.stop.success", user_id),
-                parse_mode="Markdown"
+                parse_mode="Markdown",
             )
         else:
             await update.message.reply_text(
-                "ℹ️ Stop command not supported by current runtime.",
-                parse_mode="Markdown"
+                "ℹ️ No active run to stop.",
+                parse_mode="Markdown",
             )
-    
+
     except Exception as exc:
         logger.error("Failed to stop run: %s", exc, exc_info=True)
         await update.message.reply_text(
             f"⚠️ Failed to stop run: {exc}",
-            parse_mode="Markdown"
+            parse_mode="Markdown",
         )
 
 

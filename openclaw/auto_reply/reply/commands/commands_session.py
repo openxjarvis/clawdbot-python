@@ -64,46 +64,29 @@ async def _handle_reset(
     cfg: dict[str, Any],
     session_key: str,
 ) -> ReplyPayload:
-    """Reset the session — clears history and starts fresh."""
+    """Reset the session via SessionsResetMethod, then return BARE_SESSION_RESET_PROMPT.
+
+    Mirrors TS behaviour: sessions.reset is called, then BARE_SESSION_RESET_PROMPT is used
+    as the agent body so the agent greets the user fresh in its configured persona.
+    If args is non-empty (e.g. /new hello), that is used as the message body instead.
+    """
     if not session_key:
         return ReplyPayload(text="No active session to reset.")
 
     try:
-        # Try pi_mono session manager first
-        from openclaw.agents.session_manager import get_session_manager
-        sm = get_session_manager()
-        if sm and hasattr(sm, "reset_session"):
-            await sm.reset_session(session_key)
-            logger.info(f"Session reset via session_manager: {session_key}")
-        else:
-            _reset_session_store(session_key, cfg)
+        from openclaw.gateway.api.sessions_methods import SessionsResetMethod
+        reset_method = SessionsResetMethod()
+        await reset_method.execute(
+            connection=None,
+            params={"key": session_key, "archiveTranscript": True},
+        )
+        logger.info("Session reset via SessionsResetMethod: %s", session_key)
     except Exception as exc:
-        logger.warning(f"Session reset error: {exc}")
-        try:
-            _reset_session_store(session_key, cfg)
-        except Exception:
-            pass
+        logger.warning("Session reset error: %s", exc)
 
-    msg = "Session reset. Starting fresh."
-    if args:
-        msg += f"\n\n{args}"
-    return ReplyPayload(text=msg)
-
-
-def _reset_session_store(session_key: str, cfg: dict[str, Any]) -> None:
-    """Clear the session store entry."""
-    try:
-        from openclaw.config.sessions import load_session_store, resolve_store_path, save_session_store
-        store_path = resolve_store_path(cfg.get("session", {}).get("store"), {})
-        store = load_session_store(store_path)
-        key = session_key.lower()
-        if key in store:
-            del store[key]
-        elif session_key in store:
-            del store[session_key]
-        save_session_store(store_path, store)
-    except Exception as exc:
-        logger.warning(f"_reset_session_store: {exc}")
+    from openclaw.gateway.handlers import BARE_SESSION_RESET_PROMPT
+    body = args.strip() if args and args.strip() else BARE_SESSION_RESET_PROMPT
+    return ReplyPayload(text=body)
 
 
 # ---------------------------------------------------------------------------

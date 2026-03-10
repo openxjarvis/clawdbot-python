@@ -201,7 +201,10 @@ class FeishuChannel(ChannelPlugin):
         Reads local files directly; downloads remote URLs via aiohttp.
         reply_to is accepted for API parity.
         """
+        logger.info(f"[feishu] send_media called: target={target}, media_url={media_url[:100]}, media_type={media_type}")
+        
         if not self._default_outbound:
+            logger.error("[feishu] send_media failed: no default outbound adapter")
             raise RuntimeError("FeishuChannel not started or no valid account")
 
         import os
@@ -211,12 +214,16 @@ class FeishuChannel(ChannelPlugin):
         _MAX_BYTES = 30 * 1024 * 1024
 
         is_local = not media_url.startswith(("http://", "https://", "file://"))
+        logger.info(f"[feishu] send_media: is_local={is_local}")
 
         if is_local:
             file_path = Path(media_url).expanduser()
+            logger.info(f"[feishu] send_media: resolved local path={file_path}")
             if not file_path.exists() or not file_path.is_file():
+                logger.error(f"[feishu] send_media failed: file not found at {file_path}")
                 raise RuntimeError(f"Local file not found: {media_url}")
             file_size = file_path.stat().st_size
+            logger.info(f"[feishu] send_media: file_size={file_size} bytes")
             if file_size > _MAX_BYTES:
                 size_mb = file_size / (1024 * 1024)
                 raise ValueError(
@@ -225,18 +232,27 @@ class FeishuChannel(ChannelPlugin):
             loop = asyncio.get_running_loop()
             data = await loop.run_in_executor(None, file_path.read_bytes)
             filename = file_path.name
+            logger.info(f"[feishu] send_media: read {len(data)} bytes, filename={filename}")
         else:
             import aiohttp
-            async with aiohttp.ClientSession() as http_session:
+            logger.info(f"[feishu] send_media: downloading remote URL")
+            # Set User-Agent to avoid HTTP 403 from some CDNs/sites (e.g., Wikimedia)
+            headers = {
+                "User-Agent": "Mozilla/5.0 (compatible; OpenClaw-Python/1.0; +https://github.com/openxjarvis/openclaw-python)"
+            }
+            async with aiohttp.ClientSession(headers=headers) as http_session:
                 async with http_session.get(media_url) as resp:
                     if resp.status != 200:
+                        logger.error(f"[feishu] send_media download failed: HTTP {resp.status}")
                         raise RuntimeError(
                             f"Failed to download media from {media_url}: HTTP {resp.status}"
                         )
                     data = await resp.read()
             filename = Path(media_url.split("?")[0]).name or "attachment"
+            logger.info(f"[feishu] send_media: downloaded {len(data)} bytes, filename={filename}")
 
-        return await self._default_outbound.send_media(
+        logger.info(f"[feishu] send_media: calling outbound.send_media(target={target}, filename={filename}, media_type={media_type})")
+        result = await self._default_outbound.send_media(
             target,
             data,
             filename,
@@ -244,6 +260,8 @@ class FeishuChannel(ChannelPlugin):
             caption=caption,
             reply_to=reply_to,
         )
+        logger.info(f"[feishu] send_media completed: message_id={result}")
+        return result
 
     # ------------------------------------------------------------------
     # Typing indicator — "Typing" emoji reaction (no native typing API)

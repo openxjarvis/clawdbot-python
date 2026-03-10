@@ -1029,11 +1029,13 @@ class GatewayBootstrap:
         results["steps_completed"] += 1
 
         # Step 25: Run BOOT.md runner (m10)
-        logger.info("Step 25: Running BOOT.md runner")
+        # NOTE: This early attempt may fail if runtime is not ready yet - that's OK,
+        # the boot-md hook will retry on gateway:startup event (after channels are started)
+        logger.info("Step 25: Running BOOT.md runner (early attempt)")
         try:
             await self._run_boot_once(workspace_dir)
         except Exception as e:
-            logger.warning(f"BOOT.md runner failed: {e}")
+            logger.debug(f"BOOT.md early attempt failed (will retry on gateway:startup): {e}")
         results["steps_completed"] += 1
 
         # Step 26: Write workspace-state.json (onboarding tracking)

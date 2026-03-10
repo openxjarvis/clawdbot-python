@@ -566,6 +566,54 @@ async def _handle_elevated(
     if mode not in valid:
         return ReplyPayload(text="Usage: /elevated on|off|ask|full")
 
+    # ── Gate 1: tools.elevated.enabled ────────────────────────────────────────
+    # Mirrors TS resolveElevatedPermissions() globalEnabled check.
+    tools_cfg = cfg.get("tools") or {}
+    elevated_cfg = tools_cfg.get("elevated") or {}
+    if not elevated_cfg.get("enabled", False):
+        return ReplyPayload(
+            text="Elevated mode is not enabled. Set tools.elevated.enabled=true in openclaw.json."
+        )
+
+    # ── Gate 2: tools.elevated.allowFrom ──────────────────────────────────────
+    # Mirrors TS isApprovedElevatedSender() check in reply-elevated.ts.
+    allow_from: list = elevated_cfg.get("allowFrom") or []
+    if allow_from:
+        # Determine current provider + sender from context
+        provider_id: str = ""
+        sender_id: str = ""
+        if ctx is not None:
+            # originating_channel is e.g. "telegram", "feishu"
+            provider_id = str(getattr(ctx, "originating_channel", "") or "").lower()
+            # chat_target is the sender/chat ID
+            sender_id = str(getattr(ctx, "originating_to", "") or getattr(ctx, "chat_target", "") or "")
+
+        sender_allowed = False
+        for entry in allow_from:
+            if isinstance(entry, dict):
+                entry_provider = str(entry.get("provider", "")).lower()
+                entry_senders = entry.get("senders") or []
+            else:
+                entry_provider = str(getattr(entry, "provider", "")).lower()
+                entry_senders = list(getattr(entry, "senders", []))
+
+            # wildcard provider or matching provider
+            if entry_provider and entry_provider != "*" and entry_provider != provider_id:
+                continue
+            # wildcard sender or matching sender ID
+            if "*" in entry_senders:
+                sender_allowed = True
+                break
+            if sender_id and sender_id in [str(s) for s in entry_senders]:
+                sender_allowed = True
+                break
+
+        if not sender_allowed:
+            return ReplyPayload(
+                text="You are not authorised to use elevated mode on this bot. "
+                     "Ask the admin to add you to tools.elevated.allowFrom."
+            )
+
     normalized = "ask" if mode == "on" else mode
     try:
         from openclaw.agents.sessions import patch_session_entry

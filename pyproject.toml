@@ -39,6 +39,8 @@ dependencies = [
     "pydantic-settings>=2.1.0",
     "typer[all]>=0.9.0",
     "rich>=13.7.0",
+    "questionary>=2.0.0",  # Interactive CLI prompts
+    "nest-asyncio>=1.6.0",  # Allow nested event loops for questionary
     # LLM (Updated: google-genai for new API)
     "anthropic>=0.18.0",
     "openai>=1.12.0",

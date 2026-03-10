@@ -132,52 +132,85 @@ async def load_web_media(
     # Download from URL
     try:
         timeout = aiohttp.ClientTimeout(total=30, connect=10)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(url_or_path, allow_redirects=True, max_redirects=5) as response:
-                response.raise_for_status()
+        
+        # Retry logic for transient failures
+        max_retries = 3
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(url_or_path, allow_redirects=True, max_redirects=5) as response:
+                        response.raise_for_status()
 
-                # Check content length if provided
-                content_length = response.headers.get("Content-Length")
-                if content_length:
-                    if int(content_length) > max_size:
-                        raise ValueError(
-                            f"Content length {content_length} exceeds max_bytes {max_size}"
+                        # Check content length if provided
+                        content_length = response.headers.get("Content-Length")
+                        if content_length:
+                            if int(content_length) > max_size:
+                                raise ValueError(
+                                    f"Content length {content_length} exceeds max_bytes {max_size}"
+                                )
+
+                        # Read response in chunks to enforce bounds during transfer.
+                        chunks: list[bytes] = []
+                        current = 0
+                        async for chunk in response.content.iter_chunked(64 * 1024):
+                            current += len(chunk)
+                            if current > max_size:
+                                raise ValueError(
+                                    f"Downloaded {current} bytes, exceeds max_bytes {max_size}"
+                                )
+                            chunks.append(chunk)
+                        buffer = b"".join(chunks)
+
+                        # Check actual size
+                        if len(buffer) > max_size:
+                            raise ValueError(
+                                f"Downloaded {len(buffer)} bytes, exceeds max_bytes {max_size}"
+                            )
+
+                        content_type = response.headers.get("Content-Type")
+                        if content_type:
+                            # Strip charset / boundary parameters
+                            content_type = content_type.split(";")[0].strip()
+
+                        # Extract filename from URL
+                        file_name = Path(unquote(parsed.path)).name
+                        if not file_name or "." not in file_name:
+                            file_name = None
+
+                        return LoadedMedia(
+                            buffer=buffer,
+                            content_type=content_type,
+                            file_name=file_name,
+                            kind=media_kind_from_mime(content_type),
                         )
-
-                # Read response in chunks to enforce bounds during transfer.
-                chunks: list[bytes] = []
-                current = 0
-                async for chunk in response.content.iter_chunked(64 * 1024):
-                    current += len(chunk)
-                    if current > max_size:
-                        raise ValueError(
-                            f"Downloaded {current} bytes, exceeds max_bytes {max_size}"
-                        )
-                    chunks.append(chunk)
-                buffer = b"".join(chunks)
-
-                # Check actual size
-                if len(buffer) > max_size:
-                    raise ValueError(
-                        f"Downloaded {len(buffer)} bytes, exceeds max_bytes {max_size}"
+            
+            except aiohttp.ClientResponseError as e:
+                last_error = e
+                # Don't retry on 404 or other client errors
+                if e.status in (404, 403, 401):
+                    logger.warning(f"Image URL not accessible (HTTP {e.status}): {url_or_path}")
+                    raise IOError(
+                        f"Failed to download media from {url_or_path}: HTTP {e.status} - {e.message}. "
+                        "The URL may be expired or invalid. Try using a different image URL."
                     )
-
-                content_type = response.headers.get("Content-Type")
-                if content_type:
-                    # Strip charset / boundary parameters
-                    content_type = content_type.split(";")[0].strip()
-
-                # Extract filename from URL
-                file_name = Path(unquote(parsed.path)).name
-                if not file_name or "." not in file_name:
-                    file_name = None
-
-                return LoadedMedia(
-                    buffer=buffer,
-                    content_type=content_type,
-                    file_name=file_name,
-                    kind=media_kind_from_mime(content_type),
-                )
+                
+                # Retry on server errors (500+) or temporary issues
+                if attempt < max_retries - 1 and e.status >= 500:
+                    logger.warning(f"Retrying image download (attempt {attempt + 1}/{max_retries}): {e}")
+                    continue
+                raise
+            
+            except (aiohttp.ClientConnectionError, aiohttp.ServerTimeoutError) as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    logger.warning(f"Retrying image download (attempt {attempt + 1}/{max_retries}): {e}")
+                    continue
+                raise
+        
+        # All retries failed
+        raise IOError(f"Failed to download media from {url_or_path} after {max_retries} attempts: {last_error}")
 
     except aiohttp.ClientError as e:
         raise IOError(f"Failed to download media from {url_or_path}: {e}")

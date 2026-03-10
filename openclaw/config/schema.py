@@ -137,10 +137,38 @@ class LoopDetectionConfig(BaseModel):
     threshold: int = Field(default=5)
 
 
+class MessageCrossContextMarkerConfig(BaseModel):
+    """Cross-context marker config (aligned with TS tools.message.crossContext.marker)"""
+    enabled: bool | None = Field(default=None)
+    prefix: str | None = Field(default=None)
+    suffix: str | None = Field(default=None)
+
+    model_config = {"populate_by_name": True}
+
+
 class MessageCrossContextConfig(BaseModel):
-    """Cross-context message send permissions (aligned with TS)"""
-    allow_within_provider: bool = Field(default=True, alias="allowWithinProvider")
-    allow_across_providers: bool = Field(default=False, alias="allowAcrossProviders")
+    """Cross-context send permissions (aligned with TS tools.message.crossContext)"""
+    # default=None so we can distinguish "not set" (→ TS-equivalent true/false defaults)
+    allow_within_provider: bool | None = Field(default=None, alias="allowWithinProvider")
+    allow_across_providers: bool | None = Field(default=None, alias="allowAcrossProviders")
+    marker: MessageCrossContextMarkerConfig | None = Field(default=None)
+
+    model_config = {"populate_by_name": True}
+
+
+class MessageBroadcastConfig(BaseModel):
+    """Broadcast action config (aligned with TS tools.message.broadcast)"""
+    enabled: bool | None = Field(default=None)
+
+    model_config = {"populate_by_name": True}
+
+
+class MessageToolConfig(BaseModel):
+    """Message tool configuration (aligned with TS tools.message)"""
+    # @deprecated — kept for backward compat; use crossContext instead
+    allow_cross_context_send: bool | None = Field(default=None, alias="allowCrossContextSend")
+    cross_context: MessageCrossContextConfig | None = Field(default=None, alias="crossContext")
+    broadcast: MessageBroadcastConfig | None = Field(default=None)
 
     model_config = {"populate_by_name": True}
 
@@ -181,7 +209,7 @@ class ToolsConfig(BaseModel):
     sandbox: SandboxToolsConfig | None = Field(default=None)
     loop_detection: LoopDetectionConfig | None = Field(default=None, alias="loopDetection")
     sessions: SessionsToolsConfig | None = Field(default=None)
-    message: MessageCrossContextConfig | None = Field(default=None)
+    message: MessageToolConfig | None = Field(default=None)
     agentToAgent: AgentToAgentConfig | None = Field(default=None)
 
     model_config = {"populate_by_name": True}
@@ -242,6 +270,14 @@ class AgentDefaults(BaseModel):
     maxHistoryShare: float = Field(default=0.5, ge=0.1, le=0.9)
     maxConcurrent: int | None = Field(default=None)
     subagents: "SubagentsConfig | None" = Field(default=None)
+    # Memory configuration - mirrors TS agents.defaults
+    memorySearch: "MemorySearchConfig | None" = Field(default=None)
+    memoryFlush: "MemoryFlushConfig | None" = Field(default=None)
+    # Block streaming configuration - mirrors TS agents.defaults
+    blockStreamingDefault: Literal["on", "off"] | None = Field(default=None)
+    blockStreamingBreak: Literal["text_end", "message_end"] | None = Field(default=None)
+    blockStreamingChunk: dict[str, Any] | None = Field(default=None)
+    blockStreamingCoalesce: dict[str, Any] | None = Field(default=None)
 
 
 class IdentityConfig(BaseModel):
@@ -494,12 +530,18 @@ class TelegramChannelConfig(BaseModel):
     groupPolicy: str | None = Field(default=None, alias="group_policy")
     replyToMode: str | None = Field(default=None, alias="reply_to_mode")
     
-    # Streaming and chunking
-    streamMode: str | None = Field(default=None, alias="stream_mode")
+    # Streaming and chunking - mirrors TS streaming: "off" | "partial" | "block" | "progress"
+    streaming: Literal["off", "partial", "block", "progress"] | None = Field(default=None)
+    streamMode: Literal["off", "partial", "block", "progress"] | None = Field(
+        default=None, 
+        alias="stream_mode",
+        description="Legacy alias for 'streaming' field"
+    )
     draftChunk: TelegramDraftChunkConfig | None = Field(default=None, alias="draft_chunk")
     textChunkLimit: int | None = Field(default=None, alias="text_chunk_limit")
     chunkMode: str | None = Field(default=None, alias="chunk_mode")
     blockStreaming: bool | None = Field(default=None, alias="block_streaming")
+    blockStreamingCoalesce: dict[str, Any] | None = Field(default=None, alias="block_streaming_coalesce")
     
     # Reactions
     reactionNotifications: str | None = Field(default=None, alias="reaction_notifications")
@@ -587,11 +629,15 @@ class ChannelsConfig(BaseModel):
 
 
 class SkillsConfig(BaseModel):
-    """Skills configuration"""
+    """Skills configuration (aligned with TS skills block)"""
 
     allowBundled: list[str] | None = Field(default=None)
     enable: list[str] | None = Field(default=None)
     disable: list[str] | None = Field(default=None)
+    entries: dict[str, Any] | None = Field(default=None)  # skills.entries.<skillKey>.apiKey, etc.
+    install: dict[str, Any] | None = Field(default=None)  # nodeManager, etc.
+
+    model_config = ConfigDict(extra="allow")
 
 
 class PluginEntryConfig(BaseModel):
@@ -655,10 +701,133 @@ class ModelsConfig(BaseModel):
     providers: dict[str, Any] | None = Field(default=None)
 
 
+class MemorySearchSyncSessionsConfig(BaseModel):
+    """Memory search sync sessions configuration - mirrors TS memorySearch.sync.sessions"""
+    deltaBytes: int = Field(default=100_000)
+    deltaMessages: int = Field(default=50)
+
+
+class MemorySearchSyncConfig(BaseModel):
+    """Memory search sync configuration - mirrors TS memorySearch.sync"""
+    onSessionStart: bool = Field(default=True)
+    onSearch: bool = Field(default=True)
+    watch: bool = Field(default=True)
+    watchDebounceMs: int = Field(default=1500)
+    intervalMinutes: int = Field(default=0)
+    sessions: MemorySearchSyncSessionsConfig = Field(default_factory=MemorySearchSyncSessionsConfig)
+
+
+class MemorySearchQueryHybridMMRConfig(BaseModel):
+    """Memory search query hybrid MMR configuration - mirrors TS memorySearch.query.hybrid.mmr"""
+    enabled: bool = Field(default=False)
+    lambda_: float = Field(default=0.7, alias="lambda")
+    
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class MemorySearchQueryHybridTemporalDecayConfig(BaseModel):
+    """Memory search query hybrid temporal decay configuration - mirrors TS memorySearch.query.hybrid.temporalDecay"""
+    enabled: bool = Field(default=False)
+    halfLifeDays: int = Field(default=30)
+
+
+class MemorySearchQueryHybridConfig(BaseModel):
+    """Memory search query hybrid configuration - mirrors TS memorySearch.query.hybrid"""
+    enabled: bool = Field(default=True)
+    vectorWeight: float = Field(default=0.7)
+    textWeight: float = Field(default=0.3)
+    candidateMultiplier: int = Field(default=4)
+    mmr: MemorySearchQueryHybridMMRConfig = Field(default_factory=MemorySearchQueryHybridMMRConfig)
+    temporalDecay: MemorySearchQueryHybridTemporalDecayConfig = Field(default_factory=MemorySearchQueryHybridTemporalDecayConfig)
+
+
+class MemorySearchQueryConfig(BaseModel):
+    """Memory search query configuration - mirrors TS memorySearch.query"""
+    maxResults: int = Field(default=6)
+    minScore: float = Field(default=0.35)
+    hybrid: MemorySearchQueryHybridConfig = Field(default_factory=MemorySearchQueryHybridConfig)
+
+
+class MemorySearchStoreVectorConfig(BaseModel):
+    """Memory search store vector configuration - mirrors TS memorySearch.store.vector"""
+    enabled: bool = Field(default=True)
+    extensionPath: str | None = Field(default=None)
+
+
+class MemorySearchStoreConfig(BaseModel):
+    """Memory search store configuration - mirrors TS memorySearch.store"""
+    driver: Literal["sqlite"] = Field(default="sqlite")
+    path: str | None = Field(default=None)
+    vector: MemorySearchStoreVectorConfig = Field(default_factory=MemorySearchStoreVectorConfig)
+
+
+class MemorySearchChunkingConfig(BaseModel):
+    """Memory search chunking configuration - mirrors TS memorySearch.chunking"""
+    tokens: int = Field(default=400)
+    overlap: int = Field(default=80)
+
+
+class MemorySearchCacheConfig(BaseModel):
+    """Memory search cache configuration - mirrors TS memorySearch.cache"""
+    enabled: bool = Field(default=True)
+    maxEntries: int | None = Field(default=None)
+
+
+class MemorySearchRemoteBatchConfig(BaseModel):
+    """Memory search remote batch configuration - mirrors TS memorySearch.remote.batch"""
+    enabled: bool = Field(default=False)
+    wait: bool = Field(default=True)
+    concurrency: int = Field(default=2)
+    pollIntervalMs: int = Field(default=2000)
+    timeoutMinutes: int = Field(default=60)
+
+
+class MemorySearchRemoteConfig(BaseModel):
+    """Memory search remote configuration - mirrors TS memorySearch.remote"""
+    baseUrl: str | None = Field(default=None)
+    apiKey: str | None = Field(default=None)
+    headers: dict[str, str] | None = Field(default=None)
+    batch: MemorySearchRemoteBatchConfig | None = Field(default=None)
+
+
+class MemorySearchExperimentalConfig(BaseModel):
+    """Memory search experimental configuration - mirrors TS memorySearch.experimental"""
+    sessionMemory: bool = Field(default=False)
+
+
+class MemorySearchConfig(BaseModel):
+    """Memory search configuration - mirrors TS memorySearch (src/agents/memory-search.ts)"""
+    enabled: bool = Field(default=True)
+    sources: list[Literal["memory", "sessions"]] = Field(default=["memory"])
+    extraPaths: list[str] = Field(default_factory=list)
+    provider: Literal["openai", "local", "gemini", "voyage", "mistral", "ollama", "auto"] = Field(default="auto")
+    remote: MemorySearchRemoteConfig | None = Field(default=None)
+    experimental: MemorySearchExperimentalConfig = Field(default_factory=MemorySearchExperimentalConfig)
+    fallback: Literal["openai", "gemini", "local", "voyage", "mistral", "ollama", "none"] = Field(default="none")
+    model: str = Field(default="")
+    local: dict[str, Any] | None = Field(default=None)
+    store: MemorySearchStoreConfig = Field(default_factory=MemorySearchStoreConfig)
+    sync: MemorySearchSyncConfig = Field(default_factory=MemorySearchSyncConfig)
+    query: MemorySearchQueryConfig = Field(default_factory=MemorySearchQueryConfig)
+    chunking: MemorySearchChunkingConfig = Field(default_factory=MemorySearchChunkingConfig)
+    cache: MemorySearchCacheConfig = Field(default_factory=MemorySearchCacheConfig)
+
+
+class MemoryFlushConfig(BaseModel):
+    """Memory flush configuration - mirrors TS memoryFlush (src/auto-reply/reply/memory-flush.ts)"""
+    enabled: bool = Field(default=True)
+    softThresholdTokens: int = Field(default=4000)
+    forceFlushTranscriptBytes: int | None = Field(default=2 * 1024 * 1024)  # 2MB
+    prompt: str | None = Field(default=None)
+    systemPrompt: str | None = Field(default=None)
+
+
 class MemoryConfig(BaseModel):
     """Memory configuration"""
     enabled: bool = Field(default=True)
     provider: str = Field(default="simple")
+    # Legacy fields for backward compatibility
+    # Full configuration should use agents.defaults.memorySearch and agents.defaults.memoryFlush
 
 
 class CronConfig(BaseModel):
@@ -741,7 +910,7 @@ class SessionConfig(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="allow")
 
     dmScope: Literal["main", "per-peer", "per-channel-peer", "per-account-channel-peer"] = Field(
-        default="main"
+        default="per-channel-peer"
     )
     identityLinks: dict[str, list[str]] | None = Field(default=None)
     maintenance: SessionMaintenanceConfig = Field(default_factory=SessionMaintenanceConfig)

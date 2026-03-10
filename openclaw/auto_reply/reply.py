@@ -70,10 +70,22 @@ async def get_reply(
     verbose_result = extract_verbose_directive(think_result.cleaned)
     elevated_result = extract_elevated_directive(verbose_result.cleaned)
     reasoning_result = extract_reasoning_directive(elevated_result.cleaned)
-    
+
+    # Persist inline /elevated directive to session (mirrors TS directive-handling.persist.ts)
+    # The slash-command handler (_handle_elevated) enforces allowFrom; we intentionally skip
+    # the gate here so that inline directives embedded in multi-turn system prompts still work.
+    # If a stricter gate is needed per-turn, wire ctx through get_reply.
+    if elevated_result.has_directive and elevated_result.elevated_level:
+        try:
+            from openclaw.agents.sessions import patch_session_entry as _patch_elevated
+            _normalized = "ask" if elevated_result.elevated_level == "on" else elevated_result.elevated_level
+            _patch_elevated(session_key, {"elevatedLevel": _normalized}, cfg)
+        except Exception:
+            pass
+
     # Use cleaned message without directives
     cleaned_message = reasoning_result.cleaned
-    
+
     # Apply directive overrides
     think_level = think_result.think_level
     verbose = verbose_result.verbose_level == "on" if verbose_result.verbose_level else None

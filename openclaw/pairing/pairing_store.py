@@ -366,7 +366,7 @@ def approve_channel_pairing_code(
     idx = next(
         (
             i for i, r in enumerate(reqs)
-            if r.code.strip().upper() == code_norm
+            if normalize_pairing_code(r.code) == code_norm
             and _request_matches_account(r, normalized_account_id)
         ),
         -1,

@@ -122,11 +122,40 @@ class ReplyDispatcher:
         """Enqueue a tool-result message.  Mirrors TS ``sendToolResult``."""
         await self._enqueue(QueuedMessage(kind="tool_result", content=result, tool_call_id=tool_call_id))
 
-    async def send_block_reply(self, text: str, metadata: dict[str, Any] | None = None) -> None:
-        """Accumulate a streaming block.  Flushes at 500-char threshold."""
-        self._current_text += text
-        if metadata:
-            self._current_meta.update(metadata)
+    async def send_block_reply(self, payload: "ReplyPayload | str", metadata: dict[str, Any] | None = None) -> None:
+        """Send a streaming block reply.
+        
+        Mirrors TS sendBlockReply. Accepts either:
+        - ReplyPayload object (full support for media, reply_to, etc.)
+        - str (legacy text-only, for backward compatibility)
+        
+        Accumulates text and flushes at 500-char threshold.
+        """
+        # Import here to avoid circular dependency
+        from openclaw.auto_reply.reply.get_reply import ReplyPayload
+        
+        if isinstance(payload, str):
+            # Legacy text-only mode
+            self._current_text += payload
+            if metadata:
+                self._current_meta.update(metadata)
+        elif isinstance(payload, ReplyPayload):
+            # Full ReplyPayload mode
+            if payload.text:
+                self._current_text += payload.text
+            if payload.media_url:
+                self._current_meta.setdefault("media_urls", []).append(payload.media_url)
+            if payload.media_urls:
+                self._current_meta.setdefault("media_urls", []).extend(payload.media_urls)
+            if payload.audio_as_voice is not None:
+                self._current_meta["audio_as_voice"] = payload.audio_as_voice
+            if payload.silent is not None:
+                self._current_meta["silent"] = payload.silent
+            if payload.reply_to_id:
+                self._current_meta["reply_to_id"] = payload.reply_to_id
+            if metadata:
+                self._current_meta.update(metadata)
+        
         if len(self._current_text) >= 500:
             await self._flush(is_final=False)
 

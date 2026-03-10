@@ -557,10 +557,10 @@ async def get_reply_from_config(
             logger.debug(f"Failed to trigger command hook: {err}")
         
         await _handle_session_reset(session_key, cfg)
-        if not post_reset_body:
-            return ReplyPayload(text="Session reset. How can I help you?")
-        # Continue with the post-reset message
-        body = post_reset_body
+        # Mirrors TS get-reply-run.ts: bare /new or /reset becomes BARE_SESSION_RESET_PROMPT
+        # so the agent greets the user in its configured persona.
+        from openclaw.gateway.handlers import BARE_SESSION_RESET_PROMPT
+        body = post_reset_body if post_reset_body else BARE_SESSION_RESET_PROMPT
 
     # ------------------------------------------------------------------
     # 3. Parse inline directives
@@ -703,22 +703,18 @@ async def get_reply_from_config(
 
 
 async def _handle_session_reset(session_key: str, cfg: dict[str, Any]) -> None:
-    """Clear the session store entry for session_key."""
+    """Reset session via SessionsResetMethod — mirrors TS sessions.reset."""
     if not session_key:
         return
     try:
-        from openclaw.agents.session_manager import get_session_manager
-        sm = get_session_manager()
-        if sm and hasattr(sm, "reset_session"):
-            await sm.reset_session(session_key)
-            return
-    except Exception:
-        pass
-    try:
-        from openclaw.agents.sessions import reset_session_by_key
-        reset_session_by_key(session_key)
-    except Exception:
-        pass
+        from openclaw.gateway.api.sessions_methods import SessionsResetMethod
+        reset_method = SessionsResetMethod()
+        await reset_method.execute(
+            connection=None,
+            params={"key": session_key, "archiveTranscript": True},
+        )
+    except Exception as exc:
+        logger.warning("_handle_session_reset failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -744,8 +740,8 @@ async def get_reply(
     config = config or {}
 
     async def _on_block(payload: ReplyPayload) -> None:
-        if payload.text:
-            await dispatcher.send_block_reply(payload.text)
+        # Send full ReplyPayload instead of just text
+        await dispatcher.send_block_reply(payload)
 
     async def _on_tool(payload: ReplyPayload) -> None:
         if payload.text:

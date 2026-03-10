@@ -22,6 +22,12 @@ from .base import AgentTool, ToolResult
 logger = logging.getLogger(__name__)
 
 
+# Actions that enforce cross-context policy (mirrors TS CONTEXT_GUARDED_ACTIONS)
+CONTEXT_GUARDED_ACTIONS = frozenset([
+    "send", "poll", "reply", "sendWithEffect", "sendAttachment",
+    "thread-create", "thread-reply", "sticker",
+])
+
 # Complete action list matching TS message-action-names.ts lines 1-52
 CHANNEL_MESSAGE_ACTION_NAMES = [
     "send",
@@ -290,6 +296,55 @@ class MessageTool(AgentTool):
             "required": ["action"],
         }
 
+    def _enforce_cross_context_policy(self, action: str, params: dict[str, Any]) -> None:
+        """
+        Enforce cross-context messaging policy.
+        Mirrors TS enforceCrossContextPolicy() in src/infra/outbound/outbound-policy.ts.
+
+        Raises RuntimeError if the action is denied by policy.
+        """
+        if not self.current_channel_id:
+            return
+        if action not in CONTEXT_GUARDED_ACTIONS:
+            return
+
+        tools_cfg = self.config.get("tools") if isinstance(self.config, dict) else {}
+        tools_cfg = tools_cfg or {}
+        message_cfg = tools_cfg.get("message") or {}
+
+        # @deprecated allowCrossContextSend: skip all checks if set
+        if message_cfg.get("allowCrossContextSend"):
+            return
+
+        cross_ctx = message_cfg.get("crossContext") or {}
+        # Default: allowWithinProvider=True, allowAcrossProviders=False (matches TS)
+        raw_within = cross_ctx.get("allowWithinProvider")
+        allow_within_provider = raw_within is not False
+        raw_across = cross_ctx.get("allowAcrossProviders")
+        allow_across_providers = raw_across is True
+
+        target_channel = params.get("channel") or self.current_channel_provider
+        if self.current_channel_provider and target_channel and target_channel != self.current_channel_provider:
+            if not allow_across_providers:
+                raise RuntimeError(
+                    f"Cross-context messaging denied: action={action} target provider "
+                    f'"{target_channel}" while bound to "{self.current_channel_provider}".'
+                )
+            return
+
+        if allow_within_provider:
+            return
+
+        target = params.get("target") or params.get("to") or params.get("channelId")
+        if not target:
+            return
+
+        if str(target).strip() != str(self.current_channel_id).strip():
+            raise RuntimeError(
+                f'Cross-context messaging denied: action={action} target="{target}" '
+                f'while bound to "{self.current_channel_id}".'
+            )
+
     async def execute(self, params: dict[str, Any]) -> ToolResult:
         """Execute message action. Matches TS message-tool.ts execute logic"""
         action = params.get("action", "")
@@ -298,6 +353,7 @@ class MessageTool(AgentTool):
             return ToolResult(success=False, content="", error="action required")
 
         try:
+            self._enforce_cross_context_policy(action, params)
             if action == "send":
                 return await self._handle_send(params)
             elif action == "broadcast":

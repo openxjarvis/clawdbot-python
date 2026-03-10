@@ -442,23 +442,21 @@ async def upload_task_attachment(
             raise FileNotFoundError(f"File not found: {file_path}")
 
         fname = filename or os.path.basename(file_path)
-        from lark_oapi.api.task.v2 import UploadAttachmentRequest, UploadAttachmentRequestBody
+        from lark_oapi.api.task.v2 import UploadAttachmentRequest, InputAttachment
 
         with open(file_path, "rb") as f:
-            file_data = f.read()
-
-        req = (
-            UploadAttachmentRequest.builder()
-            .request_body(
-                UploadAttachmentRequestBody.builder()
-                .resource_type("task")
-                .resource_id(task_guid)
-                .file(file_data)
+            req = (
+                UploadAttachmentRequest.builder()
+                .request_body(
+                    InputAttachment.builder()
+                    .resource_type("task")
+                    .resource_id(task_guid)
+                    .file(f)
+                    .build()
+                )
                 .build()
             )
-            .build()
-        )
-        resp = await loop.run_in_executor(None, lambda: client.task.v2.attachment.upload(req))
+            resp = await loop.run_in_executor(None, lambda: client.task.v2.attachment.upload(req))
         if not resp.success():
             raise RuntimeError(f"attachment.upload failed: {resp.msg}, code={resp.code}")
         items = [_format_attachment(a) for a in (getattr(resp.data, "items", None) or [])]

@@ -518,34 +518,47 @@ class SessionsResetMethod:
                 logger.info(f"Session not found for reset, creating new session: {key}")
                 reset_entry = SessionEntry(
                     sessionId=new_session_id,
-                    updatedAt=now_ms
+                    updatedAt=now_ms,
+                    systemSent=False,
+                    abortedLastRun=False,
+                    inputTokens=0,
+                    outputTokens=0,
+                    totalTokens=0,
+                    totalTokensFresh=True,
                 )
                 store[target.canonical_key] = reset_entry
                 return
             
-            # Preserve only the fields that survive a reset — mirrors TS sessions.reset.
-            # providerOverride, modelOverride, deliveryContext, displayName are intentionally
-            # cleared on reset (per-conversation state that should not carry over).
-            preserved = {
-                "thinking_level": entry.thinkingLevel,
-                "verbose_level": entry.verboseLevel,
-                "reasoning_level": entry.reasoningLevel,
-                "elevated_level": entry.elevatedLevel,
-                "label": entry.label,
-                "exec_security": entry.execSecurity,
-                "exec_ask": entry.execAsk,
-                "exec_node": entry.execNode,
-                "send_policy": entry.sendPolicy,
-                "group_activation": entry.groupActivation,
-                "response_usage": entry.responseUsage,
-                "origin": entry.origin,
-            }
-            
-            # Create new entry with reset fields
+            # Mirrors TS sessions.reset nextEntry construction exactly.
+            # Preserved: thinking/verbose/reasoning levels, responseUsage, sendPolicy,
+            #   label, origin, lastChannel, lastTo, model/modelProvider, contextTokens,
+            #   skillsSnapshot (re-evaluated on first turn).
+            # Cleared: elevatedLevel, execSecurity, execAsk, execNode, groupActivation,
+            #   modelOverride, providerOverride, ttsAuto, displayName, deliveryContext,
+            #   spawnedBy, groupId, groupChannel, compactionCount, memoryFlushAt,
+            #   inputTokens/outputTokens/totalTokens (reset to 0).
             reset_entry = SessionEntry(
                 sessionId=new_session_id,
                 updatedAt=now_ms,
-                **{k: v for k, v in preserved.items() if v is not None}
+                systemSent=False,
+                abortedLastRun=False,
+                thinkingLevel=entry.thinkingLevel,
+                verboseLevel=entry.verboseLevel,
+                reasoningLevel=entry.reasoningLevel,
+                responseUsage=entry.responseUsage,
+                sendPolicy=entry.sendPolicy,
+                label=entry.label,
+                origin=entry.origin,
+                lastChannel=entry.lastChannel,
+                lastTo=entry.lastTo,
+                model=entry.model,
+                modelProvider=entry.modelProvider,
+                contextTokens=entry.contextTokens,
+                skillsSnapshot=entry.skillsSnapshot,
+                inputTokens=0,
+                outputTokens=0,
+                totalTokens=0,
+                totalTokensFresh=True,
             )
             
             store[target.canonical_key] = reset_entry
@@ -558,6 +571,10 @@ class SessionsResetMethod:
             logger.warning(f"sessions.reset cleanup warning for {key}: {cleanup_error}")
 
         update_session_store(target.store_path, mutator)
+
+        # Mark session key as needing bootstrap re-read on next turn (mirrors TS clearBootstrapSnapshot)
+        from openclaw.agents.bootstrap_cache import mark_bootstrap_stale
+        mark_bootstrap_stale(target.canonical_key)
 
         # Invalidate cached Session object to force fresh load
         try:

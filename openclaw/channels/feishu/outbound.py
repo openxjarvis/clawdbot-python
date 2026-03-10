@@ -107,7 +107,9 @@ class FeishuOutboundAdapter:
         reply_in_thread: bool = False,
     ) -> str:
         """Send a media file. Returns message_id or empty string on failure."""
+        logger.info(f"[feishu outbound] send_media: target={target}, filename={filename}, media_type={media_type}, size={len(data)} bytes")
         receive_id, receive_id_type = resolve_receive_id_type(target)
+        logger.info(f"[feishu outbound] send_media: receive_id={receive_id}, receive_id_type={receive_id_type}")
 
         msg_id = await send_media_feishu(
             self._client,
@@ -120,8 +122,11 @@ class FeishuOutboundAdapter:
             reply_in_thread=reply_in_thread,
         )
 
+        logger.info(f"[feishu outbound] send_media: msg_id={msg_id}")
+
         # If caption was provided and media was sent successfully, also send the caption
         if caption and msg_id:
+            logger.info(f"[feishu outbound] send_media: sending caption")
             await self.send_text(target, caption)
 
         return msg_id or ""

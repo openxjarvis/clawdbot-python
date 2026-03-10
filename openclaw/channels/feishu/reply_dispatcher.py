@@ -155,10 +155,31 @@ class FeishuReplyDispatcher:
         When buttons are provided, the streaming card is finalized with the
         text first, then PATCH-ed again with a button card so users can
         interact with the response (e.g. confirm / choose).
+        
+        CRITICAL: This method also handles MEDIA tokens for Feishu streaming mode.
+        Must parse and extract MEDIA before finalizing the card.
         """
+        # Parse and extract MEDIA tokens (same logic as send())
+        from openclaw.auto_reply.media_parse import split_media_from_output
+        
+        logger.info(f"[feishu dispatcher] stream_finalize() called with text length: {len(final_text)}")
+        if "MEDIA:" in final_text.upper():
+            logger.info(f"[feishu dispatcher] Found MEDIA token in final_text, parsing...")
+        
+        media_result = split_media_from_output(final_text)
+        display_text = media_result.text if media_result.text is not None else final_text
+        media_urls = []
+        if media_result.media_url:
+            media_urls.append(media_result.media_url)
+        if media_result.media_urls:
+            media_urls.extend(media_result.media_urls)
+        
+        logger.info(f"[feishu dispatcher] Parsed: display_text={len(display_text)} chars, media_urls={len(media_urls)}")
+        
         msg_id: str | None = None
         if self._streaming_session:
-            msg_id = await self._streaming_session.finalize(final_text)
+            # Finalize with display text (MEDIA tokens stripped)
+            msg_id = await self._streaming_session.finalize(display_text)
             self._last_sent_id = msg_id
 
             # If buttons are requested, patch the now-finalized card with a
@@ -167,16 +188,48 @@ class FeishuReplyDispatcher:
                 try:
                     from .card_builder import build_button_card
                     from .send import patch_feishu_card
-                    button_card = build_button_card(final_text, buttons)
+                    button_card = build_button_card(display_text, buttons)
                     await patch_feishu_card(self._client, msg_id, button_card)
                 except Exception as _be:
                     logger.debug("[feishu] Failed to patch button card after finalize: %s", _be)
 
         await self.stop_typing()
+        
+        # Send media files if any were found
+        if media_urls:
+            logger.info(f"[feishu dispatcher] Sending {len(media_urls)} media files after finalize")
+            await self.send_media_urls(media_urls)
+        
         return msg_id
 
     def is_streaming_active(self) -> bool:
         return self._streaming_session is not None and self._streaming_session.is_active()
+
+    # ------------------------------------------------------------------
+    # Block reply (intermediate step message — no typing stop)
+    # ------------------------------------------------------------------
+
+    async def send_block(self, text: str) -> str | None:
+        """Send an intermediate block reply without stopping the typing indicator.
+
+        Used in thread-reply mode (where CardKit is disabled) to deliver each
+        agent reasoning step as a plain message while the typing indicator stays
+        active. Mirrors TS sendBlockReply — typing keeps running between blocks.
+        """
+        try:
+            result = await send_feishu_message(
+                self._client,
+                receive_id=self._receive_id,
+                receive_id_type=self._receive_id_type,
+                text=text,
+                render_mode=self._account.render_mode,
+                reply_to_message_id=self._reply_to_message_id,
+                reply_in_thread=self._reply_in_thread,
+            )
+            return result.message_id if result else None
+        except Exception as exc:
+            logger.debug("[feishu] send_block error (non-fatal): %s", exc)
+            return None
 
     # ------------------------------------------------------------------
     # Non-streaming single send
@@ -196,18 +249,41 @@ class FeishuReplyDispatcher:
 
         Stops typing indicator when done.
         Returns message_id or None.
+        
+        CRITICAL: This method handles MEDIA tokens for Feishu, since Feishu uses
+        a special dispatcher path that bypasses the standard _deliver_response().
+        Mirrors agent_runner.py's _deliver_response() logic for media parsing.
         """
         try:
+            # Parse and extract MEDIA tokens from text
+            # This is critical for Feishu because it uses a special send path
+            from openclaw.auto_reply.media_parse import split_media_from_output
+            
+            logger.info(f"[feishu dispatcher] send() called with text length: {len(text)}")
+            if "MEDIA:" in text.upper():
+                logger.info(f"[feishu dispatcher] Found MEDIA token in text, parsing...")
+            
+            media_result = split_media_from_output(text)
+            display_text = media_result.text if media_result.text is not None else text
+            media_urls = []
+            if media_result.media_url:
+                media_urls.append(media_result.media_url)
+            if media_result.media_urls:
+                media_urls.extend(media_result.media_urls)
+            
+            logger.info(f"[feishu dispatcher] Parsed: display_text={len(display_text)} chars, media_urls={len(media_urls)}")
+            
+            # Send text message (with MEDIA tokens stripped)
             card_override = None
             if buttons:
                 from .card_builder import build_button_card
-                card_override = build_button_card(text, buttons)
+                card_override = build_button_card(display_text, buttons)
 
             result = await send_feishu_message(
                 self._client,
                 receive_id=self._receive_id,
                 receive_id_type=self._receive_id_type,
-                text=text,
+                text=display_text,
                 render_mode=self._account.render_mode,
                 reply_to_message_id=self._reply_to_message_id,
                 reply_in_thread=self._reply_in_thread,
@@ -215,6 +291,12 @@ class FeishuReplyDispatcher:
             )
             msg_id = result.message_id if result else None
             self._last_sent_id = msg_id
+            
+            # Send media files if any were found
+            if media_urls:
+                logger.info(f"[feishu dispatcher] Sending {len(media_urls)} media files")
+                await self.send_media_urls(media_urls)
+            
             return msg_id
         finally:
             await self.stop_typing()
@@ -233,34 +315,139 @@ class FeishuReplyDispatcher:
         Download and send one or more media URLs as Feishu file/image messages.
 
         Called after text send to attach media to the reply.
+        Supports both HTTP URLs and local file paths.
         Mirrors TS sendMediaFeishu() calls inside deliver().
+        
+        IMPORTANT: Deduplicates URLs to prevent sending the same file multiple times.
         """
         import aiohttp
         from pathlib import Path
-
+        
+        logger.info(f"[feishu dispatcher] send_media_urls called with {len(media_urls)} URLs")
+        
+        # Deduplicate media_urls to prevent sending the same file multiple times
+        # This can happen when MEDIA tokens accumulate in session history
+        seen_urls = set()
+        unique_urls = []
         for url in media_urls:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-                        if resp.status != 200:
-                            logger.warning(
-                                "[feishu] Failed to download media from %s: HTTP %s",
-                                url, resp.status,
-                            )
-                            continue
-                        data = await resp.read()
+            if url not in seen_urls:
+                seen_urls.add(url)
+                unique_urls.append(url)
+        
+        if len(unique_urls) < len(media_urls):
+            logger.info(f"[feishu dispatcher] Deduped {len(media_urls)} URLs to {len(unique_urls)} unique URLs")
 
-                filename = Path(url.split("?")[0]).name or "attachment"
+        for url in unique_urls:
+            try:
+                # Resolve local paths - try multiple locations
+                # Priority: 1) session workspace, 2) common workspace, 3) absolute path
+                resolved_url = url
+                
+                if not url.startswith(("http://", "https://", "/")):
+                    # Relative path - try to resolve it
+                    candidates = []
+                    
+                    # Try session-specific workspace first
+                    if hasattr(self, '_session_workspace') and self._session_workspace:
+                        candidates.append(Path(self._session_workspace) / url.lstrip('./'))
+                    
+                    # Try common workspace (/Users/long/.openclaw/workspace)
+                    common_workspace = Path.home() / ".openclaw" / "workspace"
+                    candidates.append(common_workspace / url.lstrip('./'))
+                    
+                    # Find first existing file
+                    for candidate in candidates:
+                        if candidate.exists():
+                            resolved_url = str(candidate)
+                            logger.info(f"[feishu dispatcher] Resolved path: {url} -> {resolved_url}")
+                            break
+                    else:
+                        # No file found, use first candidate for error reporting
+                        resolved_url = str(candidates[0]) if candidates else url
+                        logger.warning(f"[feishu dispatcher] File not found in any location: {url}")
+                
+                is_local = not url.startswith(("http://", "https://"))
+                
+                if is_local:
+                    # Read local file
+                    file_path = Path(resolved_url).expanduser()
+                    logger.info(f"[feishu dispatcher] Reading local file: {file_path}")
+                    if not file_path.exists():
+                        logger.error(f"[feishu dispatcher] Local file not found: {file_path}")
+                        continue
+                    data = file_path.read_bytes()
+                    filename = file_path.name
+                else:
+                    # Download remote URL
+                    logger.info(f"[feishu dispatcher] Downloading remote URL: {resolved_url}")
+                    # Set User-Agent to avoid HTTP 403 from some CDNs/sites (e.g., Wikimedia)
+                    headers = {
+                        "User-Agent": "Mozilla/5.0 (compatible; OpenClaw-Python/1.0; +https://github.com/openxjarvis/openclaw-python)"
+                    }
+                    async with aiohttp.ClientSession(headers=headers) as session:
+                        async with session.get(resolved_url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                            if resp.status != 200:
+                                logger.warning(
+                                    "[feishu dispatcher] Failed to download media from %s: HTTP %s",
+                                    resolved_url, resp.status,
+                                )
+                                continue
+                            data = await resp.read()
+                            
+                            # Extract filename from URL or Content-Type
+                            from urllib.parse import urlparse
+                            url_path = urlparse(resolved_url).path
+                            filename = Path(url_path).name or "attachment"
+                            
+                            # If no extension, try to infer from Content-Type
+                            if '.' not in filename:
+                                content_type = resp.headers.get('Content-Type', '').split(';')[0].strip()
+                                ext_map = {
+                                    'image/jpeg': '.jpg',
+                                    'image/png': '.png',
+                                    'image/gif': '.gif',
+                                    'image/webp': '.webp',
+                                    'image/bmp': '.bmp',
+                                    'video/mp4': '.mp4',
+                                    'video/quicktime': '.mov',
+                                    'application/pdf': '.pdf',
+                                    'application/vnd.ms-powerpoint': '.ppt',
+                                    'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
+                                }
+                                ext = ext_map.get(content_type)
+                                if ext:
+                                    filename = f"{filename}{ext}"
+                                    logger.info(f"[feishu dispatcher] Inferred extension from Content-Type: {content_type} -> {ext}")
+
+                
+                logger.info(f"[feishu dispatcher] Got {len(data)} bytes, sending to Feishu as {filename}")
+                
+                # Determine media type from file extension for correct display
+                # This ensures images display inline, videos/docs as file cards
+                from pathlib import Path
+                ext = Path(filename).suffix.lower()
+                if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
+                    detected_media_type = "image"
+                elif ext in {".mp4", ".mov", ".avi", ".mkv", ".webm"}:
+                    detected_media_type = "video"
+                elif ext in {".opus", ".ogg", ".mp3", ".wav", ".m4a"}:
+                    detected_media_type = "audio"
+                else:
+                    detected_media_type = "file"
+                
+                logger.info(f"[feishu dispatcher] Detected media_type={detected_media_type} for {filename}")
+                
                 await self._outbound.send_media(
                     self._receive_id,
                     data,
                     filename,
-                    media_type=media_type,
+                    media_type=detected_media_type,
                     reply_to=self._reply_to_message_id,
                     reply_in_thread=self._reply_in_thread,
                 )
+                logger.info(f"[feishu dispatcher] Successfully sent media: {filename}")
             except Exception as exc:
-                logger.warning("[feishu] send_media_urls error for %s: %s", url, exc)
+                logger.warning("[feishu dispatcher] send_media_urls error for %s: %s", url, exc, exc_info=True)
 
     # ------------------------------------------------------------------
     # Properties
@@ -287,6 +474,7 @@ def create_feishu_reply_dispatcher(
     thread_reply: bool = False,
     root_id: str | None = None,
     header: StreamingCardHeader | None = None,
+    session_workspace: str | None = None,
 ) -> FeishuReplyDispatcher:
     """
     Factory that creates a FeishuReplyDispatcher with correct receive_id_type.
@@ -294,7 +482,7 @@ def create_feishu_reply_dispatcher(
     Mirrors TS createFeishuReplyDispatcher().
     """
     receive_id, receive_id_type = resolve_receive_id_type(chat_id)
-    return FeishuReplyDispatcher(
+    dispatcher = FeishuReplyDispatcher(
         client,
         account,
         receive_id=receive_id,
@@ -306,3 +494,6 @@ def create_feishu_reply_dispatcher(
         root_id=root_id,
         header=header,
     )
+    # Store session_workspace for media resolution
+    dispatcher._session_workspace = session_workspace
+    return dispatcher

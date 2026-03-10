@@ -110,6 +110,7 @@ async def run_agent_turn_with_fallback(
     status_reactions: Any | None = None,  # TelegramStatusReactions | None
     reasoning_stream_callback: Any | None = None,  # Callable[[str], None] | None — called with reasoning text on each delta
     reasoning_level: str = "off",  # "off" | "on" | "stream"
+    block_send_fn: Any | None = None,  # Callable[[str], Awaitable[None]] | None — sends each text block before a tool call as a visible message
 ) -> tuple[str, bool]:
     """Execute an agent turn with automatic retry on transient errors.
 
@@ -134,6 +135,11 @@ async def run_agent_turn_with_fallback(
         attempt += 1
         response_text = ""
         has_error = False
+        # Tracks how many chars of response_text have already been sent as block
+        # messages. Used so: (a) only the new segment is sent per block, (b) the
+        # stream_callback receives only the current segment's text (not full history),
+        # (c) the final return value excludes already-delivered blocks.
+        _block_sent_len: int = 0
 
         # Signal run start for typing indicator (mode=instant starts immediately)
         if typing_signaler:
@@ -193,13 +199,17 @@ async def run_agent_turn_with_fallback(
                                     pass
                             # Stream preview callbacks — split text into answer and
                             # reasoning lanes when reasoningLevel != "off".
+                            # When block streaming is active, pass only the current
+                            # segment's text (since last block send) to the draft
+                            # stream, so the preview shows only the new content.
                             # Mirrors TS onPartialReply → ingestDraftLaneSegments().
+                            _segment_text = response_text[_block_sent_len:] if _block_sent_len else response_text
                             if reasoning_level != "off" and (
                                 stream_callback is not None or reasoning_stream_callback is not None
                             ):
                                 try:
                                     from openclaw.channels.telegram.reasoning import split_telegram_reasoning_text
-                                    _r_text, _a_text = split_telegram_reasoning_text(response_text)
+                                    _r_text, _a_text = split_telegram_reasoning_text(_segment_text)
                                     if reasoning_stream_callback is not None and _r_text:
                                         _r_result = reasoning_stream_callback(_r_text)
                                         if asyncio.iscoroutine(_r_result):
@@ -212,7 +222,7 @@ async def run_agent_turn_with_fallback(
                                     pass
                             elif stream_callback is not None:
                                 try:
-                                    result = stream_callback(response_text)
+                                    result = stream_callback(_segment_text)
                                     # Support both sync and async callbacks
                                     if asyncio.iscoroutine(result):
                                         asyncio.create_task(result)
@@ -222,6 +232,20 @@ async def run_agent_turn_with_fallback(
                         EventType.AGENT_TOOL_USE, EventType.TOOL_EXECUTION_START,
                         "tool_use", "tool_call", "agent.tool_use", "tool_execution_start",
                     ):
+                        # Block reply dispatch — send any accumulated text before this
+                        # tool call as a separate visible message. Mirrors TS sendBlockReply
+                        # in dispatch-from-config.ts: each text block before a tool call
+                        # is delivered immediately so users see the agent's reasoning steps.
+                        if block_send_fn:
+                            _unsent = response_text[_block_sent_len:].strip()
+                            if _unsent:
+                                _block_sent_len = len(response_text)
+                                try:
+                                    _block_result = block_send_fn(_unsent)
+                                    if asyncio.iscoroutine(_block_result):
+                                        asyncio.create_task(_block_result)
+                                except Exception as _be:
+                                    logger.debug("block_send_fn error (non-fatal): %s", _be)
                         # Tool execution started — keep typing indicator alive
                         if typing_signaler:
                             try:
@@ -236,6 +260,21 @@ async def run_agent_turn_with_fallback(
                                 await status_reactions.set_tool(str(tool_name))
                             except Exception:
                                 pass
+                    elif evt_type in ("tool_result", "agent.tool_result", EventType.AGENT_TOOL_RESULT if hasattr(EventType, "AGENT_TOOL_RESULT") else "tool_result"):
+                        # Inject MEDIA: lines from tool results directly into response_text.
+                        # This is a reliable fallback: even if the LLM forgets to echo a
+                        # MEDIA: path in its text response, any MEDIA: token emitted by a
+                        # tool (e.g. pdf_generate, ppt_generate, image tools) will still
+                        # trigger file delivery via split_media_from_output.
+                        # Mirrors the guarantee TS imageResult() gives by embedding the
+                        # MEDIA: token as a TextContent block visible to the delivery layer.
+                        result_str = event_data.get("result", "") or ""
+                        if result_str and "MEDIA:" in result_str.upper():
+                            for _line in result_str.splitlines():
+                                _stripped = _line.strip()
+                                if _stripped.upper().startswith("MEDIA:"):
+                                    response_text += f"\n{_stripped}"
+                                    logger.info("Injected MEDIA token from tool_result: %s", _stripped[:100])
                     elif evt_type in (EventType.ERROR, "error", "agent.error"):
                         err_msg = event_data.get("message", str(event_data))
                         logger.error("run_agent_turn_with_fallback: agent error: %s", err_msg)
@@ -249,7 +288,57 @@ async def run_agent_turn_with_fallback(
                     logger.error("Event processing error: %s", evt_exc)
                     has_error = True
 
-            return response_text, has_error
+            # When block streaming was active, return only the undelivered remainder
+            # (text after the last block send). Blocks already sent as individual
+            # messages should not be re-sent by _deliver_response().
+            final_text = response_text[_block_sent_len:].strip() if _block_sent_len else response_text
+            
+            # CRITICAL FIX: Extract MEDIA: tokens from pi_coding_agent's final messages.
+            # The pi_runtime injects MEDIA tokens when it sees agent_end, but those
+            # events arrive AFTER this loop exits. Instead, we query the runtime
+            # for the final messages and scan for MEDIA: tokens directly.
+            try:
+                logger.info("[EXTRACT-DEBUG] Attempting MEDIA extraction: runtime=%s, has_pool=%s", 
+                           type(runtime).__name__, hasattr(runtime, "_pool"))
+                if hasattr(runtime, "_pool") and session_id in runtime._pool:
+                    pi_session = runtime._pool[session_id]
+                    logger.info("[EXTRACT-DEBUG] Found pi_session, has_agent=%s", hasattr(pi_session, "_agent"))
+                    if hasattr(pi_session, "_agent") and hasattr(pi_session._agent, "state"):
+                        messages = getattr(pi_session._agent.state, "messages", [])
+                        logger.info("[EXTRACT-DEBUG] Checking last assistant message only (not full history)")
+                        # Only check the LAST assistant message from THIS turn, not full history
+                        # This prevents re-sending files from previous conversation turns
+                        last_assistant_msg = None
+                        for m in reversed(messages):
+                            if getattr(m, "role", None) == "assistant":
+                                last_assistant_msg = m
+                                break
+                        
+                        if last_assistant_msg:
+                            content = getattr(last_assistant_msg, "content", [])
+                            if isinstance(content, list):
+                                # Concatenate all text chunks from this message
+                                full_text = ""
+                                for chunk in content:
+                                    chunk_type = getattr(chunk, "type", None)
+                                    chunk_text = getattr(chunk, "text", "")
+                                    if chunk_type == "text" and chunk_text:
+                                        full_text += chunk_text
+                                # Extract MEDIA: lines
+                                if full_text and "MEDIA:" in full_text.upper():
+                                    logger.info("[EXTRACT-DEBUG] Found MEDIA in last assistant message: %s", full_text[:150])
+                                    for _line in full_text.splitlines():
+                                        _stripped = _line.strip()
+                                        if _stripped.upper().startswith("MEDIA:"):
+                                            if _stripped not in final_text:
+                                                final_text += f"\n{_stripped}"
+                                                logger.info("📎 Extracted MEDIA token from current turn: %s", _stripped[:100])
+                else:
+                    logger.info("[EXTRACT-DEBUG] No pi_session found in _pool for session_id=%s", session_id[:8] if session_id else "None")
+            except Exception as extract_err:
+                logger.warning("MEDIA extraction from final messages failed: %s", extract_err, exc_info=True)
+            
+            return final_text, has_error
 
         except asyncio.CancelledError:
             raise

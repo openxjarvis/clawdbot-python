@@ -600,6 +600,18 @@ class PiAgentRuntime:
         except Exception as exc:
             logger.warning("[%s] Pre-compaction memory flush turn failed: %s", session_id[:8], exc)
 
+    def _get_session_file_path(self, session_id: str) -> "Path | None":
+        """Get the session transcript file path for size checking.
+        
+        Mirrors TS session transcript path resolution.
+        """
+        try:
+            from pathlib import Path
+            from openclaw.config.sessions.transcripts import get_session_transcript_path
+            return get_session_transcript_path(session_id)
+        except Exception:
+            return None
+
     # ------------------------------------------------------------------
     # Tool result truncation — mirrors TS truncateOversizedToolResultsInSession
     # ------------------------------------------------------------------
@@ -957,6 +969,10 @@ class PiAgentRuntime:
             except Exception as exc:
                 logger.warning(f"before_agent_start hook failed: {exc}")
 
+        # NOTE: MEDIA token instruction is now injected per-message in channel_manager.py
+        # as part of the user message context (mirrors TS get-reply-run.ts mediaReplyHint).
+        # This keeps the system prompt clean and ensures the hint is fresh for each turn.
+
         # Use effective values going forward
         if effective_model and effective_model != model:
             model = effective_model
@@ -1173,6 +1189,84 @@ class PiAgentRuntime:
                                 msgs = [msgs] if msgs else []
                             if msg:
                                 msgs = [msg] + list(msgs)
+                            
+                            # DEBUG: Log the full message structure to understand what pi returns
+                            if msgs:
+                                try:
+                                    logger.info("[MEDIA-DEBUG] agent_end has %d messages", len(msgs))
+                                    for idx, m in enumerate(msgs):
+                                        if isinstance(m, dict):
+                                            content_chunks = m.get("content", [])
+                                            msg_role = m.get("role", "unknown")
+                                        else:
+                                            content_chunks = getattr(m, "content", [])
+                                            msg_role = getattr(m, "role", "unknown")
+                                        
+                                        logger.info("[MEDIA-DEBUG] msg[%d] role=%s has %d content chunks", idx, msg_role, len(content_chunks) if isinstance(content_chunks, list) else 0)
+                                        
+                                        if isinstance(content_chunks, list):
+                                            for cidx, chunk in enumerate(content_chunks[:3]):  # Log first 3 chunks
+                                                if isinstance(chunk, dict):
+                                                    chunk_type = chunk.get("type")
+                                                    chunk_text = chunk.get("text", "")[:200]
+                                                else:
+                                                    chunk_type = getattr(chunk, "type", None)
+                                                    chunk_text = getattr(chunk, "text", "")[:200]
+                                                logger.info("[MEDIA-DEBUG]   chunk[%d] type=%s text=%s", cidx, chunk_type, chunk_text)
+                                except Exception as debug_err:
+                                    logger.info("[MEDIA-DEBUG] Error logging message structure: %s", debug_err)
+                            
+                            # Extract MEDIA: tokens from tool results in message content.
+                            # pi_coding_agent embeds ToolResult.content into message content blocks,
+                            # so we scan for any text blocks containing MEDIA: and inject them into
+                            # the response stream. This ensures file delivery works even if the LLM
+                            # doesn't echo the MEDIA: token in its final response.
+                            #
+                            # CRITICAL FIX: TextContent may be split character-by-character (146 chunks for
+                            # "MEDIA:/path..." string). We MUST concatenate all text chunks from a single
+                            # message BEFORE checking for MEDIA: tokens.
+                            for m in msgs:
+                                if isinstance(m, dict):
+                                    content_chunks = m.get("content", [])
+                                    msg_role = m.get("role", "")
+                                else:
+                                    content_chunks = getattr(m, "content", [])
+                                    msg_role = getattr(m, "role", "")
+                                
+                                if not isinstance(content_chunks, list):
+                                    content_chunks = []
+                                
+                                # Concatenate all text chunks from this message
+                                full_text = ""
+                                for chunk in content_chunks:
+                                    if isinstance(chunk, dict):
+                                        chunk_type = chunk.get("type")
+                                        chunk_text = chunk.get("text", "")
+                                    else:
+                                        chunk_type = getattr(chunk, "type", None)
+                                        chunk_text = getattr(chunk, "text", "")
+                                    
+                                    if chunk_type == "text" and chunk_text:
+                                        full_text += chunk_text
+                                
+                                # Now check the concatenated text for MEDIA: tokens
+                                if full_text and "MEDIA:" in full_text.upper():
+                                    logger.info("[MEDIA-DEBUG] Found MEDIA in %s message: %s", msg_role, full_text[:150])
+                                    for _line in full_text.splitlines():
+                                        _stripped = _line.strip()
+                                        if _stripped.upper().startswith("MEDIA:"):
+                                            # Inject as a synthetic TEXT event so agent_runner_execution sees it
+                                            try:
+                                                event_queue.put_nowait(Event(
+                                                    type=EventType.TEXT,
+                                                    source="pi-tool-result",
+                                                    session_id=session_id,
+                                                    data={"text": f"\n{_stripped}"},
+                                                ))
+                                                logger.info("✅ Injected MEDIA token from pi message: %s", _stripped[:100])
+                                            except Exception as _inject_err:
+                                                logger.debug("Failed to inject MEDIA token: %s", _inject_err)
+                            
                             for m in msgs:
                                 # m may be a dict (pi emits some events as plain dicts)
                                 if isinstance(m, dict):
@@ -1337,14 +1431,41 @@ class PiAgentRuntime:
                                     }
 
                                     # Pre-compaction memory flush — mirrors TS agent-runner-memory.ts
-                                    # When context exceeds (contextWindow - reserveTokens - 4000),
+                                    # When context exceeds (contextWindow - reserveTokens - softThresholdTokens),
+                                    # OR when session transcript file exceeds forceFlushTranscriptBytes,
                                     # write a dated memory file so critical info survives before
                                     # old messages are discarded.
                                     _reserve = compaction_settings['reserveTokens']
-                                    _flush_threshold = context_window - _reserve - 4000
+                                    
+                                    # Get memory flush config - mirrors TS resolveMemoryFlushSettings
+                                    from openclaw.auto_reply.reply.memory_flush import resolve_memory_flush_settings
+                                    _flush_config = resolve_memory_flush_settings(
+                                        cfg=self._config,
+                                        agent_cfg=session_entry.agent_config if hasattr(session_entry, 'agent_config') else None
+                                    )
+                                    
+                                    _soft_threshold = _flush_config.soft_threshold_tokens if _flush_config.enabled else 4000
+                                    _flush_threshold = context_window - _reserve - _soft_threshold
                                     _flush_state_key = f"_memory_flush_done_{session_id}"
+                                    
+                                    # Check token-based trigger
+                                    should_flush_tokens = context_tokens > _flush_threshold
+                                    
+                                    # Check file-size-based trigger (mirrors TS forceFlushTranscriptBytes)
+                                    should_flush_filesize = False
+                                    if _flush_config.enabled and _flush_config.force_flush_transcript_bytes:
+                                        try:
+                                            session_file = self._get_session_file_path(session_id)
+                                            if session_file and session_file.exists():
+                                                file_size = session_file.stat().st_size
+                                                should_flush_filesize = file_size >= _flush_config.force_flush_transcript_bytes
+                                                if should_flush_filesize:
+                                                    logger.info(f"Memory flush triggered by file size: {file_size} bytes >= {_flush_config.force_flush_transcript_bytes}")
+                                        except Exception as _size_check_exc:
+                                            logger.debug(f"File size check failed: {_size_check_exc}")
+                                    
                                     if (
-                                        context_tokens > _flush_threshold
+                                        (should_flush_tokens or should_flush_filesize)
                                         and not getattr(self, _flush_state_key, False)
                                     ):
                                         setattr(self, _flush_state_key, True)
