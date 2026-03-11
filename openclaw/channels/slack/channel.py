@@ -44,17 +44,34 @@ class SlackChannel(ChannelPlugin):
         # Mirrors TS nativeStreaming + streaming config fields
         self._native_streaming_enabled: bool = False
         self._team_id: str | None = None
+        # HTTP mode support (P1-4)
+        self._mode: str = "socket"
+        self._webhook_path: str | None = None
+        # Block streaming support (P1-5)
+        self._block_streaming: bool = True
+        self._block_streaming_coalesce: dict[str, Any] | None = None
 
     # -------------------------------------------------------------------------
     # Lifecycle
     # -------------------------------------------------------------------------
 
     async def start(self, config: dict[str, Any]) -> None:
-        """Start Slack bot using Socket Mode — aligns with TS slackPlugin.start()"""
+        """Start Slack bot — supports both Socket and HTTP modes (P1-4)"""
+        # Parse mode
+        self._mode = config.get("mode", "socket")  # default: socket
         self._bot_token = config.get("botToken") or config.get("bot_token")
-        signing_secret = config.get("signingSecret") or config.get("signing_secret")
-        self._app_token = config.get("appToken") or config.get("app_token")
-
+        
+        # Parse common config
+        self._parse_common_config(config)
+        
+        # Start based on mode
+        if self._mode == "http":
+            await self._start_http_mode(config)
+        else:
+            await self._start_socket_mode(config)
+    
+    def _parse_common_config(self, config: dict[str, Any]) -> None:
+        """Parse common configuration for both socket and HTTP modes"""
         # ResolvedSlackAccount field alignment
         self._reply_to_mode = (
             config.get("replyToMode") or config.get("reply_to_mode") or _DEFAULT_REPLY_MODE
@@ -77,11 +94,29 @@ class SlackChannel(ChannelPlugin):
         _streaming_mode = config.get("streaming") or "off"
         _native_streaming = bool(config.get("nativeStreaming") or config.get("native_streaming"))
         self._native_streaming_enabled = _streaming_mode == "partial" and _native_streaming
+        
+        # Block streaming config (P1-5)
+        self._block_streaming = config.get("blockStreaming", config.get("block_streaming", True))
+        self._block_streaming_coalesce = config.get(
+            "blockStreamingCoalesce",
+            config.get("block_streaming_coalesce", {
+                "minChars": 1500,
+                "maxChars": 2000,
+                "idleMs": 1000,
+            })
+        )
+
+    async def _start_socket_mode(self, config: dict[str, Any]) -> None:
+        """Start Slack bot using Socket Mode (existing logic)"""
+        signing_secret = config.get("signingSecret") or config.get("signing_secret")
+        self._app_token = config.get("appToken") or config.get("app_token")
 
         if not self._bot_token or not signing_secret:
             raise ValueError("Slack botToken and signingSecret are required")
+        if not self._app_token:
+            raise ValueError("Slack appToken is required for socket mode")
 
-        logger.info("Starting Slack channel...")
+        logger.info("Starting Slack channel in Socket mode...")
 
         try:
             from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -89,18 +124,8 @@ class SlackChannel(ChannelPlugin):
 
             self._app = AsyncApp(token=self._bot_token, signing_secret=signing_secret)
 
-            @self._app.message("")
-            async def handle_message(message, say):
-                await self._handle_slack_message(message, say)
-
-            if self._reaction_notifications:
-                @self._app.event("reaction_added")
-                async def handle_reaction_added(event, say):
-                    await self._handle_reaction_event(event, "add")
-
-                @self._app.event("reaction_removed")
-                async def handle_reaction_removed(event, say):
-                    await self._handle_reaction_event(event, "remove")
+            # Register event handlers
+            self._register_event_handlers()
 
             if self._app_token:
                 handler = AsyncSocketModeHandler(self._app, self._app_token)
@@ -116,11 +141,78 @@ class SlackChannel(ChannelPlugin):
                     logger.debug("[slack] auth.test failed: %s", _ae)
 
             self._running = True
-            logger.info("Slack channel started")
+            logger.info("Slack channel started in Socket mode")
 
         except ImportError:
             logger.error("slack-sdk not installed. Install with: pip install slack-sdk slack-bolt")
             raise
+
+    async def _start_http_mode(self, config: dict[str, Any]) -> None:
+        """Start Slack bot using HTTP webhook mode (P1-4)"""
+        signing_secret = config.get("signingSecret") or config.get("signing_secret")
+        self._webhook_path = config.get("webhookPath", "/slack/events")
+
+        if not self._bot_token:
+            raise ValueError("Slack botToken is required")
+        if not signing_secret:
+            raise ValueError("Slack signingSecret is required for HTTP mode")
+
+        logger.info(f"Starting Slack channel in HTTP mode, webhook: {self._webhook_path}")
+
+        try:
+            from slack_bolt.async_app import AsyncApp
+            
+            # Create HTTPReceiver with signing secret
+            from openclaw.channels.slack.http_receiver import create_http_receiver
+            
+            receiver = create_http_receiver(
+                signing_secret=signing_secret,
+                endpoint=self._webhook_path,
+            )
+
+            self._app = AsyncApp(
+                token=self._bot_token,
+                receiver=receiver,
+            )
+
+            # Register event handlers (same as socket mode)
+            self._register_event_handlers()
+
+            self._running = True
+            logger.info(f"Slack HTTP mode started, listening on {self._webhook_path}")
+
+        except ImportError:
+            logger.error("slack-bolt not installed")
+            raise
+    
+    def _register_event_handlers(self) -> None:
+        """Register Slack event handlers (common for both socket and HTTP modes)"""
+        if not self._app:
+            return
+        
+        @self._app.message("")
+        async def handle_message(message, say):
+            await self._handle_slack_message(message, say)
+
+        if self._reaction_notifications:
+            @self._app.event("reaction_added")
+            async def handle_reaction_added(event, say):
+                await self._handle_reaction_event(event, "add")
+
+            @self._app.event("reaction_removed")
+            async def handle_reaction_removed(event, say):
+                await self._handle_reaction_event(event, "remove")
+    
+    def get_webhook_handler(self):
+        """Get HTTP webhook handler for gateway registration (P1-4)"""
+        if not self._app or not hasattr(self._app, "receiver"):
+            return None
+
+        async def handler(request):
+            """Handle incoming Slack webhook request"""
+            return await self._app.receiver.handle(request)
+
+        return handler
 
     async def stop(self) -> None:
         """Stop Slack bot"""

@@ -33,7 +33,7 @@ QueueDedupeMode = Literal["message-id", "prompt", "none"]
 
 @dataclass
 class QueueSettings:
-    mode: QueueMode = "followup"
+    mode: QueueMode = "collect"  # Aligns with TS default queue mode
     debounce_ms: int | None = None
     cap: int | None = None
     drop_policy: QueueDropPolicy | None = None
@@ -291,15 +291,32 @@ def _build_collect_prompt(items: list[FollowupRun], summary_lines: list[str]) ->
     """Build a merged prompt for collect mode.
 
     Mirrors TS ``buildCollectPrompt`` in ``utils/queue-helpers.ts``.
+    Format: ---\nQueued #N\n{prompt}
     """
-    title = "[Queued messages while agent was busy]"
-    body_parts: list[str] = []
+    has_cross_channel = _has_cross_channel_items(items)
+    
+    parts: list[str] = []
+    
+    # Add summary if present
     if summary_lines:
         preview = "Dropped messages (summarized):\n" + "\n".join(f"- {s}" for s in summary_lines)
-        body_parts.append(preview)
-    for item in items:
-        body_parts.append(item.prompt.strip())
-    return title + "\n\n" + "\n\n".join(body_parts)
+        parts.append(preview)
+    
+    # Add queued items with TS format
+    for idx, item in enumerate(items, start=1):
+        prompt_text = item.prompt.strip()
+        if not prompt_text:
+            continue
+            
+        if has_cross_channel:
+            # Include channel indicator for cross-channel items
+            channel_label = f"[{item.originating_channel or 'unknown'}]"
+            parts.append(f"---\nQueued #{idx} {channel_label}\n{prompt_text}")
+        else:
+            # Compact format for same-channel items
+            parts.append(f"---\nQueued #{idx}\n{prompt_text}")
+    
+    return "\n\n".join(parts) if parts else ""
 
 
 async def _wait_for_debounce(queue: "_FollowupQueueState") -> None:

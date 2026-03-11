@@ -13,6 +13,7 @@ import os
 from typing import Any
 
 from .functions import (
+    build_compaction_summarization_instructions,
     estimate_messages_tokens,
     prune_history_for_context_share,
     resolve_context_window_tokens,
@@ -36,6 +37,8 @@ async def compact_messages(
     reserve_tokens: int = _DEFAULT_RESERVE_TOKENS,
     max_chunk_tokens: int = _DEFAULT_MAX_CHUNK_TOKENS,
     custom_instructions: str | None = None,
+    identifier_policy: str | None = None,
+    identifier_instructions: str | None = None,
 ) -> list[dict[str, Any]]:
     """Compact a message list by summarizing dropped context.
 
@@ -57,6 +60,10 @@ async def compact_messages(
         reserve_tokens: Tokens reserved for system prompt overhead.
         max_chunk_tokens: Max tokens per summary chunk.
         custom_instructions: Extra instructions injected into summarization prompt.
+        identifier_policy: "strict" | "off" | "custom" — controls identifier preservation.
+            Mirrors TS CompactionConfig.identifierPolicy.
+        identifier_instructions: Custom identifier instructions used when policy="custom".
+            Mirrors TS CompactionConfig.identifierInstructions.
 
     Returns:
         New message list: [compaction_summary_message] + kept_messages,
@@ -129,6 +136,13 @@ async def compact_messages(
         }
     model_info.setdefault("contextWindow", context_window)
 
+    # Build combined instructions using identifier policy — mirrors TS buildCompactionSummarizationInstructions()
+    effective_instructions = build_compaction_summarization_instructions(
+        custom_instructions=custom_instructions,
+        identifier_policy=identifier_policy,
+        identifier_instructions=identifier_instructions,
+    )
+
     # Step 4: summarize
     if resolved_key:
         try:
@@ -140,7 +154,7 @@ async def compact_messages(
                 reserve_tokens=reserve_tokens,
                 max_chunk_tokens=max_chunk_tokens,
                 context_window=context_window,
-                custom_instructions=custom_instructions,
+                custom_instructions=effective_instructions,
             )
         except Exception as exc:
             logger.warning("compact_messages summarization failed: %s", exc)

@@ -267,7 +267,7 @@ class BlockReplyPipeline:
     def __init__(
         self,
         on_block_reply: Callable[[ReplyPayload, dict[str, Any] | None], Awaitable[None]],
-        timeout_ms: int = 60000,
+        timeout_ms: int = 15000,  # Aligns with TS: BLOCK_REPLY_SEND_TIMEOUT_MS = 15_000
         coalescing: BlockStreamingCoalesceConfig | None = None,
         buffer: BlockReplyBuffer | None = None,
     ) -> None:

@@ -21,11 +21,10 @@ from typing import Any, Callable, Awaitable
 
 logger = logging.getLogger(__name__)
 
-# Agent run timeout. TS default is 600s (10 min) but 3 minutes is more
-# practical for interactive Telegram/Feishu sessions: it unblocks the followup
-# queue faster when an agent run gets stuck (e.g. model hallucinating tool work
-# that never completes). Complex tasks should set a higher timeout via config.
-DEFAULT_AGENT_TIMEOUT_MS = 3 * 60 * 1000  # 3 minutes
+# Agent run timeout. Mirrors TypeScript default: 600s (10 minutes).
+# Matches openclaw/src/agents/timeout.ts:DEFAULT_AGENT_TIMEOUT_SECONDS.
+# Can be overridden via config (agents.defaults.timeoutSeconds) or per-run parameters.
+DEFAULT_AGENT_TIMEOUT_MS = 600 * 1000  # 10 minutes (aligns with TS: 600 seconds)
 
 
 # ---------------------------------------------------------------------------

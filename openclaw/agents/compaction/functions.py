@@ -41,6 +41,52 @@ IDENTIFIER_PRESERVATION_INSTRUCTIONS = (
     "including UUIDs, hashes, IDs, tokens, API keys, hostnames, IPs, ports, URLs, and file names."
 )
 
+# Mirrors TS compaction.ts: AgentCompactionIdentifierPolicy
+CompactionIdentifierPolicy = str  # "strict" | "off" | "custom"
+
+
+def resolve_identifier_preservation_instructions(
+    identifier_policy: CompactionIdentifierPolicy | None = None,
+    identifier_instructions: str | None = None,
+) -> str | None:
+    """Resolve identifier preservation instructions based on policy.
+
+    Mirrors TypeScript resolveIdentifierPreservationInstructions() in compaction.ts.
+    - "strict" (default): use built-in IDENTIFIER_PRESERVATION_INSTRUCTIONS
+    - "off": no identifier instructions
+    - "custom": use identifierInstructions text (falls back to built-in if empty)
+    """
+    policy = identifier_policy or "strict"
+    if policy == "off":
+        return None
+    if policy == "custom":
+        custom = (identifier_instructions or "").strip()
+        return custom if custom else IDENTIFIER_PRESERVATION_INSTRUCTIONS
+    return IDENTIFIER_PRESERVATION_INSTRUCTIONS
+
+
+def build_compaction_summarization_instructions(
+    custom_instructions: str | None = None,
+    identifier_policy: CompactionIdentifierPolicy | None = None,
+    identifier_instructions: str | None = None,
+) -> str | None:
+    """Build combined summarization instructions for compaction.
+
+    Mirrors TypeScript buildCompactionSummarizationInstructions() in compaction.ts.
+    Combines identifier preservation instructions with any custom instructions.
+    """
+    custom = (custom_instructions or "").strip()
+    identifier_preservation = resolve_identifier_preservation_instructions(
+        identifier_policy, identifier_instructions
+    )
+    if not identifier_preservation and not custom:
+        return None
+    if not custom:
+        return identifier_preservation
+    if not identifier_preservation:
+        return f"Additional focus:\n{custom}"
+    return f"{identifier_preservation}\n\nAdditional focus:\n{custom}"
+
 _DEFAULT_SUMMARY_FALLBACK = "No prior history."
 _DEFAULT_PARTS = 2
 _MERGE_SUMMARIES_INSTRUCTIONS = "\n".join([
@@ -294,6 +340,8 @@ async def _generate_summary_via_llm(
     signal: Any,
     custom_instructions: str | None,
     previous_summary: str | None,
+    identifier_policy: CompactionIdentifierPolicy | None = None,
+    identifier_instructions: str | None = None,
 ) -> str:
     """
     Call an LLM to summarise messages — Python equivalent of TS generateSummary().
@@ -321,10 +369,17 @@ async def _generate_summary_via_llm(
             text = str(content)
         prompt_parts.append(f"[{role}]: {text[:500]}")
 
+    # Build identifier + custom instructions using policy — mirrors TS buildCompactionSummarizationInstructions()
+    summarization_instructions = build_compaction_summarization_instructions(
+        custom_instructions=None,  # custom_instructions already added to prompt_parts above
+        identifier_policy=identifier_policy,
+        identifier_instructions=identifier_instructions,
+    )
+    base_instructions = summarization_instructions or IDENTIFIER_PRESERVATION_INSTRUCTIONS
     system_prompt = (
         "You are a concise summariser. Produce a clear, factual summary of the conversation "
         "history preserving all key decisions, TODOs, open questions, and constraints.\n\n"
-        + IDENTIFIER_PRESERVATION_INSTRUCTIONS
+        + base_instructions
     )
     user_prompt = "\n".join(prompt_parts)
 

@@ -170,12 +170,19 @@ def clear_tool_loop_state(session_id: str) -> None:
     _tool_loop_states.pop(session_id, None)
 
 
-def _wrap_openclaw_tool(oc_tool: Any, session_id: str | None = None) -> Any:
+def _wrap_openclaw_tool(
+    oc_tool: Any,
+    session_id: str | None = None,
+    loop_detection_config: dict | None = None,
+) -> Any:
     """Wrap an openclaw tool in a pi_agent.AgentTool-compatible object.
 
     When *session_id* is provided, tool loop detection is applied before each
     invocation — mirroring TS ``wrapToolWithBeforeToolCallHook`` which calls
     ``detectToolCallLoop`` and ``recordToolCall``.
+
+    *loop_detection_config* mirrors TS ``ctx.loopDetection`` resolved from
+    ``cfg.tools.loopDetection`` (and optional agent-level override).
     """
     from pi_agent.types import AgentTool, AgentToolResult
     from pi_ai.types import TextContent
@@ -205,7 +212,7 @@ def _wrap_openclaw_tool(oc_tool: Any, session_id: str | None = None) -> Any:
                 )
 
                 state = _get_tool_loop_state(session_id)
-                detection = detect_tool_call_loop(state, name, args)
+                detection = detect_tool_call_loop(state, name, args, loop_detection_config)
                 if detection.stuck:
                     if detection.level == "critical":
                         # Critical: always block. Do NOT add to shown_warnings —
@@ -328,6 +335,7 @@ class AgentSession:
         system_prompt: str | None = None,
         extra_tools: list[Any] | None = None,
         session_id: str | None = None,
+        loop_detection_config: dict | None = None,
         # Legacy params (kept for backward compatibility)
         session: Any = None,
         runtime: Any = None,
@@ -342,6 +350,7 @@ class AgentSession:
         self._system_prompt = system_prompt
         self._extra_tools = list(extra_tools or tools or [])
         self._external_session_id = session_id
+        self._loop_detection_config = loop_detection_config
 
         # Legacy: if a Session object was passed, extract its session_id
         if session is not None and session_id is None:
@@ -411,7 +420,11 @@ class AgentSession:
                     if "pi_coding_agent" in type(t).__module__ or "pi_agent" in type(t).__module__:
                         wrapped.append(t)
                     else:
-                        wrapped.append(_wrap_openclaw_tool(t))
+                        wrapped.append(_wrap_openclaw_tool(
+                            t,
+                            session_id=self._external_session_id,
+                            loop_detection_config=self._loop_detection_config,
+                        ))
                 except Exception as exc:
                     logger.warning("Skipping extra tool %r: %s", getattr(t, "name", t), exc)
             all_tools = existing + wrapped

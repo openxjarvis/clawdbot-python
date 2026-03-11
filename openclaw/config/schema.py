@@ -46,23 +46,68 @@ class GatewayTailscaleConfig(BaseModel):
     reset_on_exit: bool = Field(default=False, alias="resetOnExit")
 
 
+class GatewayControlUiConfig(BaseModel):
+    """Gateway Control UI configuration.
+    
+    Mirrors TS GatewayControlUiConfig in openclaw/src/config/types.gateway.ts.
+    All fields optional to match TS optional properties.
+    """
+    
+    enabled: bool | None = Field(default=None)
+    """If false, the Gateway will not serve the Control UI (default /)."""
+    
+    base_path: str | None = Field(default=None, alias="basePath")
+    """Optional base path prefix for the Control UI (e.g. "/openclaw")."""
+    
+    root: str | None = Field(default=None)
+    """Optional filesystem root for Control UI assets (defaults to dist/control-ui)."""
+    
+    allowed_origins: list[str] | None = Field(default=None, alias="allowedOrigins")
+    """Allowed browser origins for Control UI/WebChat websocket connections."""
+    
+    dangerously_allow_host_header_origin_fallback: bool | None = Field(
+        default=None, 
+        alias="dangerouslyAllowHostHeaderOriginFallback"
+    )
+    """DANGEROUS: Keep Host-header origin fallback behavior.
+    Supported long-term for deployments that intentionally rely on this policy."""
+    
+    allow_insecure_auth: bool | None = Field(default=None, alias="allowInsecureAuth")
+    """Insecure-auth toggle.
+    Control UI still requires secure context + device identity unless
+    dangerouslyDisableDeviceAuth is enabled."""
+    
+    dangerously_disable_device_auth: bool | None = Field(
+        default=None, 
+        alias="dangerouslyDisableDeviceAuth"
+    )
+    """DANGEROUS: Disable device identity checks for the Control UI (default: false)."""
+    
+    model_config = {"populate_by_name": True}
+
+
 class GatewayConfig(BaseModel):
     """Gateway server configuration (aligned with TypeScript)"""
     port: int = Field(default=18789)
     bind: str = Field(default="loopback")
     mode: str = Field(default="local")
     auth: AuthConfig | None = Field(default=None)
+    control_ui: GatewayControlUiConfig | None = Field(default=None, alias="controlUi")
     trusted_proxies: list[str] = Field(default_factory=list, alias="trustedProxies")
-    enable_web_ui: bool = Field(default=True, alias="enableWebUI")
-    web_ui_port: int = Field(default=8080, alias="webUIPort")
-    web_ui_base_path: str = Field(default="/", alias="webUIBasePath")
     nodes: GatewayNodesConfig | None = Field(default=None)
     tailscale: GatewayTailscaleConfig | None = Field(default=None)
+    
+    # Legacy fields for backward compatibility
+    enable_web_ui: bool | None = Field(default=None, alias="enableWebUI", exclude=True)
+    web_ui_port: int | None = Field(default=None, alias="webUIPort", exclude=True)
+    web_ui_base_path: str | None = Field(default=None, alias="webUIBasePath", exclude=True)
+    
+    model_config = {"populate_by_name": True}
 
 
 class ApplyPatchConfig(BaseModel):
     """apply_patch tool sub-configuration (aligned with TS ExecToolConfig.applyPatch)"""
-    enabled: bool = Field(default=True)
+    enabled: bool = Field(default=False)  # Aligns with TS default (security-first)
     workspace_only: bool = Field(default=True, alias="workspaceOnly")
     allow_models: list[str] | None = Field(default=None, alias="allowModels")
 
@@ -71,7 +116,7 @@ class ApplyPatchConfig(BaseModel):
 
 class ExecToolConfig(BaseModel):
     """Exec tool configuration (fully aligned with TS ExecToolConfig)"""
-    host: str = Field(default="gateway")          # "sandbox" | "gateway" | "node"
+    host: str = Field(default="sandbox")          # "sandbox" | "gateway" | "node" - Aligns with TS default
     security: str = Field(default="deny")         # TS default: "deny"
     ask: str = Field(default="on-miss")           # TS default: "on-miss"
     ask_fallback: str = Field(default="deny", alias="askFallback")
@@ -130,11 +175,36 @@ class ToolPolicyConfig(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class LoopDetectionDetectorsConfig(BaseModel):
+    """Loop detection detectors configuration - mirrors TS ToolLoopDetectorsSchema"""
+    genericRepeat: bool | None = Field(default=None)
+    knownPollNoProgress: bool | None = Field(default=None)
+    pingPong: bool | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class LoopDetectionConfig(BaseModel):
-    """Tool loop detection configuration (aligned with TS ToolLoopDetectionConfig)"""
-    enabled: bool = Field(default=True)
-    window: int = Field(default=10)
-    threshold: int = Field(default=5)
+    """Tool loop detection configuration - mirrors TS ToolLoopDetectionSchema"""
+    enabled: bool | None = Field(default=None)
+    historySize: int | None = Field(default=None)           # TS field name (was "window" - wrong)
+    warningThreshold: int | None = Field(default=None)      # missing in Python before
+    criticalThreshold: int | None = Field(default=None)     # TS field name (was "threshold" - wrong)
+    globalCircuitBreakerThreshold: int | None = Field(default=None)
+    detectors: LoopDetectionDetectorsConfig | None = Field(default=None)
+
+    # Legacy aliases for backward compatibility (old Python-specific names)
+    window: int | None = Field(default=None, exclude=True)
+    threshold: int | None = Field(default=None, exclude=True)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    def model_post_init(self, __context: object) -> None:
+        """Migrate legacy field names"""
+        if self.window is not None and self.historySize is None:
+            self.historySize = self.window
+        if self.threshold is not None and self.criticalThreshold is None:
+            self.criticalThreshold = self.threshold
 
 
 class MessageCrossContextMarkerConfig(BaseModel):
@@ -195,8 +265,59 @@ class FsToolsConfig(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+class ToolsWebSearchConfig(BaseModel):
+    """Web search tool configuration - mirrors TS ToolsWebSearchSchema"""
+    enabled: bool | None = Field(default=None)
+    provider: Literal["brave", "perplexity", "grok", "gemini", "kimi"] | None = Field(default=None)
+    apiKey: str | None = Field(default=None)
+    maxResults: int | None = Field(default=None)
+    timeoutSeconds: int | None = Field(default=None)
+    cacheTtlMinutes: float | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+
+class ToolsWebFetchConfig(BaseModel):
+    """Web fetch tool configuration - mirrors TS ToolsWebFetchSchema"""
+    enabled: bool | None = Field(default=None)
+    maxChars: int | None = Field(default=None)
+    maxCharsCap: int | None = Field(default=None)
+    timeoutSeconds: int | None = Field(default=None)
+    cacheTtlMinutes: float | None = Field(default=None)
+    maxRedirects: int | None = Field(default=None)
+    userAgent: str | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class ToolsWebConfig(BaseModel):
+    """Web tools configuration (search + fetch) - mirrors TS tools.web schema"""
+    search: ToolsWebSearchConfig | None = Field(default=None)
+    fetch: ToolsWebFetchConfig | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class ToolsSessionsSpawnAttachmentsConfig(BaseModel):
+    """Spawned session attachments configuration - mirrors TS"""
+    enabled: bool | None = Field(default=None)
+    maxTotalBytes: float | None = Field(default=None)
+    maxFiles: float | None = Field(default=None)
+    maxFileBytes: float | None = Field(default=None)
+    retainOnSessionKeep: bool | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class ToolsSessionsSpawnConfig(BaseModel):
+    """Sessions spawn tool configuration - mirrors TS tools.sessions_spawn schema"""
+    attachments: ToolsSessionsSpawnAttachmentsConfig | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
 class ToolsConfig(BaseModel):
-    """Tools configuration (aligned with TypeScript ToolsConfig)"""
+    """Tools configuration - mirrors TypeScript ToolsSchema"""
     profile: str = Field(default="full")
     allow: list[str] | None = Field(default=None)
     also_allow: list[str] | None = Field(default=None, alias="alsoAllow")
@@ -209,8 +330,13 @@ class ToolsConfig(BaseModel):
     sandbox: SandboxToolsConfig | None = Field(default=None)
     loop_detection: LoopDetectionConfig | None = Field(default=None, alias="loopDetection")
     sessions: SessionsToolsConfig | None = Field(default=None)
+    sessions_spawn: ToolsSessionsSpawnConfig | None = Field(default=None, alias="sessions_spawn")
     message: MessageToolConfig | None = Field(default=None)
     agentToAgent: AgentToAgentConfig | None = Field(default=None)
+    # Fields added in P2 alignment - mirrors TS ToolsSchema
+    web: ToolsWebConfig | None = Field(default=None)
+    media: dict[str, Any] | None = Field(default=None)
+    links: dict[str, Any] | None = Field(default=None)
 
     model_config = {"populate_by_name": True}
 
@@ -229,8 +355,13 @@ class HardClearConfig(BaseModel):
 
 
 class ContextPruningToolsConfig(BaseModel):
-    """Tools configuration for context pruning"""
-    prunable: list[str] = Field(default_factory=lambda: ["Read", "Grep", "Shell"])
+    """Tools configuration for context pruning - mirrors TS contextPruning.tools schema"""
+    allow: list[str] | None = Field(default=None)   # TS field: allow specific tools for pruning
+    deny: list[str] | None = Field(default=None)    # TS field: deny specific tools from pruning
+    # Legacy Python-only field kept for backward compat (not in TS)
+    prunable: list[str] | None = Field(default=None, exclude=True)
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class ContextPruningConfig(BaseModel):
@@ -254,10 +385,44 @@ class CompactionConfig(BaseModel):
     keepRecentTokens: int = Field(default=20000, ge=0)
     maxHistoryShare: float = Field(default=0.5, ge=0.1, le=0.9)
     reserveTokensFloor: int | None = Field(default=None, ge=0)
+    # Fields from TS compaction schema (added in P2 alignment)
+    identifierPolicy: Literal["strict", "off", "custom"] | None = Field(default=None)
+    identifierInstructions: str | None = Field(default=None)
+    memoryFlush: "MemoryFlushConfig | None" = Field(default=None)  # TS location is compaction.memoryFlush
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class HeartbeatActiveHoursConfig(BaseModel):
+    """Heartbeat active hours - mirrors TS HeartbeatActiveHoursSchema"""
+    start: str | None = Field(default=None)
+    end: str | None = Field(default=None)
+    timezone: str | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class HeartbeatConfig(BaseModel):
+    """Heartbeat configuration - mirrors TS HeartbeatSchema"""
+    every: str | None = Field(default=None)
+    activeHours: HeartbeatActiveHoursConfig | None = Field(default=None)
+    model: str | None = Field(default=None)
+    session: str | None = Field(default=None)
+    includeReasoning: bool | None = Field(default=None)
+    target: str | None = Field(default=None)
+    directPolicy: Literal["allow", "block"] | None = Field(default=None)
+    to: str | None = Field(default=None)
+    accountId: str | None = Field(default=None)
+    prompt: str | None = Field(default=None)
+    ackMaxChars: int | None = Field(default=None)
+    suppressToolErrorWarnings: bool | None = Field(default=None)
+    lightContext: bool | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class AgentDefaults(BaseModel):
-    """Default agent settings"""
+    """Default agent settings - mirrors TS AgentDefaultsSchema"""
 
     workspace: str | None = Field(default=None)
     agentDir: str | None = Field(default=None)
@@ -270,14 +435,44 @@ class AgentDefaults(BaseModel):
     maxHistoryShare: float = Field(default=0.5, ge=0.1, le=0.9)
     maxConcurrent: int | None = Field(default=None)
     subagents: "SubagentsConfig | None" = Field(default=None)
+    sandbox: "SandboxConfig | None" = Field(default=None)
     # Memory configuration - mirrors TS agents.defaults
     memorySearch: "MemorySearchConfig | None" = Field(default=None)
-    memoryFlush: "MemoryFlushConfig | None" = Field(default=None)
+    memoryFlush: "MemoryFlushConfig | None" = Field(default=None, exclude=True)  # deprecated: use compaction.memoryFlush
     # Block streaming configuration - mirrors TS agents.defaults
     blockStreamingDefault: Literal["on", "off"] | None = Field(default=None)
     blockStreamingBreak: Literal["text_end", "message_end"] | None = Field(default=None)
     blockStreamingChunk: dict[str, Any] | None = Field(default=None)
     blockStreamingCoalesce: dict[str, Any] | None = Field(default=None)
+    # Fields added in P2 alignment - mirrors TS AgentDefaultsSchema
+    imageModel: str | ModelConfig | None = Field(default=None)
+    pdfModel: str | ModelConfig | None = Field(default=None)
+    pdfMaxBytesMb: float | None = Field(default=None)
+    pdfMaxPages: int | None = Field(default=None)
+    repoRoot: str | None = Field(default=None)
+    skipBootstrap: bool | None = Field(default=None)
+    bootstrapMaxChars: int | None = Field(default=None)
+    bootstrapTotalMaxChars: int | None = Field(default=None)
+    userTimezone: str | None = Field(default=None)
+    timeFormat: Literal["auto", "12", "24"] | None = Field(default=None)
+    envelopeTimezone: str | None = Field(default=None)
+    envelopeTimestamp: Literal["on", "off"] | None = Field(default=None)
+    envelopeElapsed: Literal["on", "off"] | None = Field(default=None)
+    contextTokens: int | None = Field(default=None)
+    cliBackends: dict[str, Any] | None = Field(default=None)
+    embeddedPi: dict[str, Any] | None = Field(default=None)
+    thinkingDefault: Literal["off", "minimal", "low", "medium", "high", "xhigh", "adaptive"] | None = Field(default=None)
+    verboseDefault: Literal["off", "on", "full"] | None = Field(default=None)
+    elevatedDefault: Literal["off", "on", "ask", "full"] | None = Field(default=None)
+    humanDelay: dict[str, Any] | None = Field(default=None)
+    timeoutSeconds: int | None = Field(default=None)
+    mediaMaxMb: float | None = Field(default=None)
+    imageMaxDimensionPx: int | None = Field(default=None)
+    typingIntervalSeconds: int | None = Field(default=None)
+    typingMode: Literal["never", "instant", "thinking", "message"] | None = Field(default=None)
+    heartbeat: HeartbeatConfig | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class IdentityConfig(BaseModel):
@@ -363,18 +558,24 @@ class SandboxConfig(BaseModel):
 
 
 class SubagentsConfig(BaseModel):
-    """Subagents configuration (aligned with TS subagents schema)"""
+    """Subagents configuration - mirrors TS subagents schema"""
     maxConcurrent: int | None = Field(default=None)
     maxSpawnDepth: int = Field(default=1, ge=1, le=5)
     maxChildrenPerAgent: int = Field(default=5, ge=1, le=20)
     archiveAfterMinutes: int = Field(default=60, ge=1)
     model: str | ModelConfig | None = Field(default=None)
     thinking: str | None = Field(default=None)
+    # Fields added in P2 alignment - mirrors TS subagents schema
+    runTimeoutSeconds: int | None = Field(default=None)
+    announceTimeoutMs: int | None = Field(default=None)
+    allowAgents: list[str] | None = Field(default=None)
     
     # Legacy fields for backward compatibility
     enabled: bool = Field(default=True, exclude=True)
     maxDepth: int | None = Field(default=None, exclude=True)
     maxActive: int | None = Field(default=None, exclude=True)
+
+    model_config = ConfigDict(populate_by_name=True)
     
     def model_post_init(self, __context: object) -> None:
         """Migrate legacy fields"""
@@ -391,7 +592,7 @@ class GroupChatConfig(BaseModel):
 
 
 class AgentEntry(BaseModel):
-    """Individual agent configuration (aligned with TS)"""
+    """Individual agent configuration - mirrors TS AgentEntrySchema"""
 
     id: str
     default: bool = Field(default=False)
@@ -404,6 +605,13 @@ class AgentEntry(BaseModel):
     sandbox: SandboxConfig | None = Field(default=None)
     subagents: SubagentsConfig | None = Field(default=None)
     groupChat: GroupChatConfig | None = Field(default=None)
+    # Fields added in P2 alignment - mirrors TS AgentEntrySchema
+    skills: list[str] | None = Field(default=None)
+    memorySearch: "MemorySearchConfig | None" = Field(default=None)
+    humanDelay: dict[str, Any] | None = Field(default=None)
+    heartbeat: HeartbeatConfig | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class AgentsConfig(BaseModel):
@@ -615,13 +823,93 @@ class FeishuChannelConfig(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="allow")
 
 
+class BlockStreamingCoalesceConfig(BaseModel):
+    """Block streaming coalescing configuration - mirrors TS BlockStreamingCoalesceConfig"""
+    min_chars: int | None = Field(default=None, alias="minChars")
+    max_chars: int | None = Field(default=None, alias="maxChars")
+    idle_ms: int | None = Field(default=None, alias="idleMs")
+    
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class SlackAccountConfig(BaseModel):
+    """Slack account configuration - mirrors TS SlackAccountConfig"""
+    
+    # Basic
+    name: str | None = Field(default=None)
+    enabled: bool | None = Field(default=None)
+    
+    # Connection mode (P1-4: HTTP mode support)
+    mode: Literal["socket", "http"] | None = Field(default=None)
+    signing_secret: str | None = Field(default=None, alias="signingSecret")
+    webhook_path: str | None = Field(default=None, alias="webhookPath")
+    
+    # Tokens
+    bot_token: str | None = Field(default=None, alias="botToken")
+    app_token: str | None = Field(default=None, alias="appToken")
+    user_token: str | None = Field(default=None, alias="userToken")
+    user_token_read_only: bool | None = Field(default=None, alias="userTokenReadOnly")
+    
+    # Streaming (P1-5: block_streaming support)
+    block_streaming: bool | None = Field(default=None, alias="blockStreaming")
+    block_streaming_coalesce: BlockStreamingCoalesceConfig | None = Field(
+        default=None, 
+        alias="blockStreamingCoalesce"
+    )
+    streaming: Literal["off", "partial", "block", "progress"] | bool | None = Field(default=None)
+    native_streaming: bool | None = Field(default=None, alias="nativeStreaming")
+    
+    # Text/media
+    text_chunk_limit: int | None = Field(default=None, alias="textChunkLimit")
+    chunk_mode: Literal["length", "newline"] | None = Field(default=None, alias="chunkMode")
+    media_max_mb: int | None = Field(default=None, alias="mediaMaxMb")
+    
+    # Behavior
+    allow_bots: bool | None = Field(default=None, alias="allowBots")
+    require_mention: bool | None = Field(default=None, alias="requireMention")
+    history_limit: int | None = Field(default=None, alias="historyLimit")
+    dm_history_limit: int | None = Field(default=None, alias="dmHistoryLimit")
+    
+    # Other fields
+    capabilities: list[str] | None = Field(default=None)
+    config_writes: bool | None = Field(default=None, alias="configWrites")
+    reply_to_mode: str | None = Field(default=None, alias="replyToMode")
+    reaction_notifications: str | None = Field(default=None, alias="reactionNotifications")
+    
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class SlackConfig(BaseModel):
+    """Slack configuration - mirrors TS SlackConfig"""
+    
+    # Base config (inherited by accounts)
+    mode: Literal["socket", "http"] | None = Field(default=None)
+    signing_secret: str | None = Field(default=None, alias="signingSecret")
+    webhook_path: str | None = Field(default="/slack/events", alias="webhookPath")
+    bot_token: str | None = Field(default=None, alias="botToken")
+    app_token: str | None = Field(default=None, alias="appToken")
+    
+    # Block streaming defaults
+    block_streaming: bool | None = Field(default=None, alias="blockStreaming")
+    block_streaming_coalesce: BlockStreamingCoalesceConfig | None = Field(
+        default=None,
+        alias="blockStreamingCoalesce"
+    )
+    
+    # Accounts
+    accounts: dict[str, SlackAccountConfig] | None = Field(default=None)
+    default_account: str | None = Field(default=None, alias="defaultAccount")
+    
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+
 class ChannelsConfig(BaseModel):
     """Channels configuration (mirrors TS ChannelsSchema with .passthrough())"""
 
     telegram: TelegramChannelConfig | None = Field(default=None)
     whatsapp: ChannelConfig | None = Field(default=None)
     discord: ChannelConfig | None = Field(default=None)
-    slack: ChannelConfig | None = Field(default=None)
+    slack: SlackConfig | None = Field(default=None)
     feishu: FeishuChannelConfig | None = Field(default=None)
 
     # Allow extension channels (matrix, zalo, msteams, etc.) — matches TS .passthrough()
@@ -646,11 +934,28 @@ class PluginEntryConfig(BaseModel):
 
 
 class PluginsConfig(BaseModel):
-    """Plugins configuration"""
+    """Plugins configuration - mirrors TS plugins schema"""
 
+    enabled: bool | None = Field(default=None)  # top-level toggle (added P2 alignment)
     entries: dict[str, PluginEntryConfig] | None = Field(default=None)
-    enable: list[str] | None = Field(default=None)
-    disable: list[str] | None = Field(default=None)
+    # TS uses allow/deny; Python previously used enable/disable (P2 alignment fix)
+    allow: list[str] | None = Field(default=None)     # TS field name
+    deny: list[str] | None = Field(default=None)      # TS field name
+    load: dict[str, Any] | None = Field(default=None)
+    slots: dict[str, Any] | None = Field(default=None)
+    installs: list[Any] | None = Field(default=None)
+    # Legacy Python-specific fields kept for backward compat
+    enable: list[str] | None = Field(default=None, exclude=True)
+    disable: list[str] | None = Field(default=None, exclude=True)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    def model_post_init(self, __context: object) -> None:
+        """Migrate legacy enable/disable to allow/deny"""
+        if self.enable is not None and self.allow is None:
+            self.allow = self.enable
+        if self.disable is not None and self.deny is None:
+            self.deny = self.disable
 
 
 class MetaConfig(BaseModel):
@@ -919,10 +1224,74 @@ class SessionConfig(BaseModel):
     resetByType: dict[str, Any] | None = Field(default=None)
     resetByChannel: dict[str, Any] | None = Field(default=None)
     store: str | None = Field(default=None)
+    # Fields added in P2 alignment - mirrors TS SessionSchema
+    scope: Literal["per-sender", "global"] | None = Field(default=None)
+    resetTriggers: list[str] | None = Field(default=None)
+    parentForkMaxTokens: int | None = Field(default=None)
+    mainKey: str | None = Field(default=None)
+    sendPolicy: dict[str, Any] | None = Field(default=None)
+    threadBindings: dict[str, Any] | None = Field(default=None)
+
+
+class AcpStreamConfig(BaseModel):
+    """ACP stream configuration - mirrors TS AcpStreamSchema"""
+    coalesceIdleMs: int | None = Field(default=None)
+    maxChunkChars: int | None = Field(default=None)
+    repeatSuppression: bool | None = Field(default=None)
+    deliveryMode: Literal["live", "final_only"] | None = Field(default=None)
+    hiddenBoundarySeparator: Literal["none", "space", "newline", "paragraph"] | None = Field(default=None)
+    maxOutputChars: int | None = Field(default=None)
+    maxSessionUpdateChars: int | None = Field(default=None)
+    tagVisibility: dict[str, bool] | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class AcpRuntimeConfig(BaseModel):
+    """ACP runtime configuration - mirrors TS AcpRuntimeSchema"""
+    ttlMinutes: int | None = Field(default=None)
+    installCommand: str | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class AcpConfig(BaseModel):
+    """ACP (Agent Communication Protocol) configuration - mirrors TS AcpSchema"""
+    enabled: bool | None = Field(default=None)
+    dispatch: dict[str, Any] | None = Field(default=None)
+    backend: str | None = Field(default=None)
+    defaultAgent: str | None = Field(default=None)
+    allowedAgents: list[str] | None = Field(default=None)
+    maxConcurrentSessions: int | None = Field(default=None)
+    stream: AcpStreamConfig | None = Field(default=None)
+    runtime: AcpRuntimeConfig | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
+
+
+class MediaTopLevelConfig(BaseModel):
+    """Top-level media configuration - mirrors TS media schema"""
+    preserveFilenames: bool | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class CliBannerConfig(BaseModel):
+    """CLI banner configuration"""
+    taglineMode: Literal["random", "default", "off"] | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class CliConfig(BaseModel):
+    """CLI configuration - mirrors TS cli schema"""
+    banner: CliBannerConfig | None = Field(default=None)
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
 class ClawdbotConfig(BaseModel):
-    """Root configuration schema (aligned with TypeScript OpenClawConfig)"""
+    """Root configuration schema - mirrors TypeScript OpenClawConfig"""
     
     # Core configs (original 7)
     agent: AgentConfig | None = Field(default_factory=AgentConfig)
@@ -933,7 +1302,7 @@ class ClawdbotConfig(BaseModel):
     skills: SkillsConfig | None = Field(default_factory=SkillsConfig)
     plugins: PluginsConfig | None = Field(default_factory=PluginsConfig)
     
-    # Additional configs (matching TypeScript - 21 more fields)
+    # Additional configs (matching TypeScript)
     meta: MetaConfig | None = Field(default=None)
     auth: dict[str, Any] | None = Field(default=None)
     env: EnvConfig | dict[str, Any] | None = Field(default=None)
@@ -959,6 +1328,13 @@ class ClawdbotConfig(BaseModel):
     canvas_host: dict[str, Any] | None = Field(default=None, alias="canvasHost")
     talk: dict[str, Any] | None = Field(default=None)
     memory: MemoryConfig | None = Field(default=None)
+    # P2 alignment: new top-level config sections from TS
+    acp: AcpConfig | None = Field(default=None)
+    media: MediaTopLevelConfig | None = Field(default=None)
+    cli: CliConfig | None = Field(default=None)
+    secrets: dict[str, Any] | None = Field(default=None)
+    # $schema field for JSON schema editor tooling
+    schema_ref: str | None = Field(default=None, alias="$schema")
 
     class Config:
         extra = "allow"  # Allow extra fields for extensibility

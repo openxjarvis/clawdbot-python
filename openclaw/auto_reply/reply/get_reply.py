@@ -100,6 +100,12 @@ def try_fast_abort(ctx: Any) -> dict[str, Any]:
         return {"handled": False, "aborted": False}
     session_key = getattr(ctx, "SessionKey", None)
     if session_key:
+        # Set abort cutoff to skip stale messages
+        from openclaw.auto_reply.reply.abort_cutoff import set_abort_cutoff
+        cutoff_timestamp = time.time()
+        message_id = getattr(ctx, "MessageId", None) or str(int(cutoff_timestamp * 1000))
+        set_abort_cutoff(session_key, cutoff_timestamp, message_id)
+        
         # Try to abort via the gateway's embedded pi runner
         try:
             from openclaw.gateway.chat_abort import abort_chat_runs_for_session_key
@@ -118,28 +124,94 @@ _SILENT_RE = re.compile(r"\[\[silent\]\]", re.IGNORECASE)
 _REPLY_TO_RE = re.compile(r"\[\[reply_to:([^\]]+)\]\]", re.IGNORECASE)
 _THINK_RE = re.compile(r"\[\[think(?::(low|medium|high|off))?\]\]", re.IGNORECASE)
 _MODEL_RE = re.compile(r"\[\[model:([^\]]+)\]\]", re.IGNORECASE)
+# NEW directives
+_QUEUE_RE = re.compile(r"\[\[queue(?::([^\]]+))?\]\]", re.IGNORECASE)
+_VERBOSE_RE = re.compile(r"\[\[verbose(?::(low|medium|high|off))?\]\]", re.IGNORECASE)
+_REASONING_RE = re.compile(r"\[\[reasoning(?::(on|off|stream))?\]\]", re.IGNORECASE)
+_ELEVATED_RE = re.compile(r"\[\[elevated(?::(on|off|ask))?\]\]", re.IGNORECASE)
+_EXEC_RE = re.compile(r"\[\[exec:([^\]]+)\]\]", re.IGNORECASE)
 
 
 @dataclass
 class InlineDirectives:
+    """
+    Inline directives parsed from message body.
+    Mirrors TS InlineDirectives structure.
+    """
     silent: bool = False
     reply_to_id: str | None = None
     think_level: str | None = None
     model_override: str | None = None
+    # NEW fields
+    queue_mode: str | None = None
+    verbose_level: str | None = None
+    reasoning_level: str | None = None
+    elevated_level: str | None = None
+    exec_options: dict[str, str] | None = None
     cleaned_body: str = ""
 
 
 def parse_inline_directives(body: str) -> InlineDirectives:
+    """
+    Parse inline directives from message body.
+    
+    Supports:
+    - [[silent]] - suppress echo
+    - [[reply_to:ID]] - reply to specific message
+    - [[think:level]] - thinking level (off/low/medium/high)
+    - [[model:name]] - model override
+    - [[queue:mode]] - queue mode override
+    - [[verbose:level]] - verbose level (off/low/medium/high)
+    - [[reasoning:level]] - reasoning level (on/off/stream)
+    - [[elevated:level]] - elevated mode (on/off/ask)
+    - [[exec:options]] - exec options
+    
+    Mirrors TS parseInlineDirectives.
+    """
     silent = bool(_SILENT_RE.search(body))
+    
     reply_to_m = _REPLY_TO_RE.search(body)
     reply_to_id = reply_to_m.group(1).strip() if reply_to_m else None
+    
     think_m = _THINK_RE.search(body)
     think_level = think_m.group(1) if (think_m and think_m.group(1)) else (None if not think_m else "medium")
+    
     model_m = _MODEL_RE.search(body)
     model_override = model_m.group(1).strip() if model_m else None
+    
+    # NEW: Queue directive
+    queue_m = _QUEUE_RE.search(body)
+    queue_mode = queue_m.group(1).strip() if (queue_m and queue_m.group(1)) else None
+    
+    # NEW: Verbose directive
+    verbose_m = _VERBOSE_RE.search(body)
+    verbose_level = verbose_m.group(1) if (verbose_m and verbose_m.group(1)) else (None if not verbose_m else "high")
+    
+    # NEW: Reasoning directive
+    reasoning_m = _REASONING_RE.search(body)
+    reasoning_level = reasoning_m.group(1) if (reasoning_m and reasoning_m.group(1)) else (None if not reasoning_m else "on")
+    
+    # NEW: Elevated directive
+    elevated_m = _ELEVATED_RE.search(body)
+    elevated_level = elevated_m.group(1) if (elevated_m and elevated_m.group(1)) else (None if not elevated_m else "on")
+    
+    # NEW: Exec directive
+    exec_m = _EXEC_RE.search(body)
+    exec_options = None
+    if exec_m:
+        exec_str = exec_m.group(1).strip()
+        # Parse exec options (simplified version, can be enhanced)
+        exec_options = {"raw": exec_str}
+        # Parse key=value pairs
+        parts = exec_str.split(',')
+        for part in parts:
+            if '=' in part:
+                key, val = part.split('=', 1)
+                exec_options[key.strip()] = val.strip()
 
     cleaned = body
-    for pattern in (_SILENT_RE, _REPLY_TO_RE, _THINK_RE, _MODEL_RE):
+    for pattern in (_SILENT_RE, _REPLY_TO_RE, _THINK_RE, _MODEL_RE, 
+                    _QUEUE_RE, _VERBOSE_RE, _REASONING_RE, _ELEVATED_RE, _EXEC_RE):
         cleaned = pattern.sub("", cleaned)
     cleaned = cleaned.strip()
 
@@ -148,6 +220,11 @@ def parse_inline_directives(body: str) -> InlineDirectives:
         reply_to_id=reply_to_id,
         think_level=think_level,
         model_override=model_override,
+        queue_mode=queue_mode,
+        verbose_level=verbose_level,
+        reasoning_level=reasoning_level,
+        elevated_level=elevated_level,
+        exec_options=exec_options,
         cleaned_body=cleaned,
     )
 
@@ -156,15 +233,44 @@ def parse_inline_directives(body: str) -> InlineDirectives:
 # Session reset detection
 # ---------------------------------------------------------------------------
 
+DEFAULT_RESET_TRIGGERS = ["/new", "/reset"]
+
 _RESET_RE = re.compile(r"^/(?:new|reset)(?:\s+(.*))?$", re.IGNORECASE)
 
 
-def detect_reset_command(body: str) -> tuple[bool, str]:
-    """Returns (is_reset, post_reset_message)."""
-    m = _RESET_RE.match(body.strip())
-    if not m:
-        return False, ""
-    return True, (m.group(1) or "").strip()
+def detect_reset_command(
+    body: str,
+    reset_triggers: list[str] | None = None,
+) -> tuple[bool, str]:
+    """Returns (is_reset, post_reset_message).
+
+    Mirrors TypeScript session.ts: checks body against resetTriggers config
+    (falls back to DEFAULT_RESET_TRIGGERS = ["/new", "/reset"]).
+    """
+    triggers = reset_triggers if reset_triggers else DEFAULT_RESET_TRIGGERS
+    stripped = body.strip()
+    stripped_lower = stripped.lower()
+
+    for trigger in triggers:
+        if not trigger:
+            continue
+        trigger_lower = trigger.lower()
+        # Exact match (bare trigger like /reset)
+        if stripped_lower == trigger_lower:
+            return True, ""
+        # Trigger with trailing content (e.g. /reset say hello)
+        if stripped_lower.startswith(trigger_lower + " "):
+            post = stripped[len(trigger):].strip()
+            return True, post
+
+    # Fallback: built-in regex for /new and /reset (catches e.g. /Reset case
+    # when custom triggers don't include them)
+    if not reset_triggers:
+        m = _RESET_RE.match(stripped)
+        if m:
+            return True, (m.group(1) or "").strip()
+
+    return False, ""
 
 
 # ---------------------------------------------------------------------------
@@ -512,9 +618,20 @@ async def get_reply_from_config(
         return None
 
     # ------------------------------------------------------------------
-    # 2. Session reset (/new, /reset)
+    # 2. Session reset (/new, /reset)  — mirrors TS session.ts resetTriggers
     # ------------------------------------------------------------------
-    is_reset, post_reset_body = detect_reset_command(body)
+    _session_cfg = cfg.get("session") if isinstance(cfg, dict) else getattr(cfg, "session", None)
+    _reset_triggers: list[str] | None = None
+    if _session_cfg is not None:
+        _rt = (
+            _session_cfg.get("resetTriggers")
+            if isinstance(_session_cfg, dict)
+            else getattr(_session_cfg, "resetTriggers", None)
+            or getattr(_session_cfg, "reset_triggers", None)
+        )
+        if _rt:
+            _reset_triggers = list(_rt)
+    is_reset, post_reset_body = detect_reset_command(body, _reset_triggers)
     if is_reset:
         # Trigger internal hook for reset/new commands (before resetting)
         try:
