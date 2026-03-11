@@ -10,7 +10,7 @@ name = "openclaw-python"
 version = "0.8.2"
 description = "Personal AI assistant platform - Python implementation of OpenClaw"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 license = { text = "MIT" }
 authors = [
     { name = "OpenClaw Contributors" }
@@ -22,6 +22,7 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
 
 dependencies = [
