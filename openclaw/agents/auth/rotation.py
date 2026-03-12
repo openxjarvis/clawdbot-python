@@ -58,8 +58,16 @@ class RotationManager:
         preferred_id: str | None = None,
         filter_fn: Callable[[AuthProfile], bool] | None = None,
     ) -> AuthProfile | None:
-        """
-        Get next available profile for provider
+        """Get next available profile for provider with type priority + round-robin.
+        
+        Mirrors TS resolveAuthProfileOrder() and orderProfilesByMode() from
+        openclaw/src/agents/auth-profiles/order.ts:15-190.
+        
+        Sorting logic:
+        1. Available profiles first (not in cooldown)
+        2. Within available: sort by (type_priority, lastUsed oldest first)
+           - type_priority: oauth(0) > token(1) > api_key(2)
+        3. Cooldown profiles last (sorted by cooldown expiry, soonest first)
 
         Args:
             provider: Provider name
@@ -69,6 +77,8 @@ class RotationManager:
         Returns:
             Available profile or None
         """
+        import time
+        
         profiles = self.store.list_profiles(provider)
 
         if not profiles:
@@ -79,37 +89,94 @@ class RotationManager:
         if filter_fn:
             profiles = [p for p in profiles if filter_fn(p)]
 
-        # Filter out unavailable profiles
-        available = [p for p in profiles if p.is_available()]
+        # Partition into available and in-cooldown
+        available: list[AuthProfile] = []
+        in_cooldown: list[AuthProfile] = []
+        
+        for profile in profiles:
+            if profile.is_available():
+                available.append(profile)
+            else:
+                in_cooldown.append(profile)
 
-        if not available:
-            logger.warning(f"All profiles for {provider} are in cooldown")
+        if not available and not in_cooldown:
+            logger.warning(f"All profiles for {provider} are filtered out")
             return None
 
-        # Try preferred profile first
+        # Try preferred profile first if it's available
         if preferred_id:
             for profile in available:
                 if profile.id == preferred_id:
                     return profile
 
-        # Sort by last used (least recently used first)
-        available.sort(key=lambda p: p.last_used or datetime.min)
+        if not available:
+            logger.warning(f"All profiles for {provider} are in cooldown")
+            return None
 
-        return available[0]
+        # Sort available profiles by type priority, then by lastUsed (oldest first)
+        # Mirrors TS orderProfilesByMode() lines 159-178
+        def sort_key(p: AuthProfile):
+            # Type score: oauth=0 (highest), token=1, api_key=2 (lowest)
+            type_score = {
+                "oauth": 0,
+                "token": 1,
+                "api_key": 2,
+            }.get(p.type, 3)
+            
+            # Get lastUsed from usage_stats if available, else from profile
+            profile_last_used_ms = 0
+            if p.id in self.store.usage_stats:
+                profile_last_used_ms = self.store.usage_stats[p.id].get("lastUsed", 0)
+            elif p.last_used:
+                profile_last_used_ms = int(p.last_used.timestamp() * 1000)
+            
+            # Primary sort: type (lower = higher priority)
+            # Secondary sort: lastUsed (lower = older = higher priority for round-robin)
+            return (type_score, profile_last_used_ms)
+
+        available.sort(key=sort_key)
+
+        # Note: We don't append cooldown profiles here because we only return available ones
+        # If needed, caller can handle "all in cooldown" scenario
+        
+        return available[0] if available else None
 
     def mark_success(self, profile_id: str) -> None:
-        """
-        Mark profile as successfully used
+        """Mark profile as successfully used.
+        
+        Updates both the profile and usage_stats (mirrors TS behavior).
 
         Args:
             profile_id: Profile ID
         """
+        import time
+        
         profile = self.store.get_profile(profile_id)
         if profile:
-            profile.last_used = datetime.now(UTC)
+            now_dt = datetime.now(UTC)
+            now_ms = int(now_dt.timestamp() * 1000)
+            
+            # Update profile
+            profile.last_used = now_dt
             profile.failure_count = 0
+            profile.error_count = 0
             profile.cooldown_until = None
             self.store.add_profile(profile)
+            
+            # Update usage_stats (mirrors TS)
+            if profile_id not in self.store.usage_stats:
+                self.store.usage_stats[profile_id] = {}
+            
+            self.store.usage_stats[profile_id]["lastUsed"] = now_ms
+            self.store.usage_stats[profile_id]["errorCount"] = 0
+            self.store.usage_stats[profile_id]["cooldownUntil"] = None
+            
+            # Update last_good (mirrors TS)
+            self.store.last_good[profile.provider] = profile_id
+            
+            # Persist changes
+            self.store._save()
+            
             logger.debug(f"Profile {profile_id} used successfully")
 
     def mark_failure(
@@ -127,6 +194,7 @@ class RotationManager:
         - Increments errorCount
         - Uses calculateAuthProfileCooldownMs(errorCount) → 1min/5min/25min/1h
         - Billing errors use disabledUntil with 5h/24h backoff schedule
+        - Updates usage_stats
 
         Args:
             profile_id: Profile ID
@@ -136,6 +204,8 @@ class RotationManager:
             billing_backoff_ms: Billing backoff duration (default 5h)
             billing_max_ms: Max billing disable duration (default 24h)
         """
+        import time
+        
         profile = self.store.get_profile(profile_id)
         if not profile:
             return
@@ -144,6 +214,7 @@ class RotationManager:
         profile.failure_count = profile.error_count
 
         now = datetime.now(UTC)
+        now_ms = int(now.timestamp() * 1000)
 
         if is_billing_error:
             # Billing disable: longer window, capped at billing_max_ms
@@ -170,6 +241,23 @@ class RotationManager:
             )
 
         self.store.add_profile(profile)
+        
+        # Update usage_stats (NEW - mirrors TS)
+        if profile_id not in self.store.usage_stats:
+            self.store.usage_stats[profile_id] = {}
+        
+        stats = self.store.usage_stats[profile_id]
+        stats["errorCount"] = profile.error_count
+        stats["lastFailureAt"] = now_ms
+        
+        if is_billing_error and profile.disabled_until:
+            stats["disabledUntil"] = int(profile.disabled_until.timestamp() * 1000)
+            stats["disabledReason"] = reason
+        elif profile.cooldown_until:
+            stats["cooldownUntil"] = int(profile.cooldown_until.timestamp() * 1000)
+        
+        # Persist changes
+        self.store._save()
 
     def clear_expired_cooldowns(self) -> int:
         """Remove expired cooldowns from all profiles.

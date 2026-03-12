@@ -8,6 +8,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
+# Import load_config for convenience (mirrors TS loadConfig in config/io.ts)
+from .loader import load_config  # noqa: F401
+
 
 @dataclass
 class AgentConfig:

@@ -41,7 +41,11 @@ class QueueSettings:
 
 @dataclass
 class FollowupRun:
-    """A single deferred agent turn — mirrors TS FollowupRun."""
+    """A single deferred agent turn — mirrors TS FollowupRun.
+
+    Fields aligned with TS FollowupRun type in queue/types.ts:
+    - agent_id / sender / permissions added in P1-7 alignment pass
+    """
     prompt: str
     run: dict[str, Any]
     enqueued_at: int = field(default_factory=lambda: int(time.time() * 1000))
@@ -52,6 +56,16 @@ class FollowupRun:
     originating_account_id: str | None = None
     originating_thread_id: str | int | None = None
     originating_chat_type: str | None = None
+    # P1-7: Additional fields present in TS FollowupRun but missing in Python
+    agent_id: str | None = None           # agentId — the routing target agent
+    sender: str | None = None             # sender peer id (from/sender_id)
+    sender_name: str | None = None        # human-readable sender name
+    permissions: list[str] | None = None  # resolved permission flags
+    is_heartbeat: bool = False            # mirrors TS isHeartbeat
+    heartbeat_model_override: str | None = None  # heartbeat.model override
+    skill_filter: list[str] | None = None  # merged skill filter for this turn
+    session_id: str | None = None         # resolved session UUID (for store lookup)
+    session_file: str | None = None       # path to session transcript
 
 
 @dataclass
@@ -429,3 +443,168 @@ def schedule_followup_drain(
             loop.create_task(_drain())
         except RuntimeError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Gap 8 — resolve_queue_settings (full 5-level priority chain)
+# Mirrors TS queue/settings.ts resolveQueueSettings()
+# ---------------------------------------------------------------------------
+
+def _normalize_queue_mode(raw: str | None) -> QueueMode | None:
+    """Normalize a raw queue mode string to a known QueueMode literal."""
+    if not raw:
+        return None
+    val = raw.strip().lower()
+    valid: tuple[str, ...] = ("steer", "followup", "collect", "steer-backlog", "interrupt", "queue")
+    return val if val in valid else None  # type: ignore[return-value]
+
+
+def _normalize_drop_policy(raw: str | None) -> QueueDropPolicy | None:
+    if not raw:
+        return None
+    val = raw.strip().lower()
+    valid: tuple[str, ...] = ("old", "new", "summarize")
+    return val if val in valid else None  # type: ignore[return-value]
+
+
+def _resolve_plugin_debounce(channel_key: str | None) -> int | None:
+    """Get plugin-level default debounce for a channel."""
+    if not channel_key:
+        return None
+    try:
+        from openclaw.channels.plugins import get_channel_plugin
+        plugin = get_channel_plugin(channel_key)
+        if plugin:
+            plugin_defaults = getattr(plugin, "defaults", None) or {}
+            queue_defaults = (
+                plugin_defaults.get("queue", {})
+                if isinstance(plugin_defaults, dict)
+                else getattr(plugin_defaults, "queue", None)
+            ) or {}
+            debounce = (
+                queue_defaults.get("debounceMs")
+                if isinstance(queue_defaults, dict)
+                else getattr(queue_defaults, "debounceMs", None)
+            )
+            if isinstance(debounce, (int, float)) and debounce >= 0:
+                return max(0, int(debounce))
+    except Exception:
+        pass
+    return None
+
+
+def resolve_queue_settings(
+    cfg: Any,
+    *,
+    channel: str | None = None,
+    session_entry: Any | None = None,
+    inline_mode: QueueMode | None = None,
+    inline_options: dict[str, Any] | None = None,
+) -> QueueSettings:
+    """Resolve queue settings using the full 5-level priority chain.
+
+    Priority (highest to lowest):
+      1. inline_mode / inline_options (per-message overrides)
+      2. session_entry queue fields (queueMode, queueDebounceMs, queueCap, queueDrop)
+      3. cfg.messages.queue.byChannel[channel]  (per-channel mode)
+      4. cfg.messages.queue.*  (global config)
+      5. defaults (collect / 1000ms / 20 / summarize)
+
+    Mirrors TS queue/settings.ts resolveQueueSettings().
+    """
+    inline_opts = inline_options or {}
+    channel_key = (channel or "").strip().lower() or None
+
+    # Extract the queue config block
+    messages_cfg: Any = None
+    if isinstance(cfg, dict):
+        messages_cfg = cfg.get("messages", {}) or {}
+    elif cfg is not None:
+        messages_cfg = getattr(cfg, "messages", None)
+
+    queue_cfg: Any = None
+    if isinstance(messages_cfg, dict):
+        queue_cfg = messages_cfg.get("queue") or {}
+    elif messages_cfg is not None:
+        queue_cfg = getattr(messages_cfg, "queue", None)
+
+    def _qcfg_get(key: str) -> Any:
+        if queue_cfg is None:
+            return None
+        if isinstance(queue_cfg, dict):
+            return queue_cfg.get(key)
+        return getattr(queue_cfg, key, None)
+
+    # Per-channel mode from byChannel map (priority 3)
+    by_channel_map = _qcfg_get("byChannel") or {}
+    provider_mode_raw: str | None = None
+    if channel_key and by_channel_map:
+        provider_mode_raw = (
+            by_channel_map.get(channel_key)
+            if isinstance(by_channel_map, dict)
+            else None
+        )
+
+    # Per-channel debounce from debounceMsByChannel (priority 3.5)
+    debounce_by_channel_map = _qcfg_get("debounceMsByChannel") or {}
+    channel_debounce: int | None = None
+    if channel_key and debounce_by_channel_map and isinstance(debounce_by_channel_map, dict):
+        raw_cd = debounce_by_channel_map.get(channel_key)
+        if isinstance(raw_cd, (int, float)) and raw_cd >= 0:
+            channel_debounce = max(0, int(raw_cd))
+
+    # Session entry fields
+    def _se_get(key: str) -> Any:
+        if session_entry is None:
+            return None
+        if isinstance(session_entry, dict):
+            return session_entry.get(key)
+        return getattr(session_entry, key, None)
+
+    # Resolve mode (priority chain)
+    resolved_mode: QueueMode = (
+        inline_mode
+        or _normalize_queue_mode(_se_get("queueMode"))
+        or _normalize_queue_mode(provider_mode_raw)
+        or _normalize_queue_mode(_qcfg_get("mode"))
+        or "collect"
+    )
+
+    # Resolve debounce (priority chain)
+    plugin_debounce = _resolve_plugin_debounce(channel_key)
+    _inline_debounce = inline_opts.get("debounceMs")
+    _se_debounce = _se_get("queueDebounceMs")
+    global_debounce = _qcfg_get("debounceMs")
+    debounce_chain = [_inline_debounce, _se_debounce, channel_debounce, plugin_debounce, global_debounce]
+    resolved_debounce: int | None = None
+    for v in debounce_chain:
+        if isinstance(v, (int, float)) and v >= 0:
+            resolved_debounce = max(0, int(v))
+            break
+    if resolved_debounce is None:
+        resolved_debounce = DEFAULT_QUEUE_DEBOUNCE_MS
+
+    # Resolve cap
+    _inline_cap = inline_opts.get("cap")
+    _se_cap = _se_get("queueCap")
+    _global_cap = _qcfg_get("cap")
+    resolved_cap: int | None = None
+    for v in [_inline_cap, _se_cap, _global_cap]:
+        if isinstance(v, (int, float)) and v >= 1:
+            resolved_cap = max(1, int(v))
+            break
+    if resolved_cap is None:
+        resolved_cap = DEFAULT_QUEUE_CAP
+
+    # Resolve drop policy
+    _inline_drop = inline_opts.get("dropPolicy")
+    _se_drop = _normalize_drop_policy(_se_get("queueDrop"))
+    _global_drop = _normalize_drop_policy(_qcfg_get("drop"))
+    resolved_drop: QueueDropPolicy = _inline_drop or _se_drop or _global_drop or DEFAULT_QUEUE_DROP
+
+    return QueueSettings(
+        mode=resolved_mode,
+        debounce_ms=resolved_debounce,
+        cap=resolved_cap,
+        drop_policy=resolved_drop,
+    )

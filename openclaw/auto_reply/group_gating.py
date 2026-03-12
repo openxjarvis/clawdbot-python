@@ -90,6 +90,7 @@ def apply_group_gating(
     group_history_limit: int = 50,
     owner_list: list[str] | None = None,
     session_state: dict[str, Any] | None = None,
+    group_member_names: dict[str, dict[str, str]] | None = None,
 ) -> GroupGatingResult:
     """Apply group gating logic to determine if message should be processed.
     
@@ -108,6 +109,8 @@ def apply_group_gating(
         group_history_limit: Maximum history entries to keep
         owner_list: List of owner identifiers
         session_state: Optional session state dict
+        group_member_names: Map of groupId -> {participantJid -> displayName}.
+            Mirrors TS ``groupMemberNames: Map<string, Map<string, string>>``.
         
     Returns:
         GroupGatingResult with shouldProcess and wasMentioned flags

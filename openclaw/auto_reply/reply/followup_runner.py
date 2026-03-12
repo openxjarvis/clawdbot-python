@@ -101,7 +101,7 @@ def create_followup_runner(ctx: "ReplyContext") -> Callable[["FollowupRun"], Awa
 
         try:
             try:
-                response_text, has_error = await asyncio.wait_for(
+                response_text, has_error, auto_compaction_completed = await asyncio.wait_for(
                     _execute_agent_turn(followup_ctx, run_id),
                     timeout=FOLLOWUP_TIMEOUT_S,
                 )
@@ -115,6 +115,32 @@ def create_followup_runner(ctx: "ReplyContext") -> Callable[["FollowupRun"], Awa
                 abort_embedded_pi_run(followup_ctx.session_id)
                 clear_active_embedded_run(followup_ctx.session_id, run_id)
                 return
+
+            # Gap 2: strip HEARTBEAT_OK tokens from followup response
+            has_media = bool(queued.originating_to)  # conservative: if there's a target, allow through
+            if response_text and "HEARTBEAT_OK" in response_text.upper():
+                try:
+                    from openclaw.gateway.heartbeat import strip_heartbeat_ok
+                    _stripped = strip_heartbeat_ok(response_text)
+                    if not _stripped and not has_media:
+                        logger.debug(
+                            "followup_runner: pure HEARTBEAT_OK — skipping delivery for session %s",
+                            followup_ctx.session_id[:8],
+                        )
+                        return
+                    response_text = _stripped
+                except Exception:
+                    pass
+
+            # Gap 5: prepend auto-compaction notice when verbose
+            if auto_compaction_completed and response_text is not None:
+                try:
+                    verbose_level = getattr(queued.run.get("verboseLevel", None) if isinstance(queued.run, dict) else getattr(queued.run, "verboseLevel", None), "__str__", lambda: None)() if False else (queued.run.get("verboseLevel") if isinstance(queued.run, dict) else getattr(queued.run, "verboseLevel", None))
+                    if verbose_level and verbose_level != "off":
+                        response_text = f"🧹 Auto-compaction complete.\n\n{response_text}" if response_text else "🧹 Auto-compaction complete."
+                except Exception:
+                    pass
+
             if response_text or has_error:
                 await _deliver_response(followup_ctx, response_text, has_error)
         except Exception as exc:

@@ -272,3 +272,119 @@ def stop_diagnostic_heartbeat() -> None:
         _heartbeat_task.cancel()
         logger.info("Diagnostic heartbeat stopped")
     _heartbeat_task = None
+
+
+# ---------------------------------------------------------------------------
+# P2: emit_diagnostic_event — mirrors TS emitDiagnosticEvent()
+# ---------------------------------------------------------------------------
+
+def emit_diagnostic_event(
+    event_type: str,
+    data: dict[str, Any],
+    *,
+    session_key: str | None = None,
+    run_id: str | None = None,
+) -> None:
+    """Emit a structured diagnostic event.
+
+    Mirrors TS ``emitDiagnosticEvent()`` from src/infra/diagnostic-events.ts.
+    Called from agent-runner.ts at the end of each run to record token usage,
+    model, timing, and other observability data.
+
+    Args:
+        event_type: Event type identifier (e.g. ``"run.complete"``, ``"model.usage"``).
+        data: Event payload dict.
+        session_key: Optional session key for routing.
+        run_id: Optional run ID for correlation.
+    """
+    enriched: dict[str, Any] = {**data}
+    if session_key is not None:
+        enriched.setdefault("session_key", session_key)
+    if run_id is not None:
+        enriched.setdefault("run_id", run_id)
+    _emit(event_type, enriched)
+
+
+def build_system_prompt_report(
+    system_prompt: str | None,
+    *,
+    session_key: str | None = None,
+    model: str | None = None,
+    agent_id: str | None = None,
+    extra_sections: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build a structured report of what's in the system prompt.
+
+    Mirrors TS ``buildSystemPromptReport()`` from src/agents/system-prompt-report.ts.
+    Returns a dict describing the system prompt sections for diagnostic purposes.
+    """
+    prompt_str = system_prompt or ""
+    sections = []
+    if prompt_str:
+        # Split by double-newline to identify logical sections
+        raw_sections = [s.strip() for s in prompt_str.split("\n\n") if s.strip()]
+        sections = [s[:120] + "…" if len(s) > 120 else s for s in raw_sections[:20]]
+    report: dict[str, Any] = {
+        "totalChars": len(prompt_str),
+        "sectionCount": len(sections),
+        "sections": sections,
+    }
+    if session_key:
+        report["sessionKey"] = session_key
+    if model:
+        report["model"] = model
+    if agent_id:
+        report["agentId"] = agent_id
+    if extra_sections:
+        report["extraSections"] = extra_sections
+    return report
+
+
+def append_unscheduled_reminder_note(
+    system_prompt: str,
+    session_key: str | None = None,
+    cfg: dict | None = None,
+) -> str:
+    """Append an unscheduled-reminder guard note to the system prompt.
+
+    Mirrors TS ``appendUnscheduledReminderNote()`` from
+    src/auto-reply/reply/agent-runner-reminder-guard.ts.
+    When there are reminder commitments in the session but no matching
+    scheduled cron jobs, adds a note so the model doesn't forget them.
+    """
+    # Python stub: actual implementation requires cron job registry access.
+    # Return unmodified for now; full implementation would check session data.
+    return system_prompt
+
+
+def read_post_compaction_context(
+    session_key: str | None,
+    cfg: dict | None = None,
+) -> str | None:
+    """Read any context that should be injected after auto-compaction.
+
+    Mirrors TS ``readPostCompactionContext()`` from
+    src/auto-reply/reply/post-compaction-context.ts.
+    Returns a string to inject into the system prompt after compaction, or None.
+    """
+    # Python stub: actual implementation would read the session's post-compaction
+    # context file (e.g. ~/.openclaw/sessions/<id>/post-compact.md).
+    if not session_key:
+        return None
+    try:
+        import os
+        from pathlib import Path
+        sessions_dir = Path.home() / ".openclaw" / "sessions"
+        # Try to find a post-compaction context file for this session
+        candidates = [
+            sessions_dir / session_key / "post-compact.md",
+            sessions_dir / session_key / "post_compact.md",
+        ]
+        for c in candidates:
+            if c.exists():
+                content = c.read_text(encoding="utf-8", errors="replace").strip()
+                if content:
+                    return content
+    except Exception:
+        pass
+    return None

@@ -215,7 +215,9 @@ async def build_gateway_cron_service(
                     "system_prompt": system_prompt,
                 }
                 if model_override:
-                    run_kwargs["model_override"] = model_override
+                    # TS uses 'model' parameter (not 'model_override')
+                    # See: openclaw/src/agents/pi-embedded-runner/run.ts line 243
+                    run_kwargs["model"] = model_override
                 if payload_fallbacks:
                     run_kwargs["model_fallbacks"] = payload_fallbacks
 

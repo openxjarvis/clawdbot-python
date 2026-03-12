@@ -81,11 +81,52 @@ def build_system_prompt_params(
     
     if repo_root:
         runtime_info["repo_root"] = str(repo_root)
-    
+
+    # P2: acp_enabled — whether the Agent Communication Protocol is active.
+    # Mirrors TS acpEnabled param in system-prompt.ts.
+    acp_enabled = False
+    if isinstance(config, dict):
+        acp_enabled = bool(
+            config.get("acpEnabled")
+            or config.get("acp_enabled")
+            or (config.get("acp") or {}).get("enabled", False)
+        )
+
+    # P2: owner_display — human-readable owner name for the system prompt.
+    # Mirrors TS ownerDisplay param.
+    owner_display: str | None = None
+    if isinstance(config, dict):
+        owner_display = (
+            config.get("ownerDisplay")
+            or config.get("owner_display")
+            or (config.get("agents", {}).get("defaults", {}) or {}).get("ownerDisplay")
+        )
+
+    # P2: user_time — current timestamp in user's local timezone for injection.
+    # Mirrors TS userTime param (ISO string) in system-prompt.ts.
+    try:
+        import time as _time_mod
+        import datetime as _dt_mod
+        _now_utc = _dt_mod.datetime.utcnow()
+        user_time = _now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+        # Attempt local timezone formatting
+        try:
+            from zoneinfo import ZoneInfo as _ZI
+            _tz = _ZI(user_timezone)
+            _now_local = _dt_mod.datetime.now(tz=_tz)
+            user_time = _now_local.strftime("%Y-%m-%dT%H:%M:%S%z")
+        except Exception:
+            pass
+    except Exception:
+        user_time = None
+
     return {
         "user_timezone": user_timezone,
         "runtime_info": runtime_info,
-        "repo_root": str(repo_root) if repo_root else None
+        "repo_root": str(repo_root) if repo_root else None,
+        "acp_enabled": acp_enabled,
+        "owner_display": owner_display,
+        "user_time": user_time,
     }
 
 

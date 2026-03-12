@@ -76,6 +76,14 @@ class ReplyContext:
     # Enabled for Telegram DMs and Feishu thread replies where intermediate steps
     # should appear as individual messages rather than a single streaming preview.
     block_send_fn: Callable[[str], Awaitable[None]] | None = None
+    # Verbose mode level — mirrors TS resolvedVerboseLevel ("off" | "on" | "full").
+    # When not "off", operational notices (new session, compaction, fallback) and a
+    # usage summary line are appended to the response.
+    verbose_level: str = "off"
+    # Whether the current turn is the first message of a brand-new session.
+    # Mirrors TS activeIsNewSession. When True and verbose_level != "off", a
+    # "🧭 New session" notice is prepended to the response.
+    is_new_session: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +193,12 @@ async def _run_agent_now(ctx: ReplyContext) -> None:
 
         timeout_s = (ctx.timeout_ms or DEFAULT_AGENT_TIMEOUT_MS) / 1000.0
 
+        # P0: Memory flush — mirrors TS runMemoryFlushIfNeeded() called in
+        # runReplyAgent() just before typingSignals.signalRunStart().
+        # Runs a short pre-compaction agent turn to persist memories to disk
+        # when the session context is near the threshold.
+        await _maybe_run_memory_flush(ctx)
+
         # Transition status reaction from "queued" → "thinking" just before the
         # agent turn starts. Mirrors TS: statusReactionController.setThinking()
         # called in bot-message-dispatch.ts before dispatchReplyWithBufferedBlockDispatcher.
@@ -194,11 +208,203 @@ async def _run_agent_now(ctx: ReplyContext) -> None:
             except Exception:
                 pass
 
+        run_started_at = time.monotonic()
         try:
-            response_text, has_error = await asyncio.wait_for(
+            response_text, has_error, _auto_compact = await asyncio.wait_for(
                 _execute_agent_turn(ctx, run_id),
                 timeout=timeout_s,
             )
+            # Gap 2: strip HEARTBEAT_OK from main-path response before delivery
+            if response_text and "HEARTBEAT_OK" in response_text.upper():
+                try:
+                    from openclaw.gateway.heartbeat import strip_heartbeat_ok
+                    _stripped_text = strip_heartbeat_ok(response_text)
+                    if not _stripped_text:
+                        logger.debug("_run_agent_now: pure HEARTBEAT_OK response — skipping delivery")
+                        finalize_with_followup(ctx)
+                        return
+                    response_text = _stripped_text
+                except Exception:
+                    pass
+
+            # ------------------------------------------------------------------
+            # persistRunSessionUsage — mirrors TS persistRunSessionUsage() in
+            # agent-runner.ts, called after runAgentTurnWithFallback succeeds.
+            # Persists token counts to the session store for quota tracking.
+            # ------------------------------------------------------------------
+            try:
+                _cfg_for_usage: dict = {}
+                try:
+                    _cfg_attr = getattr(ctx.runtime, "cfg", None) or getattr(ctx.runtime, "config", None)
+                    if isinstance(_cfg_attr, dict):
+                        _cfg_for_usage = _cfg_attr
+                except Exception:
+                    pass
+                # Attempt to extract usage from the runtime session pool
+                _input_tokens = 0
+                _output_tokens = 0
+                try:
+                    if hasattr(ctx.runtime, "_pool") and ctx.session_id in ctx.runtime._pool:
+                        pi_sess = ctx.runtime._pool[ctx.session_id]
+                        _usage = getattr(pi_sess, "_last_usage", None) or {}
+                        if isinstance(_usage, dict):
+                            _input_tokens = int(_usage.get("input") or _usage.get("prompt_tokens") or 0)
+                            _output_tokens = int(_usage.get("output") or _usage.get("completion_tokens") or 0)
+                except Exception:
+                    pass
+                if _input_tokens > 0 or _output_tokens > 0:
+                    asyncio.create_task(
+                        persist_run_session_usage(
+                            ctx.session_key,
+                            input_tokens=_input_tokens,
+                            output_tokens=_output_tokens,
+                            cfg=_cfg_for_usage,
+                        )
+                    )
+            except Exception as _pu_exc:
+                logger.debug("_run_agent_now: persist_run_session_usage error (non-fatal): %s", _pu_exc)
+
+            # ------------------------------------------------------------------
+            # emitDiagnosticEvent — mirrors TS emitDiagnosticEvent({ type: "model.usage" })
+            # Called from agent-runner.ts after persistRunSessionUsage.
+            # ------------------------------------------------------------------
+            try:
+                from openclaw.infra.diagnostic_events import log_model_usage, emit_diagnostic_event
+                _provider = ""
+                _model = ""
+                try:
+                    if hasattr(ctx.runtime, "provider"):
+                        _provider = str(ctx.runtime.provider or "")
+                    if hasattr(ctx.runtime, "model"):
+                        _model = str(ctx.runtime.model or "")
+                except Exception:
+                    pass
+                if ctx.session_key and (_input_tokens > 0 or _output_tokens > 0):
+                    _duration_ms = (time.monotonic() - run_started_at) * 1000
+                    _usage_payload = {
+                        "input": _input_tokens,
+                        "output": _output_tokens,
+                        "cacheRead": 0,
+                        "cacheWrite": 0,
+                        "promptTokens": _input_tokens,
+                        "total": _input_tokens + _output_tokens,
+                    }
+                    # Attempt cost estimation
+                    _cost_usd: float | None = None
+                    try:
+                        from openclaw.utils.usage_format import (
+                            estimate_usage_cost,
+                            resolve_model_cost_config,
+                        )
+                        _cost_cfg = resolve_model_cost_config(
+                            provider=_provider,
+                            model=_model,
+                            config=_cfg_for_usage,
+                        )
+                        _cost_usd = estimate_usage_cost(usage=_usage_payload, cost=_cost_cfg)
+                    except Exception:
+                        pass
+                    emit_diagnostic_event(
+                        "model.usage",
+                        {
+                            "provider": _provider,
+                            "model": _model,
+                            "usage": _usage_payload,
+                            "cost_usd": _cost_usd,
+                            "duration_ms": _duration_ms,
+                            "session_id": ctx.session_id,
+                        },
+                        session_key=ctx.session_key,
+                        run_id=run_id,
+                    )
+            except Exception as _de_exc:
+                logger.debug("_run_agent_now: emitDiagnosticEvent error (non-fatal): %s", _de_exc)
+
+            # ------------------------------------------------------------------
+            # Reminder guard — mirrors TS reminder guard in agent-runner.ts.
+            # Appends a note when the reply contains a reminder commitment
+            # without a corresponding scheduled cron job.
+            # ------------------------------------------------------------------
+            if response_text and not has_error:
+                try:
+                    from openclaw.auto_reply.reply.reminder_guard import (
+                        has_unbacked_reminder_commitment,
+                        has_session_related_cron_jobs,
+                    )
+                    if has_unbacked_reminder_commitment(response_text):
+                        _cfg_for_cron: dict = {}
+                        try:
+                            _cfg_attr2 = getattr(ctx.runtime, "cfg", None)
+                            if isinstance(_cfg_attr2, dict):
+                                _cfg_for_cron = _cfg_attr2
+                        except Exception:
+                            pass
+                        _cron_store_path = (
+                            _cfg_for_cron.get("cron", {}).get("store")
+                            if isinstance(_cfg_for_cron, dict)
+                            else None
+                        )
+                        # Note: successful_cron_adds is not tracked in Python yet;
+                        # default to 0 (conservative: always append note unless
+                        # an existing cron job covers this session).
+                        _covered = await has_session_related_cron_jobs(
+                            cron_store_path=_cron_store_path,
+                            session_key=ctx.session_key,
+                        )
+                        if not _covered:
+                            from openclaw.auto_reply.reply.reminder_guard import UNSCHEDULED_REMINDER_NOTE
+                            response_text = f"{response_text.rstrip()}\n\n{UNSCHEDULED_REMINDER_NOTE}"
+                except Exception as _rg_exc:
+                    logger.debug("_run_agent_now: reminder guard error (non-fatal): %s", _rg_exc)
+
+            # ------------------------------------------------------------------
+            # Verbose notices — mirrors TS agent-runner.ts lines 594-690:
+            # When verbose_level != "off", prepend operational status notices and
+            # append a token-usage summary line to the final response.
+            # ------------------------------------------------------------------
+            verbose_enabled = getattr(ctx, "verbose_level", "off") not in ("off", None, "")
+            if verbose_enabled and not has_error:
+                verbose_prefix_lines: list[str] = []
+
+                # New session notice — mirrors TS: verboseEnabled && activeIsNewSession
+                if getattr(ctx, "is_new_session", False):
+                    verbose_prefix_lines.append(f"🧭 New session: {ctx.session_id}")
+
+                # Auto-compaction notice — mirrors TS: autoCompactionCompleted
+                if _auto_compact:
+                    verbose_prefix_lines.append("🧹 Auto-compaction complete.")
+
+                if verbose_prefix_lines:
+                    prefix_block = "\n".join(verbose_prefix_lines)
+                    response_text = f"{prefix_block}\n\n{response_text}" if response_text else prefix_block
+
+                # Usage summary line — mirrors TS formatResponseUsageLine + appendUsageLine
+                try:
+                    from openclaw.utils.usage_format import (
+                        format_response_usage_line,
+                        resolve_model_cost_config,
+                    )
+                    _usage_line_input = _input_tokens
+                    _usage_line_output = _output_tokens
+                    if _usage_line_input > 0 or _usage_line_output > 0:
+                        _usage_dict = {
+                            "input": _usage_line_input,
+                            "output": _usage_line_output,
+                            "cacheRead": 0,
+                            "cacheWrite": 0,
+                        }
+                        _usage_str = format_response_usage_line(
+                            usage=_usage_dict,
+                            show_cost=False,
+                        )
+                        if _usage_str and response_text:
+                            sep = "" if response_text.endswith("\n") else "\n"
+                            response_text = f"{response_text}{sep}{_usage_str}"
+                        elif _usage_str:
+                            response_text = _usage_str
+                except Exception as _vl_exc:
+                    logger.debug("_run_agent_now: verbose usage line error (non-fatal): %s", _vl_exc)
+
         except asyncio.TimeoutError:
             logger.warning(
                 "_run_agent_now: timed out after %.0fs for session %s",
@@ -440,6 +646,196 @@ async def _run_agent_now(ctx: ReplyContext) -> None:
         finalize_with_followup(ctx)
 
 
+async def _maybe_run_memory_flush(ctx: ReplyContext) -> None:
+    """Run a pre-compaction memory flush turn if settings warrant it.
+
+    Mirrors TS ``runMemoryFlushIfNeeded()`` called from ``runReplyAgent()``.
+    Resolves memory-flush settings from runtime/config and, if enabled and
+    the session is near the context window threshold, fires a silent agent
+    turn to persist memories to disk before compaction.
+    """
+    if not ctx.session_key or not ctx.runtime:
+        return
+    try:
+        from openclaw.auto_reply.reply.memory_flush import (
+            run_memory_flush,
+            resolve_memory_flush_settings,
+        )
+        # Resolve config from runtime if available, else empty dict.
+        cfg: dict = {}
+        try:
+            _cfg_attr = getattr(ctx.runtime, "cfg", None) or getattr(ctx.runtime, "config", None)
+            if isinstance(_cfg_attr, dict):
+                cfg = _cfg_attr
+        except Exception:
+            pass
+
+        settings = resolve_memory_flush_settings(cfg, None)
+        if not settings.enabled:
+            return
+
+        result = await run_memory_flush(
+            session_key=ctx.session_key,
+            settings=settings,
+            cfg=cfg,
+            runtime=ctx.runtime,
+        )
+        if result.flushed and not result.silent:
+            logger.debug(
+                "_maybe_run_memory_flush: flush ran for session %s, reply: %s",
+                ctx.session_id[:8],
+                (result.reply_text or "")[:60],
+            )
+    except Exception as exc:
+        logger.debug("_maybe_run_memory_flush: error (non-fatal): %s", exc)
+
+
+async def reset_session(
+    session_key: str,
+    session_id: str,
+    runtime: Any,
+    cfg: dict | None = None,
+    cleanup_transcript: bool = False,
+) -> str:
+    """Reset a session: generate a new UUID, update the store, optionally delete transcript.
+
+    Mirrors TS ``resetSession()`` in agent-runner.ts:
+    - Generates a new UUID via ``generateSecureUuid()``
+    - Updates the in-memory store entry with the new sessionId
+    - Writes the new entry to the store file
+    - Optionally removes the old transcript file
+
+    Returns the new session ID.
+    """
+    import uuid as _uuid
+    new_session_id = str(_uuid.uuid4())
+    cfg = cfg or {}
+
+    try:
+        from openclaw.config.sessions.paths import resolve_store_path
+        from openclaw.config.sessions.store_utils import (
+            load_session_store_from_path,
+            save_session_store_to_path,
+        )
+        _sess_cfg = cfg.get("session", {}) if isinstance(cfg, dict) else {}
+        store_path = resolve_store_path(
+            _sess_cfg.get("store") if isinstance(_sess_cfg, dict) else None, {}
+        )
+        if store_path:
+            store = load_session_store_from_path(store_path) or {}
+            entry = store.get(session_key.lower()) or store.get(session_key) or {}
+            now_ms = int(time.time() * 1000)
+            if isinstance(entry, dict):
+                old_transcript = entry.get("sessionFile") if cleanup_transcript else None
+                entry.update({
+                    "sessionId": new_session_id,
+                    "updatedAt": now_ms,
+                    "systemSent": False,
+                    "abortedLastRun": False,
+                })
+            else:
+                old_transcript = getattr(entry, "sessionFile", None) if cleanup_transcript else None
+                try:
+                    entry.sessionId = new_session_id
+                    entry.updatedAt = now_ms
+                    entry.systemSent = False
+                    entry.abortedLastRun = False
+                except Exception:
+                    entry = {
+                        "sessionId": new_session_id,
+                        "updatedAt": now_ms,
+                        "systemSent": False,
+                        "abortedLastRun": False,
+                    }
+            store[session_key.lower()] = entry
+            save_session_store_to_path(store_path, store)
+
+            # Optionally remove the old transcript (mirrors TS cleanupTranscripts flag)
+            if old_transcript and cleanup_transcript:
+                import os
+                try:
+                    if os.path.exists(old_transcript):
+                        os.remove(old_transcript)
+                        logger.debug("reset_session: removed old transcript %s", old_transcript)
+                except Exception as _rm_exc:
+                    logger.debug("reset_session: could not remove transcript: %s", _rm_exc)
+    except Exception as exc:
+        logger.warning("reset_session: failed to persist new session ID: %s", exc)
+
+    # Evict from runtime pool so next turn starts fresh
+    if runtime is not None:
+        try:
+            if hasattr(runtime, "evict_session"):
+                runtime.evict_session(session_id)
+        except Exception:
+            pass
+
+    logger.info(
+        "reset_session: rotated session %s -> %s (key=%s)",
+        (session_id or "")[:8],
+        new_session_id[:8],
+        session_key,
+    )
+    return new_session_id
+
+
+async def persist_run_session_usage(
+    session_key: str,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cfg: dict | None = None,
+) -> None:
+    """Persist token usage from the current run into the session store.
+
+    Mirrors TS ``persistRunSessionUsage()`` in session-run-accounting.ts.
+    Updates ``totalTokens`` and ``totalTokensFresh`` on the session entry.
+    """
+    if not session_key or (input_tokens <= 0 and output_tokens <= 0):
+        return
+    cfg = cfg or {}
+    try:
+        from openclaw.config.sessions.paths import resolve_store_path
+        from openclaw.config.sessions.store_utils import (
+            load_session_store_from_path,
+            save_session_store_to_path,
+        )
+        _sess_cfg = cfg.get("session", {}) if isinstance(cfg, dict) else {}
+        store_path = resolve_store_path(
+            _sess_cfg.get("store") if isinstance(_sess_cfg, dict) else None, {}
+        )
+        if not store_path:
+            return
+        store = load_session_store_from_path(store_path) or {}
+        entry = store.get(session_key.lower()) or store.get(session_key) or {}
+        total_tokens = input_tokens + output_tokens
+        now_ms = int(time.time() * 1000)
+        if isinstance(entry, dict):
+            entry.update({
+                "totalTokens": total_tokens,
+                "totalTokensFresh": True,
+                "updatedAt": now_ms,
+            })
+        else:
+            try:
+                entry.totalTokens = total_tokens
+                entry.totalTokensFresh = True
+                entry.updatedAt = now_ms
+            except Exception:
+                entry = {
+                    "totalTokens": total_tokens,
+                    "totalTokensFresh": True,
+                    "updatedAt": now_ms,
+                }
+        store[session_key.lower()] = entry
+        save_session_store_to_path(store_path, store)
+        logger.debug(
+            "persist_run_session_usage: session=%s in=%d out=%d total=%d",
+            session_key, input_tokens, output_tokens, total_tokens,
+        )
+    except Exception as exc:
+        logger.debug("persist_run_session_usage: error (non-fatal): %s", exc)
+
+
 async def _cleanup_draft_stream_on_abort(ctx: "ReplyContext") -> None:
     """Emergency cleanup of streaming sessions on timeout/cancel/error.
 
@@ -478,10 +874,10 @@ async def _cleanup_draft_stream_on_abort(ctx: "ReplyContext") -> None:
 async def _execute_agent_turn(
     ctx: ReplyContext,
     run_id: str,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, bool]:
     """Run one agent turn and collect the response.
 
-    Returns (response_text, has_error).
+    Returns (response_text, has_error, auto_compaction_completed).
     Uses ``run_agent_turn_with_fallback`` for compaction + transient retry.
     """
     from openclaw.auto_reply.reply.agent_runner_execution import run_agent_turn_with_fallback
@@ -509,6 +905,10 @@ async def _execute_agent_turn(
         reasoning_stream_callback=ctx.reasoning_stream_callback,
         reasoning_level=ctx.reasoning_level,
         block_send_fn=ctx.block_send_fn,
+        verbose_level=getattr(ctx, "verbose_level", "off"),
+        is_heartbeat=False,  # TODO: derive from context if heartbeat flag exists
+        provider=getattr(ctx.runtime, "provider", "") if hasattr(ctx.runtime, "provider") else "",
+        cfg=getattr(ctx.runtime, "cfg", None) if hasattr(ctx.runtime, "cfg") else None,
     )
 
 
@@ -624,10 +1024,12 @@ async def _deliver_response(
             logger.info("[DELIVER-DEBUG] Found Markdown image/link syntax in response - this will NOT send files!")
             logger.info("[DELIVER-DEBUG] Response preview: %s", response_text[:800])
         
-        # Parse [[buttons:...]] directive before splitting media
+        # Parse [[buttons:...]] and [[reply:…]] directives before splitting media
         directive_result = parse_inline_directives(response_text, strip_reply_tags=True)
         buttons = directive_result.buttons  # list[list[dict]] | None
-        # Use the text with the buttons directive stripped for further processing
+        # Gap 6: apply reply threading — use directive reply_to_id if set, else ctx value
+        effective_reply_to_id = directive_result.reply_to_id or ctx.reply_to_id
+        # Use the text with directives stripped for further processing
         cleaned_text = directive_result.text if directive_result.text else response_text
 
         media_result = split_media_from_output(cleaned_text)
@@ -643,7 +1045,7 @@ async def _deliver_response(
             await ctx.channel_send(
                 display_text,
                 ctx.chat_target,
-                reply_to=ctx.reply_to_id,
+                reply_to=effective_reply_to_id,
                 buttons=buttons,
             )
 
@@ -714,4 +1116,9 @@ async def _deliver_response(
         logger.error("_deliver_response error: %s", exc, exc_info=True)
 
 
-__all__ = ["ReplyContext", "run_prepared_reply"]
+__all__ = [
+    "ReplyContext",
+    "run_prepared_reply",
+    "reset_session",
+    "persist_run_session_usage",
+]

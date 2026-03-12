@@ -1,13 +1,15 @@
 """Agent runner execution with fallback and error recovery.
 
-Mirrors TypeScript ``openclaw/src/auto-reply/reply/agent-runner-execution.ts``.
+Mirrors TypeScript ``openclaw/src/auto-reply/reply/agent-runner-execution.ts``
+and ``openclaw/src/agents/model-fallback.ts``.
 
 Provides ``run_agent_turn_with_fallback`` that wraps ``PiAgentRuntime.run_turn``
 with:
-- Model fallback on failure (already handled in PiAgentRuntime, but surfaced here)
+- Cross-model fallback chain (runWithModelFallback) on auth/rate-limit failures
 - Session corruption recovery after compaction failures
 - Session recovery after role-ordering conflicts (Gemini)
 - Transient HTTP error retry (up to 3 attempts with backoff)
+- Tool result serialization to prevent out-of-order delivery
 - Structured error events
 """
 from __future__ import annotations
@@ -15,7 +17,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import Any, AsyncIterator
+from dataclasses import dataclass
+from typing import Any, Callable, Awaitable
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +51,18 @@ _ROLE_ORDER_PATTERNS = [
     re.compile(r"INVALID_ARGUMENT.*function", re.IGNORECASE),
 ]
 
+# Patterns indicating auth / rate-limit errors that should trigger model fallback
+_AUTH_RATE_LIMIT_PATTERNS = [
+    re.compile(r"\b(401|403|429)\b"),
+    re.compile(r"unauthorized", re.IGNORECASE),
+    re.compile(r"forbidden", re.IGNORECASE),
+    re.compile(r"rate.?limit", re.IGNORECASE),
+    re.compile(r"quota.*exceed", re.IGNORECASE),
+    re.compile(r"too many requests", re.IGNORECASE),
+    re.compile(r"invalid.?api.?key", re.IGNORECASE),
+    re.compile(r"authentication.*failed", re.IGNORECASE),
+]
+
 
 def _is_transient_http_error(exc: BaseException) -> bool:
     msg = str(exc)
@@ -62,6 +77,160 @@ def _is_compaction_failure(exc: BaseException) -> bool:
 def _is_role_ordering_conflict(exc: BaseException) -> bool:
     msg = str(exc)
     return any(p.search(msg) for p in _ROLE_ORDER_PATTERNS)
+
+
+def _is_auth_or_rate_limit_error(exc: BaseException) -> bool:
+    """Return True for errors that should trigger cross-model fallback."""
+    msg = str(exc)
+    return any(p.search(msg) for p in _AUTH_RATE_LIMIT_PATTERNS)
+
+
+@dataclass
+class FallbackAttempt:
+    provider: str
+    model: str
+    error: str
+    reason: str = "unknown"
+
+
+def _resolve_fallback_candidates(
+    cfg: dict | None,
+    primary_provider: str,
+    primary_model: str,
+) -> list[tuple[str, str]]:
+    """Return ordered list of (provider, model) candidates to try.
+
+    Mirrors TS ``resolveFallbackCandidates`` in model-fallback.ts:
+    starts with the primary model, appends entries from
+    ``agents.defaults.model.fallbacks`` in the config.
+    """
+    candidates: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def _add(provider: str, model: str) -> None:
+        key = f"{provider}/{model}"
+        if key not in seen and provider and model:
+            seen.add(key)
+            candidates.append((provider, model))
+
+    _add(primary_provider, primary_model)
+
+    if not cfg:
+        return candidates
+
+    fallback_raw = (
+        cfg.get("agents", {})
+        .get("defaults", {})
+        .get("model", {})
+    )
+    if isinstance(fallback_raw, dict):
+        for raw in (fallback_raw.get("fallbacks") or []):
+            if not raw:
+                continue
+            raw_str = str(raw).strip()
+            if "/" in raw_str:
+                parts = raw_str.split("/", 1)
+                _add(parts[0].strip(), parts[1].strip())
+            else:
+                _add(primary_provider, raw_str)
+
+    return candidates
+
+
+async def run_with_model_fallback(
+    runtime: Any,
+    session: Any,
+    message: str,
+    *,
+    tools: list[Any] | None = None,
+    primary_provider: str = "",
+    primary_model: str | None = None,
+    system_prompt: str | None = None,
+    images: list[str] | None = None,
+    run_id: str | None = None,
+    session_key: str | None = None,
+    typing_signaler: Any | None = None,
+    stream_callback: Any | None = None,
+    status_reactions: Any | None = None,
+    reasoning_stream_callback: Any | None = None,
+    reasoning_level: str = "off",
+    block_send_fn: Any | None = None,
+    cfg: dict | None = None,
+    on_fallback: Callable[[FallbackAttempt], Awaitable[None]] | None = None,
+) -> tuple[str, bool, bool]:
+    """Execute an agent turn with cross-model fallback on auth/rate-limit errors.
+
+    Mirrors TS ``runWithModelFallback()`` in model-fallback.ts.
+
+    When the primary model fails with an auth/rate-limit error, tries fallback
+    models from ``agents.defaults.model.fallbacks`` in sequence.
+    Context overflow and compaction errors are NOT retried here — they bubble
+    up to ``run_agent_turn_with_fallback`` for special handling.
+    """
+    candidates = _resolve_fallback_candidates(cfg, primary_provider, primary_model or "")
+    attempts: list[FallbackAttempt] = []
+    last_error: BaseException | None = None
+
+    for idx, (provider, model) in enumerate(candidates):
+        try:
+            result = await run_agent_turn_with_fallback(
+                runtime=runtime,
+                session=session,
+                message=message,
+                tools=tools,
+                model=model if model else None,
+                system_prompt=system_prompt,
+                images=images,
+                run_id=run_id,
+                session_key=session_key,
+                typing_signaler=typing_signaler,
+                stream_callback=stream_callback,
+                status_reactions=status_reactions,
+                reasoning_stream_callback=reasoning_stream_callback,
+                reasoning_level=reasoning_level,
+                block_send_fn=block_send_fn,
+            )
+            if attempts:
+                logger.info(
+                    "run_with_model_fallback: succeeded on fallback candidate %d/%d: %s/%s",
+                    idx + 1, len(candidates), provider, model,
+                )
+            return result
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            # Context overflow / compaction → re-raise; outer handler deals with it
+            if _is_compaction_failure(exc) or _is_role_ordering_conflict(exc):
+                raise
+            # Only continue fallback chain for auth/rate-limit errors
+            if not _is_auth_or_rate_limit_error(exc):
+                if idx == len(candidates) - 1:
+                    raise
+                # Non-auth errors: still propagate after last candidate
+                raise
+            attempt = FallbackAttempt(
+                provider=provider,
+                model=model,
+                error=str(exc)[:200],
+                reason="auth_or_rate_limit",
+            )
+            attempts.append(attempt)
+            if on_fallback:
+                try:
+                    await on_fallback(attempt)
+                except Exception:
+                    pass
+            if idx < len(candidates) - 1:
+                logger.warning(
+                    "run_with_model_fallback: %s/%s failed (%s) — trying next candidate",
+                    provider, model, str(exc)[:80],
+                )
+
+    # All candidates exhausted
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("run_with_model_fallback: no candidates available")
 
 
 async def reset_session_after_compaction_failure(
@@ -94,6 +263,152 @@ async def reset_session_after_role_ordering_conflict(
         logger.debug("reset_session_after_role_ordering_conflict: error: %s", exc)
 
 
+def sanitize_user_facing_text(text: str, *, error_context: bool = False) -> str:
+    """Strip internal tokens and rewrite error messages for user-facing delivery.
+
+    Mirrors TS ``sanitizeUserFacingText`` from ``pi-embedded-helpers/errors.ts``.
+
+    Rules:
+    - Strip ``<final>...</final>`` tags (internal chain-of-thought markers).
+    - When ``error_context=True``: rewrite role-conflict, context-overflow, billing,
+      and raw-API-error text with clean user-friendly copies.
+    - Strip leading blank lines.
+    - Collapse consecutive duplicate blocks.
+    """
+    if not text:
+        return text
+
+    import re as _re
+
+    # Strip <final>...</final> tags (stripFinalTagsFromText equivalent)
+    stripped = _re.sub(r"<final>.*?</final>", "", text, flags=_re.DOTALL)
+    stripped = _re.sub(r"<final>", "", stripped)
+    trimmed = stripped.strip()
+    if not trimmed:
+        return ""
+
+    if error_context:
+        # Role ordering conflict
+        if _re.search(r"incorrect role information|roles must alternate", trimmed, _re.IGNORECASE):
+            return (
+                "Message ordering conflict - please try again. "
+                "If this persists, use /new to start a fresh session."
+            )
+        # Context overflow
+        if _re.search(
+            r"prompt is too long|context.*(length|window|limit|overflow|too large)|"
+            r"maximum.*context|exceed.*token|too many tokens",
+            trimmed, _re.IGNORECASE
+        ):
+            return (
+                "Context overflow: prompt too large for the model. "
+                "Try /reset (or /new) to start a fresh session, or use a larger-context model."
+            )
+        # Raw HTTP error codes — rewrite to hide internals
+        if _re.match(r"^(4[0-9]{2}|5[0-9]{2})\b", trimmed):
+            return f"Error communicating with AI backend ({trimmed[:80]})"
+
+    # Strip leading blank/whitespace lines without clobbering first-line indentation
+    result = _re.sub(r"^(?:[ \t]*\r?\n)+", "", stripped)
+    return result
+
+
+def normalize_streaming_text(
+    text: str | None,
+    *,
+    is_heartbeat: bool = False,
+    media_urls: list[str] | None = None,
+    is_error: bool = False,
+) -> dict[str, Any]:
+    """Clean up a streaming text payload before delivery.
+
+    Mirrors TS ``normalizeStreamingText`` defined inside the ``while(true)``
+    loop in ``agent-runner-execution.ts``.
+
+    Rules (in order):
+    - Strip ``HEARTBEAT_OK`` tokens when NOT in heartbeat mode.
+    - Skip (``skip=True``) if the stripped result is empty, unless media_urls is
+      non-empty (media-only payloads must pass through).
+    - Skip entire payload if it begins with ``[[silent]]``.
+    - Apply ``sanitize_user_facing_text`` before returning.
+
+    Args:
+        text: Raw text from the agent.
+        is_heartbeat: When True, HEARTBEAT_OK is preserved.
+        media_urls: Media attachment URLs — when non-empty, media-only payloads
+            with no text are passed through (``skip=False, text=None``).
+            Mirrors TS: ``if (payload.mediaUrls?.length ?? 0) > 0 → { skip: false }``.
+        is_error: Forward to ``sanitize_user_facing_text`` error_context flag.
+
+    Returns a dict ``{"text": str | None, "skip": bool}``.
+    """
+    HEARTBEAT_OK = "HEARTBEAT_OK"
+    SILENT_TOKEN = "[[silent]]"
+    HEARTBEAT_TOKEN = "[[heartbeat]]"
+
+    has_media = bool(media_urls)
+
+    if text is None:
+        # Media-only payload — allow through (mirrors TS line 157-159)
+        if has_media:
+            return {"text": None, "skip": False}
+        return {"text": None, "skip": True}
+
+    cleaned = text
+
+    # Strip stray HEARTBEAT_OK when not in heartbeat mode
+    if not is_heartbeat and HEARTBEAT_OK in cleaned.upper():
+        cleaned = cleaned.replace(HEARTBEAT_OK, "").replace("HEARTBEAT_OK", "")
+        cleaned = cleaned.strip()
+        if not cleaned:
+            # Media-only payloads still pass through after HEARTBEAT strip (TS line 141)
+            if has_media:
+                return {"text": None, "skip": False}
+            return {"text": None, "skip": True}
+
+    # Silent reply token — skip entire payload
+    if cleaned.startswith(SILENT_TOKEN) or cleaned == SILENT_TOKEN:
+        return {"text": None, "skip": True}
+    if cleaned.startswith(HEARTBEAT_TOKEN):
+        return {"text": None, "skip": True}
+
+    cleaned = cleaned.strip()
+    if not cleaned:
+        # Media-only pass-through (mirrors TS lines 155-160)
+        if has_media:
+            return {"text": None, "skip": False}
+        return {"text": None, "skip": True}
+
+    # Sanitize user-facing text (mirrors TS line 162-168)
+    sanitized = sanitize_user_facing_text(cleaned, error_context=is_error)
+    if not sanitized.strip():
+        return {"text": None, "skip": True}
+
+    return {"text": sanitized, "skip": False}
+
+
+async def run_cli_agent(*args: Any, **kwargs: Any) -> tuple[str, bool, bool]:
+    """Stub for CLI-backed agent execution (Claude Code, Codex CLI, Gemini CLI, etc.).
+
+    CLI provider routing mirrors TS ``runCliAgent`` called from agent-runner-execution.ts
+    when ``isCliProvider(provider, config)`` is True.
+
+    Full CLI backend integration is out of scope for this port; this stub ensures
+    the routing branch exists so providers that declare a CLI type do not fall
+    through to the embedded Pi runner silently.
+    """
+    provider = kwargs.get("provider") or (args[0] if args else "cli")
+    logger.warning(
+        "run_cli_agent: CLI provider '%s' is not fully implemented in the Python runtime. "
+        "Returning empty result. Set provider to an embedded model to get AI responses.",
+        provider,
+    )
+    raise NotImplementedError(
+        f"CLI provider '{provider}' is not supported in the Python runtime. "
+        "Use an embedded model provider (e.g. anthropic, openai, gemini) instead."
+    )
+
+
 async def run_agent_turn_with_fallback(
     runtime: Any,
     session: Any,
@@ -111,10 +426,14 @@ async def run_agent_turn_with_fallback(
     reasoning_stream_callback: Any | None = None,  # Callable[[str], None] | None — called with reasoning text on each delta
     reasoning_level: str = "off",  # "off" | "on" | "stream"
     block_send_fn: Any | None = None,  # Callable[[str], Awaitable[None]] | None — sends each text block before a tool call as a visible message
-) -> tuple[str, bool]:
+    verbose_level: str = "off",  # mirrors TS resolvedVerboseLevel
+    is_heartbeat: bool = False,
+    provider: str = "",  # used for CLI provider check
+    cfg: dict | None = None,  # used for CLI provider check
+) -> tuple[str, bool, bool]:
     """Execute an agent turn with automatic retry on transient errors.
 
-    Returns ``(response_text, has_error)``.
+    Returns ``(response_text, has_error, auto_compaction_completed)``.
 
     Mirrors TS ``runAgentTurnWithFallback``.
 
@@ -126,9 +445,41 @@ async def run_agent_turn_with_fallback(
     """
     from openclaw.events import EventType
 
+    # ------------------------------------------------------------------
+    # CLI provider routing — mirrors TS isCliProvider(provider, config) check
+    # in agent-runner-execution.ts lines 194+. When the configured provider is
+    # a CLI-backed backend (claude-cli, codex-cli, etc.), delegate to run_cli_agent.
+    # ------------------------------------------------------------------
+    if provider:
+        try:
+            from openclaw.agents.model_selection import is_cli_provider
+            if is_cli_provider(provider, cfg):
+                return await run_cli_agent(provider=provider, session_key=session_key, run_id=run_id)
+        except NotImplementedError:
+            raise
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Register run context — mirrors TS registerAgentRunContext() called
+    # at the top of runAgentTurnWithFallback in agent-runner-execution.ts.
+    # Allows event enrichment with sessionKey, verboseLevel, isHeartbeat.
+    # ------------------------------------------------------------------
+    if run_id and session_key:
+        try:
+            from openclaw.infra.agent_events import register_agent_run_context
+            register_agent_run_context(run_id, {
+                "session_key": session_key,
+                "verbose_level": verbose_level,
+                "is_heartbeat": is_heartbeat,
+            })
+        except Exception:
+            pass
+
     session_id = getattr(session, "session_id", "") or ""
     response_text = ""
     has_error = False
+    auto_compaction_completed = False
     attempt = 0
 
     while attempt < MAX_TRANSIENT_RETRIES:
@@ -275,6 +626,9 @@ async def run_agent_turn_with_fallback(
                                 if _stripped.upper().startswith("MEDIA:"):
                                     response_text += f"\n{_stripped}"
                                     logger.info("Injected MEDIA token from tool_result: %s", _stripped[:100])
+                    elif evt_type == "auto_compaction_end":
+                        # Mirrors TS onAgentEvent phase === "end" detection in followup-runner.ts
+                        auto_compaction_completed = True
                     elif evt_type in (EventType.ERROR, "error", "agent.error"):
                         err_msg = event_data.get("message", str(event_data))
                         logger.error("run_agent_turn_with_fallback: agent error: %s", err_msg)
@@ -338,7 +692,7 @@ async def run_agent_turn_with_fallback(
             except Exception as extract_err:
                 logger.warning("MEDIA extraction from final messages failed: %s", extract_err, exc_info=True)
             
-            return final_text, has_error
+            return final_text, has_error, auto_compaction_completed
 
         except asyncio.CancelledError:
             raise
@@ -373,11 +727,16 @@ async def run_agent_turn_with_fallback(
             raise
 
     # Should not reach here, but return error state if we somehow exit the loop
-    return response_text, True
+    return response_text, True, auto_compaction_completed
 
 
 __all__ = [
     "run_agent_turn_with_fallback",
+    "run_with_model_fallback",
+    "run_cli_agent",
     "reset_session_after_compaction_failure",
     "reset_session_after_role_ordering_conflict",
+    "normalize_streaming_text",
+    "sanitize_user_facing_text",
+    "FallbackAttempt",
 ]

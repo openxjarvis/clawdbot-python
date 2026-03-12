@@ -24,6 +24,7 @@ Usage::
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -31,20 +32,100 @@ logger = logging.getLogger(__name__)
 # Module-level listener registry — synchronous callbacks only (mirrors TS)
 _listeners: set[Callable[[dict[str, Any]], None]] = set()
 
+# Per-run sequence counters — mirrors TS seqByRun Map<string, number>
+_seq_by_run: dict[str, int] = {}
+
+# Per-run context registry — mirrors TS runContextById Map<string, AgentRunContext>
+_run_context_by_id: dict[str, dict[str, Any]] = {}
+
+
+# ---------------------------------------------------------------------------
+# Run context registry — mirrors TS registerAgentRunContext / getAgentRunContext
+# ---------------------------------------------------------------------------
+
+def register_agent_run_context(run_id: str, context: dict[str, Any]) -> None:
+    """Register context for a specific run.
+
+    Mirrors TS ``registerAgentRunContext(runId, context)`` from
+    ``src/infra/agent-events.ts``.  Stores ``sessionKey``, ``verboseLevel``,
+    and ``isHeartbeat`` for later event enrichment.
+
+    Args:
+        run_id: Unique run identifier (UUID).
+        context: Dict with optional keys: ``session_key``, ``verbose_level``,
+                 ``is_heartbeat``.
+    """
+    if not run_id:
+        return
+    existing = _run_context_by_id.get(run_id)
+    if existing is None:
+        _run_context_by_id[run_id] = dict(context)
+        return
+    # Merge — only overwrite if new value is truthy
+    if context.get("session_key") and existing.get("session_key") != context["session_key"]:
+        existing["session_key"] = context["session_key"]
+    if context.get("verbose_level") and existing.get("verbose_level") != context["verbose_level"]:
+        existing["verbose_level"] = context["verbose_level"]
+    if context.get("is_heartbeat") is not None and existing.get("is_heartbeat") != context["is_heartbeat"]:
+        existing["is_heartbeat"] = context["is_heartbeat"]
+
+
+def get_agent_run_context(run_id: str) -> dict[str, Any] | None:
+    """Return the context registered for *run_id*, or ``None``.
+
+    Mirrors TS ``getAgentRunContext``.
+    """
+    return _run_context_by_id.get(run_id)
+
+
+def clear_agent_run_context(run_id: str) -> None:
+    """Remove the context registered for *run_id*.
+
+    Mirrors TS ``clearAgentRunContext``.  Call after the run completes to
+    prevent unbounded growth of the registry.
+    """
+    _run_context_by_id.pop(run_id, None)
+    _seq_by_run.pop(run_id, None)
+
+
+def reset_agent_run_context_for_test() -> None:
+    """Clear all run context entries (useful for tests)."""
+    _run_context_by_id.clear()
+    _seq_by_run.clear()
+
+
+# ---------------------------------------------------------------------------
+# Event emission — mirrors TS emitAgentEvent
+# ---------------------------------------------------------------------------
 
 def emit_agent_event(event: dict[str, Any]) -> None:
     """Emit an agent event to all registered listeners.
 
     Synchronous and non-blocking — mirrors TS ``emitAgentEvent``.
+    Automatically enriches the event with ``seq``, ``ts``, and
+    ``session_key`` from the registered run context (if available).
+
     Listener exceptions are caught and logged so one bad listener cannot
     break the entire event pipeline.
 
     Args:
         event: Arbitrary event payload dict. Convention:
-               ``{"type": str, ...}`` where ``type`` is the event category
-               (e.g. ``"agent_lifecycle"``, ``"fallback_transition"``,
-               ``"memory_flush"``).
+               ``{"run_id": str, "stream": str, "data": dict, ...}``.
+               ``type`` is accepted as an alias for older callers.
     """
+    run_id = event.get("run_id") or event.get("runId") or ""
+    if run_id:
+        next_seq = _seq_by_run.get(run_id, 0) + 1
+        _seq_by_run[run_id] = next_seq
+        context = _run_context_by_id.get(run_id)
+        # Enrich with session_key from context if not already set
+        if context and not event.get("session_key") and not event.get("sessionKey"):
+            session_key = context.get("session_key")
+            if session_key:
+                event = {**event, "session_key": session_key, "seq": next_seq, "ts": int(time.time() * 1000)}
+        else:
+            event = {**event, "seq": next_seq, "ts": int(time.time() * 1000)}
+
     for listener in list(_listeners):
         try:
             listener(event)
@@ -86,4 +167,8 @@ __all__ = [
     "on_agent_event",
     "listener_count",
     "clear_all_listeners",
+    "register_agent_run_context",
+    "get_agent_run_context",
+    "clear_agent_run_context",
+    "reset_agent_run_context_for_test",
 ]

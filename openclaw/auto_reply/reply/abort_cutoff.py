@@ -14,6 +14,7 @@ __all__ = [
     "AbortCutoff",
     "set_abort_cutoff",
     "should_skip_message_by_abort_cutoff",
+    "should_skip_message_by_abort_cutoff_v2",
     "clear_abort_cutoff",
     "apply_abort_cutoff_to_session_entry",
 ]
@@ -105,6 +106,49 @@ def apply_abort_cutoff_to_session_entry(session_entry: dict, session_key: str) -
             "timestamp": cutoff.timestamp,
             "cutoffId": cutoff.cutoff_id
         }
+
+
+def should_skip_message_by_abort_cutoff_v2(
+    *,
+    cutoff_message_sid: str | None = None,
+    cutoff_timestamp: float | None = None,
+    message_sid: str | None = None,
+    timestamp: float | None = None,
+) -> bool:
+    """Session-entry-aware abort cutoff check.
+
+    Mirrors TS ``shouldSkipMessageByAbortCutoff`` from abort-cutoff.ts.
+
+    Prefers SID-based comparison (WhatsApp message SIDs are numeric strings
+    that increase monotonically). Falls back to timestamp comparison.
+
+    Returns True if the incoming message predates the cutoff and should be
+    skipped.
+    """
+    cutoff_sid = (cutoff_message_sid or "").strip() or None
+    current_sid = (message_sid or "").strip() or None
+
+    if cutoff_sid and current_sid:
+        # Numeric SID comparison (mirrors TS toNumericMessageSid logic)
+        try:
+            cutoff_num = int(cutoff_sid) if cutoff_sid.isdigit() else None
+            current_num = int(current_sid) if current_sid.isdigit() else None
+            if cutoff_num is not None and current_num is not None:
+                return current_num <= cutoff_num
+        except (ValueError, OverflowError):
+            pass
+        if current_sid == cutoff_sid:
+            return True
+
+    if (
+        cutoff_timestamp is not None
+        and isinstance(cutoff_timestamp, (int, float))
+        and timestamp is not None
+        and isinstance(timestamp, (int, float))
+    ):
+        return timestamp <= cutoff_timestamp
+
+    return False
 
 
 def get_abort_cutoff_from_session_entry(session_entry: dict, session_key: str) -> None:

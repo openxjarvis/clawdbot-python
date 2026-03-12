@@ -235,18 +235,114 @@ def notify_embedded_run_ended(session_id: str) -> None:
     clear_active_embedded_run(session_id)
 
 
+COMMAND_LANE_MAIN = "main"
+
+
+def resolve_session_lane(key: str) -> str:
+    """Return the command lane name for *key*.
+
+    Mirrors TS ``resolveSessionLane(key)`` in pi-embedded-runner/lanes.ts:
+    - Trims whitespace
+    - Falls back to COMMAND_LANE_MAIN when empty
+    - Adds "session:" prefix ONLY if the key does not already start with it
+    """
+    cleaned = (key or "").strip() or COMMAND_LANE_MAIN
+    return cleaned if cleaned.startswith("session:") else f"session:{cleaned}"
+
+
+def resolve_global_lane(lane: str | None = None) -> str:
+    """Return the global command lane name.
+
+    Mirrors TS ``resolveGlobalLane(lane?)`` in pi-embedded-runner/lanes.ts:
+    - Trims whitespace
+    - Falls back to COMMAND_LANE_MAIN when empty/None
+    """
+    cleaned = (lane or "").strip()
+    return cleaned if cleaned else COMMAND_LANE_MAIN
+
+
 def resolve_embedded_session_lane(session_key: str) -> str:
     """Return the command lane name for *session_key*.
 
-    Mirrors TS ``resolveSessionLane(key)`` → ``session:${key}`` from
-    ``pi-embedded-runner/lanes.ts``.
+    Mirrors TS ``resolveEmbeddedSessionLane(key)`` from
+    ``pi-embedded-runner/lanes.ts`` which delegates to ``resolveSessionLane``.
+
+    Alignment fixes (P1-10):
+    - Trims the key before use
+    - Falls back to COMMAND_LANE_MAIN when key is empty
+    - Does NOT double-add the "session:" prefix
     """
-    return f"session:{session_key}"
+    return resolve_session_lane(session_key)
+
+
+# ---------------------------------------------------------------------------
+# P1-11: RotationManager — multi-key auth rotation placeholder
+# ---------------------------------------------------------------------------
+
+class RotationManager:
+    """Manages rotation through multiple API keys for a provider.
+
+    Mirrors TS auth profile rotation in agents/auth-profiles.ts.
+    The rotation manager maintains a list of API keys and cycles through them
+    on rate-limit / auth errors, with per-key cooldowns.
+
+    In the Python version this provides a foundation for future multi-key
+    support. Current implementation cycles naively without cooldown tracking.
+    """
+
+    def __init__(self, profiles: list[dict]) -> None:
+        """
+        Args:
+            profiles: List of auth profile dicts with at least ``{"apiKey": str}``
+        """
+        self._profiles = [p for p in profiles if p and p.get("apiKey")]
+        self._index = 0
+        self._cooldowns: dict[str, float] = {}  # profile_id → cooldown_until_ts
+        logger.debug("RotationManager: initialized with %d profile(s)", len(self._profiles))
+
+    def get_current(self) -> dict | None:
+        """Return the current auth profile, or None if all profiles are exhausted."""
+        if not self._profiles:
+            return None
+        # Find the first non-cooled-down profile starting from _index
+        import time as _time
+        now = _time.time()
+        n = len(self._profiles)
+        for i in range(n):
+            idx = (self._index + i) % n
+            profile = self._profiles[idx]
+            pid = profile.get("id", str(idx))
+            if self._cooldowns.get(pid, 0) <= now:
+                self._index = idx
+                return profile
+        return None  # All in cooldown
+
+    def mark_failed(self, profile_id: str | None, cooldown_seconds: float = 60.0) -> None:
+        """Put a profile into cooldown after a rate-limit or auth error."""
+        if not profile_id:
+            return
+        import time as _time
+        self._cooldowns[profile_id] = _time.time() + cooldown_seconds
+        # Advance index to the next profile
+        self._index = (self._index + 1) % max(len(self._profiles), 1)
+        logger.debug("RotationManager: profile %s in cooldown for %.0fs", profile_id, cooldown_seconds)
+
+    def advance(self) -> dict | None:
+        """Advance to the next available profile and return it."""
+        if not self._profiles:
+            return None
+        self._index = (self._index + 1) % len(self._profiles)
+        return self.get_current()
+
+    def has_available(self) -> bool:
+        """Return True when at least one profile is not in cooldown."""
+        return self.get_current() is not None
 
 
 __all__ = [
     "EmbeddedPiRunHandle",
     "ACTIVE_EMBEDDED_RUNS",
+    "COMMAND_LANE_MAIN",
     "set_active_embedded_run",
     "clear_active_embedded_run",
     "get_active_embedded_run",
@@ -257,5 +353,8 @@ __all__ = [
     "abort_embedded_pi_run",
     "wait_for_embedded_pi_run_end",
     "notify_embedded_run_ended",
+    "resolve_session_lane",
+    "resolve_global_lane",
     "resolve_embedded_session_lane",
+    "RotationManager",
 ]

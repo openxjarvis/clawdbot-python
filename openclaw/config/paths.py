@@ -41,6 +41,14 @@ def _resolve_user_path(input_str: str, env: Optional[Dict[str, str]] = None, hom
     return str(Path(trimmed).resolve())
 
 
+def resolve_user_path(input_str: str) -> str:
+    """Public API: Expand ~ prefix and resolve to absolute path.
+    
+    Mirrors TS resolveUserPath() from utils.ts.
+    """
+    return _resolve_user_path(input_str)
+
+
 # ---------------------------------------------------------------------------
 # Nix mode detection (matches TS resolveIsNixMode)
 # ---------------------------------------------------------------------------
@@ -238,6 +246,27 @@ def resolve_config_path(
 # Pre-resolved defaults (module-level, matches TS CONFIG_PATH / STATE_DIR)
 STATE_DIR = resolve_state_dir()
 CONFIG_PATH = resolve_config_path_candidate()
+
+
+# ---------------------------------------------------------------------------
+# OpenClaw temp directory (matches TS resolvePreferredOpenClawTmpDir)
+# ---------------------------------------------------------------------------
+
+def resolve_preferred_openclaw_tmp_dir() -> str:
+    """
+    Resolve the preferred OpenClaw temporary directory.
+    
+    Mirrors TS resolvePreferredOpenClawTmpDir() from src/infra/tmp-openclaw-dir.ts.
+    
+    Returns {tmpdir}/openclaw-{uid} or {tmpdir}/openclaw on Windows.
+    """
+    base = tempfile.gettempdir()
+    try:
+        uid = os.getuid()
+        suffix = f"openclaw-{uid}"
+    except AttributeError:
+        suffix = "openclaw"
+    return str(Path(base) / suffix)
 
 
 # ---------------------------------------------------------------------------

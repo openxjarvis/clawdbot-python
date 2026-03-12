@@ -140,9 +140,16 @@ def _convert_pi_event(pi_event: Any, session_id: str) -> Any | None:
         return Event(type=et, source="pi-session", session_id=session_id, data=data)
 
     # auto_retry / auto_compaction synthetic events from pi AgentSession
-    if etype in ("auto_retry_start", "auto_retry_end",
-                 "auto_compaction_start", "auto_compaction_end"):
+    if etype in ("auto_retry_start", "auto_retry_end", "auto_compaction_start"):
         return None  # internal pi events — don't forward to openclaw
+    # auto_compaction_end is forwarded so followup_runner can emit a notice
+    if etype == "auto_compaction_end":
+        return Event(
+            type="auto_compaction_end",
+            source="pi-session",
+            session_id=session_id,
+            data={"phase": "end", "stream": "compaction"},
+        )
 
     return None
 

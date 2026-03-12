@@ -6,6 +6,7 @@ Matches TypeScript src/media/store.ts and src/web/media.ts
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -16,6 +17,119 @@ import aiohttp
 from openclaw.media.mime import MediaKind, media_kind_from_mime
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Exceptions (mirrors TS LocalMediaAccessError from src/web/media.ts)
+# ---------------------------------------------------------------------------
+
+class LocalMediaAccessError(Exception):
+    """Error when local media path access is not allowed.
+    
+    Mirrors TS LocalMediaAccessError from src/web/media.ts lines 67-75.
+    """
+    
+    def __init__(self, code: str, message: str, cause: Optional[Exception] = None):
+        super().__init__(message)
+        self.code = code
+        self.cause = cause
+
+
+# ---------------------------------------------------------------------------
+# Security validation (mirrors TS assertLocalMediaAllowed)
+# ---------------------------------------------------------------------------
+
+async def _assert_local_media_allowed(
+    media_path: Path,
+    local_roots: Optional[list[str] | str],
+) -> None:
+    """Validate that local media path is under allowed roots.
+    
+    Mirrors TS assertLocalMediaAllowed() from src/web/media.ts lines 81-138.
+    
+    Args:
+        media_path: Path to validate
+        local_roots: List of allowed root directories, "any" to bypass, or None for defaults
+    
+    Raises:
+        LocalMediaAccessError: If path is not allowed
+    """
+    # Bypass check if explicitly "any" (dangerous, should only be used with sandbox_validated=True)
+    if local_roots == "any":
+        return
+    if local_roots is not None and isinstance(local_roots, list) and len(local_roots) == 1 and local_roots[0] == "any":
+        return
+    
+    # Get roots (use defaults if None)
+    if local_roots is None:
+        from openclaw.media.local_roots import get_default_media_local_roots
+        roots = get_default_media_local_roots()
+    else:
+        roots = local_roots
+    
+    # Resolve symlinks to prevent symlink attacks (e.g., /tmp/link → /etc/passwd)
+    try:
+        resolved = media_path.resolve(strict=False)
+    except Exception:
+        resolved = media_path.absolute()
+    
+    # Hardening: even if default allowlist includes workspace root,
+    # block per-agent workspace-* subdirectories unless explicitly allowed
+    # (prevents temp-dir-based agents from accessing other agents' workspaces)
+    if local_roots is None:
+        from openclaw.config.paths import resolve_state_dir
+        state_dir = Path(resolve_state_dir())
+        
+        # Find workspace root in allowed roots
+        workspace_root = None
+        for root_str in roots:
+            root_path = Path(root_str)
+            if root_path.name == "workspace":
+                workspace_root = root_path
+                break
+        
+        if workspace_root:
+            try:
+                rel = resolved.relative_to(state_dir)
+                # Check if trying to access workspace-* subdirectory
+                parts = rel.parts
+                if parts and parts[0].startswith("workspace-"):
+                    raise LocalMediaAccessError(
+                        "path-not-allowed",
+                        f"Local media path is not under an allowed directory: {media_path}"
+                    )
+            except ValueError:
+                # Path is not relative to state_dir, continue normal validation
+                pass
+    
+    # Check if resolved path is under any allowed root
+    for root_str in roots:
+        try:
+            root_path = Path(root_str).resolve(strict=False)
+        except Exception:
+            root_path = Path(root_str).absolute()
+        
+        # Refuse filesystem root as a localRoot (security)
+        if root_path == root_path.anchor or str(root_path) == root_path.anchor:
+            raise LocalMediaAccessError(
+                "invalid-root",
+                f"Invalid localRoots entry (refuses filesystem root): {root_str}. Pass a narrower directory."
+            )
+        
+        # Check if resolved path is under this root
+        try:
+            resolved.relative_to(root_path)
+            # Success - path is under this root
+            return
+        except ValueError:
+            # Not under this root, try next
+            continue
+    
+    # Path is not under any allowed root
+    raise LocalMediaAccessError(
+        "path-not-allowed",
+        f"Local media path is not under an allowed directory: {media_path}"
+    )
 
 
 @dataclass
@@ -38,10 +152,11 @@ async def load_web_media(
     *,
     # Extra kwargs accepted for TS-API parity (load_web_media callers may pass these)
     source: Optional[str] = None,
-    local_roots: Optional[list[str]] = None,
+    local_roots: Optional[list[str] | str] = None,
     allow_remote: bool = True,
     workspace_root: Optional[Path] = None,
     optimize_images: bool = False,
+    sandbox_validated: bool = False,
 ) -> LoadedMedia:
     """Load media from URL or local file path.
 
@@ -53,10 +168,12 @@ async def load_web_media(
         max_bytes: Maximum bytes to load (optional).
         source: Alias for ``url_or_path`` — accepted so callers that use the
             ``source=`` keyword argument from a previous API version never crash.
-        local_roots: Allowed local directory roots (accepted, not yet enforced).
+        local_roots: Allowed local directory roots. When None, uses default roots.
+            Pass "any" string to bypass restrictions (dangerous).
         allow_remote: Whether remote HTTP downloads are permitted (accepted).
         workspace_root: Workspace root for sandbox path validation (accepted).
         optimize_images: Whether to optimize loaded images (accepted, not applied here).
+        sandbox_validated: If True, caller has validated sandbox paths (requires local_roots).
 
     Returns:
         LoadedMedia with buffer, content_type, file_name, and kind.
@@ -64,6 +181,7 @@ async def load_web_media(
     Raises:
         ValueError: If max_bytes exceeded or file not found.
         IOError: If download fails.
+        LocalMediaAccessError: If local path is not under allowed roots.
     """
     # Support ``source=`` keyword used by some callers (TS-API parity)
     if source is not None:
@@ -73,7 +191,7 @@ async def load_web_media(
 
     # TS-compatible convenience prefix.
     if url_or_path.startswith("MEDIA:"):
-        url_or_path = url_or_path[len("MEDIA:"):]
+        url_or_path = url_or_path[len("MEDIA:") :].strip()
     if url_or_path.startswith("~/"):
         url_or_path = str(Path.home() / url_or_path[2:])
 
@@ -105,6 +223,10 @@ async def load_web_media(
     if scheme in ("", "file") or url_or_path.startswith("/"):
         path_str = unquote(url_or_path.replace("file://", ""))
         path = Path(path_str)
+
+        # Assert local media is allowed (mirrors TS lines 81-138 in src/web/media.ts)
+        if not sandbox_validated:
+            await _assert_local_media_allowed(path, local_roots)
 
         if not path.exists():
             raise FileNotFoundError(f"File not found: {path}")
@@ -239,19 +361,32 @@ class MediaLoader:
 
     async def load(self, url_or_path: str) -> LoadedMedia:
         """Load media from URL or file path, applying sandbox and size constraints."""
+        # Parse URL to check scheme
+        from urllib.parse import urlparse
+        parsed = urlparse(url_or_path)
+        scheme = parsed.scheme.lower()
+        
+        # Build local_roots from workspace_root for security checks
+        local_roots_list: list[str] | None = None
         if self.workspace_root is not None:
-            # Validate path is inside workspace (unless it's a URL/data URI)
-            parsed = urlparse(url_or_path)
-            scheme = parsed.scheme.lower()
+            local_roots_list = [str(self.workspace_root)]
+            # Only validate path for local files (not http/https/data)
             if scheme not in ("http", "https", "data"):
-                resolved = Path(url_or_path).resolve()
+                # For file:// URLs, extract the path first
+                if scheme == "file":
+                    from urllib.parse import unquote
+                    path_str = unquote(url_or_path.replace("file://", ""))
+                    resolved = Path(path_str).resolve()
+                else:
+                    resolved = Path(url_or_path).resolve()
+                    
                 ws_resolved = Path(self.workspace_root).resolve()
                 # Check if the resolved path is inside workspace or media/inbound fallback
                 try:
                     resolved.relative_to(ws_resolved)
                 except ValueError:
                     # Try media/inbound fallback (bare filename → {workspace}/media/inbound/{name})
-                    if "/" not in url_or_path and "\\" not in url_or_path:
+                    if "/" not in url_or_path and "\\" not in url_or_path and scheme == "":
                         fallback = ws_resolved / "media" / "inbound" / url_or_path
                         if fallback.exists():
                             url_or_path = str(fallback)
@@ -265,7 +400,14 @@ class MediaLoader:
             max_bytes=self.max_bytes,
             workspace_root=self.workspace_root,
             allow_remote=self.allow_remote,
+            local_roots=local_roots_list,  # Pass local_roots for security check
         )
 
 
-__all__ = ["LoadedMedia", "load_web_media", "load_media", "MediaLoader"]
+__all__ = [
+    "LoadedMedia",
+    "load_web_media",
+    "load_media",
+    "MediaLoader",
+    "LocalMediaAccessError",
+]

@@ -179,6 +179,202 @@ class PiAgentRuntime:
         except Exception:
             pass
 
+        # Copilot token state cache — mirrors TS CopilotTokenState in run.ts.
+        # Maps profile_id -> {github_token, api_token, expires_at, refresh_task}.
+        # The refresh task is an asyncio.Task that auto-refreshes the token
+        # before expiry (COPILOT_REFRESH_MARGIN_MS before expires_at).
+        self._copilot_token_cache: dict[str, dict[str, Any]] = {}
+
+    # ------------------------------------------------------------------
+    # GitHub Copilot token refresh — mirrors TS CopilotTokenState / refreshCopilotToken
+    # ------------------------------------------------------------------
+
+    _COPILOT_REFRESH_MARGIN_S: float = 5 * 60        # 5 min before expiry
+    _COPILOT_REFRESH_RETRY_S: float = 60             # retry delay on failure
+    _COPILOT_REFRESH_MIN_DELAY_S: float = 5          # minimum refresh delay
+
+    async def _refresh_copilot_token(
+        self,
+        profile_id: str,
+        github_token: str,
+        auth_storage: Any,
+        reason: str = "manual",
+    ) -> bool:
+        """Refresh the GitHub Copilot API token using the stored GitHub OAuth token.
+
+        Mirrors TS ``refreshCopilotToken()`` in run.ts.
+        Updates ``auth_storage`` in-place (setRuntimeApiKey).
+
+        Includes ``refreshInFlight`` deduplication: if another refresh is already
+        running for this profile, awaits it instead of launching a second one.
+        Mirrors TS lines 406-409: ``if (copilotTokenState.refreshInFlight) { await ...; return; }``.
+
+        Returns True on success, False on failure.
+        """
+        import asyncio as _asyncio
+
+        if not github_token.strip():
+            logger.warning("Copilot refresh requires a GitHub token (profile=%s).", profile_id)
+            return False
+
+        state = self._copilot_token_cache.setdefault(profile_id, {})
+
+        # ------------------------------------------------------------------
+        # refreshInFlight dedup — mirrors TS lines 406-409:
+        # ``if (copilotTokenState.refreshInFlight) { await copilotTokenState.refreshInFlight; return; }``
+        # If a refresh is already in-flight for this profile, await it and return.
+        # ------------------------------------------------------------------
+        in_flight: _asyncio.Task | None = state.get("refresh_in_flight")
+        if in_flight is not None and not in_flight.done():
+            logger.debug(
+                "_refresh_copilot_token: refresh already in-flight for profile=%s, awaiting...", profile_id
+            )
+            # Await in-flight task and propagate any error (mirrors TS behavior)
+            await in_flight
+            return bool(state.get("api_token"))
+
+        async def _do_refresh() -> bool:
+            try:
+                from pi_ai.utils.oauth.github_copilot import resolve_copilot_api_token  # type: ignore[import]
+                logger.debug("Refreshing GitHub Copilot token (%s, profile=%s)...", reason, profile_id)
+                token_info = await resolve_copilot_api_token(github_token=github_token)
+                api_token: str = token_info.get("token") or token_info.get("api_token") or ""
+                expires_at: float = float(token_info.get("expiresAt") or token_info.get("expires_at") or 0)
+                if not api_token:
+                    logger.warning("Copilot token refresh returned empty token (profile=%s).", profile_id)
+                    return False
+                if hasattr(auth_storage, "set_runtime_api_key"):
+                    auth_storage.set_runtime_api_key("github-copilot", api_token)
+                st = self._copilot_token_cache.setdefault(profile_id, {})
+                st["github_token"] = github_token
+                st["api_token"] = api_token
+                st["expires_at"] = expires_at
+                remaining = expires_at - __import__("time").time()
+                logger.debug(
+                    "Copilot token refreshed (profile=%s); expires in %.0fs.", profile_id, max(0.0, remaining)
+                )
+                return True
+            except ImportError:
+                logger.debug("resolve_copilot_api_token not available; Copilot refresh skipped.")
+                return False
+            except Exception as exc:
+                logger.warning("Copilot token refresh failed (profile=%s, reason=%s): %s", profile_id, reason, exc)
+                return False
+            finally:
+                # Clear in-flight marker when done — mirrors TS .finally(() => { refreshInFlight = undefined })
+                st2 = self._copilot_token_cache.get(profile_id)
+                if st2 is not None:
+                    st2.pop("refresh_in_flight", None)
+
+        try:
+            task = _asyncio.create_task(_do_refresh())
+            state["refresh_in_flight"] = task
+            result = await task
+            return result
+        except RuntimeError:
+            # No running event loop — run synchronously would be wrong; skip
+            logger.debug("_refresh_copilot_token: no running event loop (profile=%s)", profile_id)
+            return False
+
+    def _schedule_copilot_refresh(
+        self,
+        profile_id: str,
+        auth_storage: Any,
+    ) -> None:
+        """Schedule an asyncio task to proactively refresh the Copilot token.
+
+        Mirrors TS ``scheduleCopilotRefresh()`` in run.ts.
+
+        Checks ``cancelled`` flag (set by ``_stop_copilot_refresh``) before each
+        sleep and before rescheduling, mirroring TS ``copilotRefreshCancelled`` guards.
+        """
+        state = self._copilot_token_cache.get(profile_id)
+        if not state or not state.get("github_token"):
+            return
+        # Check cancellation before scheduling (mirrors TS: if (copilotRefreshCancelled) return)
+        if state.get("cancelled"):
+            return
+        github_token: str = state["github_token"]
+        expires_at: float = float(state.get("expires_at") or 0)
+        if expires_at <= 0:
+            return
+        import time as _time
+        import asyncio as _asyncio
+
+        now = _time.time()
+        refresh_at = expires_at - self._COPILOT_REFRESH_MARGIN_S
+        delay_s = max(self._COPILOT_REFRESH_MIN_DELAY_S, refresh_at - now)
+
+        async def _refresh_and_reschedule() -> None:
+            await _asyncio.sleep(delay_s)
+            # Check cancellation after sleep (mirrors TS: if (copilotRefreshCancelled) return)
+            state2 = self._copilot_token_cache.get(profile_id)
+            if not state2 or state2.get("cancelled"):
+                return
+            ok = await self._refresh_copilot_token(profile_id, github_token, auth_storage, "scheduled")
+            # Check cancellation before rescheduling
+            state2b = self._copilot_token_cache.get(profile_id)
+            if not state2b or state2b.get("cancelled"):
+                return
+            if ok:
+                self._schedule_copilot_refresh(profile_id, auth_storage)
+            else:
+                # Retry after backoff
+                await _asyncio.sleep(self._COPILOT_REFRESH_RETRY_S)
+                state3 = self._copilot_token_cache.get(profile_id)
+                if state3 and not state3.get("cancelled"):
+                    await self._refresh_copilot_token(profile_id, github_token, auth_storage, "scheduled-retry")
+                    state3b = self._copilot_token_cache.get(profile_id)
+                    if state3b and not state3b.get("cancelled"):
+                        self._schedule_copilot_refresh(profile_id, auth_storage)
+
+        try:
+            task = _asyncio.create_task(_refresh_and_reschedule())
+            state["refresh_task"] = task
+            # Double-check cancellation after task creation (race guard)
+            if state.get("cancelled"):
+                task.cancel()
+                state.pop("refresh_task", None)
+        except RuntimeError:
+            # No running event loop (e.g. in tests)
+            pass
+
+    def _stop_copilot_refresh(self, profile_id: str) -> None:
+        """Cancel any pending Copilot token refresh for a profile.
+
+        Mirrors TS ``stopCopilotRefreshTimer()`` called in the ``finally`` block of
+        ``runEmbeddedPiAgent``. Sets ``cancelled=True`` so the scheduled background
+        task exits early, and cancels the asyncio task if still pending.
+        """
+        state = self._copilot_token_cache.get(profile_id)
+        if not state:
+            return
+        # Set cancellation flag — mirrors TS: copilotRefreshCancelled = true
+        state["cancelled"] = True
+        # Cancel the background refresh task if still running
+        task: asyncio.Task | None = state.get("refresh_task")
+        if task is not None and not task.done():
+            task.cancel()
+            state.pop("refresh_task", None)
+
+    async def _apply_copilot_auth_profile(
+        self,
+        profile_id: str,
+        api_key: str,
+        auth_storage: Any,
+    ) -> bool:
+        """Apply a GitHub Copilot auth profile — exchange GitHub token for Copilot API token.
+
+        Mirrors TS ``applyApiKeyInfo()`` for the github-copilot provider path in run.ts.
+        Returns True if token was resolved and applied, False otherwise.
+        """
+        state = self._copilot_token_cache.setdefault(profile_id, {})
+        state["github_token"] = api_key
+        ok = await self._refresh_copilot_token(profile_id, api_key, auth_storage, "initial")
+        if ok:
+            self._schedule_copilot_refresh(profile_id, auth_storage)
+        return ok
+
     # ------------------------------------------------------------------
     # Pool management
     # ------------------------------------------------------------------
@@ -360,8 +556,22 @@ class PiAgentRuntime:
         return self._pool[session_id]
 
     def evict_session(self, session_id: str) -> None:
-        """Remove a session from the pool."""
+        """Remove a session from the pool.
+
+        Also stops any pending Copilot token refresh timers associated with the
+        evicted session, mirrors TS stopCopilotRefreshTimer() called on session
+        eviction to prevent background task leaks.
+        """
         self._pool.pop(session_id, None)
+        # Stop Copilot refresh for all profiles that had this session active.
+        # _copilot_token_cache may have a session_id field set when the token
+        # was applied (added by _apply_copilot_auth_profile path).
+        for _profile_id, _state in list(self._copilot_token_cache.items()):
+            if isinstance(_state, dict) and _state.get("session_id") == session_id:
+                try:
+                    self._stop_copilot_refresh(_profile_id)
+                except Exception:
+                    pass
 
     async def reset_session(self, session_id: str) -> None:
         """Reset a session — fires before_reset hook then evicts the session.
@@ -1034,12 +1244,44 @@ class PiAgentRuntime:
         current_profile_idx = 0
         current_think_level: str | None = None  # set on fallback
 
+        # Copilot token state for this run — one per provider_hint/profile combo.
+        # Mirrors TS: copilotTokenState created once per runEmbeddedPiAgent call.
+        _is_copilot_provider = provider_hint.lower() in ("github-copilot", "github_copilot")
+        _copilot_auth_retry_pending = False
+
         try:
             for retry_iteration in range(max_retry):
-                # Apply auth profile (if available)
+                # Apply auth profile (if available).
+                # For github-copilot: exchange GitHub OAuth token → Copilot API token.
                 if auth_profile_ids and current_profile_idx < len(auth_profile_ids):
                     pid = auth_profile_ids[current_profile_idx]
-                    self._apply_auth_profile(pid)
+                    if _is_copilot_provider and pid:
+                        # Copilot path: load GitHub token from profile, exchange for API token.
+                        # Mirrors TS: applyApiKeyInfo() → github-copilot branch → resolveCopilotApiToken().
+                        _gh_key = self._apply_auth_profile(pid)
+                        if _gh_key and not self._copilot_token_cache.get(pid, {}).get("api_token"):
+                            try:
+                                _pi_session_for_copilot = self._pool.get(session_id)
+                                _auth_storage_for_copilot = (
+                                    getattr(_pi_session_for_copilot, "_agent", None)
+                                    and getattr(
+                                        getattr(_pi_session_for_copilot, "_agent", None),
+                                        "auth_storage",
+                                        None,
+                                    )
+                                )
+                                if _auth_storage_for_copilot:
+                                    # Store session_id in cache state so evict_session can cancel refresh
+                                    _cop_state = self._copilot_token_cache.setdefault(pid, {})
+                                    _cop_state["session_id"] = session_id
+                                    await self._apply_copilot_auth_profile(pid, _gh_key, _auth_storage_for_copilot)
+                            except Exception as _cop_exc:
+                                logger.debug("Copilot auth profile init failed (non-fatal): %s", _cop_exc)
+                    else:
+                        self._apply_auth_profile(pid)
+
+                _copilot_auth_retry = _copilot_auth_retry_pending
+                _copilot_auth_retry_pending = False
 
                 last_error: Exception | None = None
                 context_tokens = 0
@@ -1317,9 +1559,16 @@ class PiAgentRuntime:
                                     return
 
                         from openclaw.agents.agent_session import _convert_pi_event
-                        oc_event = _convert_pi_event(pi_event, session_id)
-                        if oc_event is not None:
-                            event_queue.put_nowait(oc_event)
+                        try:
+                            oc_event = _convert_pi_event(pi_event, session_id)
+                            if oc_event is not None:
+                                event_queue.put_nowait(oc_event)
+                        except Exception as conv_err:
+                            # Gracefully handle validation errors (e.g., EventDone with stop_reason='error')
+                            # TS version accepts "error" as a valid stopReason (see stream-message-shared.ts line 87)
+                            # but pi_ai Python package may have stricter validation.
+                            # Log and continue — the error was already logged above via error_message handling.
+                            logger.debug("Event conversion failed (likely validation error): %s", conv_err)
 
                     unsub = pi_session.subscribe(on_event)
 
@@ -1784,7 +2033,30 @@ class PiAgentRuntime:
                         except Exception as exc:
                             logger.debug(f"agent_end hook failed: {exc}")
 
-                    # If quota error and NO more fallbacks — check auth profile rotation
+                    # If quota error and NO more fallbacks — check auth profile rotation.
+                    # For github-copilot: try refreshing the token once before rotating profile.
+                    # Mirrors TS: maybeRefreshCopilotForAuthError() in run.ts.
+                    if _quota_error and _is_copilot_provider and not _copilot_auth_retry:
+                        _cur_pid = auth_profile_ids[current_profile_idx] if auth_profile_ids and current_profile_idx < len(auth_profile_ids) else None
+                        if _cur_pid:
+                            _cop_state = self._copilot_token_cache.get(_cur_pid, {})
+                            _cop_gh_token = _cop_state.get("github_token", "")
+                            if _cop_gh_token:
+                                _pi_sess_cop = self._pool.get(session_id)
+                                _auth_st_cop = (
+                                    getattr(_pi_sess_cop, "_agent", None)
+                                    and getattr(getattr(_pi_sess_cop, "_agent", None), "auth_storage", None)
+                                )
+                                if _auth_st_cop:
+                                    _refreshed = await self._refresh_copilot_token(
+                                        _cur_pid, _cop_gh_token, _auth_st_cop, "auth-error"
+                                    )
+                                    if _refreshed:
+                                        self._schedule_copilot_refresh(_cur_pid, _auth_st_cop)
+                                        _copilot_auth_retry_pending = True
+                                        logger.info("Copilot token refreshed on auth error; retrying.")
+                                        break  # retry in outer loop
+
                     if _quota_error:
                         _auth_error = True
                         # Try next auth profile before giving up
@@ -1879,6 +2151,18 @@ class PiAgentRuntime:
             # Deregister active run — runs on normal exit AND GeneratorExit/cancellation
             if _active_handle is not None:
                 clear_active_embedded_run(session_id, _active_handle.run_id)
+
+            # Stop Copilot token refresh timer — mirrors TS stopCopilotRefreshTimer()
+            # called in the finally block of runEmbeddedPiAgent (run.ts line 1321).
+            # Cancels the background refresh task to prevent leaked asyncio tasks
+            # after the run completes.
+            if _is_copilot_provider and auth_profile_ids and current_profile_idx < len(auth_profile_ids):
+                _pid_for_cleanup = auth_profile_ids[current_profile_idx]
+                if _pid_for_cleanup:
+                    try:
+                        self._stop_copilot_refresh(_pid_for_cleanup)
+                    except Exception:
+                        pass
 
     # ------------------------------------------------------------------
     # Abort running session

@@ -1882,16 +1882,20 @@ class ChannelManager:
                 # Resolve session_id for active-run tracking
                 session_id_for_run = session.session_id if session else session_key
 
-                # Resolve queue settings from session entry
-                from openclaw.auto_reply.reply.queue import QueueSettings
-                _queue_settings = QueueSettings()
+                # Resolve queue settings using the full 5-level priority chain (Gap 8)
+                from openclaw.auto_reply.reply.queue import resolve_queue_settings
+                _session_entry_for_queue = None
                 if _session_mgr:
                     try:
-                        _entry = _session_mgr.get_session_entry(session_key)
-                        if _entry and hasattr(_entry, "queueMode") and _entry.queueMode:
-                            _queue_settings.mode = _entry.queueMode
+                        _session_entry_for_queue = _session_mgr.get_session_entry(session_key)
                     except Exception:
                         pass
+                _channel_id_for_queue = getattr(message, "channel", None) or getattr(self, "channel_id", None)
+                _queue_settings = resolve_queue_settings(
+                    _cfg,
+                    channel=str(_channel_id_for_queue) if _channel_id_for_queue else None,
+                    session_entry=_session_entry_for_queue,
+                )
 
                 # Build ReplyContext and dispatch via pipeline
                 # (steer / enqueue-followup / interrupt / run-now)

@@ -39,6 +39,7 @@ class AuthProfile:
         id: Unique profile identifier
         provider: Provider name (anthropic, openai, etc.)
         api_key: API key (can be env var name)
+        type: Credential type (api_key, token, or oauth) - mirrors TS
         last_used: Last time this profile was used
         failure_count: Deprecated alias for error_count
         error_count: Number of consecutive API errors (drives cooldown schedule)
@@ -51,6 +52,7 @@ class AuthProfile:
     id: str
     provider: str
     api_key: str
+    type: str = "api_key"           # NEW: mirrors TS type field (api_key|token|oauth)
     last_used: Optional[datetime] = None
     failure_count: int = 0          # legacy alias
     error_count: int = 0            # mirrors TS errorCount
@@ -98,6 +100,7 @@ class AuthProfile:
             "id": self.id,
             "provider": self.provider,
             "api_key": self.api_key,
+            "type": self.type,  # NEW: include type field
             "last_used": self.last_used.isoformat() if self.last_used else None,
             "failure_count": self.failure_count,
             "errorCount": self.error_count,
@@ -116,6 +119,7 @@ class AuthProfile:
             id=data["id"],
             provider=data["provider"],
             api_key=data["api_key"],
+            type=data.get("type", "api_key"),  # NEW: load type field
             last_used=datetime.fromisoformat(data["last_used"]) if data.get("last_used") else None,
             failure_count=data.get("failure_count", error_count),
             error_count=error_count,
@@ -135,8 +139,9 @@ class AuthProfile:
 
 
 class ProfileStore:
-    """
-    Store and manage authentication profiles
+    """Store and manage authentication profiles.
+    
+    Aligned with TS AuthProfileStore in auth-profiles/types.ts:60-72.
     """
 
     def __init__(self, config_dir: Optional[Path] = None):
@@ -151,6 +156,12 @@ class ProfileStore:
         self.config_file = self.config_dir / "auth_profiles.json"
 
         self.profiles: Dict[str, AuthProfile] = {}
+        
+        # NEW: Align with TS AuthProfileStore (types.ts:60-72)
+        self.usage_stats: Dict[str, Dict[str, Any]] = {}  # Per-profile usage statistics
+        self.order: Dict[str, List[str]] = {}              # Per-agent preferred profile order
+        self.last_good: Dict[str, str] = {}                 # Last successful profile per provider
+        
         self._load()
 
     def add_profile(self, profile: AuthProfile) -> None:
@@ -193,14 +204,36 @@ class ProfileStore:
         try:
             with open(self.config_file) as f:
                 data = json.load(f)
-                self.profiles = {pid: AuthProfile.from_dict(pdata) for pid, pdata in data.items()}
+                
+                # Load profiles
+                if "profiles" in data:
+                    self.profiles = {pid: AuthProfile.from_dict(pdata) for pid, pdata in data["profiles"].items()}
+                else:
+                    # Legacy format (flat dict)
+                    self.profiles = {pid: AuthProfile.from_dict(pdata) for pid, pdata in data.items()}
+                
+                # Load usage_stats (NEW)
+                self.usage_stats = data.get("usageStats", {})
+                
+                # Load order (NEW)
+                self.order = data.get("order", {})
+                
+                # Load last_good (NEW)
+                self.last_good = data.get("lastGood", {})
+                
         except Exception as e:
             print(f"Warning: Failed to load profiles: {e}")
 
     def _save(self) -> None:
         """Save profiles to disk"""
         try:
-            data = {pid: p.to_dict() for pid, p in self.profiles.items()}
+            data = {
+                "version": 1,
+                "profiles": {pid: p.to_dict() for pid, p in self.profiles.items()},
+                "usageStats": self.usage_stats,  # NEW
+                "order": self.order,              # NEW
+                "lastGood": self.last_good,       # NEW
+            }
             with open(self.config_file, "w") as f:
                 json.dump(data, f, indent=2)
         except Exception as e:
