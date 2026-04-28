@@ -1,8 +1,8 @@
 ---
 name: discord
-description: "Discord ops via the message tool (channel=discord)."
+description: "Send messages, react with emoji, manage pins, create polls, search history, and moderate on Discord via the message tool (channel=discord). Use when user asks to send a Discord message, react to a message, pin or unpin, create a thread, run a poll, search message history, or set bot presence in a Discord server."
 metadata: { "openclaw": { "emoji": "🎮", "requires": { "config": ["channels.discord.token"] } } }
-allowed-tools: ["message"]
+allowed-tools: "message"
 ---
 
 # Discord (Via `message`)
@@ -189,6 +189,11 @@ Presence (often gated):
   "status": "online"
 }
 ```
+
+## Safety for Destructive Actions
+
+- **Before delete**: Read the message first to confirm the target (`action: "read"` with the channelId).
+- **Before edit**: Verify the messageId belongs to the bot (only bot-authored messages can be edited).
 
 ## Writing Style (Discord)
 
