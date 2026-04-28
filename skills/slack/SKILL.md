@@ -1,6 +1,6 @@
 ---
 name: slack
-description: Use when you need to control Slack from OpenClaw via the slack tool, including reacting to messages or pinning/unpinning items in Slack channels or DMs.
+description: "Send messages, add emoji reactions, pin/unpin messages, edit or delete messages, read channel history, and look up member info in Slack. Use when user asks to send a Slack message, react with an emoji, pin a message, read recent messages, edit or delete a Slack message, or look up a Slack user."
 metadata: { "openclaw": { "emoji": "💬", "requires": { "config": ["channels.slack"] } } }
 ---
 
@@ -138,7 +138,7 @@ Message context lines include `slack message id` and `channel` fields you can re
 }
 ```
 
-## Ideas to try
+## Safety for Destructive Actions
 
-- React with ✅ to mark completed tasks.
-- Pin key decisions or weekly status updates.
+- **Before deleteMessage**: Read the message first (`readMessages`) to confirm the target. Only bot-posted messages can be deleted.
+- **Before editMessage**: Verify the messageId is correct and the message belongs to the bot.

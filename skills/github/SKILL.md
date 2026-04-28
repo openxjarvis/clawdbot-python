@@ -32,36 +32,10 @@ metadata:
 
 Use the `gh` CLI to interact with GitHub repositories, issues, PRs, and CI.
 
-## When to Use
+## Scope
 
-✅ **USE this skill when:**
-
-- Checking PR status, reviews, or merge readiness
-- Viewing CI/workflow run status and logs
-- Creating, closing, or commenting on issues
-- Creating or merging pull requests
-- Querying GitHub API for repository data
-- Listing repos, releases, or collaborators
-
-## When NOT to Use
-
-❌ **DON'T use this skill when:**
-
-- Local git operations (commit, push, pull, branch) → use `git` directly
-- Non-GitHub repos (GitLab, Bitbucket, self-hosted) → different CLIs
-- Cloning repositories → use `git clone`
-- Reviewing actual code changes → use `coding-agent` skill
-- Complex multi-file diffs → use `coding-agent` or read files directly
-
-## Setup
-
-```bash
-# Authenticate (one-time)
-gh auth login
-
-# Verify
-gh auth status
-```
+**Use for**: PR status/reviews/merges, CI run status and logs, issue create/close/comment, GitHub API queries, listing repos/releases/collaborators.
+**Not for**: local git ops (use `git`), non-GitHub hosts (GitLab/Bitbucket), code review diffs (use `coding-agent`).
 
 ## Common Commands
 
@@ -80,7 +54,10 @@ gh pr view 55 --repo owner/repo
 # Create PR
 gh pr create --title "feat: add feature" --body "Description"
 
-# Merge PR
+# Check CI before merging
+gh pr checks 55 --repo owner/repo
+
+# Merge PR (only after CI passes)
 gh pr merge 55 --squash --repo owner/repo
 ```
 
